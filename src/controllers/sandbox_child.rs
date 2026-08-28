@@ -15,16 +15,17 @@
 //! kubeconfig is read from controller-authorised storage into memory and never
 //! written to status, an API response, a log line, or an event.
 //!
-//! The operator provides Agent Sandbox v1.0.0 through a generic, explicitly
-//! referenced `BootstrapConfig` or another external provisioning mechanism.
-//! Kobe performs read-only API compatibility checks before creating tenant
-//! pool objects; it does not ship or inject a privileged runtime installer.
+//! Managed mode publishes the pinned Agent Sandbox v1.0.0 manifest as an
+//! explicitly referenced `BootstrapConfig`. Before creating the tenant Claim,
+//! Kobe authenticates that installation and completes a restart-safe real
+//! create/delete canary inside the exact child. External mode still expects
+//! the operator to provide v1.0.0 through a generic BootstrapConfig.
 
 use std::time::Duration;
 
 use kube::Resource;
 use kube::api::ObjectMeta;
-use kube::{Client, ResourceExt};
+use kube::{Api, Client, ResourceExt};
 
 use crate::crd::{
     CleanupMode, ClusterLease, ClusterLeaseSpec, ClusterPool, ClusterPoolPhase, Requester,
@@ -124,6 +125,11 @@ pub enum ChildPlacementError {
         cluster_pool: String,
         reason: &'static str,
     },
+    #[error("ClusterPool {cluster_pool} has an unusable managed Sandbox bootstrap: {reason}")]
+    ChildBootstrapUnusable {
+        cluster_pool: String,
+        reason: String,
+    },
 }
 
 impl ChildPlacementError {
@@ -137,8 +143,67 @@ impl ChildPlacementError {
             Self::ChildRuntimeUnusable { .. } => "child_runtime_unusable",
             Self::ChildCredentialUnusable { .. } => "child_credential_unusable",
             Self::CapacityUnavailable { .. } => "capacity_unavailable",
+            Self::ChildBootstrapUnusable { .. } => "child_bootstrap_unusable",
         }
     }
+}
+
+/// Prove the selected ClusterPool references the exact chart-published
+/// managed runtime bundle. Applying it remains the generic ClusterInstance
+/// bootstrap controller's job; this check grants no child credentials.
+pub async fn validate_managed_child_bootstrap(
+    client: &Client,
+    namespace: &str,
+    cluster_pool: &ClusterPool,
+    identity: &crate::sandbox_runtime::ManagedRuntimeIdentity,
+) -> Result<(), ChildPlacementError> {
+    let pool_name = cluster_pool.name_any();
+    let references = cluster_pool
+        .spec
+        .bootstraps
+        .iter()
+        .filter(|reference| reference.name == identity.bootstrap_name)
+        .collect::<Vec<_>>();
+    if references.len() != 1 || !references[0].params.is_empty() {
+        return Err(ChildPlacementError::ChildBootstrapUnusable {
+            cluster_pool: pool_name,
+            reason: "spec.bootstraps must reference the managed BootstrapConfig exactly once without parameters".into(),
+        });
+    }
+
+    let configs: Api<crate::crd::BootstrapConfig> = Api::namespaced(client.clone(), namespace);
+    let config = configs.get(&identity.bootstrap_name).await.map_err(|_| {
+        ChildPlacementError::ChildBootstrapUnusable {
+            cluster_pool: pool_name.clone(),
+            reason: "managed BootstrapConfig is unavailable".into(),
+        }
+    })?;
+    let annotations = config.annotations();
+    if annotations.get(crate::sandbox_runtime::MANAGED_OWNER_ANNOTATION) != Some(&identity.owner)
+        || annotations.get(crate::sandbox_runtime::MANAGED_DIGEST_ANNOTATION)
+            != Some(&identity.manifest_sha256)
+    {
+        return Err(ChildPlacementError::ChildBootstrapUnusable {
+            cluster_pool: pool_name,
+            reason: "BootstrapConfig ownership or pinned-manifest digest drifted".into(),
+        });
+    }
+    let manifest = config.spec.files.get("agent-sandbox-v1.0.0.yaml");
+    if config.spec.files.len() != 1
+        || config.spec.job.is_some()
+        || manifest.is_none_or(|manifest| {
+            !manifest.contains(crate::sandbox_runtime::MANAGED_CONTROLLER_IMAGE)
+                || !crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_CRDS
+                    .iter()
+                    .all(|(name, _)| manifest.contains(name))
+        })
+    {
+        return Err(ChildPlacementError::ChildBootstrapUnusable {
+            cluster_pool: pool_name,
+            reason: "BootstrapConfig is not the declarative v1.0.0 runtime bundle".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Prove a child pool may safely accept compositions before allocation.
@@ -694,8 +759,9 @@ pub fn child_provenance(
 pub async fn validate_child_runtime(
     child: &Client,
     cluster: &str,
+    identity: &crate::sandbox_runtime::ManagedRuntimeIdentity,
 ) -> Result<(), ChildPlacementError> {
-    crate::sandbox_runtime::validate_external_runtime(child)
+    crate::sandbox_runtime::validate_managed_runtime(child, identity)
         .await
         .map_err(|reason| ChildPlacementError::ChildRuntimeUnusable {
             cluster: cluster.to_string(),
@@ -736,6 +802,70 @@ mod tests {
             ..Default::default()
         });
         pool
+    }
+
+    #[tokio::test]
+    async fn managed_child_pool_requires_the_exact_declarative_bootstrap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let identity = crate::sandbox_runtime::ManagedRuntimeIdentity {
+            owner: "kobe/kobe".into(),
+            manifest_sha256: "a".repeat(64),
+            bootstrap_name: "kobe-agent-sandbox-v1-0-0".into(),
+        };
+        let mut pool = healthy_cluster_pool();
+        pool.spec.bootstraps = vec![crate::crd::BootstrapRef {
+            name: identity.bootstrap_name.clone(),
+            params: Default::default(),
+        }];
+        let required_names = crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_CRDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe/bootstrapconfigs/{}",
+                identity.bootstrap_name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "BootstrapConfig",
+                "metadata": {
+                    "name": identity.bootstrap_name.clone(),
+                    "namespace": "kobe",
+                    "annotations": {
+                        "kobe.kunobi.ninja/agent-sandbox-owner": identity.owner.clone(),
+                        "kobe.kunobi.ninja/agent-sandbox-manifest-sha256": identity.manifest_sha256.clone(),
+                    }
+                },
+                "spec": {
+                    "files": {
+                        "agent-sandbox-v1.0.0.yaml": format!(
+                            "{}\n{}",
+                            crate::sandbox_runtime::MANAGED_CONTROLLER_IMAGE,
+                            required_names
+                        )
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        validate_managed_child_bootstrap(&client, "kobe", &pool, &identity)
+            .await
+            .expect("exact managed bootstrap");
+
+        pool.spec.bootstraps[0]
+            .params
+            .insert("version".into(), "latest".into());
+        assert!(matches!(
+            validate_managed_child_bootstrap(&client, "kobe", &pool, &identity).await,
+            Err(ChildPlacementError::ChildBootstrapUnusable { .. })
+        ));
     }
 
     fn backend_wire_name(backend: BackendType) -> String {

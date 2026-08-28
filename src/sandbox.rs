@@ -18,6 +18,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::ResourceExt;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use thiserror::Error;
 
@@ -120,6 +121,50 @@ pub fn require_current_sandbox_pool_ready(
         });
     }
     Ok(())
+}
+
+/// Return the exact child ClusterPool authority currently certified for
+/// allocation, without claiming the remote runtime is ready yet.
+///
+/// This certificate may allocate only the internal exclusive ClusterLease.
+/// The composition reconciler still must authenticate and canary that exact
+/// child before creating the caller's upstream Claim.
+pub fn current_child_pool_allocation_authority(
+    pool: &SandboxPool,
+) -> Option<&crate::crd::SandboxPlacementAuthority> {
+    let generation = pool.metadata.generation?;
+    if pool.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let crate::crd::SandboxPlacement::ChildCluster { cluster_pool_ref } = &pool.spec.placement
+    else {
+        return None;
+    };
+    let status = pool.status.as_ref()?;
+    if status.observed_generation != Some(generation) {
+        return None;
+    }
+    let ready = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type == "Ready")
+        .collect::<Vec<_>>();
+    if ready.len() != 1
+        || ready[0].status != SandboxConditionStatus::False
+        || ready[0].reason != "CompositionEligible"
+        || ready[0].observed_generation != Some(generation)
+    {
+        return None;
+    }
+    let authority = status.placement_authority.as_ref()?;
+    let namespace = pool.namespace()?;
+    (authority.api_version == KOBE_API_VERSION
+        && authority.kind == "ClusterPool"
+        && authority.namespace == namespace
+        && authority.name == *cluster_pool_ref
+        && !authority.uid.is_empty()
+        && authority.generation > 0)
+        .then_some(authority)
 }
 
 /// Why a SandboxPool cannot currently authorize new workload placement.
@@ -1535,6 +1580,58 @@ mod tests {
             require_current_sandbox_pool_ready(&duplicate),
             Err(SandboxPoolReadinessError::DuplicateReadyCondition)
         );
+    }
+
+    #[test]
+    fn child_allocation_certificate_is_exact_current_and_not_runtime_readiness() {
+        let mut child = pool_resource(Some(SandboxPoolStatus {
+            observed_generation: Some(3),
+            ready: 0,
+            allocated: 0,
+            quarantined: 0,
+            placement: Some(SandboxPlacement::ChildCluster {
+                cluster_pool_ref: "children".into(),
+            }),
+            placement_authority: Some(crate::crd::SandboxPlacementAuthority {
+                api_version: KOBE_API_VERSION.into(),
+                kind: "ClusterPool".into(),
+                namespace: "kobe".into(),
+                name: "children".into(),
+                uid: "children-uid".into(),
+                generation: 7,
+            }),
+            certification: None,
+            conditions: vec![SandboxCondition {
+                condition_type: "Ready".into(),
+                status: SandboxConditionStatus::False,
+                reason: "CompositionEligible".into(),
+                message: "runtime canary still required".into(),
+                observed_generation: Some(3),
+                last_transition_time: None,
+            }],
+        }));
+        child.spec.placement = SandboxPlacement::ChildCluster {
+            cluster_pool_ref: "children".into(),
+        };
+
+        let authority = current_child_pool_allocation_authority(&child)
+            .expect("current child allocation authority");
+        assert_eq!(authority.uid, "children-uid");
+        assert!(require_current_sandbox_pool_ready(&child).is_err());
+
+        let mut stale = child.clone();
+        stale.status.as_mut().unwrap().observed_generation = Some(2);
+        assert!(current_child_pool_allocation_authority(&stale).is_none());
+
+        let mut duplicate = child;
+        let condition = duplicate.status.as_ref().unwrap().conditions[0].clone();
+        duplicate
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(condition);
+        assert!(current_child_pool_allocation_authority(&duplicate).is_none());
     }
 
     fn reference(kind: &str, name: &str, uid: &str) -> SandboxObjectReference {

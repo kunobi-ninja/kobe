@@ -7,9 +7,10 @@ description: Define bounded, administrator-owned Agent Sandbox templates and pla
 
 <Callout type="warn">
   `SandboxPool` and `SandboxLease` are alpha APIs. Set
-  `agentSandbox.mode=external` only after installing Agent Sandbox v1.0.0
-  yourself. Kobe validates its consumed APIs read-only before mounting the
-  Sandbox HTTP API; `disabled` mounts no Sandbox endpoints.
+  Use `agentSandbox.mode=managed` for Kobe-owned management and child runtimes,
+  or `external` after installing Agent Sandbox v1.0.0 yourself. Kobe validates
+  consumed APIs before mounting the Sandbox HTTP API; `disabled` mounts no
+  Sandbox endpoints.
 </Callout>
 
 Administrators author `SandboxPool` objects. API callers only choose an allowed
@@ -18,13 +19,16 @@ RuntimeClass, environment values, mounts, PVCs, or target credentials.
 
 ## Runtime ownership
 
-`agentSandbox.mode` has two values:
+`agentSandbox.mode` has three values:
 
 - `disabled` is the default. Kobe renders no upstream Agent Sandbox resources
   and serves no new Sandbox API work. Lifecycle controllers continue cleanup
   for leases admitted before the mode changed.
 - `external` installs, upgrades, and uninstalls nothing. The operator owns the
   Agent Sandbox v1.0.0 core, extensions, CRDs, and controller.
+- `managed` installs the chart-pinned v1.0.0 runtime by controller image digest,
+  retains its CRDs, RBAC, and controller on Helm uninstall, and publishes a
+  retained child `BootstrapConfig` from the same manifest.
 
 Kobe checks that all four consumed CRDs are established, serve `v1beta1` only
 (no leftover `v1alpha1` or conversion webhook), and expose the WarmPool
@@ -35,27 +39,30 @@ healthy. The actual Claim for a requested lease still fails closed during
 provisioning, and its administrator-declared readiness command must pass before
 that lease becomes Ready.
 
-Kobe does not provide an Agent-Sandbox-specific child bootstrap. An operator
-may create a normal `BootstrapConfig` and reference it explicitly from the
-child `ClusterPool`, or provide the runtime through another provisioning path:
+Child placement requires `managed` mode. Reference the BootstrapConfig
+published by the Helm release explicitly from the child `ClusterPool`. For a
+release named `kobe`, the default reference is:
 
 ```yaml
 spec:
   bootstraps:
-    - name: my-agent-sandbox-v1-0-0
+    - name: kobe-agent-sandbox-v1-0-0
 ```
 
-`BootstrapConfig` is generic operator input. Kobe does not create, inject, or
-require a special name or bundle digest. Before writing Sandbox objects inside
-an allocated child, Kobe performs the same read-only API compatibility check.
+Kobe checks the exact BootstrapConfig owner and pinned-manifest digest before
+allocating a child. After the generic ClusterInstance bootstrap completes, Kobe
+authenticates the installed CRDs and controller image, then runs a restart-safe
+create/delete canary inside that exact child. The canary checkpoints the Claim,
+Sandbox, and Pod UIDs and proves their absence before Kobe creates the caller's
+Claim. Helm contains no operational canary hook.
 
 <Callout type="info">
   If a cluster still runs v0.5.x, follow the upstream v1.0.0 migration: prune
   `v1alpha1` from CRD `status.storedVersions`, install v1.0.0, then delete the
   leftover webhook Service, cert Secret, and namespaced Role/RoleBinding.
-  Update operator-authored child bootstrap content at the same time and recycle
-  or upgrade older children according to your pool policy. Kobe never performs
-  this upgrade; it rejects a child whose APIs are incompatible.
+  Update operator-authored child bootstrap content at the same time. Managed
+  child pools must be recycled after changing the pinned runtime; Kobe rejects
+  mismatched children. Kobe never performs this upgrade.
 </Callout>
 
 Agent Sandbox does not install gVisor, Kata, node runtimes, or RuntimeClasses.

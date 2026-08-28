@@ -1,15 +1,15 @@
-//! Validation of an operator-installed upstream Agent Sandbox runtime.
+//! Ownership and validation of the upstream Agent Sandbox runtime.
 //!
 //! Kobe consumes `SandboxTemplate`, `SandboxWarmPool`, `SandboxClaim`, and
-//! `Sandbox` from upstream Agent Sandbox. The operator installs and upgrades
-//! Agent Sandbox v1.0.0; Kobe owns none of that installation. Before enabling
-//! Sandbox admission, Kobe performs only read-only API/schema compatibility
-//! checks. It never installs runtime resources or writes a sacrificial Claim.
+//! `Sandbox` from upstream Agent Sandbox. External mode validates an
+//! operator-owned v1.0.0 installation. Managed mode consumes the retained Helm
+//! installation and exact disposable-child bootstrap published from the same
+//! vendored v1.0.0 release.
 //!
-//! This is intentionally weaker than a live runtime canary: a compatible API
-//! can still have a wedged controller. Actual tenant leases fail closed during
-//! provisioning and run their administrator-declared readiness command before
-//! becoming Ready.
+//! External mode is intentionally read-only and therefore weaker than a live
+//! runtime canary. Managed mode additionally requires the exact chart-owned
+//! controller. Runtime capability remains the SandboxPool reconciler's job,
+//! using its existing real create/delete certification protocol.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +24,15 @@ pub enum AgentSandboxMode {
     /// The operator installs and owns Agent Sandbox. Kobe only validates its
     /// consumed API surface and creates ordinary, lease-owned product objects.
     External,
+    /// Kobe's chart owns the exact management runtime and publishes the
+    /// matching BootstrapConfig for disposable child clusters.
+    Managed,
 }
 
 impl AgentSandboxMode {
     /// Whether new Sandbox admission and placement may run.
     pub const fn enabled(self) -> bool {
-        matches!(self, Self::External)
+        matches!(self, Self::External | Self::Managed)
     }
 }
 
@@ -62,13 +65,10 @@ pub const REQUIRED_AGENT_SANDBOX_CRDS: &[(&str, &str)] = &[
 /// Why an operator-installed runtime cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AgentSandboxUnusable {
-    #[error("Agent Sandbox mode {configured:?} is invalid; expected disabled or external")]
-    InvalidMode { configured: String },
-    /// `managed` stays a distinct error rather than degrading to another mode.
     #[error(
-        "Agent Sandbox managed mode is not implemented; install and upgrade Agent Sandbox {release} yourself, then use agentSandbox.mode=external"
+        "Agent Sandbox mode {configured:?} is invalid; expected disabled, external, or managed"
     )]
-    ManagedNotApproved { release: &'static str },
+    InvalidMode { configured: String },
     #[error("Agent Sandbox CRD {crd} is not installed or not established")]
     CrdMissing { crd: String },
     /// Reading the CRD itself failed. A transport error, throttling, or a 5xx
@@ -89,6 +89,12 @@ pub enum AgentSandboxUnusable {
         release: &'static str,
         reason: &'static str,
     },
+    #[error("managed Agent Sandbox configuration is invalid: {reason}")]
+    ManagedConfiguration { reason: String },
+    #[error("managed Agent Sandbox resource {resource} is missing")]
+    ManagedResourceMissing { resource: String },
+    #[error("managed Agent Sandbox resource {resource} failed certification: {reason}")]
+    ManagedCertification { resource: String, reason: String },
 }
 
 impl AgentSandboxUnusable {
@@ -96,11 +102,13 @@ impl AgentSandboxUnusable {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidMode { .. } => "invalid_mode",
-            Self::ManagedNotApproved { .. } => "managed_not_approved",
             Self::CrdMissing { .. } => "crd_missing",
             Self::Unreachable { .. } => "apiserver_unreachable",
             Self::VersionMismatch { .. } => "version_mismatch",
             Self::SchemaMismatch { .. } => "schema_mismatch",
+            Self::ManagedConfiguration { .. } => "managed_configuration",
+            Self::ManagedResourceMissing { .. } => "managed_resource_missing",
+            Self::ManagedCertification { .. } => "managed_certification",
         }
     }
 
@@ -110,8 +118,76 @@ impl AgentSandboxUnusable {
     /// incompatible CRD stays absent until an operator acts, and retrying
     /// would hide a real misconfiguration behind a delay.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Unreachable { .. })
+        matches!(
+            self,
+            Self::Unreachable { .. } | Self::ManagedResourceMissing { .. }
+        )
     }
+}
+
+pub const MANAGED_OWNER_ANNOTATION: &str = "kobe.kunobi.ninja/agent-sandbox-owner";
+pub const MANAGED_DIGEST_ANNOTATION: &str = "kobe.kunobi.ninja/agent-sandbox-manifest-sha256";
+pub const MANAGED_CONTROLLER_IMAGE: &str = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRuntimeIdentity {
+    pub owner: String,
+    pub manifest_sha256: String,
+    pub bootstrap_name: String,
+}
+
+impl ManagedRuntimeIdentity {
+    pub fn from_env() -> Result<Self, AgentSandboxUnusable> {
+        fn required(name: &str) -> Result<String, AgentSandboxUnusable> {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| AgentSandboxUnusable::ManagedConfiguration {
+                    reason: format!("{name} is required in managed mode"),
+                })
+        }
+
+        let identity = Self {
+            owner: required("KOBE_AGENT_SANDBOX_OWNER")?,
+            manifest_sha256: required("KOBE_AGENT_SANDBOX_MANIFEST_SHA256")?,
+            bootstrap_name: required("KOBE_AGENT_SANDBOX_BOOTSTRAP")?,
+        };
+        if identity.manifest_sha256.len() != 64
+            || !identity
+                .manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AgentSandboxUnusable::ManagedConfiguration {
+                reason: "managed manifest digest must be 64 hexadecimal characters".into(),
+            });
+        }
+        Ok(identity)
+    }
+}
+
+fn require_managed_annotations(
+    resource: &str,
+    annotations: Option<&std::collections::BTreeMap<String, String>>,
+    identity: &ManagedRuntimeIdentity,
+) -> Result<(), AgentSandboxUnusable> {
+    let annotations = annotations.ok_or_else(|| AgentSandboxUnusable::ManagedCertification {
+        resource: resource.into(),
+        reason: "ownership annotations are absent".into(),
+    })?;
+    if annotations.get(MANAGED_OWNER_ANNOTATION) != Some(&identity.owner) {
+        return Err(AgentSandboxUnusable::ManagedCertification {
+            resource: resource.into(),
+            reason: "owner annotation does not match this Helm release".into(),
+        });
+    }
+    if annotations.get(MANAGED_DIGEST_ANNOTATION) != Some(&identity.manifest_sha256) {
+        return Err(AgentSandboxUnusable::ManagedCertification {
+            resource: resource.into(),
+            reason: "manifest digest annotation does not match the pinned release".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse the configured ownership mode without silently degrading bad input.
@@ -119,9 +195,7 @@ pub fn parse_mode(configured: &str) -> Result<AgentSandboxMode, AgentSandboxUnus
     match configured.trim().to_ascii_lowercase().as_str() {
         "disabled" | "" => Ok(AgentSandboxMode::Disabled),
         "external" => Ok(AgentSandboxMode::External),
-        "managed" => Err(AgentSandboxUnusable::ManagedNotApproved {
-            release: AGENT_SANDBOX_RELEASE,
-        }),
+        "managed" => Ok(AgentSandboxMode::Managed),
         _ => Err(AgentSandboxUnusable::InvalidMode {
             configured: configured.trim().to_string(),
         }),
@@ -306,6 +380,78 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
     Ok(())
 }
 
+/// Validate the exact chart-owned managed installation.
+pub async fn validate_managed_runtime(
+    client: &kube::Client,
+    identity: &ManagedRuntimeIdentity,
+) -> Result<(), AgentSandboxUnusable> {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    use kube::{Api, ResourceExt};
+
+    validate_external_runtime(client).await?;
+
+    let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
+    for (name, _) in REQUIRED_AGENT_SANDBOX_CRDS {
+        let crd = crds.get(name).await.map_err(|error| match error {
+            kube::Error::Api(response) if response.code == 404 => {
+                AgentSandboxUnusable::ManagedResourceMissing {
+                    resource: format!("CustomResourceDefinition/{name}"),
+                }
+            }
+            other => AgentSandboxUnusable::Unreachable {
+                crd: (*name).into(),
+                detail: other.to_string(),
+            },
+        })?;
+        require_managed_annotations(
+            &format!("CustomResourceDefinition/{name}"),
+            crd.metadata.annotations.as_ref(),
+            identity,
+        )?;
+    }
+
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "agent-sandbox-system");
+    let deployment =
+        deployments
+            .get("agent-sandbox-controller")
+            .await
+            .map_err(|error| match error {
+                kube::Error::Api(response) if response.code == 404 => {
+                    AgentSandboxUnusable::ManagedResourceMissing {
+                        resource: "Deployment/agent-sandbox-system/agent-sandbox-controller".into(),
+                    }
+                }
+                other => AgentSandboxUnusable::Unreachable {
+                    crd: "Deployment/agent-sandbox-system/agent-sandbox-controller".into(),
+                    detail: other.to_string(),
+                },
+            })?;
+    require_managed_annotations(
+        "Deployment/agent-sandbox-system/agent-sandbox-controller",
+        deployment.metadata.annotations.as_ref(),
+        identity,
+    )?;
+    let image = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .and_then(|spec| {
+            spec.containers
+                .iter()
+                .find(|container| container.name == "agent-sandbox-controller")
+        })
+        .and_then(|container| container.image.as_deref());
+    if image != Some(MANAGED_CONTROLLER_IMAGE) {
+        return Err(AgentSandboxUnusable::ManagedCertification {
+            resource: format!("Deployment/{}", deployment.name_any()),
+            reason: "controller image is not the pinned digest".into(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Retry startup validation while the API server is merely unreachable.
 ///
 /// The shape mirrors [`crate::sandbox_ledger::validate`]: a bounded window
@@ -324,6 +470,23 @@ pub async fn validate_external_runtime_with_retry(
         tokio::time::Instant::now() + std::time::Duration::from_secs(30),
     )
     .await
+}
+
+pub async fn validate_managed_runtime_with_retry(
+    client: &kube::Client,
+    identity: &ManagedRuntimeIdentity,
+) -> Result<(), AgentSandboxUnusable> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match validate_managed_runtime(client, identity).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_transient() && tokio::time::Instant::now() < deadline => {
+                tracing::debug!(reason = error.reason_code(), "{error}");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// [`validate_external_runtime_with_retry`] with an injectable deadline.
@@ -348,15 +511,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_is_rejected_and_external_is_the_only_enabled_mode() {
+    fn managed_and_external_are_enabled_modes() {
         assert_eq!(AgentSandboxMode::default(), AgentSandboxMode::Disabled);
         assert!(!AgentSandboxMode::Disabled.enabled());
         assert!(AgentSandboxMode::External.enabled());
+        assert!(AgentSandboxMode::Managed.enabled());
         assert_eq!(parse_mode("external"), Ok(AgentSandboxMode::External));
-        assert!(matches!(
-            parse_mode(" managed "),
-            Err(AgentSandboxUnusable::ManagedNotApproved { .. })
-        ));
+        assert_eq!(parse_mode(" managed "), Ok(AgentSandboxMode::Managed));
         assert!(matches!(
             parse_mode("typo"),
             Err(AgentSandboxUnusable::InvalidMode { .. })

@@ -1,0 +1,25 @@
+{{- if eq .Values.agentSandbox.mode "managed" }}
+{{- /*
+The upstream runtime is a retained, Helm-owned installation. Ownership and the
+exact pinned-manifest digest are stamped on every object. Helm therefore
+refuses to adopt a runtime belonging to another release, while uninstall keeps
+the cluster-scoped API and its controller available for explicit migration.
+*/ -}}
+{{ include "kobe.agentSandboxManagedManifest" (dict "root" . "keep" true) }}
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: BootstrapConfig
+metadata:
+  name: {{ include "kobe.agentSandboxBootstrapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+    kobe.kunobi.ninja/agent-sandbox-owner: {{ include "kobe.agentSandboxOwner" . | quote }}
+    kobe.kunobi.ninja/agent-sandbox-manifest-sha256: {{ include "kobe.agentSandboxManifestDigest" . | quote }}
+spec:
+  files:
+    agent-sandbox-v1.0.0.yaml: |-
+      {{- include "kobe.agentSandboxManagedManifest" (dict "root" . "keep" false) | nindent 6 }}
+{{- end }}

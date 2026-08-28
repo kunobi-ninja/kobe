@@ -99,6 +99,14 @@ spec:
             # operator-installed Agent Sandbox v1.0.0 runtime.
             - name: AGENT_SANDBOX_MODE
               value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
+            {{- if eq .Values.agentSandbox.mode "managed" }}
+            - name: KOBE_AGENT_SANDBOX_OWNER
+              value: {{ include "kobe.agentSandboxOwner" . | quote }}
+            - name: KOBE_AGENT_SANDBOX_MANIFEST_SHA256
+              value: {{ include "kobe.agentSandboxManifestDigest" . | quote }}
+            - name: KOBE_AGENT_SANDBOX_BOOTSTRAP
+              value: {{ include "kobe.agentSandboxBootstrapName" . | quote }}
+            {{- end }}
             - name: KOBE_SANDBOX_RESERVATION_NAMESPACE
               value: {{ include "kobe.sandboxLedgerNamespace" . | quote }}
             - name: KOBE_SANDBOX_LEDGER_POLICY_NAME
