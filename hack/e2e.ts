@@ -17,14 +17,14 @@ const DEMO_OTHER_TOKEN_SECRET = "e2e-other-token";
 const DEMO_OTHER_POLICY = "e2e-other-token";
 const DEMO_SANDBOX_POOL_MANAGEMENT = "e2e-sandbox-management-trusted";
 const DEMO_SANDBOX_POOL_CHILD = "e2e-sandbox-child-k3s-trusted";
-const DEMO_SANDBOX_BOOTSTRAP = "agent-sandbox-v0-5-6";
+const DEMO_SANDBOX_BOOTSTRAP = "agent-sandbox-v1-0-0";
 // Kobe's external mode installs nothing: the harness plays the operator and
 // applies the pinned upstream release itself, to the management cluster
 // directly and to child clusters through an ordinary BootstrapConfig.
-const SANDBOX_RUNTIME_FIXTURE = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
-const SANDBOX_RUNTIME_SHA256 = "1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
-const SANDBOX_RUNTIME_TAGGED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
-const SANDBOX_RUNTIME_PINNED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
+const SANDBOX_RUNTIME_FIXTURE = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
+const SANDBOX_RUNTIME_SHA256 = "3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
+const SANDBOX_RUNTIME_TAGGED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0";
+const SANDBOX_RUNTIME_PINNED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd";
 const SANDBOX_RUNTIME_CRDS = [
   "sandboxclaims.extensions.agents.x-k8s.io",
   "sandboxes.agents.x-k8s.io",
@@ -1119,7 +1119,7 @@ async function applySandboxBootstrap(cluster: string, namespace: string): Promis
     apiVersion: "kobe.kunobi.ninja/v1alpha1",
     kind: "BootstrapConfig",
     metadata: { name: DEMO_SANDBOX_BOOTSTRAP, namespace },
-    spec: { files: { "agent-sandbox-v0.5.6.yaml": pinnedSandboxRuntime() } },
+    spec: { files: { "agent-sandbox-v1.0.0.yaml": pinnedSandboxRuntime() } },
   };
   const manifestPath = `${process.env.RUNNER_TEMP ?? "/tmp"}/kobe-e2e-agent-sandbox-bootstrap.json`;
   await Bun.write(manifestPath, JSON.stringify(bootstrap));

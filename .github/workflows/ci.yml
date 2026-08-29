@@ -312,10 +312,10 @@ jobs:
         run: mise exec -- kind delete cluster --name "$SANDBOX_CONTRACT_CLUSTER" || true
 
   # Proves the pinned release fixture against a real cluster: a live warm
-  # Claim survives the operator-side v0.5.4 -> v0.5.6 rollout, then the pinned
-  # controller, conversion webhook and exact Claim -> Sandbox -> Pod lifecycle
-  # are healthy. The script owns a uniquely named Kind cluster and refuses to
-  # reuse one.
+  # Claim survives the operator-side v0.5.6 -> v1.0.0 rollout, then the pinned
+  # controller and exact Claim -> Sandbox -> Pod lifecycle are healthy without
+  # a conversion webhook. The script owns a uniquely named Kind cluster and
+  # refuses to reuse one.
   sandbox-runtime-contract:
     name: Agent Sandbox Runtime Contract
     runs-on: kunobi-runners
@@ -337,7 +337,7 @@ jobs:
       - name: Install Helm and chart dependencies
         uses: azure/setup-helm@v5
 
-      - name: Upgrade and exercise the pinned v0.5.6 runtime
+      - name: Upgrade and exercise the pinned v1.0.0 runtime
         run: |
           helm repo add bitnami https://charts.bitnami.com/bitnami
           helm dependency build charts/kobe/

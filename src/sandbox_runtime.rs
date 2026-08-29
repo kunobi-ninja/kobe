@@ -2,7 +2,7 @@
 //!
 //! Kobe consumes `SandboxTemplate`, `SandboxWarmPool`, `SandboxClaim`, and
 //! `Sandbox` from upstream Agent Sandbox. The operator installs and upgrades
-//! Agent Sandbox v0.5.6; Kobe owns none of that installation. Before enabling
+//! Agent Sandbox v1.0.0; Kobe owns none of that installation. Before enabling
 //! Sandbox admission, Kobe performs only read-only API/schema compatibility
 //! checks. It never installs runtime resources or writes a sacrificial Claim.
 //!
@@ -34,7 +34,7 @@ impl AgentSandboxMode {
 }
 
 /// Operator-installed Agent Sandbox release supported by this Kobe build.
-pub const AGENT_SANDBOX_RELEASE: &str = "v0.5.6";
+pub const AGENT_SANDBOX_RELEASE: &str = "v1.0.0";
 
 /// Extensions API version consumed by Kobe.
 pub const REQUIRED_AGENT_SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io/v1beta1";
@@ -163,9 +163,34 @@ pub fn crd_is_compatible(
     })
 }
 
-/// Whether the served WarmPool schema carries the v0.5.6 generation ACK Kobe
-/// uses before trusting replica counts. v0.5.4 serves the same `v1beta1`
-/// version, so the served-version check alone cannot distinguish it.
+/// Whether a CRD still advertises the removed `v1alpha1` API.
+///
+/// Agent Sandbox v1.0.0 serves only `v1beta1`. v0.5.x served both and needed a
+/// conversion webhook; that pair is the live 0.5.x shape this pin rejects.
+fn crd_serves_legacy_alpha(
+    crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+) -> bool {
+    crd.spec
+        .versions
+        .iter()
+        .any(|version| version.served && version.name == "v1alpha1")
+}
+
+/// Whether a CRD still routes conversion through a webhook.
+///
+/// v1.0.0 dropped conversion infrastructure. A `Webhook` strategy, or a
+/// leftover `webhook` client config, is the 0.5.x install this pin rejects.
+fn crd_has_conversion_webhook(
+    crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+) -> bool {
+    crd.spec.conversion.as_ref().is_some_and(|conversion| {
+        conversion.strategy.eq_ignore_ascii_case("Webhook") || conversion.webhook.is_some()
+    })
+}
+
+/// Whether the served WarmPool schema carries the generation ACK Kobe uses
+/// before trusting replica counts. v0.5.4 served the same `v1beta1` version
+/// without this field, so the served-version check alone cannot distinguish it.
 fn warm_pool_crd_supports_observed_generation(
     crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 ) -> bool {
@@ -200,9 +225,10 @@ fn warm_pool_crd_supports_observed_generation(
 
 /// Validate an operator-installed runtime using GET requests only.
 ///
-/// Kobe checks the four consumed CRDs, their served versions, and the v0.5.6
-/// WarmPool generation field. It deliberately does not inspect a particular
-/// Deployment/webhook topology and does not create any runtime object.
+/// Kobe checks the four consumed CRDs, their served versions, that none still
+/// serve `v1alpha1` or a conversion webhook, and the WarmPool generation field.
+/// It deliberately does not inspect a particular Deployment topology and does
+/// not create any runtime object.
 ///
 /// A CRD GET that fails for any reason other than a plain 404 surfaces as
 /// [`AgentSandboxUnusable::Unreachable`] rather than collapsing into
@@ -249,6 +275,22 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
             })
             .unwrap_or_default();
         crd_is_compatible(name, expected_api_version, established, &served)?;
+        if let Some(crd) = observed.as_ref() {
+            if crd_serves_legacy_alpha(crd) {
+                return Err(AgentSandboxUnusable::SchemaMismatch {
+                    crd: name.to_string(),
+                    release: AGENT_SANDBOX_RELEASE,
+                    reason: "still serves v1alpha1; upgrade to v1.0.0 and prune storedVersions first",
+                });
+            }
+            if crd_has_conversion_webhook(crd) {
+                return Err(AgentSandboxUnusable::SchemaMismatch {
+                    crd: name.to_string(),
+                    release: AGENT_SANDBOX_RELEASE,
+                    reason: "still has a conversion webhook; v1.0.0 is v1beta1-only",
+                });
+            }
+        }
         if *name == "sandboxwarmpools.extensions.agents.x-k8s.io"
             && observed
                 .as_ref()
@@ -459,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn v054_shape_is_not_v056_compatible() {
+    fn v054_shape_is_not_v1_compatible() {
         let mut value = crd_response("sandboxwarmpools.extensions.agents.x-k8s.io");
         value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
             ["status"]["properties"]
@@ -468,6 +510,89 @@ mod tests {
             .remove("observedGeneration");
         let crd = serde_json::from_value(value).expect("legacy CRD");
         assert!(!warm_pool_crd_supports_observed_generation(&crd));
+    }
+
+    /// v0.5.x still serves `v1alpha1` and a conversion webhook on the same
+    /// `v1beta1` WarmPool schema. Those two bits are what v1.0.0 removed, so
+    /// GET-only validation must fail closed on them — otherwise a 0.5.6
+    /// cluster would look compatible after this pin bump.
+    #[test]
+    fn v056_shape_is_not_v1_compatible() {
+        let mut value = crd_response("sandboxwarmpools.extensions.agents.x-k8s.io");
+        let versions = value["spec"]["versions"].as_array_mut().expect("versions");
+        versions.push(serde_json::json!({
+            "name": "v1alpha1",
+            "served": true,
+            "storage": false,
+            "schema": { "openAPIV3Schema": { "type": "object" } }
+        }));
+        value["spec"]["conversion"] = serde_json::json!({
+            "strategy": "Webhook",
+            "webhook": {
+                "conversionReviewVersions": ["v1", "v1beta1"],
+                "clientConfig": {
+                    "service": {
+                        "name": "agent-sandbox-webhook-service",
+                        "namespace": "agent-sandbox-system",
+                        "path": "/convert"
+                    }
+                }
+            }
+        });
+        let crd = serde_json::from_value(value).expect("v0.5.6 CRD");
+        assert!(crd_serves_legacy_alpha(&crd));
+        assert!(crd_has_conversion_webhook(&crd));
+        assert!(warm_pool_crd_supports_observed_generation(&crd));
+    }
+
+    #[tokio::test]
+    async fn v056_installation_fails_external_validation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (name, _) in REQUIRED_AGENT_SANDBOX_CRDS {
+            let mut body = crd_response(name);
+            body["spec"]["versions"]
+                .as_array_mut()
+                .expect("versions")
+                .push(serde_json::json!({
+                    "name": "v1alpha1",
+                    "served": true,
+                    "storage": false,
+                    "schema": { "openAPIV3Schema": { "type": "object" } }
+                }));
+            body["spec"]["conversion"] = serde_json::json!({
+                "strategy": "Webhook",
+                "webhook": {
+                    "conversionReviewVersions": ["v1"],
+                    "clientConfig": {
+                        "service": {
+                            "name": "agent-sandbox-webhook-service",
+                            "namespace": "agent-sandbox-system",
+                            "path": "/convert"
+                        }
+                    }
+                }
+            });
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new(server.uri().parse().expect("mock URI"));
+        let client = kube::Client::try_from(config).expect("mock kube client");
+        assert!(matches!(
+            validate_external_runtime(&client).await,
+            Err(AgentSandboxUnusable::SchemaMismatch {
+                release: "v1.0.0",
+                ..
+            })
+        ));
     }
 
     /// A throttled or briefly unreachable API server is not evidence that a

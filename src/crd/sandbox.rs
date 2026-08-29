@@ -745,7 +745,7 @@ pub struct SandboxPoolCertificationStatus {
     #[schemars(with = "Vec<BoundedSandboxUidSchema>", length(max = 256))]
     pub baseline_idle_sandbox_uids: Vec<String>,
     /// WarmPool generation created by the post-fence scale-to-zero write. The
-    /// v0.5.6 `observedGeneration` ACK is meaningful only for this exact value.
+    /// WarmPool `observedGeneration` ACK is meaningful only for this exact value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub drain_generation: Option<i64>,

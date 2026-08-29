@@ -96,7 +96,7 @@ spec:
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
             # External mode performs read-only compatibility checks against an
-            # operator-installed Agent Sandbox v0.5.6 runtime.
+            # operator-installed Agent Sandbox v1.0.0 runtime.
             - name: AGENT_SANDBOX_MODE
               value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
             - name: KOBE_SANDBOX_RESERVATION_NAMESPACE

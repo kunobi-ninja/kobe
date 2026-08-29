@@ -45,7 +45,7 @@ const TEARDOWN_FENCE_LABEL: &str = "kobe.kunobi.ninja/sandbox-teardown-fence";
 const TEARDOWN_FENCE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-teardown-fence";
 const TEARDOWN_FENCE_DENIAL_MESSAGE: &str =
     "Sandbox teardown has fenced descendant creation for this controller owner UID";
-const REQUIRED_POOL_ACK_RELEASE: &str = "v0.5.6";
+const REQUIRED_POOL_ACK_RELEASE: &str = "v1.0.0";
 
 fn sandbox_resource() -> ApiResource {
     ApiResource {
@@ -732,7 +732,7 @@ async fn capture_storage_manifest(
     Ok((pvc_refs, pv_refs))
 }
 
-/// Exact v0.5.6 `NameHash`: FNV-1a rendered as eight lower-case hex digits.
+/// Exact upstream `NameHash`: FNV-1a rendered as eight lower-case hex digits.
 pub(super) fn upstream_name_hash(value: &str) -> String {
     let mut hash = 2_166_136_261u32;
     for byte in value.as_bytes() {
@@ -1691,7 +1691,7 @@ async fn revalidate_captured_workload(
 ///
 /// The post-fence drain/restore transition is implemented exactly as the
 /// fence's own contract specifies: a UID/resourceVersion-fenced scale-to-zero,
-/// the v0.5.6 `observedGeneration` ACK plus zero ready replicas as a causal
+/// the WarmPool `observedGeneration` ACK plus zero ready replicas as a causal
 /// drain barrier, foreground deletion of the sacrificial Claim, exact
 /// descendant and storage absence, a fenced capacity restore with clean new
 /// UID proof, then fence release. `observedGeneration` alone is never treated
@@ -3086,7 +3086,7 @@ mod tests {
         assert!(validate_pod_labels(&pod, "sandbox-one", "kobe-agents", &policy).is_err());
     }
 
-    /// The workload labels must be the exact keys Agent Sandbox v0.5.6 puts on
+    /// The workload labels must be the exact keys Agent Sandbox v1.0.0 puts on
     /// Pods and Services. Every earlier test compared our constant against
     /// itself, so a mistyped key passed every fixture while rejecting every
     /// real upstream workload — which is how certification timed out for its
@@ -3096,11 +3096,11 @@ mod tests {
     fn workload_label_keys_match_the_pinned_upstream_release() {
         assert_eq!(
             SANDBOX_HASH_LABEL, "agents.x-k8s.io/sandbox-name-hash",
-            "v0.5.6 labels Pods and Services with sandbox-name-hash (controllers/sandbox_controller.go sandboxLabel)"
+            "v1.0.0 labels Pods and Services with sandbox-name-hash (controllers/sandbox_controller.go sandboxLabel)"
         );
         assert_eq!(
             TEMPLATE_REF_HASH_LABEL, "agents.x-k8s.io/sandbox-template-ref-hash",
-            "v0.5.6 propagates the template's self-label to Pods (SandboxTemplateRefHashLabel)"
+            "v1.0.0 propagates the template's self-label to Pods (SandboxTemplateRefHashLabel)"
         );
     }
 

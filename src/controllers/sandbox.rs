@@ -3964,9 +3964,9 @@ async fn claim_labelled_sandboxes_absent(
 
 /// Enumerate children whose controller owner is the exact recorded Sandbox.
 ///
-/// Agent Sandbox v0.5.6 does not copy the Claim UID label onto Services (it
-/// uses a sandbox-name hash), so label-only proof would miss a late Service.
-/// Owner UID is the stable join shared by Pod, Service and PVC.
+/// Agent Sandbox labels Services with a sandbox-name hash, not the Claim UID,
+/// so label-only proof would miss a late Service. Owner UID is the stable join
+/// shared by Pod, Service and PVC.
 async fn exact_owned_objects_absent(
     api: &Api<DynamicObject>,
     sandbox: &SandboxObjectReference,
@@ -8946,22 +8946,7 @@ pub(crate) mod tests {
                             "served": true,
                             "storage": true,
                             "schema": { "openAPIV3Schema": openapi }
-                        }],
-                        "conversion": {
-                            "strategy": "Webhook",
-                            "webhook": {
-                                "conversionReviewVersions": ["v1", "v1beta1"],
-                                "clientConfig": {
-                                    "caBundle": "AQ==",
-                                    "service": {
-                                        "name": "agent-sandbox-webhook-service",
-                                        "namespace": "agent-sandbox-system",
-                                        "path": "/convert",
-                                        "port": 443
-                                    }
-                                }
-                            }
-                        }
+                        }]
                     },
                     "status": {
                         "conditions": [{
@@ -12876,8 +12861,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Agent Sandbox v0.5.6 Services have only a Sandbox owner UID (not the
-    /// Claim UID label). Exact-owner enumeration still catches a late Service.
+    /// Agent Sandbox Services have only a Sandbox owner UID (not the Claim UID
+    /// label). Exact-owner enumeration still catches a late Service.
     #[tokio::test]
     async fn late_service_without_claim_uid_label_retains_capacity() {
         let (ctx, server) = test_context().await;
