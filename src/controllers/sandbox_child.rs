@@ -285,11 +285,15 @@ pub fn child_pool_is_composition_eligible(
                 | ClusterPoolPhase::ScalingUp
                 | ClusterPoolPhase::ScalingDown
                 | ClusterPoolPhase::Idle
+                // Backoff is a retry window after a provision miss, not proven
+                // unusable capacity. Composition still queues; Failing and
+                // Quarantined stay fail-closed above.
+                | ClusterPoolPhase::Backoff
         )
     ) {
         return Err(ChildPlacementError::CapacityUnavailable {
             cluster_pool: cluster_pool.name_any(),
-            reason: "pool is failing, backed off, or has no published phase",
+            reason: "pool is failing or has no published phase",
         });
     }
     let worst_ttl = parse_std_duration(&sandbox_pool.spec.max_ttl)
@@ -953,6 +957,19 @@ mod tests {
         let mut scaling = healthy.clone();
         scaling.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::ScalingUp);
         assert!(child_pool_is_composition_eligible(&sandbox_pool, &scaling).is_ok());
+
+        let mut backoff = healthy.clone();
+        backoff.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::Backoff);
+        backoff.status.as_mut().unwrap().ready = 0;
+        child_pool_is_composition_eligible(&sandbox_pool, &backoff)
+            .expect("a retry-window ClusterPool remains composition-eligible");
+
+        let mut failing = healthy.clone();
+        failing.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::Failing);
+        assert!(matches!(
+            child_pool_is_composition_eligible(&sandbox_pool, &failing),
+            Err(ChildPlacementError::CapacityUnavailable { .. })
+        ));
 
         let mut empty = healthy;
         empty.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::Idle);
