@@ -8333,26 +8333,32 @@ mod tests {
         mount_create_lease_objects(server, true, false).await
     }
 
-    async fn mount_create_lease_objects(
-        server: &MockServer,
-        relist_created: bool,
-        ambiguous_admit_response: bool,
-    ) -> Arc<Mutex<Option<serde_json::Value>>> {
-        let lease_state = Arc::new(Mutex::new(None::<serde_json::Value>));
+    /// `get_opt` needs a Kubernetes Status 404. Wiremock's empty miss is an
+    /// API error, and unified create then answers 503 "Unable to read pool".
+    async fn mount_absent_cluster_pool(server: &MockServer, name: &str) {
         Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/agent-small",
-            ))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/{name}"
+            )))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "kind": "Status",
                 "apiVersion": "v1",
                 "status": "Failure",
                 "reason": "NotFound",
                 "code": 404,
-                "message": "clusterpools \"agent-small\" not found"
+                "message": format!("clusterpools \"{name}\" not found")
             })))
             .mount(server)
             .await;
+    }
+
+    async fn mount_create_lease_objects(
+        server: &MockServer,
+        relist_created: bool,
+        ambiguous_admit_response: bool,
+    ) -> Arc<Mutex<Option<serde_json::Value>>> {
+        let lease_state = Arc::new(Mutex::new(None::<serde_json::Value>));
+        mount_absent_cluster_pool(server, "agent-small").await;
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
@@ -8568,6 +8574,7 @@ mod tests {
         for variant in ["missing", "stale", "false", "receiptless"] {
             let server = MockServer::start().await;
             mount_sandbox_crds(&server).await;
+            mount_absent_cluster_pool(&server, "agent-small").await;
             let mut pool = pool_json();
             match variant {
                 "missing" => {
@@ -8632,6 +8639,7 @@ mod tests {
     async fn composition_eligible_child_pool_remains_closed_to_http_admission() {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
+        mount_absent_cluster_pool(&server, "agent-small").await;
         let mut pool = pool_json();
         pool["spec"]["placement"] = serde_json::json!({
             "type": "childCluster",
@@ -10926,6 +10934,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
+        mount_absent_cluster_pool(&server, "agent-small").await;
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
@@ -10994,6 +11003,21 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
+        mount_absent_cluster_pool(&server, "agent-small").await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404,
+                "message": "sandboxpools \"agent-small\" not found"
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path(format!(
                 "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{SANDBOX_POOL_CRD}"
@@ -12482,6 +12506,7 @@ mod tests {
     async fn assert_late_admission_returns_durable_handle(include_exact_gate: bool) {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
+        mount_absent_cluster_pool(&server, "agent-small").await;
         let ledger = mount_reservation_api(&server, &[]).await;
         Mock::given(method("GET"))
             .and(path(
