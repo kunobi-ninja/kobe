@@ -153,13 +153,15 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
             super::sandbox::sandbox_actions_for_pool(&config, &detail.profile, command.output)
                 .await;
         super::sandbox::emit_lease_output(
-            &detail.id,
-            &detail.phase,
-            &detail.profile,
-            Some(command.ttl),
-            command.name,
-            detail.expires_at.as_deref(),
-            &actions,
+            &super::sandbox::LeasePrint {
+                id: &detail.id,
+                phase: &detail.phase,
+                pool: &detail.profile,
+                ttl: Some(command.ttl),
+                alias: command.name,
+                expires_at: detail.expires_at.as_deref(),
+                capabilities: &actions,
+            },
             command.output,
         )?;
         if command.keepalive {

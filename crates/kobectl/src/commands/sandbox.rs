@@ -753,13 +753,15 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
 
     if command.no_wait {
         return emit_lease_output(
-            &lease_id,
-            "Pending",
-            command.pool,
-            command.ttl,
-            command.alias,
-            None,
-            &actions,
+            &LeasePrint {
+                id: &lease_id,
+                phase: "Pending",
+                pool: command.pool,
+                ttl: command.ttl,
+                alias: command.alias,
+                expires_at: None,
+                capabilities: &actions,
+            },
             command.output,
         );
     }
@@ -791,13 +793,15 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
         }
     };
     emit_lease_output(
-        &ready.id,
-        &ready.phase,
-        command.pool,
-        ready.effective_ttl.as_deref().or(command.ttl),
-        ready.alias.as_deref().or(command.alias),
-        ready.expires_at.as_deref(),
-        &actions,
+        &LeasePrint {
+            id: &ready.id,
+            phase: &ready.phase,
+            pool: command.pool,
+            ttl: ready.effective_ttl.as_deref().or(command.ttl),
+            alias: ready.alias.as_deref().or(command.alias),
+            expires_at: ready.expires_at.as_deref(),
+            capabilities: &actions,
+        },
         command.output,
     )?;
 
@@ -821,41 +825,42 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
     Ok(())
 }
 
-pub(crate) fn emit_lease_output(
-    id: &str,
-    phase: &str,
-    pool: &str,
-    ttl: Option<&str>,
-    alias: Option<&str>,
-    expires_at: Option<&str>,
-    capabilities: &[String],
-    output: OutputFormat,
-) -> Result<()> {
+pub(crate) struct LeasePrint<'a> {
+    pub id: &'a str,
+    pub phase: &'a str,
+    pub pool: &'a str,
+    pub ttl: Option<&'a str>,
+    pub alias: Option<&'a str>,
+    pub expires_at: Option<&'a str>,
+    pub capabilities: &'a [String],
+}
+
+pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Text => {
-            println!("Lease:   {id}");
-            println!("Pool:    {pool}");
+            println!("Lease:   {}", lease.id);
+            println!("Pool:    {}", lease.pool);
             println!("Kind:    Sandbox");
-            println!("Status:  {}", phase.to_ascii_lowercase());
-            if let Some(expires_at) = expires_at {
+            println!("Status:  {}", lease.phase.to_ascii_lowercase());
+            if let Some(expires_at) = lease.expires_at {
                 println!("Expires: {expires_at}");
             }
-            println!("Actions: {}", capabilities.join(", "));
-            if let Some(next) = next_sandbox_hint(id, phase, capabilities) {
+            println!("Actions: {}", lease.capabilities.join(", "));
+            if let Some(next) = next_sandbox_hint(lease.id, lease.phase, lease.capabilities) {
                 println!("Next:    {next}");
             }
             Ok(())
         }
         OutputFormat::Json => print_json(&LeaseOutput {
             api_version: SANDBOX_CLI_API_VERSION,
-            id,
-            phase,
-            pool,
+            id: lease.id,
+            phase: lease.phase,
+            pool: lease.pool,
             resource_kind: "Sandbox",
-            capabilities,
-            ttl,
-            alias,
-            expires_at,
+            capabilities: lease.capabilities,
+            ttl: lease.ttl,
+            alias: lease.alias,
+            expires_at: lease.expires_at,
         }),
     }
 }
