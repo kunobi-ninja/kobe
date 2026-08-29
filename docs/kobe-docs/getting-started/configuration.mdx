@@ -41,6 +41,34 @@ To edit interactively:
 kobe config edit
 ```
 
+### Project file (`.kobe.toml`)
+
+A gitignored `./.kobe.toml` in the current directory can register extra
+targets (for example a local `e2e` operator). It does not replace a global
+`current_target` unless you opt in:
+
+```toml
+# Optional: make this checkout default to e2e.
+# Without this, `current_target` in this file is ignored when a global
+# current target is already set, so `cd` into the repo does not steal it.
+override_current_target = true
+current_target = "e2e"
+
+[targets.e2e]
+endpoint = "http://127.0.0.1:8080"
+auth = "token"
+token = "e2e-dev-token"
+```
+
+If the global file has no current target, a local one is used. That is
+how a project file that only sets `endpoint` still works: it migrates to
+the `default` target.
+
+`current_target = ""` is not a fallback to global; it is an unknown target
+name. Omit the key instead.
+
+Use `kobe --target e2e` or `kobe config use e2e` without opting in.
+
 ## Environment variables
 
 | Variable | Description |

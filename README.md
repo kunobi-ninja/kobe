@@ -73,17 +73,14 @@ When a client leases a cluster, Kobe binds one from the warm pool instantly. Whe
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/v1/leases` | Create a lease from a pool (returns `202` + a `Pending` lease) |
-| `GET` | `/v1/leases` | List your active leases |
-| `GET` | `/v1/leases/:id` | Get a lease (includes the kubeconfig once `Bound`) |
+| `POST` | `/v1/leases` | Create a lease from a pool. The server picks Cluster vs Sandbox from the pool. |
+| `GET` | `/v1/leases` | List your active leases of every kind |
+| `GET` | `/v1/leases/:id` | Get a lease (kubeconfig once a Cluster lease is `Bound`) |
 | `DELETE` | `/v1/leases/:id` | Release a lease |
 | `PATCH` | `/v1/leases/:id` | Extend a lease TTL |
 | `GET` | `/v1/pools` | List available pools with status |
 | `GET` | `/v1/pools/:name` | Get a specific pool's status |
-| `POST` | `/v1/sandbox-leases` | Create caller-safe Sandbox lease intent |
-| `GET` | `/v1/sandbox-leases` | List your Sandbox leases |
-| `GET` | `/v1/sandbox-leases/:id` | Get a Sandbox lease's lifecycle state |
-| `DELETE` | `/v1/sandbox-leases/:id` | Request Sandbox lease release |
+| `POST` | `/v1/sandbox-leases` | Compatibility alias for `POST /v1/leases` |
 | `GET` | `/v1/status` | Endpoint status + auth methods (no auth required) |
 
 See [docs/kobe-docs/api/reference.mdx](docs/kobe-docs/api/reference.mdx) for full request/response shapes.

@@ -36,6 +36,10 @@ pub struct LeaseCreateCommand<'a> {
 pub(crate) struct LeaseAcceptedResponse {
     pub(crate) id: String,
     phase: String,
+    #[serde(default, rename = "resourceKind")]
+    #[allow(dead_code)]
+    resource_kind: Option<String>,
+    #[serde(alias = "pool")]
     pub(crate) profile: String,
     #[serde(default)]
     queue_position: u32,
@@ -120,6 +124,11 @@ pub(crate) async fn create_lease_request(
 pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(command.target_override, command.endpoint_override)?;
+    if command.output == OutputFormat::Text
+        && let Some(endpoint_version) = super::version::fetch_endpoint_version(&config).await
+    {
+        super::version::warn_if_cli_behind_endpoint(&endpoint_version);
+    }
     let metadata = parse_metadata_json(command.metadata_json)?;
 
     // Determine which lease to operate on: an existing active one (#107 P3
@@ -140,13 +149,19 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
             );
         }
         let detail = fetch_lease(&config, &existing.id).await?;
+        let actions =
+            super::sandbox::sandbox_actions_for_pool(&config, &detail.profile, command.output)
+                .await;
         super::sandbox::emit_lease_output(
-            &detail.id,
-            &detail.phase,
-            &detail.profile,
-            Some(command.ttl),
-            command.name,
-            detail.expires_at.as_deref(),
+            &super::sandbox::LeasePrint {
+                id: &detail.id,
+                phase: &detail.phase,
+                pool: &detail.profile,
+                ttl: Some(command.ttl),
+                alias: command.name,
+                expires_at: detail.expires_at.as_deref(),
+                capabilities: &actions,
+            },
             command.output,
         )?;
         if command.keepalive {
@@ -222,7 +237,7 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     };
 
     if command.output == OutputFormat::Text && !renewed {
-        eprintln!("Waiting for lease {lease_id} to become ready...");
+        eprintln!("Waiting for Cluster lease {lease_id} to become ready (kubeconfig)...");
     }
 
     let ready = wait_for_usable_lease(
@@ -424,6 +439,10 @@ pub(crate) fn parse_metadata_json(input: Option<&str>) -> Result<Option<JsonValu
     Ok(Some(metadata))
 }
 
+pub(crate) fn interrupted_waiting(lease_id: &str) -> String {
+    format!("Interrupted while waiting for lease {lease_id}. Release with: kobe release {lease_id}")
+}
+
 pub(crate) async fn wait_for_usable_lease(
     config: &super::config::ResolvedConfig,
     lease_id: &str,
@@ -440,37 +459,60 @@ pub(crate) async fn wait_for_usable_lease(
             && Instant::now() >= deadline
         {
             anyhow::bail!(
-                "Timed out waiting for lease {lease_id} to become ready. Use --no-wait to return the queued lease immediately."
+                "Timed out waiting for lease {lease_id} to become ready. Use --no-wait to return the queued lease immediately. Release with: kobe release {lease_id}"
             );
         }
 
-        let token = get_auth_header(config, "GET", &path, b"").await?;
-        let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
-            .send()
-            .await?;
+        let poll = async {
+            let token = get_auth_header(config, "GET", &path, b"").await?;
+            let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
+                .send()
+                .await?;
+            match response.status().as_u16() {
+                200 => {
+                    let detail: LeaseDetail = response.json().await?;
+                    if lease_is_usable(&detail) {
+                        return Ok(Some(detail));
+                    }
+                    if is_terminal_failure_phase(&detail.phase) {
+                        let ttl = effective_ttl
+                            .clone()
+                            .unwrap_or_else(|| "requested TTL".to_string());
+                        anyhow::bail!(
+                            "Lease {lease_id} ended in phase {} before it became usable (effective TTL {ttl})",
+                            detail.phase
+                        );
+                    }
+                    Ok(None)
+                }
+                503 => {
+                    // Bound leases can briefly return 503 while kubeconfig extraction catches up.
+                    Ok(None)
+                }
+                404 => anyhow::bail!("Lease {lease_id} was not found while waiting for readiness"),
+                status => {
+                    anyhow::bail!("Failed to get lease {lease_id} while waiting (HTTP {status})")
+                }
+            }
+        };
 
-        match response.status().as_u16() {
-            200 => {
-                let detail: LeaseDetail = response.json().await?;
-                if lease_is_usable(&detail) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                anyhow::bail!(interrupted_waiting(lease_id));
+            }
+            outcome = poll => {
+                if let Some(detail) = outcome? {
                     return Ok(detail);
                 }
-                if is_terminal_failure_phase(&detail.phase) {
-                    let ttl = effective_ttl.unwrap_or_else(|| "requested TTL".to_string());
-                    anyhow::bail!(
-                        "Lease {lease_id} ended in phase {} before it became usable (effective TTL {ttl})",
-                        detail.phase
-                    );
-                }
             }
-            503 => {
-                // Bound leases can briefly return 503 while kubeconfig extraction catches up.
-            }
-            404 => anyhow::bail!("Lease {lease_id} was not found while waiting for readiness"),
-            status => anyhow::bail!("Failed to get lease {lease_id} while waiting (HTTP {status})"),
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                anyhow::bail!(interrupted_waiting(lease_id));
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 

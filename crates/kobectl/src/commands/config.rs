@@ -169,6 +169,14 @@ pub struct CliConfig {
     )]
     pub current_target: Option<String>,
 
+    /// When true, a local `.kobe.toml` `current_target` replaces a global
+    /// one. Default false: project files may register extra targets, but
+    /// `cd` into a repo must not steal an already-set active target.
+    /// A local value is still used when the global file has none (legacy
+    /// endpoint-only project files migrate to `current_target = "default"`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub override_current_target: bool,
+
     /// Named endpoint/auth configurations.
     #[serde(
         default,
@@ -261,7 +269,9 @@ impl CliConfig {
     }
 
     fn overlay(&mut self, local: Self) {
-        if local.current_target.is_some() {
+        if local.current_target.is_some()
+            && (local.override_current_target || self.current_target.is_none())
+        {
             self.current_target = local.current_target;
         }
 
@@ -1076,8 +1086,47 @@ mod tests {
         assert_eq!(global.ssh_fingerprint.as_deref(), Some("SHA256:global"));
     }
 
-    /// …and when they *are* set, local wins for every legacy field plus
-    /// the active-target name.
+    /// Local `current_target` does not steal a global active target.
+    /// Register extra targets from `.kobe.toml`; opt in with
+    /// `override_current_target` to pin the repo's default. A local value
+    /// still applies when the global file has no current target, so a
+    /// legacy endpoint-only project file keeps working.
+    #[test]
+    fn overlay_ignores_local_current_target_unless_opted_in() {
+        let mut global = CliConfig {
+            current_target: Some("prod".to_string()),
+            ..CliConfig::default()
+        };
+        let local = CliConfig {
+            current_target: Some("e2e".to_string()),
+            ..CliConfig::default()
+        };
+        global.overlay(local);
+        assert_eq!(global.current_target.as_deref(), Some("prod"));
+
+        let mut global = CliConfig {
+            current_target: Some("prod".to_string()),
+            ..CliConfig::default()
+        };
+        let local = CliConfig {
+            current_target: Some("e2e".to_string()),
+            override_current_target: true,
+            ..CliConfig::default()
+        };
+        global.overlay(local);
+        assert_eq!(global.current_target.as_deref(), Some("e2e"));
+
+        let mut global = CliConfig::default();
+        let local = CliConfig {
+            current_target: Some("default".to_string()),
+            ..CliConfig::default()
+        };
+        global.overlay(local);
+        assert_eq!(global.current_target.as_deref(), Some("default"));
+    }
+
+    /// …and when they *are* set, local wins for every legacy field. The
+    /// active-target name is not stolen without `override_current_target`.
     #[test]
     fn overlay_local_values_win_when_present() {
         let mut global = CliConfig {
@@ -1099,7 +1148,7 @@ mod tests {
 
         global.overlay(local);
 
-        assert_eq!(global.current_target.as_deref(), Some("staging"));
+        assert_eq!(global.current_target.as_deref(), Some("prod"));
         assert_eq!(global.endpoint.as_deref(), Some("https://local.test"));
         assert_eq!(global.auth, AuthMode::Token);
         assert_eq!(global.token.as_deref(), Some("local-token"));

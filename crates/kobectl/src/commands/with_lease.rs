@@ -37,6 +37,10 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(command.target_override, command.endpoint_override)?;
     let verbose = command.output == OutputFormat::Text;
+    if verbose && let Some(endpoint_version) = super::version::fetch_endpoint_version(&config).await
+    {
+        super::version::warn_if_cli_behind_endpoint(&endpoint_version);
+    }
 
     // with-lease is non-interactive (it wraps a command), so the pool must be
     // explicit rather than prompted.

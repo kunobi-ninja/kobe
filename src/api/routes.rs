@@ -411,25 +411,72 @@ async fn request_logging(mut request: axum::extract::Request, next: Next) -> Res
 
 // --- Request/Response types ---
 
-#[derive(Deserialize)]
-struct CreateLeaseRequest {
-    profile: String,
+#[derive(Deserialize, Default)]
+pub(crate) struct CreateLeaseRequest {
+    /// Cluster-lease historical field. Sandbox clients send `pool`. Either is
+    /// accepted; if both are set they must match.
     #[serde(default)]
-    ttl: Option<String>,
+    pub(crate) profile: Option<String>,
+    #[serde(default)]
+    pub(crate) pool: Option<String>,
+    #[serde(default)]
+    pub(crate) ttl: Option<String>,
     /// Optional caller-supplied alias (#107 P2). Stored as the label
     /// `kobe.kunobi.ninja/alias`; unique among the requester's ACTIVE leases so
     /// it can name "which lease" in scripts (`kobe extend pr-106 30m`).
     #[serde(default)]
-    alias: Option<String>,
+    pub(crate) alias: Option<String>,
     /// Optional caller-supplied descriptive JSON. This is stored verbatim but
-    /// has no authorization, scheduling, or lifecycle semantics.
+    /// has no authorization, scheduling, or lifecycle semantics. Rejected for
+    /// Sandbox pools.
     #[serde(default)]
-    metadata: Option<serde_json::Value>,
+    pub(crate) metadata: Option<serde_json::Value>,
+    /// Sandbox create idempotency key. Ignored for Cluster pools.
+    #[serde(default, rename = "idempotencyKey", alias = "idempotency_key")]
+    pub(crate) idempotency_key: Option<String>,
+}
+
+impl CreateLeaseRequest {
+    fn pool_name(&self) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let profile = self
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let pool = self
+            .pool
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        match (profile, pool) {
+            (Some(profile), Some(pool)) if profile != pool => Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "profile and pool must name the same pool".to_string(),
+                    detail: None,
+                    reason: None,
+                }),
+            )),
+            (Some(name), _) | (_, Some(name)) => Ok(name.to_string()),
+            (None, None) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Pool name is required".to_string(),
+                    detail: Some("Provide `profile` or `pool`".to_string()),
+                    reason: None,
+                }),
+            )),
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct LeaseResponse {
     id: String,
+    #[serde(rename = "resourceKind")]
+    resource_kind: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kubeconfig: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,6 +579,10 @@ fn validate_lease_metadata(metadata: &serde_json::Value) -> Result<(), String> {
 struct LeaseSummary {
     id: String,
     phase: String,
+    #[serde(rename = "resourceKind")]
+    resource_kind: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<&'static str>,
     profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cluster_name: Option<String>,
@@ -628,6 +679,8 @@ enum ErrorReason {
     Warming,
     /// Release was refused because verified teardown remains quarantined.
     TeardownQuarantined,
+    /// The pool name exists as the other resource kind (Cluster vs Sandbox).
+    WrongResourceKind,
 }
 
 impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
@@ -677,16 +730,44 @@ fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
     }
 }
 
-fn profile_response(profile: &ClusterPool, policy: &policy::Policy) -> ProfileResponse {
-    let status = profile.status.clone().unwrap_or_default();
+fn cluster_lease_capabilities(policy: &policy::Policy) -> Vec<&'static str> {
     let mut capabilities = vec!["lease", "kubeconfig", "release"];
     if policy.max_extensions > 0 {
         capabilities.push("extend");
     }
+    capabilities
+}
+
+fn sandbox_lease_capabilities(pool: &str, policy: &policy::Policy) -> Vec<&'static str> {
+    let mut capabilities = vec!["lease"];
+    if is_sandbox_allowed(pool, SandboxVerb::Exec, policy) {
+        capabilities.extend(["exec", "cancel", "attach"]);
+    }
+    if is_sandbox_allowed(pool, SandboxVerb::Logs, policy) {
+        capabilities.push("logs");
+    }
+    if is_sandbox_allowed(pool, SandboxVerb::PortForward, policy) {
+        capabilities.push("port-forward");
+    }
+    if is_sandbox_allowed(pool, SandboxVerb::Release, policy) {
+        capabilities.push("release");
+    }
+    if policy
+        .sandbox
+        .as_ref()
+        .is_some_and(|grant| grant.max_extensions > 0)
+    {
+        capabilities.push("extend");
+    }
+    capabilities
+}
+
+fn profile_response(profile: &ClusterPool, policy: &policy::Policy) -> ProfileResponse {
+    let status = profile.status.clone().unwrap_or_default();
     ProfileResponse {
         name: profile.name_any(),
         resource_kind: "Cluster",
-        capabilities,
+        capabilities: cluster_lease_capabilities(policy),
         phase: status.phase.map(|phase| format!("{phase:?}")),
         ready: status.ready,
         leased: status.leased,
@@ -701,26 +782,6 @@ fn profile_response(profile: &ClusterPool, policy: &policy::Policy) -> ProfileRe
 
 fn sandbox_pool_response(pool: &SandboxPool, policy: &policy::Policy) -> ProfileResponse {
     let status = pool.status.clone().unwrap_or_default();
-    let mut capabilities = vec!["lease"];
-    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Exec, policy) {
-        capabilities.extend(["exec", "cancel", "attach"]);
-    }
-    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Logs, policy) {
-        capabilities.push("logs");
-    }
-    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::PortForward, policy) {
-        capabilities.push("port-forward");
-    }
-    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Release, policy) {
-        capabilities.push("release");
-    }
-    if policy
-        .sandbox
-        .as_ref()
-        .is_some_and(|grant| grant.max_extensions > 0)
-    {
-        capabilities.push("extend");
-    }
     let phase = if crate::sandbox::require_current_sandbox_pool_ready(pool).is_ok() {
         "Ready"
     } else {
@@ -729,7 +790,7 @@ fn sandbox_pool_response(pool: &SandboxPool, policy: &policy::Policy) -> Profile
     ProfileResponse {
         name: pool.name_any(),
         resource_kind: "Sandbox",
-        capabilities,
+        capabilities: sandbox_lease_capabilities(&pool.name_any(), policy),
         phase: Some(phase.to_string()),
         ready: status.ready,
         leased: status.allocated,
@@ -1156,15 +1217,45 @@ fn backend_request_url(
 
 // --- Route handlers ---
 
+pub(crate) enum CreatePoolKind {
+    Cluster,
+    Sandbox,
+    Ambiguous,
+    Missing,
+}
+
+pub(crate) async fn resolve_create_pool_kind<B: ClusterBackend>(
+    state: &AppState<B>,
+    name: &str,
+) -> Result<CreatePoolKind, kube::Error> {
+    let clusters: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let cluster = clusters.get_opt(name).await?;
+    let sandbox = if state.sandbox_enabled {
+        let sandboxes: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
+        sandboxes.get_opt(name).await?
+    } else {
+        None
+    };
+    Ok(match (cluster.is_some(), sandbox.is_some()) {
+        (true, true) => CreatePoolKind::Ambiguous,
+        (true, false) => CreatePoolKind::Cluster,
+        (false, true) => CreatePoolKind::Sandbox,
+        (false, false) => CreatePoolKind::Missing,
+    })
+}
+
 #[tracing::instrument(skip_all)]
-async fn create_lease<B: ClusterBackend>(
+pub(crate) async fn create_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Json(req): Json<CreateLeaseRequest>,
 ) -> Response {
-    let policy = policy_for(&identity);
+    let profile = match req.pool_name() {
+        Ok(name) => name,
+        Err(error) => return error.into_response(),
+    };
 
-    if !is_valid_k8s_name(&req.profile) {
+    if !is_valid_k8s_name(&profile) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1179,14 +1270,89 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
-    if !is_pool_allowed(&req.profile, &policy) {
+    if let Some(metadata) = req.metadata.as_ref()
+        && let Err(detail) = validate_lease_metadata(metadata)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid lease metadata".to_string(),
+                detail: Some(detail),
+                reason: None,
+            }),
+        )
+            .into_response();
+    }
+
+    // Kind is server-owned. The client POSTs `/v1/leases`; we look up the pool
+    // and admit the matching CRD. Two HTTP trees made old/buggy clients create
+    // a ClusterLease for a Sandbox pool that then queued forever.
+    match resolve_create_pool_kind(&state, &profile).await {
+        Err(error) => {
+            return infra_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Unable to read pool",
+                error,
+            );
+        }
+        Ok(CreatePoolKind::Ambiguous) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Pool name '{profile}' is ambiguous across Cluster and Sandbox resources"
+                    ),
+                    detail: Some("Pool names must be unique across resource kinds".to_string()),
+                    reason: Some(ErrorReason::WrongResourceKind),
+                }),
+            )
+                .into_response();
+        }
+        Ok(CreatePoolKind::Missing) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Pool '{profile}' not found"),
+                    detail: None,
+                    reason: None,
+                }),
+            )
+                .into_response();
+        }
+        Ok(CreatePoolKind::Sandbox) => {
+            if req.metadata.is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Sandbox leases do not accept metadata".to_string(),
+                        detail: None,
+                        reason: None,
+                    }),
+                )
+                    .into_response();
+            }
+            return crate::api::sandbox::create_sandbox_lease(
+                State(state),
+                identity,
+                Json(crate::api::sandbox::CreateSandboxLeaseRequest {
+                    pool: profile,
+                    ttl: req.ttl,
+                    alias: req.alias,
+                    idempotency_key: req.idempotency_key,
+                }),
+            )
+            .await;
+        }
+        Ok(CreatePoolKind::Cluster) => {}
+    }
+
+    let policy = policy_for(&identity);
+
+    if !is_pool_allowed(&profile, &policy) {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: format!(
-                    "Profile '{}' not allowed for your identity type",
-                    req.profile
-                ),
+                error: format!("Profile '{profile}' not allowed for your identity type"),
                 detail: None,
                 reason: None,
             }),
@@ -1208,20 +1374,6 @@ async fn create_lease<B: ClusterBackend>(
                     "Alias must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
                         .to_string(),
                 ),
-                reason: None,
-            }),
-        )
-            .into_response();
-    }
-
-    if let Some(metadata) = req.metadata.as_ref()
-        && let Err(detail) = validate_lease_metadata(metadata)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Invalid lease metadata".to_string(),
-                detail: Some(detail),
                 reason: None,
             }),
         )
@@ -1329,14 +1481,23 @@ async fn create_lease<B: ClusterBackend>(
     // forever (fixed-size pools have no queue_timeout). A `Failing` pool — or a
     // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
     // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
-    // empty warm pool keeps the 202 Pending below. A missing pool / read error
-    // is non-fatal here (the lease controller surfaces it), so we fall through.
+    // empty warm pool keeps the 202 Pending below. Missing pools are rejected
+    // above in `resolve_create_pool_kind`.
     {
         let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
-        if let Ok(pool) = pools_api.get(&req.profile).await
-            && let Some(unavailable) = pool_preflight_rejection(&req.profile, &pool)
-        {
-            return unavailable;
+        match pools_api.get(&profile).await {
+            Ok(pool) => {
+                if let Some(unavailable) = pool_preflight_rejection(&profile, &pool) {
+                    return unavailable;
+                }
+            }
+            Err(e) => {
+                return infra_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to read Cluster pool",
+                    e,
+                );
+            }
         }
     }
 
@@ -1348,7 +1509,7 @@ async fn create_lease<B: ClusterBackend>(
     let lease = build_lease_crd(
         &lease_id,
         &state.namespace,
-        &req.profile,
+        &profile,
         &ttl_formatted,
         &identity,
         policy.default_priority,
@@ -1428,12 +1589,12 @@ async fn create_lease<B: ClusterBackend>(
     }
 
     metrics::CLAIMS_TOTAL
-        .with_label_values(&[req.profile.as_str(), "created"])
+        .with_label_values(&[profile.as_str(), "created"])
         .inc();
 
     info!(
         lease_id = %lease_id,
-        profile = %req.profile,
+        profile = %profile,
         identity = %identity.identity,
         priority = policy.default_priority,
         "Lease created, queued for binding"
@@ -1441,11 +1602,13 @@ async fn create_lease<B: ClusterBackend>(
 
     let mut resp = LeaseResponse {
         id: lease_id,
+        resource_kind: "Cluster",
+        capabilities: cluster_lease_capabilities(&policy),
         kubeconfig: None,
         cluster_name: None,
         expires_at: None,
         phase: "Pending".to_string(),
-        profile: req.profile,
+        profile,
         queue_position: 0,
         diagnostics_url: None,
         effective_ttl: None,
@@ -1475,7 +1638,8 @@ async fn list_leases<B: ClusterBackend>(
 
     match leases_api.list(&lp).await {
         Ok(claims) => {
-            let my_claims: Vec<LeaseSummary> = claims
+            let policy = policy_for(&identity);
+            let mut my_claims: Vec<LeaseSummary> = claims
                 .iter()
                 .filter(|c| c.spec.requester.identity == identity.identity)
                 // #107 P2: optional ?alias= filter (exact match on the alias label).
@@ -1489,6 +1653,8 @@ async fn list_leases<B: ClusterBackend>(
                     LeaseSummary {
                         id: c.name_any(),
                         phase: status.phase.to_string(),
+                        resource_kind: "Cluster",
+                        capabilities: cluster_lease_capabilities(&policy),
                         profile: c.spec.pool_ref.clone(),
                         cluster_name: status.cluster_name,
                         expires_at: status.expires_at,
@@ -1500,6 +1666,44 @@ async fn list_leases<B: ClusterBackend>(
                     }
                 })
                 .collect();
+
+            if state.sandbox_enabled {
+                match crate::api::sandbox::caller_sandbox_summaries(&state, &identity).await {
+                    Ok(sandboxes) => {
+                        my_claims.extend(sandboxes.into_iter().filter_map(|lease| {
+                            if params
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| lease.alias.as_deref() != Some(alias.as_str()))
+                            {
+                                return None;
+                            }
+                            Some(LeaseSummary {
+                                id: lease.id,
+                                phase: lease.phase,
+                                resource_kind: "Sandbox",
+                                capabilities: sandbox_lease_capabilities(&lease.pool, &policy),
+                                profile: lease.pool,
+                                cluster_name: None,
+                                expires_at: lease.expires_at,
+                                queue_position: 0,
+                                diagnostics_url: None,
+                                requester: None,
+                                alias: lease.alias,
+                                metadata: None,
+                            })
+                        }));
+                    }
+                    Err(error) => {
+                        return infra_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to list Sandbox leases",
+                            error,
+                        );
+                    }
+                }
+            }
+            my_claims.sort_by(|left, right| left.id.cmp(&right.id));
 
             (StatusCode::OK, Json(my_claims)).into_response()
         }
@@ -1518,6 +1722,9 @@ async fn get_lease<B: ClusterBackend>(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
+        return crate::api::sandbox::get_sandbox_lease(State(state), identity, Path(id)).await;
+    }
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match leases_api.get(&id).await {
@@ -1623,6 +1830,8 @@ async fn get_lease<B: ClusterBackend>(
                 StatusCode::OK,
                 Json(LeaseResponse {
                     id,
+                    resource_kind: "Cluster",
+                    capabilities: cluster_lease_capabilities(&policy_for(&identity)),
                     kubeconfig,
                     cluster_name: status.cluster_name,
                     expires_at: status.expires_at,
@@ -2317,6 +2526,9 @@ async fn release_lease<B: ClusterBackend>(
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
+    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
+        return crate::api::sandbox::release_sandbox_lease(State(state), identity, Path(id)).await;
+    }
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     let lease = match leases_api.get(&id).await {
@@ -2427,6 +2639,17 @@ async fn extend_lease<B: ClusterBackend>(
     Path(id): Path<String>,
     Json(req): Json<ExtendLeaseRequest>,
 ) -> Response {
+    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
+        return crate::api::sandbox::extend_sandbox_lease(
+            State(state),
+            identity,
+            Path(id),
+            Json(crate::api::sandbox::ExtendSandboxLeaseRequest {
+                extend_ttl: req.extend_ttl,
+            }),
+        )
+        .await;
+    }
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
     // Carry the UID of the object we authorized into the mutation, so the
     // extend cannot land on a same-named lease created after this check.
@@ -2506,6 +2729,17 @@ async fn get_diagnostics<B: ClusterBackend>(
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
+    if crate::api::sandbox_access::looks_like_lease_id(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Diagnostics are a Cluster lease capability".to_string(),
+                detail: Some("This id is a Sandbox lease".to_string()),
+                reason: Some(ErrorReason::WrongResourceKind),
+            }),
+        )
+            .into_response();
+    }
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match leases_api.get(&id).await {
@@ -2686,6 +2920,40 @@ async fn list_pool_leases<B: ClusterBackend>(
     Path(pool_name): Path<String>,
 ) -> Response {
     let policy = policy_for(&identity);
+    let sandbox_ok =
+        state.sandbox_enabled && is_sandbox_allowed(&pool_name, SandboxVerb::Lease, &policy);
+    if sandbox_ok && !is_pool_allowed(&pool_name, &policy) {
+        match crate::api::sandbox::caller_sandbox_summaries(&state, &identity).await {
+            Ok(leases) => {
+                let summaries: Vec<LeaseSummary> = leases
+                    .into_iter()
+                    .filter(|lease| lease.pool == pool_name)
+                    .map(|lease| LeaseSummary {
+                        id: lease.id,
+                        phase: lease.phase,
+                        resource_kind: "Sandbox",
+                        capabilities: sandbox_lease_capabilities(&lease.pool, &policy),
+                        profile: lease.pool,
+                        cluster_name: None,
+                        expires_at: lease.expires_at,
+                        queue_position: 0,
+                        diagnostics_url: None,
+                        requester: None,
+                        alias: lease.alias,
+                        metadata: None,
+                    })
+                    .collect();
+                return (StatusCode::OK, Json(summaries)).into_response();
+            }
+            Err(error) => {
+                return infra_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to list Sandbox pool leases",
+                    error,
+                );
+            }
+        }
+    }
     if !is_pool_allowed(&pool_name, &policy) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -2723,6 +2991,8 @@ fn pool_lease_summary(lease: &ClusterLease, caller_identity: &str) -> LeaseSumma
     LeaseSummary {
         id: lease.name_any(),
         phase: status.phase.to_string(),
+        resource_kind: "Cluster",
+        capabilities: Vec::new(),
         profile: lease.spec.pool_ref.clone(),
         cluster_name: status.cluster_name,
         expires_at: status.expires_at,
@@ -5378,10 +5648,9 @@ mod tests {
             State(state),
             test_identity(),
             Json(CreateLeaseRequest {
-                profile: "e2e-basic".to_string(),
-                ttl: None,
-                alias: None,
+                profile: Some("e2e-basic".to_string()),
                 metadata: Some(serde_json::json!(["not", "an", "object"])),
+                ..CreateLeaseRequest::default()
             }),
         )
         .await;
@@ -5398,6 +5667,7 @@ mod tests {
         use wiremock::{Mock, ResponseTemplate};
 
         let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
 
         // count_active_leases: the requester has no active leases.
         Mock::given(method("GET"))
@@ -5434,10 +5704,8 @@ mod tests {
             State(state),
             test_identity(),
             Json(CreateLeaseRequest {
-                profile: "e2e-basic".to_string(),
-                ttl: None,
-                alias: None,
-                metadata: None,
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
             }),
         )
         .await;
@@ -5470,6 +5738,7 @@ mod tests {
         use wiremock::{Mock, ResponseTemplate};
 
         let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
 
         // Both the count and the post-create re-list see no active leases.
         Mock::given(method("GET"))
@@ -5518,10 +5787,9 @@ mod tests {
             State(state),
             test_identity(),
             Json(CreateLeaseRequest {
-                profile: "e2e-basic".to_string(),
-                ttl: None,
-                alias: None,
+                profile: Some("e2e-basic".to_string()),
                 metadata: Some(metadata.clone()),
+                ..CreateLeaseRequest::default()
             }),
         )
         .await;
@@ -5548,6 +5816,194 @@ mod tests {
             .expect("the accepted request must create one ClusterLease");
         let created: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
         assert_eq!(created["spec"]["metadata"], metadata);
+    }
+
+    fn k8s_not_found(message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "metadata": {},
+            "status": "Failure",
+            "reason": "NotFound",
+            "code": 404,
+            "message": message
+        })
+    }
+
+    fn sandbox_pool_named(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxPool",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "uid": "sandbox-pool-uid",
+                "generation": 1
+            },
+            "spec": {
+                "warmCapacity": 1,
+                "defaultTtl": "30m",
+                "maxTtl": "2h",
+                "provisioningTimeout": "10m",
+                "placement": { "type": "management" },
+                "template": {
+                    "defaultContainer": "workspace",
+                    "containers": [{
+                        "name": "workspace",
+                        "image": "example.invalid/busybox@sha256:abc",
+                        "resources": {
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "64Mi",
+                                "ephemeralStorage": "64Mi"
+                            },
+                            "limits": {
+                                "cpu": "250m",
+                                "memory": "256Mi",
+                                "ephemeralStorage": "256Mi"
+                            }
+                        }
+                    }]
+                },
+                "isolation": { "tier": "trusted-runc" },
+                "readiness": { "canary": { "argv": ["/bin/true"], "timeout": "30s" } }
+            }
+        })
+    }
+
+    async fn mount_missing_sandbox_pool(server: &wiremock::MockServer, name: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/{name}"
+            )))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found(&format!("sandboxpools \"{name}\" not found"))),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_empty_cluster_leases(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_lease_dispatches_a_sandbox_pool_without_creating_a_cluster_lease() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_empty_cluster_leases(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-agent",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("clusterpools \"e2e-agent\" not found")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/e2e-agent",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_pool_named("e2e-agent")))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-agent".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "a Sandbox pool name must not 409 on POST /v1/leases"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a Sandbox pool that exists must not 404 on POST /v1/leases"
+        );
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method == http::Method::POST)
+            .count();
+        assert_eq!(posts, 0, "must not create a ClusterLease");
+    }
+
+    #[tokio::test]
+    async fn create_lease_returns_404_when_no_pool_exists() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_empty_cluster_leases(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-missing",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("clusterpools \"e2e-missing\" not found")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/e2e-missing",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("sandboxpools \"e2e-missing\" not found")),
+            )
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-missing".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("e2e-missing"),
+            "error should name the pool: {body}"
+        );
     }
 
     #[test]
