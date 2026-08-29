@@ -7284,6 +7284,28 @@ fn metadata_has_no_owner_references(metadata: &kube::api::ObjectMeta) -> bool {
     metadata.owner_references.as_ref().is_none_or(Vec::is_empty)
 }
 
+/// k3s stamps the kubeconfig Secret with the exact ClusterInstance as its
+/// sole controller owner so a foreign same-named Secret cannot be adopted.
+/// Ownerless Secrets remain valid (the publisher path). Anything else is
+/// another object's GC dependency and cannot be a composition credential.
+fn child_kubeconfig_secret_control_is_safe(
+    metadata: &kube::api::ObjectMeta,
+    instance: &crate::crd::SandboxObjectReference,
+) -> bool {
+    let owners = metadata.owner_references.as_deref().unwrap_or(&[]);
+    match owners {
+        [] => true,
+        [owner] => {
+            owner.api_version == instance.api_version
+                && owner.kind == instance.kind
+                && owner.name == instance.name
+                && owner.uid == instance.uid
+                && owner.controller == Some(true)
+        }
+        _ => false,
+    }
+}
+
 /// Exact outer-lease identity fence for an upstream claim.
 ///
 /// Management claims intentionally have no owner reference, while a
@@ -7335,12 +7357,13 @@ struct ChildKubeconfigObservation {
 /// Observe the write-once identity and payload checkpoint for the management
 /// Secret that authenticates one exact child instance.
 ///
-/// The k3s publisher intentionally creates this Secret without a GC owner, so
-/// composition uses a trust-on-first-use boundary before kubeconfig bytes are
-/// parsed or used: the first read only computes the checkpoint, then returns.
-/// Every later use re-GETs the same UID and payload digest. Existing child
-/// placements that already consumed an uncheckpointed Secret cannot be
-/// backfilled safely.
+/// k3s reserves the Secret name under the ClusterInstance controller owner
+/// before the publisher writes `data.kubeconfig`. Composition still uses a
+/// trust-on-first-use boundary: the first read only computes the checkpoint,
+/// then returns. Owners other than that exact ClusterInstance, or more than
+/// one owner, fail closed. Every later use re-GETs the same UID and payload
+/// digest. Existing child placements that already consumed an uncheckpointed
+/// Secret cannot be backfilled safely.
 fn child_kubeconfig_secret_observation(
     secret: &Secret,
     management_namespace: &str,
@@ -7366,7 +7389,7 @@ fn child_kubeconfig_secret_observation(
             .as_deref()
             .is_none_or(str::is_empty)
         || secret.metadata.deletion_timestamp.is_some()
-        || !metadata_has_no_owner_references(&secret.metadata)
+        || !child_kubeconfig_secret_control_is_safe(&secret.metadata, instance)
     {
         return Err(SandboxPlacementError::Invalid(format!(
             "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance"
@@ -15333,6 +15356,52 @@ current-context: child
         replaced.metadata.uid = Some("replacement-secret-uid".into());
         let replaced = child_kubeconfig_secret_observation(&replaced, NS, instance).unwrap();
         assert!(require_exact_child_kubeconfig_secret(recorded, digest, &replaced).is_err());
+    }
+
+    /// k3s reserves `{instance}-kubeconfig` under the ClusterInstance
+    /// controller owner. That exact owner is composition-safe; a foreign or
+    /// extra owner is not.
+    #[tokio::test]
+    async fn child_kubeconfig_observation_accepts_exact_instance_controller_owner() {
+        let server = MockServer::start().await;
+        let lease = child_placed_lease("child-lease-uid");
+        let instance = lease
+            .status
+            .as_ref()
+            .and_then(|status| status.target.as_ref())
+            .and_then(|target| target.child_cluster_instance.as_ref())
+            .unwrap();
+
+        let mut owned = child_kubeconfig_secret_json(&server, "child-kubeconfig-secret-uid");
+        owned["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "name": "kobe-abc123",
+            "uid": "child-instance-uid",
+            "controller": true
+        }]);
+        let owned: Secret = serde_json::from_value(owned).unwrap();
+        child_kubeconfig_secret_observation(&owned, NS, instance).unwrap();
+
+        let mut foreign = owned.clone();
+        foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "other-instance".into();
+        assert!(child_kubeconfig_secret_observation(&foreign, NS, instance).is_err());
+
+        let mut extra = owned;
+        extra
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()
+            .push(k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                name: "publisher".into(),
+                uid: "pod-uid".into(),
+                controller: Some(false),
+                ..Default::default()
+            });
+        assert!(child_kubeconfig_secret_observation(&extra, NS, instance).is_err());
     }
 
     /// The first Secret observation may hash bytes for the checkpoint, but it
