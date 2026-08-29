@@ -145,15 +145,33 @@ pub(crate) async fn fetch_all_leases_with_output(
         }
         response.json().await?
     };
+    let unified = leases
+        .iter()
+        .any(|lease| lease.resource_kind.eq_ignore_ascii_case("sandbox"));
     for lease in &mut leases {
-        lease.resource_kind = "Cluster".to_string();
-        lease.capabilities = vec![
-            "kubeconfig".to_string(),
-            "extend".to_string(),
-            "release".to_string(),
-        ];
+        if lease.resource_kind.is_empty() {
+            lease.resource_kind = if lease.id.starts_with("sandbox-") {
+                "Sandbox".to_string()
+            } else {
+                "Cluster".to_string()
+            };
+        }
+        if lease.capabilities.is_empty() && !lease.is_sandbox() {
+            lease.capabilities = vec![
+                "kubeconfig".to_string(),
+                "extend".to_string(),
+                "release".to_string(),
+            ];
+        }
     }
-    leases.extend(fetch_sandbox_leases_with_output(config, output).await?);
+    if !unified {
+        let extra = fetch_sandbox_leases_with_output(config, output).await?;
+        for lease in extra {
+            if !leases.iter().any(|existing| existing.id == lease.id) {
+                leases.push(lease);
+            }
+        }
+    }
     leases.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(leases)
 }

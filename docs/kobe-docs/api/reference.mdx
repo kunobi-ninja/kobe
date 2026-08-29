@@ -14,16 +14,16 @@ signature.
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/v1/leases` | Required | Create a lease from a pool |
-| `GET` | `/v1/leases` | Required | List your active leases |
+| `POST` | `/v1/leases` | Required | Create a lease from a pool (any kind) |
+| `GET` | `/v1/leases` | Required | List your active leases of every kind |
 | `GET` | `/v1/leases/:id` | Required | Get a specific lease |
 | `DELETE` | `/v1/leases/:id` | Required | Release a lease |
 | `PATCH` | `/v1/leases/:id` | Required | Extend a lease TTL |
-| `GET` | `/v1/leases/:id/diagnostics` | Required | Get diagnostics bundle URL |
+| `GET` | `/v1/leases/:id/diagnostics` | Required | Get diagnostics bundle URL (Cluster) |
 | `GET` | `/v1/pools` | Required | List available pools |
 | `GET` | `/v1/pools/:name` | Required | Get a specific pool's status |
 | `GET` | `/v1/pools/:name/leases` | Required | List leases for a specific pool |
-| `POST` | `/v1/sandbox-leases` | Required | Create a Sandbox lease from a SandboxPool |
+| `POST` | `/v1/sandbox-leases` | Required | Compatibility alias for `POST /v1/leases` |
 | `GET` | `/v1/sandbox-leases` | Required | List your Sandbox leases |
 | `GET` | `/v1/sandbox-leases/:id` | Required | Get one Sandbox lease |
 | `PATCH` | `/v1/sandbox-leases/:id` | Required | Extend a Sandbox lease TTL |
@@ -43,7 +43,12 @@ signature.
 
 ## `POST /v1/leases`
 
-Creates a lease from the specified pool. Returns `202 Accepted` immediately with the lease ID and `Pending` phase. Poll `GET /v1/leases/:id` until the phase is `Bound` and `kubeconfig` is populated.
+Creates a lease from the named pool. The server looks up the pool and admits
+the matching resource kind. Clients do not choose Cluster vs Sandbox URLs.
+
+Returns `202 Accepted` with the lease id, `resourceKind`, and `Pending` phase.
+Poll `GET /v1/leases/:id` until the lease is usable: `Bound` with `kubeconfig`
+for Cluster, `Ready` for Sandbox.
 
 **Request body**
 
@@ -65,10 +70,12 @@ Creates a lease from the specified pool. Returns `202 Accepted` immediately with
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `profile` | string | Yes | Pool name to lease from |
+| `profile` | string | One of `profile` or `pool` | Pool name. `pool` is an alias used by Sandbox clients. |
+| `pool` | string | One of `profile` or `pool` | Same as `profile`. If both are set they must match. |
 | `ttl` | string | No | Requested TTL (e.g. `"30m"`, `"1h"`). Defaults to the pool's `spec.ttl`. Capped by AccessPolicy `maxTtl`. |
 | `alias` | string | No | DNS-label name unique among the requester's active leases. |
-| `metadata` | object | No | Opaque caller context. Maximum 8 KiB encoded JSON, 32 top-level keys, four nesting levels, and 128 JSON values. |
+| `metadata` | object | No | Opaque caller context. Cluster leases only. Maximum 8 KiB encoded JSON, 32 top-level keys, four nesting levels, and 128 JSON values. |
+| `idempotencyKey` | string | No | Sandbox create recovery key. Ignored for Cluster pools. |
 
 `metadata` is descriptive, untrusted, and creation-time only: the lease API
 does not expose an update operation. It never affects authorization, quota,
@@ -82,6 +89,7 @@ and alias.
 ```json
 {
   "id": "lease-a1b2c3d4e5f6",
+  "resourceKind": "Cluster",
   "phase": "Pending",
   "profile": "ci-small",
   "queue_position": 0,
@@ -105,6 +113,7 @@ Once bound, `GET /v1/leases/:id` returns:
 ```json
 {
   "id": "lease-a1b2c3d4e5f6",
+  "resourceKind": "Cluster",
   "phase": "Bound",
   "profile": "ci-small",
   "kubeconfig": "apiVersion: v1\nclusters:\n...",
@@ -118,15 +127,20 @@ Once bound, `GET /v1/leases/:id` returns:
 |---|---|
 | `400` | Invalid profile name, alias, TTL, or metadata |
 | `403` | Profile not allowed for your identity |
-| `404` | No Cluster pool with that name |
-| `409` | The name is a Sandbox pool (`reason: wrong_resource_kind`). Use `POST /v1/sandbox-leases`; `kobe lease` selects the route from the pool kind. |
+| `404` | No pool with that name |
+| `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`) |
 | `429` | Concurrent lease limit reached, or server overloaded |
+
+`POST /v1/sandbox-leases` is a compatibility alias for this same create. Prefer
+`POST /v1/leases`. Kind-specific verbs (`exec`, `logs`, `attach`, `port-forward`,
+`executions`) are also served under `/v1/leases/:id/...`.
 
 ---
 
 ## `GET /v1/leases`
 
-Lists all active leases belonging to your identity.
+Lists your active Cluster and Sandbox leases. Each item includes `resourceKind`
+and `capabilities`.
 
 **Response** — `200 OK`
 
@@ -325,13 +339,14 @@ bounded reason exists. The closed set:
 | `expiry_derivation_mismatch` | no |
 | `conflict_retryable` | yes, against current state |
 | `teardown_quarantined` | no — resolve cleanup first |
-| `wrong_resource_kind` | no — this name is a Cluster pool; `POST /v1/leases` |
+| `wrong_resource_kind` | no — the pool name is ambiguous across kinds |
 
 ### `POST /v1/sandbox-leases`
 
-Creates caller-safe Sandbox intent and returns `202 Accepted`. The response
-includes `Location: /v1/sandbox-leases/:id`; poll that URL until the lease is
-ready or terminal.
+Compatibility alias for `POST /v1/leases`. Prefer `/v1/leases`. This path
+still accepts the Sandbox body (`pool`, `idempotencyKey`) and still returns
+`Location: /v1/sandbox-leases/:id`. A Cluster pool name is admitted as a
+Cluster lease rather than rejected.
 
 ```json
 {
@@ -351,6 +366,7 @@ while recovering that request. It remains optional for older clients.
 ```json
 {
   "id": "sandbox-a1b2c3d4e5f60718293a4b5c",
+  "resourceKind": "Sandbox",
   "phase": "Pending",
   "pool": "agent-small",
   "ttl": "30m",
@@ -396,7 +412,7 @@ the connection failed before headers, the same keyed POST may be repeated.
 | `400` | Invalid pool name, alias, or TTL |
 | `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
 | `404` | An allowed SandboxPool does not exist |
-| `409` | Alias is already active, an idempotency key is bound to different intent, or the name is a Cluster pool (`reason: wrong_resource_kind`) |
+| `409` | Alias is already active, an idempotency key is bound to different intent, or the pool name is ambiguous across kinds |
 | `429` | Sandbox concurrency limit reached, or the per-principal admission rate limit was hit |
 | `503` | Pool configuration or Kubernetes admission cannot be verified |
 

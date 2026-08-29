@@ -27,10 +27,9 @@ use super::routes::AppState;
 use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
-    ClusterPool, ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase,
-    SandboxLeaseSpec, SandboxPlacement, SandboxPlacementAuthority, SandboxPool,
-    SandboxPoolReference, SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance,
-    SandboxVerb,
+    ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
+    SandboxPlacement, SandboxPlacementAuthority, SandboxPool, SandboxPoolReference,
+    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
@@ -112,6 +111,28 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
         )
         .route(
             "/v1/sandbox-leases/{id}/executions/{execution}/logs",
+            get(get_sandbox_execution_logs::<B>),
+        )
+        // Canonical lease tree. `/v1/sandbox-leases` above stays as an alias
+        // so older clients keep working; create/list/get/release/extend for
+        // mixed kinds are served from `/v1/leases` in `routes.rs`.
+        .route("/v1/leases/{id}/logs", get(sandbox_logs::<B>))
+        .route("/v1/leases/{id}/exec", post(sandbox_exec::<B>))
+        .route("/v1/leases/{id}/attach", get(sandbox_attach::<B>))
+        .route(
+            "/v1/leases/{id}/port-forward",
+            get(sandbox_port_forward::<B>),
+        )
+        .route(
+            "/v1/leases/{id}/executions",
+            post(create_sandbox_execution::<B>),
+        )
+        .route(
+            "/v1/leases/{id}/executions/{execution}",
+            get(get_sandbox_execution::<B>).delete(cancel_sandbox_execution::<B>),
+        )
+        .route(
+            "/v1/leases/{id}/executions/{execution}/logs",
             get(get_sandbox_execution_logs::<B>),
         )
 }
@@ -2896,17 +2917,17 @@ fn access_denied(
 /// upstream Pod/Sandbox spec through a future-tolerant JSON object.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateSandboxLeaseRequest {
-    pool: String,
+pub(crate) struct CreateSandboxLeaseRequest {
+    pub(crate) pool: String,
     #[serde(default)]
-    ttl: Option<String>,
+    pub(crate) ttl: Option<String>,
     #[serde(default)]
-    alias: Option<String>,
+    pub(crate) alias: Option<String>,
     /// Optional for compatibility with older API clients. Current clients send
     /// one key per deliberate create and reuse it only to recover an ambiguous
     /// response. The server never treats a missing key as retryable.
     #[serde(default, rename = "idempotencyKey")]
-    idempotency_key: Option<String>,
+    pub(crate) idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2967,6 +2988,8 @@ fn sha256_hex<'a>(components: impl IntoIterator<Item = &'a [u8]>) -> String {
 #[derive(Debug, Serialize)]
 struct SandboxLeaseResponse {
     id: String,
+    #[serde(rename = "resourceKind")]
+    resource_kind: &'static str,
     phase: String,
     pool: String,
     ttl: String,
@@ -2993,14 +3016,16 @@ struct SandboxLeaseResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct SandboxLeaseSummary {
-    id: String,
-    phase: String,
-    pool: String,
+pub(crate) struct SandboxLeaseSummary {
+    pub id: String,
+    #[serde(rename = "resourceKind")]
+    resource_kind: &'static str,
+    pub phase: String,
+    pub pool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    alias: Option<String>,
+    pub alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    expires_at: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 /// Error body for every Sandbox route denial.
@@ -3249,6 +3274,7 @@ fn pending_sandbox_lease_response(
 ) -> SandboxLeaseResponse {
     SandboxLeaseResponse {
         id: lease_id,
+        resource_kind: "Sandbox",
         phase: SandboxLeasePhase::Pending.to_string(),
         pool,
         ttl: effective_ttl.clone(),
@@ -3287,7 +3313,7 @@ fn sandbox_throttled(error: String, retry_after: std::time::Duration) -> Respons
 }
 
 #[tracing::instrument(skip_all)]
-async fn create_sandbox_lease<B: ClusterBackend>(
+pub(crate) async fn create_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Json(request): Json<CreateSandboxLeaseRequest>,
@@ -3340,6 +3366,49 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
             );
         }
     };
+    if !is_valid_k8s_name(&request.pool) {
+        return sandbox_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid SandboxPool name",
+            Some(
+                "Pool must be a DNS label (lowercase alphanumeric and hyphens, 1-63 characters)"
+                    .into(),
+            ),
+        );
+    }
+    match crate::api::routes::resolve_create_pool_kind(&state, &request.pool).await {
+        Err(error) => return sandbox_infra_error("Unable to read pool", error),
+        Ok(crate::api::routes::CreatePoolKind::Cluster) => {
+            return crate::api::routes::create_lease(
+                State(state),
+                identity,
+                Json(crate::api::routes::CreateLeaseRequest {
+                    profile: Some(request.pool),
+                    pool: None,
+                    ttl: request.ttl,
+                    alias: request.alias,
+                    metadata: None,
+                    idempotency_key: None,
+                }),
+            )
+            .await;
+        }
+        Ok(crate::api::routes::CreatePoolKind::Ambiguous) => {
+            return sandbox_error_with_reason(
+                StatusCode::CONFLICT,
+                format!(
+                    "Pool name '{}' is ambiguous across Cluster and Sandbox resources",
+                    request.pool
+                ),
+                Some("Pool names must be unique across resource kinds".into()),
+                "wrong_resource_kind",
+            );
+        }
+        Ok(
+            crate::api::routes::CreatePoolKind::Sandbox
+            | crate::api::routes::CreatePoolKind::Missing,
+        ) => {}
+    }
     // FIRST operation that touches shared state, deliberately. Once admitted
     // by this limiter, the attempt spends its token even if a later pool,
     // policy, quota, or Kubernetes check refuses it: downstream failure must
@@ -3460,18 +3529,6 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     {
         Ok(Ok(pool)) => pool,
         Ok(Err(kube::Error::Api(error))) if error.code == 404 => {
-            let clusters: Api<ClusterPool> =
-                Api::namespaced(state.client.clone(), &state.namespace);
-            if matches!(clusters.get_opt(&request.pool).await, Ok(Some(_))) {
-                return sandbox_error_with_reason(
-                    StatusCode::CONFLICT,
-                    format!("Pool '{}' is a Cluster pool", request.pool),
-                    Some(
-                        "POST /v1/sandbox-leases creates Sandbox leases. Use POST /v1/leases; `kobe lease` selects the route from the pool kind.".into(),
-                    ),
-                    "wrong_resource_kind",
-                );
-            }
             return sandbox_error(StatusCode::NOT_FOUND, "SandboxPool not found", None);
         }
         Ok(Err(err)) => return sandbox_infra_error("Unable to load SandboxPool", err),
@@ -4201,8 +4258,50 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     )
 }
 
+/// Caller's Sandbox leases for the unified `GET /v1/leases` inventory.
+///
+/// Missing CRDs or a missing Sandbox grant return an empty list rather than
+/// failing the mixed inventory. The kind-specific `/v1/sandbox-leases` list
+/// still 403s when the grant is absent.
+pub(crate) async fn caller_sandbox_summaries<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+) -> Result<Vec<SandboxLeaseSummary>, kube::Error> {
+    let policy = policy_for(identity);
+    let Some(grant) = policy.sandbox.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if !grant.verbs.contains(&SandboxVerb::Lease) {
+        return Ok(Vec::new());
+    }
+    if require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD])
+        .await
+        .is_err()
+    {
+        return Ok(Vec::new());
+    }
+    let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let items = leases.list(&requester_list_params(identity)).await?;
+    Ok(items
+        .iter()
+        .filter(|lease| principal_matches(&lease.spec.requester, identity))
+        .filter(|lease| is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Lease, &policy))
+        .map(|lease| {
+            let status = lease.status.clone().unwrap_or_default();
+            SandboxLeaseSummary {
+                id: lease.name_any(),
+                resource_kind: "Sandbox",
+                phase: status.phase.to_string(),
+                pool: lease.spec.pool_ref.name.clone(),
+                alias: lease.spec.alias.clone(),
+                expires_at: status.expires_at.clone(),
+            }
+        })
+        .collect())
+}
+
 #[tracing::instrument(skip_all)]
-async fn list_sandbox_leases<B: ClusterBackend>(
+pub(crate) async fn list_sandbox_leases<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
 ) -> Response {
@@ -4239,6 +4338,7 @@ async fn list_sandbox_leases<B: ClusterBackend>(
                     let status = lease.status.clone().unwrap_or_default();
                     SandboxLeaseSummary {
                         id: lease.name_any(),
+                        resource_kind: "Sandbox",
                         phase: status.phase.to_string(),
                         pool: lease.spec.pool_ref.name.clone(),
                         alias: lease.spec.alias.clone(),
@@ -4253,7 +4353,7 @@ async fn list_sandbox_leases<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn get_sandbox_lease<B: ClusterBackend>(
+pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
@@ -4286,9 +4386,9 @@ async fn get_sandbox_lease<B: ClusterBackend>(
 /// and the older cluster-lease endpoint.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ExtendSandboxLeaseRequest {
+pub(crate) struct ExtendSandboxLeaseRequest {
     #[serde(alias = "extend_ttl")]
-    extend_ttl: String,
+    pub(crate) extend_ttl: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -4314,7 +4414,7 @@ struct ExtendSandboxLeaseResponse {
 /// taken at admission: a grant that has since been narrowed, or removed
 /// entirely, must bind immediately rather than let an old allowance coast.
 #[tracing::instrument(skip_all)]
-async fn extend_sandbox_lease<B: ClusterBackend>(
+pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
@@ -4549,7 +4649,7 @@ fn parse_lease_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 #[tracing::instrument(skip_all)]
-async fn release_sandbox_lease<B: ClusterBackend>(
+pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
@@ -4910,6 +5010,7 @@ fn sandbox_lease_response(
     let status = lease.status.unwrap_or_default();
     SandboxLeaseResponse {
         id,
+        resource_kind: "Sandbox",
         phase: status.phase.to_string(),
         pool: lease.spec.pool_ref.name,
         ttl: lease.spec.ttl,
@@ -8240,6 +8341,20 @@ mod tests {
         let lease_state = Arc::new(Mutex::new(None::<serde_json::Value>));
         Mock::given(method("GET"))
             .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404,
+                "message": "clusterpools \"agent-small\" not found"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
@@ -9365,10 +9480,38 @@ mod tests {
             "the id this endpoint issues ({id:?}) is not recognised as a lease id, \
              so every operation addressed by it is resolved as an alias and 404s"
         );
+        assert_eq!(body["resourceKind"], "Sandbox");
     }
 
     #[tokio::test]
-    async fn create_sandbox_lease_rejects_a_cluster_pool_name() {
+    async fn post_v1_leases_admits_a_sandbox_pool() {
+        let server = MockServer::start().await;
+        mount_create_api(&server, true, false).await;
+
+        let response = crate::api::routes::create_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(crate::api::routes::CreateLeaseRequest {
+                profile: Some("agent-small".into()),
+                ..crate::api::routes::CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "response: {body}");
+        assert_eq!(body["resourceKind"], "Sandbox");
+        assert!(
+            body["id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("sandbox-"),
+            "id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_lease_dispatches_a_cluster_pool_name() {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
         Mock::given(method("GET"))
@@ -9410,15 +9553,10 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response_json(response).await;
-        assert_eq!(body["reason"], "wrong_resource_kind");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Cluster pool"),
-            "error should name the kind: {body}"
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "dispatch to Cluster create uses Cluster pool policy, not a kind 409"
         );
     }
 

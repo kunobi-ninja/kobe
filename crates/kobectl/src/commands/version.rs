@@ -29,14 +29,10 @@ fn parse_dotted_version(raw: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Warn on stderr when this binary is older than the operator it talks to.
-/// Lease routing for Sandbox pools landed in 0.40.2; an older CLI will POST
-/// `/v1/leases` for every pool name.
 pub(crate) fn warn_if_cli_behind_endpoint(endpoint_version: &str) {
     let cli = cli_version();
     if cli_is_behind_endpoint(cli, endpoint_version) {
-        eprintln!(
-            "warning: CLI {cli} is older than endpoint {endpoint_version}; `kobe lease` may mis-route pool kinds. Upgrade the CLI."
-        );
+        eprintln!("warning: CLI {cli} is older than endpoint {endpoint_version}. Upgrade the CLI.");
     }
 }
 
