@@ -246,6 +246,36 @@ async function applyRuntime(rendered: string): Promise<void> {
 	]);
 }
 
+function splitRendered(rendered: string): {
+	crdManifest: string;
+	restManifest: string;
+} {
+	const documents = rendered
+		.split(/^---\s*$/m)
+		.map((document) => document.trim())
+		.filter(Boolean);
+	const crdDocuments: string[] = [];
+	const restDocuments: string[] = [];
+	for (const document of documents) {
+		if (/^kind:\s*CustomResourceDefinition\s*$/m.test(document)) {
+			crdDocuments.push(document);
+		} else {
+			restDocuments.push(document);
+		}
+	}
+	invariant(
+		crdDocuments.length === crds.length,
+		"runtime manifest CRD count drifted",
+	);
+	invariant(restDocuments.length > 0, "runtime manifest has no non-CRD objects");
+	const join = (parts: string[]) =>
+		`${parts.map((part) => `---\n${part}`).join("\n")}\n`;
+	return {
+		crdManifest: join(crdDocuments),
+		restManifest: join(restDocuments),
+	};
+}
+
 async function installPreviousRuntime(): Promise<void> {
 	const response = await fetch(previousReleaseUrl, {
 		signal: AbortSignal.timeout(60_000),
@@ -286,7 +316,15 @@ async function pruneConvertedWebhookOrphans(): Promise<void> {
 }
 
 async function installRuntime(): Promise<void> {
-	await applyRuntime(await pinnedRuntime());
+	// v1.0.0 CRDs omit spec.conversion. Server-side apply over a v0.5.6 CRD
+	// leaves webhookClientConfig in place without strategy=Webhook, and the
+	// API server rejects that merge. Upstream applies CRDs as a full replace
+	// before the controller; `kubectl replace` is that step and also drops
+	// served v1alpha1.
+	const { crdManifest, restManifest } = splitRendered(await pinnedRuntime());
+	await kubectl(["replace", "-f", "-"], { stdin: crdManifest });
+	info("replaced v0.5.6 CRDs with the v1.0.0 schemas");
+	await applyRuntime(restManifest);
 	await pruneConvertedWebhookOrphans();
 }
 
@@ -325,8 +363,12 @@ async function verifyRuntime(): Promise<void> {
 			),
 			`CRD ${name} still serves v1alpha1`,
 		);
+		const conversion = spec.conversion as Record<string, unknown> | undefined;
 		invariant(
-			spec.conversion == null,
+			conversion == null ||
+				(conversion.strategy === "None" &&
+					conversion.webhook == null &&
+					conversion.webhookClientConfig == null),
 			`CRD ${name} still declares a conversion webhook`,
 		);
 		const storedVersions = crd.status?.storedVersions;
