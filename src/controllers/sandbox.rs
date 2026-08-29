@@ -15388,19 +15388,16 @@ current-context: child
         assert!(child_kubeconfig_secret_observation(&foreign, NS, instance).is_err());
 
         let mut extra = owned;
-        extra
-            .metadata
-            .owner_references
-            .as_mut()
-            .unwrap()
-            .push(k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+        extra.metadata.owner_references.as_mut().unwrap().push(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
                 api_version: "v1".into(),
                 kind: "Pod".into(),
                 name: "publisher".into(),
                 uid: "pod-uid".into(),
                 controller: Some(false),
                 ..Default::default()
-            });
+            },
+        );
         assert!(child_kubeconfig_secret_observation(&extra, NS, instance).is_err());
     }
 
