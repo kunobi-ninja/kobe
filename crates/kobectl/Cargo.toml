@@ -33,9 +33,10 @@ sha2 = "0.10"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
-# rustls (ring) — never default-features (which would pull aws-lc-sys and break
-# the Windows cross-build, per kache's hard-won note).
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+# rustls-no-provider (ring) — never default-features and never the `rustls`
+# feature, which would pull aws-lc-sys and break the Windows cross-build,
+# per kache's hard-won note. Unify with kunobi-auth's reqwest 0.13.
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider", "stream"], default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 # WebSocket client for `sandbox attach` / `sandbox port-forward`. rustls with
 # ring, never default-features — the same constraint as reqwest above, because
