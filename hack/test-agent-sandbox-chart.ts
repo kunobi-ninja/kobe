@@ -634,14 +634,37 @@ const evidenceRule = generalRules.find(
 		Array.isArray(rule.resources) &&
 		rule.resources.includes("verifiedteardownevidence"),
 );
-invariant(evidenceRule, "general control plane cannot authenticate teardown evidence");
+invariant(evidenceRule, "combined control plane cannot authenticate teardown evidence");
 invariant(
 	Array.isArray(evidenceRule.verbs) &&
-		["get", "list", "watch"].every((verb) => evidenceRule.verbs.includes(verb)) &&
-		["create", "update", "patch", "delete"].every(
+		["get", "list", "watch", "create"].every((verb) =>
+			evidenceRule.verbs.includes(verb),
+		) &&
+		["update", "patch", "delete"].every(
 			(verb) => !evidenceRule.verbs.includes(verb),
 		),
-	"general control plane can mutate teardown evidence",
+	"combined control plane must create evidence and must not rewrite or delete it",
+);
+
+const splitOperatorRole = objectNamed(externalSplit, "ClusterRole", "kobe");
+invariant(splitOperatorRole, "split render omitted the lifecycle ClusterRole");
+const splitEvidenceRule = (
+	(splitOperatorRole.rules ?? []) as Record<string, unknown>[]
+).find(
+	(rule) =>
+		Array.isArray(rule.resources) &&
+		rule.resources.includes("verifiedteardownevidence"),
+);
+invariant(splitEvidenceRule, "split control plane cannot authenticate teardown evidence");
+invariant(
+	Array.isArray(splitEvidenceRule.verbs) &&
+		["get", "list", "watch"].every((verb) =>
+			splitEvidenceRule.verbs.includes(verb),
+		) &&
+		["create", "update", "patch", "delete"].every(
+			(verb) => !splitEvidenceRule.verbs.includes(verb),
+		),
+	"split control plane can mutate teardown evidence",
 );
 
 

@@ -60,10 +60,16 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch"]
-  # The control plane may authenticate evidence but cannot write it.
+  # Split mode: the control plane authenticates evidence but cannot write it.
+  # Combined mode: this identity IS the authority, so it must be able to create
+  # the immutable evidence object child composition consumes.
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["verifiedteardownevidence"]
+    {{- if .Values.teardownAuthority.separate }}
     verbs: ["get", "list", "watch"]
+    {{- else }}
+    verbs: ["get", "list", "watch", "create"]
+    {{- end }}
   # Pool reconciliation publishes exact allocation counts and a fail-closed
   # readiness certificate. Keep status authority separate from pool spec:
   # the operator may report observations but cannot rewrite administrator
