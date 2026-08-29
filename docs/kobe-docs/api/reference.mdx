@@ -118,6 +118,8 @@ Once bound, `GET /v1/leases/:id` returns:
 |---|---|
 | `400` | Invalid profile name, alias, TTL, or metadata |
 | `403` | Profile not allowed for your identity |
+| `404` | No Cluster pool with that name |
+| `409` | The name is a Sandbox pool (`reason: wrong_resource_kind`). Use `POST /v1/sandbox-leases`; `kobe lease` selects the route from the pool kind. |
 | `429` | Concurrent lease limit reached, or server overloaded |
 
 ---
@@ -323,6 +325,7 @@ bounded reason exists. The closed set:
 | `expiry_derivation_mismatch` | no |
 | `conflict_retryable` | yes, against current state |
 | `teardown_quarantined` | no — resolve cleanup first |
+| `wrong_resource_kind` | no — this name is a Cluster pool; `POST /v1/leases` |
 
 ### `POST /v1/sandbox-leases`
 
@@ -393,7 +396,7 @@ the connection failed before headers, the same keyed POST may be repeated.
 | `400` | Invalid pool name, alias, or TTL |
 | `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
 | `404` | An allowed SandboxPool does not exist |
-| `409` | Alias is already active, or an idempotency key is bound to different intent |
+| `409` | Alias is already active, an idempotency key is bound to different intent, or the name is a Cluster pool (`reason: wrong_resource_kind`) |
 | `429` | Sandbox concurrency limit reached, or the per-principal admission rate limit was hit |
 | `503` | Pool configuration or Kubernetes admission cannot be verified |
 

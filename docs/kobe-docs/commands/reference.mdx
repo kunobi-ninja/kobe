@@ -103,6 +103,12 @@ kobe lease ci-small --no-wait
 ```
 
 Prints the lease ID, resource kind, capabilities, and expiry on success.
+While waiting, the CLI names the resource kind and what "ready" means
+(kubeconfig for Cluster, canary for Sandbox). Ctrl-C stops waiting and
+prints `kobe release <id>`; it does not release the lease.
+
+If the CLI version is older than the operator, `kobe status` and `kobe lease`
+print a warning: older CLIs POST `/v1/leases` for every pool name.
 
 **Flags**
 

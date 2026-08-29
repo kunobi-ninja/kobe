@@ -27,9 +27,10 @@ use super::routes::AppState;
 use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
-    ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
-    SandboxPlacement, SandboxPlacementAuthority, SandboxPool, SandboxPoolReference,
-    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxVerb,
+    ClusterPool, ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase,
+    SandboxLeaseSpec, SandboxPlacement, SandboxPlacementAuthority, SandboxPool,
+    SandboxPoolReference, SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance,
+    SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
@@ -3026,6 +3027,7 @@ struct SandboxLeaseSummary {
 /// | `expiry_derivation_mismatch` | 409 | no |
 /// | `conflict_retryable` | 409 | yes, against current state |
 /// | `teardown_quarantined` | 409 | no — operator must resolve cleanup |
+/// | `wrong_resource_kind` | 409 | no — this name is a Cluster pool |
 /// | `runner_*` / `execution_*` codes | varies | per their meaning below |
 #[derive(Debug, Serialize)]
 struct SandboxErrorResponse {
@@ -3458,6 +3460,18 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     {
         Ok(Ok(pool)) => pool,
         Ok(Err(kube::Error::Api(error))) if error.code == 404 => {
+            let clusters: Api<ClusterPool> =
+                Api::namespaced(state.client.clone(), &state.namespace);
+            if matches!(clusters.get_opt(&request.pool).await, Ok(Some(_))) {
+                return sandbox_error_with_reason(
+                    StatusCode::CONFLICT,
+                    format!("Pool '{}' is a Cluster pool", request.pool),
+                    Some(
+                        "POST /v1/sandbox-leases creates Sandbox leases. Use POST /v1/leases; `kobe lease` selects the route from the pool kind.".into(),
+                    ),
+                    "wrong_resource_kind",
+                );
+            }
             return sandbox_error(StatusCode::NOT_FOUND, "SandboxPool not found", None);
         }
         Ok(Err(err)) => return sandbox_infra_error("Unable to load SandboxPool", err),
@@ -9350,6 +9364,61 @@ mod tests {
             crate::api::sandbox_access::looks_like_lease_id(id),
             "the id this endpoint issues ({id:?}) is not recognised as a lease id, \
              so every operation addressed by it is resolved as an alias and 404s"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_lease_rejects_a_cluster_pool_name() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-cluster",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404,
+                "message": "sandboxpools \"agent-cluster\" not found"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/agent-cluster",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "metadata": { "name": "agent-cluster", "namespace": "test-ns" },
+                "spec": { "size": 3, "ttl": "2h", "cluster": { "version": "v1.31.3+k3s1" } },
+                "status": { "phase": "Healthy", "ready": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-cluster".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+                idempotency_key: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "wrong_resource_kind");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Cluster pool"),
+            "error should name the kind: {body}"
         );
     }
 

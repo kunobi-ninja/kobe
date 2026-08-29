@@ -628,6 +628,8 @@ enum ErrorReason {
     Warming,
     /// Release was refused because verified teardown remains quarantined.
     TeardownQuarantined,
+    /// The pool name exists as the other resource kind (Cluster vs Sandbox).
+    WrongResourceKind,
 }
 
 impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
@@ -1329,14 +1331,64 @@ async fn create_lease<B: ClusterBackend>(
     // forever (fixed-size pools have no queue_timeout). A `Failing` pool — or a
     // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
     // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
-    // empty warm pool keeps the 202 Pending below. A missing pool / read error
-    // is non-fatal here (the lease controller surfaces it), so we fall through.
+    // empty warm pool keeps the 202 Pending below.
+    //
+    // A missing ClusterPool used to fall through and still create the lease.
+    // POST /v1/leases with a Sandbox pool name then queued forever. Reject
+    // that here: 409 when the name is a Sandbox pool, 404 when it is neither.
     {
         let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
-        if let Ok(pool) = pools_api.get(&req.profile).await
-            && let Some(unavailable) = pool_preflight_rejection(&req.profile, &pool)
-        {
-            return unavailable;
+        match pools_api.get_opt(&req.profile).await {
+            Ok(Some(pool)) => {
+                if let Some(unavailable) = pool_preflight_rejection(&req.profile, &pool) {
+                    return unavailable;
+                }
+            }
+            Ok(None) => {
+                if state.sandbox_enabled {
+                    let sandboxes: Api<SandboxPool> =
+                        Api::namespaced(state.client.clone(), &state.namespace);
+                    match sandboxes.get_opt(&req.profile).await {
+                        Ok(Some(_)) => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(ErrorResponse {
+                                    error: format!("Pool '{}' is a Sandbox pool", req.profile),
+                                    detail: Some(
+                                        "POST /v1/leases creates Cluster leases. Use POST /v1/sandbox-leases; `kobe lease` selects the route from the pool kind.".to_string(),
+                                    ),
+                                    reason: Some(ErrorReason::WrongResourceKind),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return infra_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Unable to verify pool kind",
+                                e,
+                            );
+                        }
+                    }
+                }
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Cluster pool '{}' not found", req.profile),
+                        detail: None,
+                        reason: None,
+                    }),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return infra_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to read Cluster pool",
+                    e,
+                );
+            }
         }
     }
 
@@ -5548,6 +5600,183 @@ mod tests {
             .expect("the accepted request must create one ClusterLease");
         let created: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
         assert_eq!(created["spec"]["metadata"], metadata);
+    }
+
+    fn k8s_not_found(message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "metadata": {},
+            "status": "Failure",
+            "reason": "NotFound",
+            "code": 404,
+            "message": message
+        })
+    }
+
+    fn sandbox_pool_named(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxPool",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "uid": "sandbox-pool-uid",
+                "generation": 1
+            },
+            "spec": {
+                "warmCapacity": 1,
+                "defaultTtl": "30m",
+                "maxTtl": "2h",
+                "provisioningTimeout": "10m",
+                "placement": { "type": "management" },
+                "template": {
+                    "defaultContainer": "workspace",
+                    "containers": [{
+                        "name": "workspace",
+                        "image": "example.invalid/busybox@sha256:abc",
+                        "resources": {
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "64Mi",
+                                "ephemeralStorage": "64Mi"
+                            },
+                            "limits": {
+                                "cpu": "250m",
+                                "memory": "256Mi",
+                                "ephemeralStorage": "256Mi"
+                            }
+                        }
+                    }]
+                },
+                "isolation": { "tier": "trusted-runc" },
+                "readiness": { "canary": { "argv": ["/bin/true"], "timeout": "30s" } }
+            }
+        })
+    }
+
+    async fn mount_empty_cluster_leases(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_lease_rejects_a_sandbox_pool_name_instead_of_queuing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_empty_cluster_leases(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-agent",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("clusterpools \"e2e-agent\" not found")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/e2e-agent",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_pool_named("e2e-agent")))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: "e2e-agent".to_string(),
+                ttl: None,
+                alias: None,
+                metadata: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "wrong_resource_kind");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Sandbox pool"),
+            "error should name the kind: {body}"
+        );
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method == http::Method::POST)
+            .count();
+        assert_eq!(posts, 0, "must not create a ClusterLease");
+    }
+
+    #[tokio::test]
+    async fn create_lease_returns_404_when_no_pool_exists() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_empty_cluster_leases(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-missing",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("clusterpools \"e2e-missing\" not found")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/e2e-missing",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(k8s_not_found("sandboxpools \"e2e-missing\" not found")),
+            )
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: "e2e-missing".to_string(),
+                ttl: None,
+                alias: None,
+                metadata: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("e2e-missing"),
+            "error should name the pool: {body}"
+        );
     }
 
     #[test]

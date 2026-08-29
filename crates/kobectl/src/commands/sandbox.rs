@@ -414,7 +414,7 @@ struct LeaseOutput<'a> {
     phase: &'a str,
     pool: &'a str,
     resource_kind: &'static str,
-    capabilities: &'static [&'static str],
+    capabilities: &'a [String],
     ttl: Option<&'a str>,
     alias: Option<&'a str>,
     expires_at: Option<&'a str>,
@@ -429,6 +429,64 @@ const SANDBOX_CAPABILITIES: &[&str] = &[
     "extend",
     "release",
 ];
+
+fn default_sandbox_actions() -> Vec<String> {
+    SANDBOX_CAPABILITIES
+        .iter()
+        .map(|action| (*action).to_string())
+        .collect()
+}
+
+pub(crate) async fn sandbox_actions_for_pool(
+    config: &ResolvedConfig,
+    pool: &str,
+    output: OutputFormat,
+) -> Vec<String> {
+    match super::pools::fetch_pool_for_config_with_output(config, pool, output).await {
+        Ok(summary) if !summary.capabilities.is_empty() => summary.capabilities,
+        _ => default_sandbox_actions(),
+    }
+}
+
+fn next_sandbox_hint(id: &str, phase: &str, actions: &[String]) -> Option<String> {
+    if !phase.eq_ignore_ascii_case("ready") {
+        return None;
+    }
+    if actions.iter().any(|action| action == "exec") {
+        Some(format!("kobe exec {id} -- <command>"))
+    } else {
+        Some(format!(
+            "this pool has no exec (actions: {})",
+            actions.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod next_hint_tests {
+    use super::next_sandbox_hint;
+
+    #[test]
+    fn pending_has_no_next_hint() {
+        let actions = vec!["lease".into(), "release".into()];
+        assert!(next_sandbox_hint("sandbox-abc", "Pending", &actions).is_none());
+    }
+
+    #[test]
+    fn ready_without_exec_says_so() {
+        let actions = vec!["lease".into(), "logs".into(), "release".into()];
+        let hint = next_sandbox_hint("sandbox-abc", "Ready", &actions).unwrap();
+        assert!(hint.contains("no exec"), "{hint}");
+        assert!(hint.contains("logs"), "{hint}");
+    }
+
+    #[test]
+    fn ready_with_exec_points_at_kobe_exec() {
+        let actions = vec!["lease".into(), "exec".into(), "release".into()];
+        let hint = next_sandbox_hint("sandbox-abc", "Ready", &actions).unwrap();
+        assert_eq!(hint, "kobe exec sandbox-abc -- <command>");
+    }
+}
 
 /// One stable schema for every `sandbox run --output json` outcome.
 ///
@@ -691,6 +749,8 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
         Err(failure) => return Err(failure.error),
     };
 
+    let actions = sandbox_actions_for_pool(config, command.pool, command.output).await;
+
     if command.no_wait {
         return emit_lease_output(
             &lease_id,
@@ -699,21 +759,37 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
             command.ttl,
             command.alias,
             None,
+            &actions,
             command.output,
         );
     }
 
     if command.output == OutputFormat::Text {
-        eprintln!("Waiting for lease {lease_id} to become ready...");
+        eprintln!("Waiting for Sandbox lease {lease_id} to become ready (canary)...");
     }
     let ready_timeout = match command.wait_timeout {
         Some(value) => super::lease_create::parse_cli_duration(value)
             .ok_or_else(|| anyhow::anyhow!("Invalid --wait-timeout '{value}'"))?,
         None => READY_TIMEOUT,
     };
-    let ready = wait_until_ready(config, &lease_id, command.output, ready_timeout)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message()))?;
+    // Ctrl-C is handled here, not inside `wait_until_ready`. `kobe run` shares
+    // that helper and has its own signal machine that always releases.
+    let ready = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            anyhow::bail!(super::lease_create::interrupted_waiting(&lease_id));
+        }
+        result = wait_until_ready(config, &lease_id, command.output, ready_timeout) => {
+            result.map_err(|error| {
+                let timed_out = matches!(error, RunExecutionError::ReadyTimeout(_));
+                let message = error.message();
+                if timed_out {
+                    anyhow::anyhow!("{message}. Release with: kobe release {lease_id}")
+                } else {
+                    anyhow::anyhow!(message)
+                }
+            })?
+        }
+    };
     emit_lease_output(
         &ready.id,
         &ready.phase,
@@ -721,6 +797,7 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
         ready.effective_ttl.as_deref().or(command.ttl),
         ready.alias.as_deref().or(command.alias),
         ready.expires_at.as_deref(),
+        &actions,
         command.output,
     )?;
 
@@ -751,6 +828,7 @@ pub(crate) fn emit_lease_output(
     ttl: Option<&str>,
     alias: Option<&str>,
     expires_at: Option<&str>,
+    capabilities: &[String],
     output: OutputFormat,
 ) -> Result<()> {
     match output {
@@ -762,7 +840,10 @@ pub(crate) fn emit_lease_output(
             if let Some(expires_at) = expires_at {
                 println!("Expires: {expires_at}");
             }
-            println!("Actions: {}", SANDBOX_CAPABILITIES.join(", "));
+            println!("Actions: {}", capabilities.join(", "));
+            if let Some(next) = next_sandbox_hint(id, phase, capabilities) {
+                println!("Next:    {next}");
+            }
             Ok(())
         }
         OutputFormat::Json => print_json(&LeaseOutput {
@@ -771,7 +852,7 @@ pub(crate) fn emit_lease_output(
             phase,
             pool,
             resource_kind: "Sandbox",
-            capabilities: SANDBOX_CAPABILITIES,
+            capabilities,
             ttl,
             alias,
             expires_at,
@@ -1372,7 +1453,7 @@ async fn wait_until_ready(
 
 fn ready_deadline_error(lease: &str) -> RunExecutionError {
     RunExecutionError::ReadyTimeout(format!(
-        "sandbox {lease} was not ready within the absolute {READY_TIMEOUT:?} deadline"
+        "sandbox {lease} was not ready within the wait deadline"
     ))
 }
 

@@ -1,8 +1,57 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use super::config::CliConfig;
+use super::config::{CliConfig, ResolvedConfig};
 use super::{OutputFormat, authed_client, cli_version, print_json};
+
+/// Compare dotted versions, ignoring a leading `v` and any `+metadata` /
+/// `-prerelease` suffix. Returns true when `cli` is strictly older than
+/// `endpoint`. Unparseable values never warn.
+pub(crate) fn cli_is_behind_endpoint(cli: &str, endpoint: &str) -> bool {
+    match (parse_dotted_version(cli), parse_dotted_version(endpoint)) {
+        (Some(cli), Some(endpoint)) => cli < endpoint,
+        _ => false,
+    }
+}
+
+fn parse_dotted_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("");
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Warn on stderr when this binary is older than the operator it talks to.
+/// Lease routing for Sandbox pools landed in 0.40.2; an older CLI will POST
+/// `/v1/leases` for every pool name.
+pub(crate) fn warn_if_cli_behind_endpoint(endpoint_version: &str) {
+    let cli = cli_version();
+    if cli_is_behind_endpoint(cli, endpoint_version) {
+        eprintln!(
+            "warning: CLI {cli} is older than endpoint {endpoint_version}; `kobe lease` may mis-route pool kinds. Upgrade the CLI."
+        );
+    }
+}
+
+pub(crate) async fn fetch_endpoint_version(config: &ResolvedConfig) -> Option<String> {
+    let response = authed_client()
+        .get(format!("{}/v1/status", config.endpoint))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    body["version"].as_str().map(str::to_string)
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +90,7 @@ pub async fn version(
             }
             println!("endpoint: {endpoint}");
             println!("endpoint version: {endpoint_version}");
+            warn_if_cli_behind_endpoint(&endpoint_version);
         }
         OutputFormat::Json => print_json(&VersionOutput {
             cli_version: cli_version().to_string(),
@@ -51,4 +101,19 @@ pub async fn version(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_is_behind_endpoint;
+
+    #[test]
+    fn older_cli_is_behind() {
+        assert!(cli_is_behind_endpoint("0.40.0", "v0.40.2"));
+        assert!(cli_is_behind_endpoint("0.39.2", "0.40.0"));
+        assert!(!cli_is_behind_endpoint("0.40.2", "v0.40.2"));
+        assert!(!cli_is_behind_endpoint("0.41.0", "0.40.2"));
+        assert!(!cli_is_behind_endpoint("dev", "v0.40.2"));
+        assert!(!cli_is_behind_endpoint("0.40.0", "unavailable"));
+    }
 }

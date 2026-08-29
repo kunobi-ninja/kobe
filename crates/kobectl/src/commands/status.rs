@@ -164,6 +164,7 @@ pub async fn status(
     }
     println!("  endpoint: {endpoint}");
     println!("  endpoint version: {endpoint_version}");
+    super::version::warn_if_cli_behind_endpoint(endpoint_version);
     println!();
 
     println!("\x1b[1mAuth\x1b[0m");
