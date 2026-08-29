@@ -437,7 +437,7 @@ pub(crate) struct CreateLeaseRequest {
 }
 
 impl CreateLeaseRequest {
-    fn pool_name(&self) -> Result<String, Response> {
+    fn pool_name(&self) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
         let profile = self
             .profile
             .as_deref()
@@ -456,8 +456,7 @@ impl CreateLeaseRequest {
                     detail: None,
                     reason: None,
                 }),
-            )
-                .into_response()),
+            )),
             (Some(name), _) | (_, Some(name)) => Ok(name.to_string()),
             (None, None) => Err((
                 StatusCode::BAD_REQUEST,
@@ -466,8 +465,7 @@ impl CreateLeaseRequest {
                     detail: Some("Provide `profile` or `pool`".to_string()),
                     reason: None,
                 }),
-            )
-                .into_response()),
+            )),
         }
     }
 }
@@ -1254,7 +1252,7 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
 ) -> Response {
     let profile = match req.pool_name() {
         Ok(name) => name,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
 
     if !is_valid_k8s_name(&profile) {
