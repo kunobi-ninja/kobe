@@ -1884,6 +1884,30 @@ export function sandboxPoolCertificationBlocker(
   return `SandboxPool/${name} is fail-closed at ${ready.reason}: ${ready.message ?? "no detail"}`;
 }
 
+/// Return why a child pool has not reached its current-generation admission
+/// boundary. Child runtime readiness is certified later, inside the exact
+/// cluster allocated for a tenant lease.
+export function childPoolCompositionEligibilityError(
+  pool: ConformanceObject,
+  name: string,
+): string | undefined {
+  const generation = pool.metadata?.generation;
+  if (generation === undefined) return `SandboxPool/${name} has no generation`;
+  if (pool.status?.observedGeneration !== generation) {
+    return `SandboxPool/${name} status is stale (observed ${pool.status?.observedGeneration ?? "none"}, current ${generation})`;
+  }
+  const ready = (pool.status?.conditions ?? []).filter((condition) => condition.type === "Ready");
+  if (ready.length !== 1) return `SandboxPool/${name} must have exactly one Ready condition`;
+  if (
+    ready[0].status !== "False"
+    || ready[0].observedGeneration !== generation
+    || ready[0].reason !== "CompositionEligible"
+  ) {
+    return `SandboxPool/${name} has not reached CompositionEligible (now ${ready[0].reason ?? "unknown"}: ${ready[0].message ?? ""})`;
+  }
+  return undefined;
+}
+
 async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   let lastError = `SandboxPool/${name} has not reported certification`;
@@ -1911,10 +1935,34 @@ async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
   throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
 }
 
+async function waitForChildCompositionEligibility(args: Args, name: string): Promise<void> {
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastError = `SandboxPool/${name} has not reported composition eligibility`;
+  while (Date.now() < deadline) {
+    let current: ConformanceObject;
+    try {
+      current = await kubectlJson<ConformanceObject>(args, [
+        "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+      ]);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await Bun.sleep(1_000);
+      continue;
+    }
+    const blocker = sandboxPoolCertificationBlocker(current, name);
+    requireConformance(blocker === undefined, blocker ?? "unreachable certification blocker");
+    const eligibilityError = childPoolCompositionEligibilityError(current, name);
+    if (eligibilityError === undefined) return;
+    lastError = eligibilityError;
+    await Bun.sleep(1_000);
+  }
+  throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
+}
+
 /// Privileged setup evidence for #76, deliberately separate from the public
 /// contract suite. It proves the harness created the exact two identities,
-/// managed runtime, receipt-capable child pool, and both current-generation
-/// SandboxPool certifications before any caller assertion is allowed to run.
+/// managed runtime, receipt-capable child pool, management certification, and
+/// current child composition boundary before any caller assertion can run.
 async function sandboxConformancePreflight(args: Args): Promise<void> {
   const state = loadState();
   requireConformance(state, "no e2e state exists; run `up --sandbox-conformance` first");
@@ -2019,8 +2067,8 @@ async function sandboxConformancePreflight(args: Args): Promise<void> {
   ], { step: `ClusterPool/${DEMO_K3S_POOL} did not retain one Ready child fixture` });
 
   await waitForCertifiedPool(args, DEMO_SANDBOX_POOL_MANAGEMENT);
-  await waitForCertifiedPool(args, DEMO_SANDBOX_POOL_CHILD);
-  step("Management and child placement pools are certified");
+  await waitForChildCompositionEligibility(args, DEMO_SANDBOX_POOL_CHILD);
+  step("Management placement is certified; child placement is composition eligible");
 }
 
 async function down(args: Args): Promise<void> {

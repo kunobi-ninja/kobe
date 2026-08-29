@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   bootstrapManifest,
+  childPoolCompositionEligibilityError,
   decodeKeystrokes,
   forwardingAddress,
   guestImagesForBackend,
@@ -103,6 +104,13 @@ test("the conformance preflight reports durable pool blockers without waiting fo
     .toBeUndefined();
   expect(sandboxPoolCertificationBlocker(pool("CleanupBlocked", "stale", 6), "management"))
     .toBeUndefined();
+
+  expect(childPoolCompositionEligibilityError(pool("CompositionEligible", "exact bootstrap accepted"), "child"))
+    .toBeUndefined();
+  expect(childPoolCompositionEligibilityError(pool("CanaryRunning", "wrong boundary"), "child"))
+    .toContain("has not reached CompositionEligible");
+  expect(childPoolCompositionEligibilityError(pool("CompositionEligible", "stale", 6), "child"))
+    .toContain("status is stale");
 });
 
 // ---------------------------------------------------------------------------
