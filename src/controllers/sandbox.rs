@@ -7284,26 +7284,74 @@ fn metadata_has_no_owner_references(metadata: &kube::api::ObjectMeta) -> bool {
     metadata.owner_references.as_ref().is_none_or(Vec::is_empty)
 }
 
-/// k3s stamps the kubeconfig Secret with the exact ClusterInstance as its
-/// sole controller owner so a foreign same-named Secret cannot be adopted.
-/// Ownerless Secrets remain valid (the publisher path). Anything else is
-/// another object's GC dependency and cannot be a composition credential.
+fn owner_identity_matches_instance(
+    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    instance: &crate::crd::SandboxObjectReference,
+) -> bool {
+    owner.api_version == instance.api_version
+        && owner.kind == instance.kind
+        && owner.name == instance.name
+        && owner.uid == instance.uid
+}
+
+/// k3s reserves `{instance}-kubeconfig` under the ClusterInstance controller
+/// owner before the publisher writes `data.kubeconfig`. The publisher path
+/// (`kubectl apply` of an ownerless dry-run Secret) may leave that controller
+/// owner in place, drop the controller bit, or add non-controller metadata
+/// owners. Composition is safe when:
+///
+/// * there are no owners (publisher created the name), or
+/// * the unique `controller: true` owner is this ClusterInstance, or
+/// * the sole owner is this ClusterInstance even if `controller` was dropped.
+///
+/// A foreign controller owner cannot be a composition credential.
 fn child_kubeconfig_secret_control_is_safe(
     metadata: &kube::api::ObjectMeta,
     instance: &crate::crd::SandboxObjectReference,
 ) -> bool {
     let owners = metadata.owner_references.as_deref().unwrap_or(&[]);
-    match owners {
-        [] => true,
-        [owner] => {
-            owner.api_version == instance.api_version
-                && owner.kind == instance.kind
-                && owner.name == instance.name
-                && owner.uid == instance.uid
-                && owner.controller == Some(true)
+    if owners.is_empty() {
+        return true;
+    }
+    let controllers = owners
+        .iter()
+        .filter(|owner| owner.controller == Some(true))
+        .collect::<Vec<_>>();
+    match controllers.as_slice() {
+        [] => {
+            matches!(owners, [owner] if owner_identity_matches_instance(owner, instance))
         }
+        [owner] => owner_identity_matches_instance(owner, instance),
         _ => false,
     }
+}
+
+fn child_kubeconfig_secret_control_error(
+    metadata: &kube::api::ObjectMeta,
+    instance: &crate::crd::SandboxObjectReference,
+) -> String {
+    let owners = metadata.owner_references.as_deref().unwrap_or(&[]);
+    let summary = owners
+        .iter()
+        .map(|owner| {
+            format!(
+                "{}/{} {} uid {} controller={}",
+                owner.api_version,
+                owner.kind,
+                owner.name,
+                owner.uid,
+                owner
+                    .controller
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "owners [{summary}] are not the ClusterInstance {} uid {}",
+        instance.name, instance.uid
+    )
 }
 
 /// Exact outer-lease identity fence for an upstream claim.
@@ -7360,10 +7408,9 @@ struct ChildKubeconfigObservation {
 /// k3s reserves the Secret name under the ClusterInstance controller owner
 /// before the publisher writes `data.kubeconfig`. Composition still uses a
 /// trust-on-first-use boundary: the first read only computes the checkpoint,
-/// then returns. Owners other than that exact ClusterInstance, or more than
-/// one owner, fail closed. Every later use re-GETs the same UID and payload
-/// digest. Existing child placements that already consumed an uncheckpointed
-/// Secret cannot be backfilled safely.
+/// then returns. A foreign controller owner fails closed. Every later use
+/// re-GETs the same UID and payload digest. Existing child placements that
+/// already consumed an uncheckpointed Secret cannot be backfilled safely.
 fn child_kubeconfig_secret_observation(
     secret: &Secret,
     management_namespace: &str,
@@ -7372,27 +7419,63 @@ fn child_kubeconfig_secret_observation(
     use sha2::{Digest as _, Sha256};
 
     let expected_name = crate::backend::kubeconfig_secret_name(&instance.name);
-    let uid = secret.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+    let secret_ns = secret.namespace();
+    let provenance_error = |reason: String| {
         SandboxPlacementError::Invalid(format!(
-            "child kubeconfig Secret {management_namespace}/{expected_name} has no UID"
+            "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance: {reason}"
         ))
-    })?;
-    if instance.api_version != "kobe.kunobi.ninja/v1alpha1"
-        || instance.kind != "ClusterInstance"
-        || instance.namespace.as_deref() != Some(management_namespace)
-        || instance.uid.is_empty()
-        || secret.name_any() != expected_name
-        || secret.namespace().as_deref() != Some(management_namespace)
-        || secret
-            .metadata
-            .resource_version
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || secret.metadata.deletion_timestamp.is_some()
-        || !child_kubeconfig_secret_control_is_safe(&secret.metadata, instance)
+    };
+    if instance.api_version != "kobe.kunobi.ninja/v1alpha1" || instance.kind != "ClusterInstance" {
+        return Err(provenance_error(format!(
+            "recorded instance is {}/{}",
+            instance.api_version, instance.kind
+        )));
+    }
+    if instance.namespace.as_deref() != Some(management_namespace) {
+        return Err(provenance_error(format!(
+            "recorded instance namespace is {}",
+            instance.namespace.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if instance.uid.is_empty() {
+        return Err(provenance_error("recorded instance UID is empty".into()));
+    }
+    if secret.name_any() != expected_name {
+        return Err(provenance_error(format!(
+            "live name is {}",
+            secret.name_any()
+        )));
+    }
+    // Namespaced GET may omit metadata.namespace because it is implied by the
+    // request path. Treat a missing namespace as the namespace we fetched from.
+    if secret_ns
+        .as_deref()
+        .is_some_and(|namespace| namespace != management_namespace)
     {
-        return Err(SandboxPlacementError::Invalid(format!(
-            "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance"
+        return Err(provenance_error(format!(
+            "live namespace is {}",
+            secret_ns.unwrap_or_else(|| "<none>".into())
+        )));
+    }
+    let uid = secret
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| provenance_error("Secret has no UID".into()))?;
+    if secret
+        .metadata
+        .resource_version
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(provenance_error("Secret has no resourceVersion".into()));
+    }
+    if secret.metadata.deletion_timestamp.is_some() {
+        return Err(provenance_error("Secret is deleting".into()));
+    }
+    if !child_kubeconfig_secret_control_is_safe(&secret.metadata, instance) {
+        return Err(provenance_error(child_kubeconfig_secret_control_error(
+            &secret.metadata,
+            instance,
         )));
     }
     let kubeconfig_payload =
@@ -15359,8 +15442,9 @@ current-context: child
     }
 
     /// k3s reserves `{instance}-kubeconfig` under the ClusterInstance
-    /// controller owner. That exact owner is composition-safe; a foreign or
-    /// extra owner is not.
+    /// controller owner. That controller owner is composition-safe even when
+    /// kubectl apply leaves extra non-controller metadata; a foreign
+    /// controller is not.
     #[tokio::test]
     async fn child_kubeconfig_observation_accepts_exact_instance_controller_owner() {
         let server = MockServer::start().await;
@@ -15378,16 +15462,37 @@ current-context: child
             "kind": "ClusterInstance",
             "name": "kobe-abc123",
             "uid": "child-instance-uid",
-            "controller": true
+            "controller": true,
+            "blockOwnerDeletion": true
         }]);
         let owned: Secret = serde_json::from_value(owned).unwrap();
         child_kubeconfig_secret_observation(&owned, NS, instance).unwrap();
 
+        let mut unnamed_namespace = owned.clone();
+        unnamed_namespace.metadata.namespace = None;
+        child_kubeconfig_secret_observation(&unnamed_namespace, NS, instance).unwrap();
+
+        let mut dropped_controller = owned.clone();
+        dropped_controller
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()[0]
+            .controller = None;
+        child_kubeconfig_secret_observation(&dropped_controller, NS, instance).unwrap();
+
         let mut foreign = owned.clone();
         foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "other-instance".into();
-        assert!(child_kubeconfig_secret_observation(&foreign, NS, instance).is_err());
+        let foreign_error = match child_kubeconfig_secret_observation(&foreign, NS, instance) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("foreign ClusterInstance owner must fail closed"),
+        };
+        assert!(
+            foreign_error.contains("unsafe provenance"),
+            "{foreign_error}"
+        );
 
-        let mut extra = owned;
+        let mut extra = owned.clone();
         extra.metadata.owner_references.as_mut().unwrap().push(
             k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
                 api_version: "v1".into(),
@@ -15398,7 +15503,16 @@ current-context: child
                 ..Default::default()
             },
         );
-        assert!(child_kubeconfig_secret_observation(&extra, NS, instance).is_err());
+        child_kubeconfig_secret_observation(&extra, NS, instance).unwrap();
+
+        let mut foreign_controller = extra;
+        foreign_controller
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()[1]
+            .controller = Some(true);
+        assert!(child_kubeconfig_secret_observation(&foreign_controller, NS, instance).is_err());
     }
 
     /// The first Secret observation may hash bytes for the checkpoint, but it
