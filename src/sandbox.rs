@@ -1,4 +1,4 @@
-//! Pure Agent Sandbox v0.5.6 `v1beta1` projections and lease invariants.
+//! Pure Agent Sandbox v1.0.0 `v1beta1` projections and lease invariants.
 //!
 //! This module has no Kubernetes client or reconciliation side effects. Pool
 //! controllers can render the restricted Kobe contract into upstream objects,

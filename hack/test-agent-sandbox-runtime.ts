@@ -1,5 +1,5 @@
-// Live contract for the pinned Agent Sandbox v0.5.6 release Kobe's external
-// mode consumes, including the supported operator-side v0.5.4 -> v0.5.6
+// Live contract for the pinned Agent Sandbox v1.0.0 release Kobe's external
+// mode consumes, including the supported operator-side v0.5.6 -> v1.0.0
 // rolling upgrade with a live warm Claim. Kobe does not install this runtime;
 // the harness plays the operator and installs the pinned fixture itself.
 //
@@ -7,26 +7,26 @@
 // arbitrary kubectl context, and it refuses an existing cluster name before
 // creation, so cleanup cannot delete resources belonging to another run.
 
-const releaseFixture = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
+const releaseFixture = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
 const releaseSha256 =
-	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
+	"3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
 const taggedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0";
 const pinnedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd";
 const pinnedImageDigests = new Set([
-	"sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd",
-	"sha256:a502cfdbcf550e77509cc56097978458a1ac3d5b59972f21b7ce0e0a84a5c12e",
-	"sha256:db3d5a89473701ff0859eb81c98a0f8fcbce70915f2af052f599eba094284061",
+	"sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd",
+	"sha256:3c197b4e1b6283486937abd433b8a38292884e3aa198a78ac1a280d9ddb6e7ba",
+	"sha256:f685cbfb572d38a1d497ad6e019c10e4164e945ff23f887da201c111f0a8d2d6",
 ]);
 const previousReleaseUrl =
-	"https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.4/sandbox-with-extensions.yaml";
+	"https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.6/sandbox-with-extensions.yaml";
 const previousReleaseSha256 =
-	"7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4";
+	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
 const previousTaggedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
 const previousPinnedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
 const pauseImage =
 	"registry.k8s.io/pause@sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c";
 const crds = [
@@ -206,7 +206,7 @@ async function pinnedRuntime(): Promise<string> {
 	const pinned = source.replaceAll(taggedImage, pinnedImage);
 	invariant(
 		pinned.includes(pinnedImage) && !pinned.includes(taggedImage),
-		"v0.5.6 runtime image was not pinned",
+		"v1.0.0 runtime image was not pinned",
 	);
 	return pinned;
 }
@@ -252,25 +252,42 @@ async function installPreviousRuntime(): Promise<void> {
 	});
 	invariant(
 		response.ok,
-		`failed to download v0.5.4 runtime: HTTP ${response.status}`,
+		`failed to download v0.5.6 runtime: HTTP ${response.status}`,
 	);
 	const source = await response.text();
 	invariant(
 		sha256(source) === previousReleaseSha256,
-		"downloaded v0.5.4 runtime digest drifted",
+		"downloaded v0.5.6 runtime digest drifted",
 	);
 	const pinned = source.replace(previousTaggedImage, previousPinnedImage);
 	invariant(
 		pinned.includes(previousPinnedImage) &&
 			!pinned.includes(previousTaggedImage),
-		"v0.5.4 runtime image was not pinned",
+		"v0.5.6 runtime image was not pinned",
 	);
 	await applyRuntime(pinned);
-	info("installed the exact former v0.5.4 runtime");
+	info("installed the exact former v0.5.6 runtime");
+}
+
+async function pruneConvertedWebhookOrphans(): Promise<void> {
+	// kubectl apply of the v1.0.0 manifest does not delete objects the new
+	// release dropped. Upstream's upgrade procedure requires this exact
+	// namespaced cleanup; the cluster-scoped controller Role stays.
+	await kubectl([
+		"delete",
+		"-n",
+		"agent-sandbox-system",
+		"svc/agent-sandbox-webhook-service",
+		"secret/agent-sandbox-webhook-certs",
+		"role/agent-sandbox-controller",
+		"rolebinding/agent-sandbox-controller",
+		"--ignore-not-found",
+	]);
 }
 
 async function installRuntime(): Promise<void> {
 	await applyRuntime(await pinnedRuntime());
+	await pruneConvertedWebhookOrphans();
 }
 
 async function verifyRuntime(): Promise<void> {
@@ -299,16 +316,24 @@ async function verifyRuntime(): Promise<void> {
 				observedGeneration.type === "integer" &&
 					observedGeneration.format === "int64" &&
 					observedGeneration.minimum === 0,
-				"SandboxWarmPool CRD lacks the v0.5.6 observedGeneration contract",
+				"SandboxWarmPool CRD lacks the v1.0.0 observedGeneration contract",
 			);
 		}
-		const conversion = nestedRecord(spec.conversion);
-		const webhook = nestedRecord(conversion.webhook);
-		const clientConfig = nestedRecord(webhook.clientConfig);
 		invariant(
-			typeof clientConfig.caBundle === "string" &&
-				clientConfig.caBundle.length > 0,
-			`CRD ${name} has no conversion webhook CA bundle`,
+			!versions.some(
+				(version) => version.name === "v1alpha1" && version.served === true,
+			),
+			`CRD ${name} still serves v1alpha1`,
+		);
+		invariant(
+			spec.conversion == null,
+			`CRD ${name} still declares a conversion webhook`,
+		);
+		const storedVersions = crd.status?.storedVersions;
+		invariant(
+			!Array.isArray(storedVersions) ||
+				storedVersions.every((version) => version === "v1beta1"),
+			`CRD ${name} still stores ${JSON.stringify(storedVersions)}`,
 		);
 	}
 
@@ -370,34 +395,20 @@ async function verifyRuntime(): Promise<void> {
 		return undefined;
 	});
 
-	await eventually("webhook TLS Secret and endpoint", 90_000, async () => {
-		const secret = await getObject(
-			"secret",
-			"agent-sandbox-webhook-certs",
-			"agent-sandbox-system",
-		);
-		if (
-			!secret?.data ||
-			!["ca.crt", "tls.crt", "tls.key"].every((key) => secret.data?.[key])
-		) {
-			return undefined;
+	await eventually("conversion webhook orphans are gone", 90_000, async () => {
+		for (const [resource, name] of [
+			["svc", "agent-sandbox-webhook-service"],
+			["secret", "agent-sandbox-webhook-certs"],
+			["role", "agent-sandbox-controller"],
+			["rolebinding", "agent-sandbox-controller"],
+		] as const) {
+			if (await getObject(resource, name, "agent-sandbox-system")) {
+				return undefined;
+			}
 		}
-		const endpoints = await getObject(
-			"endpoints",
-			"agent-sandbox-webhook-service",
-			"agent-sandbox-system",
-		);
-		const ready = endpoints?.subsets?.some((subset) => {
-			const addresses = subset.addresses as unknown[] | undefined;
-			const ports = subset.ports as Array<Record<string, unknown>> | undefined;
-			return (
-				(addresses?.length ?? 0) > 0 &&
-				ports?.some((port) => port.name === "webhook" && port.port === 9443)
-			);
-		});
-		return ready ? secret : undefined;
+		return true;
 	});
-	info("pinned controller, CRDs and conversion webhook are healthy");
+	info("pinned controller and CRDs are healthy without a conversion webhook");
 }
 
 function canaryObjects(
@@ -562,7 +573,7 @@ async function createWarmUpgradeClaim(): Promise<RuntimeFootprint> {
 		],
 		{ stdin: objectList(objects.slice(0, 2)) },
 	);
-	await eventually("v0.5.4 warm capacity", 180_000, async () => {
+	await eventually("v0.5.6 warm capacity", 180_000, async () => {
 		const warmPool = await getObject(
 			"sandboxwarmpools.extensions.agents.x-k8s.io",
 			upgradeCanary,
@@ -581,7 +592,7 @@ async function createWarmUpgradeClaim(): Promise<RuntimeFootprint> {
 		{ stdin: JSON.stringify(objects[2]) },
 	);
 	const footprint = await readyFootprint(upgradeCanary);
-	info("v0.5.4 warm Claim is Ready before the controller upgrade");
+	info("v0.5.6 warm Claim is Ready before the controller upgrade");
 	return footprint;
 }
 
@@ -591,7 +602,7 @@ async function verifyUpgradePreserved(
 	const observed = await readyFootprint(upgradeCanary);
 	invariant(
 		JSON.stringify(observed) === JSON.stringify(expected),
-		"v0.5.4 -> v0.5.6 changed the live warm Claim footprint",
+		"v0.5.6 -> v1.0.0 changed the live warm Claim footprint",
 	);
 	await eventually(
 		"upgraded WarmPool current-generation status",
@@ -609,7 +620,7 @@ async function verifyUpgradePreserved(
 				: undefined;
 		},
 	);
-	info("v0.5.6 preserved the exact live warm Claim and observed its pool");
+	info("v1.0.0 preserved the exact live warm Claim and observed its pool");
 }
 
 async function cleanupUpgradeCanary(
@@ -896,4 +907,4 @@ if (creationStarted) {
 }
 
 if (failure) throw failure;
-console.log("Agent Sandbox v0.5.6 pinned runtime contract passed");
+console.log("Agent Sandbox v1.0.0 pinned runtime contract passed");

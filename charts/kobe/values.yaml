@@ -115,7 +115,7 @@ containerSecurityContext:
 #             Sandbox API is served, so an upgrade never starts depending on a
 #             runtime you have not installed.
 #
-#   external  You install and upgrade Agent Sandbox v0.5.6 before enabling this
+#   external  You install and upgrade Agent Sandbox v1.0.0 before enabling this
 #             mode. Kobe owns none of that installation and performs read-only
 #             API/schema compatibility checks. Child clusters may use a generic
 #             operator-authored BootstrapConfig explicitly referenced by their

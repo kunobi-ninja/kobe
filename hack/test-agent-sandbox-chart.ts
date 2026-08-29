@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 
 const chart = "charts/kobe";
-const releaseFixture = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
+const releaseFixture = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
 const releaseSha256 =
-	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
+	"3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
 const taggedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0";
 const upstreamCrds = new Set([
 	"sandboxclaims.extensions.agents.x-k8s.io",
 	"sandboxes.agents.x-k8s.io",
@@ -135,7 +135,7 @@ function teardownFencePolicy(
 // -----------------------------------------------------------------------------
 // The pinned release fixture is the compatibility oracle for external mode and
 // the harness's operator-role install source. It must remain the exact
-// upstream v0.5.6 asset; the digest pin happens where it is applied.
+// upstream v1.0.0 asset; the digest pin happens where it is applied.
 // -----------------------------------------------------------------------------
 
 const source = await Bun.file(releaseFixture).text();
@@ -183,7 +183,32 @@ invariant(
 	observedGeneration.type === "integer" &&
 		observedGeneration.format === "int64" &&
 		observedGeneration.minimum === 0,
-	"fixture WarmPool CRD lacks v0.5.6 status.observedGeneration",
+	"fixture WarmPool CRD lacks v1.0.0 status.observedGeneration",
+);
+
+for (const crd of fixtureCrds) {
+	const spec = crd.spec as Record<string, unknown>;
+	const versions = spec.versions as Array<Record<string, unknown>>;
+	invariant(
+		!versions.some(
+			(version) => version.name === "v1alpha1" && version.served === true,
+		),
+		`${String(metadata(crd).name)} still serves v1alpha1`,
+	);
+	invariant(
+		spec.conversion == null,
+		`${String(metadata(crd).name)} still declares a conversion webhook`,
+	);
+}
+invariant(
+	!fixtureDocuments.some(
+		(document) =>
+			(document.kind === "Service" &&
+				metadata(document).name === "agent-sandbox-webhook-service") ||
+			(document.kind === "Secret" &&
+				metadata(document).name === "agent-sandbox-webhook-certs"),
+	),
+	"fixture still ships conversion-webhook infrastructure",
 );
 
 invariant(
@@ -626,7 +651,7 @@ for (const [mode, documents] of [
 		`${mode} rendered the upstream controller`,
 	);
 	invariant(
-		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v0-5-6"),
+		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v1-0-0"),
 		`${mode} rendered a child runtime bootstrap`,
 	);
 	invariant(

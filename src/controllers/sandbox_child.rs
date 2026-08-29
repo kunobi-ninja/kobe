@@ -15,7 +15,7 @@
 //! kubeconfig is read from controller-authorised storage into memory and never
 //! written to status, an API response, a log line, or an event.
 //!
-//! The operator provides Agent Sandbox v0.5.6 through a generic, explicitly
+//! The operator provides Agent Sandbox v1.0.0 through a generic, explicitly
 //! referenced `BootstrapConfig` or another external provisioning mechanism.
 //! Kobe performs read-only API compatibility checks before creating tenant
 //! pool objects; it does not ship or inject a privileged runtime installer.
@@ -114,7 +114,7 @@ pub enum ChildPlacementError {
     InvalidDuration { field: &'static str },
     #[error(
         "child cluster {cluster} does not serve a compatible Agent Sandbox runtime ({reason}). \
-         Configure the operator-owned ClusterPool bootstrap or image to install Agent Sandbox v0.5.6."
+         Configure the operator-owned ClusterPool bootstrap or image to install Agent Sandbox v1.0.0."
     )]
     ChildRuntimeUnusable { cluster: String, reason: String },
     #[error("child cluster {cluster} has an unusable checkpointed kubeconfig Secret")]
