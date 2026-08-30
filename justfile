@@ -54,7 +54,7 @@ build-cli:
 # Build and install the CLI into ~/.cargo/bin (honors $CARGO_INSTALL_ROOT)
 [group('build')]
 install:
-    cargo install --path crates/kobectl --bin kobe --force
+    cargo install --path crates/kobectl --bin kobe --force --locked
 
 # Run the CLI (pass args after --)
 [group('dev')]
