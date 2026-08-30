@@ -6360,9 +6360,11 @@ async fn finish_child_release_after_proof(
             .await;
         }
     };
-    if current.uid().as_deref() != Some(recorded.uid.as_str())
-        || current.metadata.generation != recorded.generation
-    {
+    // Identity is the UID. metadata.generation advances when we ACK via
+    // annotations, so requiring the checkpointed generation here strands
+    // every verified child teardown as Releasing and fills the admission
+    // quota.
+    if current.uid().as_deref() != Some(recorded.uid.as_str()) {
         return record_post_proof_cleanup_failure(
             lease,
             ctx,
