@@ -387,6 +387,10 @@ mod json_safety_tests {
             v.get("binding").is_none(),
             "binding must be omitted when None"
         );
+        assert!(
+            v.get("teardownAttemptId").is_none(),
+            "teardownAttemptId must be omitted when None"
+        );
 
         // Set values are still serialized.
         let set_status = ClusterLeaseStatus {
@@ -395,12 +399,17 @@ mod json_safety_tests {
             bound_at: Some("2026-06-04T00:00:00Z".into()),
             expires_at: Some("2026-06-04T01:00:00Z".into()),
             teardown_receipt: None,
+            teardown_attempt_id: Some("attempt-1".into()),
             ..Default::default()
         };
         let v = serde_json::to_value(&set_status).unwrap();
         assert_eq!(
             v.get("clusterName").and_then(|x| x.as_str()),
             Some("pool-x-0")
+        );
+        assert_eq!(
+            v.get("teardownAttemptId").and_then(|x| x.as_str()),
+            Some("attempt-1")
         );
         assert_eq!(
             v.get("boundAt").and_then(|x| x.as_str()),
