@@ -21,10 +21,12 @@
 //! before its quota reservation committed, so acting on one would place work
 //! that admission never authorised — the reason that annotation exists.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Secret};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -71,6 +73,10 @@ pub struct SandboxContext {
     /// Disabled-mode controllers set this false but still reconcile every
     /// admitted lease through verified teardown.
     pub placement_enabled: bool,
+    /// Runtime ownership mode carried into child-pool certification.
+    pub runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
+    /// Exact chart identity required for managed child bootstrap references.
+    pub managed_runtime_identity: Option<crate::sandbox_runtime::ManagedRuntimeIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -826,6 +832,23 @@ pub async fn reconcile_pool(
                 &cluster_pool,
                 &ctx.namespace,
             )?;
+            if ctx.runtime_mode != crate::sandbox_runtime::AgentSandboxMode::Managed {
+                return Err(SandboxPlacementError::Invalid(
+                    "child placement requires agentSandbox.mode=managed".into(),
+                ));
+            }
+            let identity = ctx.managed_runtime_identity.as_ref().ok_or_else(|| {
+                SandboxPlacementError::Invalid(
+                    "managed child bootstrap identity is unavailable".into(),
+                )
+            })?;
+            crate::controllers::sandbox_child::validate_managed_child_bootstrap(
+                &ctx.client,
+                &ctx.namespace,
+                &cluster_pool,
+                identity,
+            )
+            .await?;
             Ok::<_, SandboxPlacementError>(authority)
         }
         .await;
@@ -833,7 +856,7 @@ pub async fn reconcile_pool(
             Ok(authority) => (
                 "CompositionEligible",
                 format!(
-                    "ClusterPool {cluster_pool_ref} is eligible for verified composition, but Ready remains withheld until an equivalent in-child certification and teardown receipt protocol exists"
+                    "ClusterPool {cluster_pool_ref} is eligible for verified composition and references the exact managed runtime bootstrap; live child certification remains required before its tenant Claim"
                 ),
                 Some(authority),
             ),
@@ -5642,10 +5665,7 @@ async fn release_child_composition(
     let internal: Api<crate::crd::ClusterLease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
-        Ok(current)
-            if current.uid().as_deref() == Some(recorded.uid.as_str())
-                && current.metadata.generation == recorded.generation =>
-        {
+        Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
             match ensure_internal_lease_fenced(&internal, &current, lease).await? {
                 InternalHandleFence::Ready => {}
                 InternalHandleFence::Patched => {
@@ -6337,9 +6357,11 @@ async fn finish_child_release_after_proof(
             .await;
         }
     };
-    if current.uid().as_deref() != Some(recorded.uid.as_str())
-        || current.metadata.generation != recorded.generation
-    {
+    // Identity is the UID. metadata.generation advances when we ACK via
+    // annotations, so requiring the checkpointed generation here strands
+    // every verified child teardown as Releasing and fills the admission
+    // quota.
+    if current.uid().as_deref() != Some(recorded.uid.as_str()) {
         return record_post_proof_cleanup_failure(
             lease,
             ctx,
@@ -6738,7 +6760,6 @@ fn validated_child_receipt_token(
     let binding = status.binding.as_ref()?;
     if lease.name_any() != recorded_lease.name
         || lease.uid().as_deref() != Some(recorded_lease.uid.as_str())
-        || lease.metadata.generation != recorded_lease.generation
         || binding.lease.name != recorded_lease.name
         || binding.lease.uid.as_deref() != Some(recorded_lease.uid.as_str())
         || binding.pool.name != recorded_pool.name
@@ -7261,6 +7282,76 @@ fn metadata_has_no_owner_references(metadata: &kube::api::ObjectMeta) -> bool {
     metadata.owner_references.as_ref().is_none_or(Vec::is_empty)
 }
 
+fn owner_identity_matches_instance(
+    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    instance: &crate::crd::SandboxObjectReference,
+) -> bool {
+    owner.api_version == instance.api_version
+        && owner.kind == instance.kind
+        && owner.name == instance.name
+        && owner.uid == instance.uid
+}
+
+/// k3s reserves `{instance}-kubeconfig` under the ClusterInstance controller
+/// owner before the publisher writes `data.kubeconfig`. The publisher path
+/// (`kubectl apply` of an ownerless dry-run Secret) may leave that controller
+/// owner in place, drop the controller bit, or add non-controller metadata
+/// owners. Composition is safe when:
+///
+/// * there are no owners (publisher created the name), or
+/// * the unique `controller: true` owner is this ClusterInstance, or
+/// * the sole owner is this ClusterInstance even if `controller` was dropped.
+///
+/// A foreign controller owner cannot be a composition credential.
+fn child_kubeconfig_secret_control_is_safe(
+    metadata: &kube::api::ObjectMeta,
+    instance: &crate::crd::SandboxObjectReference,
+) -> bool {
+    let owners = metadata.owner_references.as_deref().unwrap_or(&[]);
+    if owners.is_empty() {
+        return true;
+    }
+    let controllers = owners
+        .iter()
+        .filter(|owner| owner.controller == Some(true))
+        .collect::<Vec<_>>();
+    match controllers.as_slice() {
+        [] => {
+            matches!(owners, [owner] if owner_identity_matches_instance(owner, instance))
+        }
+        [owner] => owner_identity_matches_instance(owner, instance),
+        _ => false,
+    }
+}
+
+fn child_kubeconfig_secret_control_error(
+    metadata: &kube::api::ObjectMeta,
+    instance: &crate::crd::SandboxObjectReference,
+) -> String {
+    let owners = metadata.owner_references.as_deref().unwrap_or(&[]);
+    let summary = owners
+        .iter()
+        .map(|owner| {
+            format!(
+                "{}/{} {} uid {} controller={}",
+                owner.api_version,
+                owner.kind,
+                owner.name,
+                owner.uid,
+                owner
+                    .controller
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "owners [{summary}] are not the ClusterInstance {} uid {}",
+        instance.name, instance.uid
+    )
+}
+
 /// Exact outer-lease identity fence for an upstream claim.
 ///
 /// Management claims intentionally have no owner reference, while a
@@ -7312,12 +7403,12 @@ struct ChildKubeconfigObservation {
 /// Observe the write-once identity and payload checkpoint for the management
 /// Secret that authenticates one exact child instance.
 ///
-/// The k3s publisher intentionally creates this Secret without a GC owner, so
-/// composition uses a trust-on-first-use boundary before kubeconfig bytes are
-/// parsed or used: the first read only computes the checkpoint, then returns.
-/// Every later use re-GETs the same UID and payload digest. Existing child
-/// placements that already consumed an uncheckpointed Secret cannot be
-/// backfilled safely.
+/// k3s reserves the Secret name under the ClusterInstance controller owner
+/// before the publisher writes `data.kubeconfig`. Composition still uses a
+/// trust-on-first-use boundary: the first read only computes the checkpoint,
+/// then returns. A foreign controller owner fails closed. Every later use
+/// re-GETs the same UID and payload digest. Existing child placements that
+/// already consumed an uncheckpointed Secret cannot be backfilled safely.
 fn child_kubeconfig_secret_observation(
     secret: &Secret,
     management_namespace: &str,
@@ -7326,27 +7417,63 @@ fn child_kubeconfig_secret_observation(
     use sha2::{Digest as _, Sha256};
 
     let expected_name = crate::backend::kubeconfig_secret_name(&instance.name);
-    let uid = secret.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+    let secret_ns = secret.namespace();
+    let provenance_error = |reason: String| {
         SandboxPlacementError::Invalid(format!(
-            "child kubeconfig Secret {management_namespace}/{expected_name} has no UID"
+            "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance: {reason}"
         ))
-    })?;
-    if instance.api_version != "kobe.kunobi.ninja/v1alpha1"
-        || instance.kind != "ClusterInstance"
-        || instance.namespace.as_deref() != Some(management_namespace)
-        || instance.uid.is_empty()
-        || secret.name_any() != expected_name
-        || secret.namespace().as_deref() != Some(management_namespace)
-        || secret
-            .metadata
-            .resource_version
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || secret.metadata.deletion_timestamp.is_some()
-        || !metadata_has_no_owner_references(&secret.metadata)
+    };
+    if instance.api_version != "kobe.kunobi.ninja/v1alpha1" || instance.kind != "ClusterInstance" {
+        return Err(provenance_error(format!(
+            "recorded instance is {}/{}",
+            instance.api_version, instance.kind
+        )));
+    }
+    if instance.namespace.as_deref() != Some(management_namespace) {
+        return Err(provenance_error(format!(
+            "recorded instance namespace is {}",
+            instance.namespace.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if instance.uid.is_empty() {
+        return Err(provenance_error("recorded instance UID is empty".into()));
+    }
+    if secret.name_any() != expected_name {
+        return Err(provenance_error(format!(
+            "live name is {}",
+            secret.name_any()
+        )));
+    }
+    // Namespaced GET may omit metadata.namespace because it is implied by the
+    // request path. Treat a missing namespace as the namespace we fetched from.
+    if secret_ns
+        .as_deref()
+        .is_some_and(|namespace| namespace != management_namespace)
     {
-        return Err(SandboxPlacementError::Invalid(format!(
-            "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance"
+        return Err(provenance_error(format!(
+            "live namespace is {}",
+            secret_ns.unwrap_or_else(|| "<none>".into())
+        )));
+    }
+    let uid = secret
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| provenance_error("Secret has no UID".into()))?;
+    if secret
+        .metadata
+        .resource_version
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(provenance_error("Secret has no resourceVersion".into()));
+    }
+    if secret.metadata.deletion_timestamp.is_some() {
+        return Err(provenance_error("Secret is deleting".into()));
+    }
+    if !child_kubeconfig_secret_control_is_safe(&secret.metadata, instance) {
+        return Err(provenance_error(child_kubeconfig_secret_control_error(
+            &secret.metadata,
+            instance,
         )));
     }
     let kubeconfig_payload =
@@ -7433,7 +7560,15 @@ async fn current_sandbox_pool_for_create(
         )));
     }
     if crate::sandbox::require_current_sandbox_pool_ready(&pool).is_err() {
-        return Ok(None);
+        let Some(authority) = crate::sandbox::current_child_pool_allocation_authority(&pool) else {
+            return Ok(None);
+        };
+        if lease.spec.placement_authority.as_ref() != Some(authority) {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "SandboxPool {} changed child placement authority before allocation",
+                lease.spec.pool_ref.name
+            )));
+        }
     }
     Ok(Some(pool))
 }
@@ -7728,6 +7863,231 @@ async fn ensure_child_namespace(
         )));
     }
     Ok(namespace)
+}
+
+const CHILD_RUNTIME_CANARY_NAME: &str = "kobe-runtime-canary-v1-0-0";
+const CHILD_RUNTIME_RECEIPT_NAME: &str = "kobe-runtime-certified-v1-0-0";
+
+/// Certify one disposable child runtime with a restart-safe create/delete
+/// canary. The receipt is local to the exclusive child and binds the exact
+/// ClusterInstance UID plus the pinned managed manifest.
+async fn ensure_child_runtime_certified(
+    client: &Client,
+    namespace_owner: &OwnerReference,
+    pool: &SandboxPool,
+    warm_pool_name: &str,
+    instance_uid: &str,
+    provisioning_deadline: chrono::DateTime<chrono::Utc>,
+    identity: &crate::sandbox_runtime::ManagedRuntimeIdentity,
+) -> Result<bool, SandboxPlacementError> {
+    let namespace = CHILD_SANDBOX_NAMESPACE;
+    let receipts: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let receipt = match receipts.get(CHILD_RUNTIME_RECEIPT_NAME).await {
+        Ok(receipt) => Some(receipt),
+        Err(kube::Error::Api(error)) if error.code == 404 => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    if let Some(mut receipt) = receipt {
+        if !metadata_is_controlled_by(
+            &receipt.metadata,
+            &namespace_owner.api_version,
+            &namespace_owner.kind,
+            &namespace_owner.name,
+            &namespace_owner.uid,
+        ) {
+            return Err(SandboxPlacementError::Invalid(
+                "child runtime certification receipt has foreign ownership".into(),
+            ));
+        }
+        let data = receipt.data.as_mut().ok_or_else(|| {
+            SandboxPlacementError::Invalid("child runtime certification receipt has no data".into())
+        })?;
+        if data.get("instanceUid").map(String::as_str) != Some(instance_uid)
+            || data.get("owner").map(String::as_str) != Some(identity.owner.as_str())
+            || data.get("manifestSha256").map(String::as_str)
+                != Some(identity.manifest_sha256.as_str())
+        {
+            return Err(SandboxPlacementError::Invalid(
+                "child runtime certification receipt does not match the exact instance and managed runtime".into(),
+            ));
+        }
+        match data.get("phase").map(String::as_str) {
+            Some("Certified") => return Ok(true),
+            Some("Deleting") => {
+                let required = |key: &str| {
+                    data.get(key)
+                        .cloned()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            SandboxPlacementError::Invalid(format!(
+                                "child runtime certification receipt lacks {key}"
+                            ))
+                        })
+                };
+                let claim_uid = required("claimUid")?;
+                let sandbox_name = required("sandboxName")?;
+                let sandbox_uid = required("sandboxUid")?;
+                let pod_name = required("podName")?;
+                let pod_uid = required("podUid")?;
+                let claims: Api<DynamicObject> = Api::namespaced_with(
+                    client.clone(),
+                    namespace,
+                    &upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+                );
+                match claims.get(CHILD_RUNTIME_CANARY_NAME).await {
+                    Ok(claim) => {
+                        if claim.uid().as_deref() != Some(&claim_uid) {
+                            return Err(SandboxPlacementError::Invalid(
+                                "child runtime canary Claim was replaced".into(),
+                            ));
+                        }
+                        let params = DeleteParams {
+                            propagation_policy: Some(PropagationPolicy::Foreground),
+                            preconditions: Some(Preconditions {
+                                uid: Some(claim_uid),
+                                resource_version: claim.resource_version(),
+                            }),
+                            ..Default::default()
+                        };
+                        match claims.delete(CHILD_RUNTIME_CANARY_NAME, &params).await {
+                            Ok(_) => return Ok(false),
+                            Err(kube::Error::Api(error))
+                                if error.code == 404 || error.code == 409 =>
+                            {
+                                return Ok(false);
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 404 => {}
+                    Err(error) => return Err(error.into()),
+                }
+
+                let sandboxes: Api<DynamicObject> =
+                    Api::namespaced_with(client.clone(), namespace, &sandbox_resource());
+                match sandboxes.get(&sandbox_name).await {
+                    Ok(sandbox) if sandbox.uid().as_deref() == Some(&sandbox_uid) => {
+                        return Ok(false);
+                    }
+                    Ok(_) => {
+                        return Err(SandboxPlacementError::Invalid(
+                            "child runtime canary Sandbox was replaced".into(),
+                        ));
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 404 => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+                match pods.get(&pod_name).await {
+                    Ok(pod) if pod.uid().as_deref() == Some(&pod_uid) => return Ok(false),
+                    Ok(_) => {
+                        return Err(SandboxPlacementError::Invalid(
+                            "child runtime canary Pod was replaced".into(),
+                        ));
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 404 => {}
+                    Err(error) => return Err(error.into()),
+                }
+
+                data.insert("phase".into(), "Certified".into());
+                let resource_version = receipt.resource_version().ok_or_else(|| {
+                    SandboxPlacementError::Invalid(
+                        "child runtime certification receipt has no resourceVersion".into(),
+                    )
+                })?;
+                receipt.metadata.resource_version = Some(resource_version);
+                match receipts
+                    .replace(CHILD_RUNTIME_RECEIPT_NAME, &PostParams::default(), &receipt)
+                    .await
+                {
+                    Ok(_) => return Ok(false),
+                    Err(kube::Error::Api(error)) if error.code == 409 => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ => {
+                return Err(SandboxPlacementError::Invalid(
+                    "child runtime certification receipt has an invalid phase".into(),
+                ));
+            }
+        }
+    }
+
+    let claim = build_sandbox_claim(
+        CHILD_RUNTIME_CANARY_NAME,
+        namespace,
+        warm_pool_name,
+        instance_uid,
+        provisioning_deadline,
+        false,
+        Some(namespace_owner),
+    );
+    let claim = apply_upstream(
+        client,
+        namespace,
+        &upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+        &claim,
+        namespace_owner,
+    )
+    .await?;
+    if !upstream_claim_is_ready(&claim) {
+        return Ok(false);
+    }
+    let resolved =
+        crate::controllers::sandbox_canary::resolve_sandbox_pod(client, namespace, &claim)
+            .await
+            .map_err(SandboxPlacementError::Invalid)?;
+    let Some(resolved) = resolved else {
+        return Ok(false);
+    };
+    match crate::controllers::sandbox_canary::run_canary(
+        client,
+        namespace,
+        &resolved,
+        &pool.spec.template.default_container,
+        &pool.spec.readiness.canary,
+    )
+    .await
+    {
+        crate::controllers::sandbox_canary::CanaryOutcome::Passed => {}
+        outcome => {
+            debug!(
+                reason = outcome.reason_code(),
+                "child runtime execution canary did not pass"
+            );
+            return Ok(false);
+        }
+    }
+    let claim_uid = claim.uid().ok_or_else(|| {
+        SandboxPlacementError::Invalid("child runtime canary Claim has no UID".into())
+    })?;
+    let data = BTreeMap::from([
+        ("phase".into(), "Deleting".into()),
+        ("instanceUid".into(), instance_uid.into()),
+        ("owner".into(), identity.owner.clone()),
+        ("manifestSha256".into(), identity.manifest_sha256.clone()),
+        ("claimUid".into(), claim_uid),
+        ("sandboxName".into(), resolved.sandbox_name),
+        ("sandboxUid".into(), resolved.sandbox_uid),
+        ("podName".into(), resolved.pod_name),
+        ("podUid".into(), resolved.pod_uid),
+    ]);
+    let marker = ConfigMap {
+        metadata: kube::api::ObjectMeta {
+            name: Some(CHILD_RUNTIME_RECEIPT_NAME.into()),
+            namespace: Some(namespace.into()),
+            owner_references: Some(vec![namespace_owner.clone()]),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+    match receipts.create(&PostParams::default(), &marker).await {
+        Ok(_) => Ok(false),
+        Err(kube::Error::Api(error)) if error.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Acquire — or resume — the exclusive child cluster this lease runs in.
@@ -8106,11 +8466,18 @@ async fn compose_child_target(
             cluster: binding.binding.instance.name.clone(),
         })?;
 
-    // The child installation is operator-authored (for example through a
-    // generic ClusterPool BootstrapConfig). Validate only its consumed APIs
-    // before writing any Sandbox object; no built-in install or sacrificial
-    // Claim is created here.
-    child::validate_child_runtime(&child_client, &binding.binding.instance.name).await?;
+    // Authenticate the exact chart-owned child installation before writing a
+    // Sandbox object. The live create/delete proof follows after the child-side
+    // pool identities have been checkpointed.
+    let managed_identity = ctx.managed_runtime_identity.as_ref().ok_or_else(|| {
+        SandboxPlacementError::Invalid("managed child runtime identity is unavailable".into())
+    })?;
+    child::validate_child_runtime(
+        &child_client,
+        &binding.binding.instance.name,
+        managed_identity,
+    )
+    .await?;
 
     let target_namespace = ensure_child_namespace(&child_client, &name, &lease_uid).await?;
     let namespace_owner = target_namespace.controller_owner_ref(&()).ok_or_else(|| {
@@ -8167,6 +8534,33 @@ async fn compose_child_target(
             debug!(lease = %name, "child pool provenance write lost a status race");
         }
         return Ok(ChildTarget::Pending(Action::await_change()));
+    }
+
+    let provisioning_deadline = status
+        .provisioning_deadline
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no valid provisioning deadline for child certification"
+            ))
+        })?;
+    if !ensure_child_runtime_certified(
+        &child_client,
+        &namespace_owner,
+        pool,
+        &warm_pool.name_any(),
+        &binding.binding.instance.uid,
+        provisioning_deadline,
+        managed_identity,
+    )
+    .await?
+    {
+        debug!(lease = %name, "waiting for exact child runtime create/delete certification");
+        return Ok(ChildTarget::Pending(Action::requeue(
+            std::time::Duration::from_secs(5),
+        )));
     }
 
     Ok(ChildTarget::Ready(Target {
@@ -8519,7 +8913,6 @@ fn composition_handle_matches_consumer(
     child.uid().as_deref() == Some(recorded.uid.as_str())
         && child.name_any() == recorded.name
         && child.namespace() == recorded.namespace
-        && child.metadata.generation == recorded.generation
         && crate::controllers::sandbox_child::internal_lease_is_for_sandbox(child, consumer)
         && child.spec.requester.identity == consumer_uid
         && child
@@ -8641,6 +9034,11 @@ pub async fn run_sandbox_controller(
     shutdown: CancellationToken,
 ) {
     let placement_enabled = runtime_mode.enabled();
+    let managed_runtime_identity =
+        (runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed).then(|| {
+            crate::sandbox_runtime::ManagedRuntimeIdentity::from_env()
+                .expect("managed runtime identity was validated during startup")
+        });
     let ctx = Arc::new(SandboxContext {
         client: client.clone(),
         namespace: namespace.to_string(),
@@ -8648,6 +9046,8 @@ pub async fn run_sandbox_controller(
         shutdown: shutdown.clone(),
         access_ledger_enabled: true,
         placement_enabled,
+        runtime_mode,
+        managed_runtime_identity,
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
@@ -8878,6 +9278,14 @@ pub(crate) mod tests {
     const CHILD_INSTANCE_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/kobe-abc123";
 
+    fn test_managed_identity() -> crate::sandbox_runtime::ManagedRuntimeIdentity {
+        crate::sandbox_runtime::ManagedRuntimeIdentity {
+            owner: "test-ns/kobe".into(),
+            manifest_sha256: "a".repeat(64),
+            bootstrap_name: "kobe-agent-sandbox-v1-0-0".into(),
+        }
+    }
+
     async fn mount_healthy_runtime(server: &MockServer) {
         for (name, group, plural, kind) in [
             (
@@ -8931,7 +9339,13 @@ pub(crate) mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "apiVersion": "apiextensions.k8s.io/v1",
                     "kind": "CustomResourceDefinition",
-                    "metadata": { "name": name },
+                    "metadata": {
+                        "name": name,
+                        "annotations": {
+                            "kobe.kunobi.ninja/agent-sandbox-owner": "test-ns/kobe",
+                            "kobe.kunobi.ninja/agent-sandbox-manifest-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
+                    },
                     "spec": {
                         "group": group,
                         "names": {
@@ -8962,6 +9376,34 @@ pub(crate) mod tests {
                 .mount(server)
                 .await;
         }
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/agent-sandbox-system/deployments/agent-sandbox-controller",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "agent-sandbox-controller",
+                    "namespace": "agent-sandbox-system",
+                    "annotations": {
+                        "kobe.kunobi.ninja/agent-sandbox-owner": "test-ns/kobe",
+                        "kobe.kunobi.ninja/agent-sandbox-manifest-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                },
+                "spec": {
+                    "selector": { "matchLabels": { "app": "agent-sandbox" } },
+                    "template": {
+                        "metadata": { "labels": { "app": "agent-sandbox" } },
+                        "spec": { "containers": [{
+                            "name": "agent-sandbox-controller",
+                            "image": crate::sandbox_runtime::MANAGED_CONTROLLER_IMAGE
+                        }] }
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
     }
 
     async fn test_context() -> (Arc<SandboxContext>, MockServer) {
@@ -8974,8 +9416,38 @@ pub(crate) mod tests {
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
             placement_enabled: true,
+            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::Managed,
+            managed_runtime_identity: Some(test_managed_identity()),
         });
         mount_healthy_runtime(&server).await;
+        let required_names = crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_CRDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/bootstrapconfigs/kobe-agent-sandbox-v1-0-0",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "BootstrapConfig",
+                "metadata": {
+                    "name": "kobe-agent-sandbox-v1-0-0",
+                    "namespace": NS,
+                    "annotations": {
+                        "kobe.kunobi.ninja/agent-sandbox-owner": "test-ns/kobe",
+                        "kobe.kunobi.ninja/agent-sandbox-manifest-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                },
+                "spec": { "files": { "agent-sandbox-v1.0.0.yaml": format!(
+                    "{}\n{}",
+                    crate::sandbox_runtime::MANAGED_CONTROLLER_IMAGE,
+                    required_names
+                ) } }
+            })))
+            .mount(&server)
+            .await;
 
         let pool = management_pool(POOL_UID, POOL_GENERATION);
         let owner = pool.controller_owner_ref(&()).unwrap();
@@ -9065,6 +9537,159 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         (ctx, server)
+    }
+
+    #[tokio::test]
+    async fn exact_child_runtime_receipt_skips_repeating_the_canary() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let owner = OwnerReference {
+            api_version: "v1".into(),
+            kind: "Namespace".into(),
+            name: CHILD_SANDBOX_NAMESPACE.into(),
+            uid: "child-namespace-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}/configmaps/{CHILD_RUNTIME_RECEIPT_NAME}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": CHILD_RUNTIME_RECEIPT_NAME,
+                    "namespace": CHILD_SANDBOX_NAMESPACE,
+                    "uid": "receipt-uid",
+                    "resourceVersion": "1",
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "name": CHILD_SANDBOX_NAMESPACE,
+                        "uid": "child-namespace-uid",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    }]
+                },
+                "data": {
+                    "phase": "Certified",
+                    "instanceUid": "child-instance-uid",
+                    "owner": "test-ns/kobe",
+                    "manifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(
+            ensure_child_runtime_certified(
+                &client,
+                &owner,
+                &management_pool(POOL_UID, POOL_GENERATION),
+                "agents",
+                "child-instance-uid",
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                &test_managed_identity(),
+            )
+            .await
+            .expect("exact certification receipt")
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_runtime_receipt_becomes_certified_only_after_exact_absence() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let owner = OwnerReference {
+            api_version: "v1".into(),
+            kind: "Namespace".into(),
+            name: CHILD_SANDBOX_NAMESPACE.into(),
+            uid: "child-namespace-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let receipt = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": CHILD_RUNTIME_RECEIPT_NAME,
+                "namespace": CHILD_SANDBOX_NAMESPACE,
+                "uid": "receipt-uid",
+                "resourceVersion": "1",
+                "ownerReferences": [{
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "name": CHILD_SANDBOX_NAMESPACE, "uid": "child-namespace-uid",
+                    "controller": true, "blockOwnerDeletion": true
+                }]
+            },
+            "data": {
+                "phase": "Deleting",
+                "instanceUid": "child-instance-uid",
+                "owner": "test-ns/kobe",
+                "manifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "claimUid": "claim-uid",
+                "sandboxName": "runtime-sandbox",
+                "sandboxUid": "sandbox-uid",
+                "podName": "runtime-pod",
+                "podUid": "pod-uid"
+            }
+        });
+        let receipt_path = format!(
+            "/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}/configmaps/{CHILD_RUNTIME_RECEIPT_NAME}"
+        );
+        Mock::given(method("GET"))
+            .and(path(&receipt_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&receipt))
+            .mount(&server)
+            .await;
+        for missing_path in [
+            format!(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/{CHILD_SANDBOX_NAMESPACE}/sandboxclaims/{CHILD_RUNTIME_CANARY_NAME}"
+            ),
+            format!(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/{CHILD_SANDBOX_NAMESPACE}/sandboxes/runtime-sandbox"
+            ),
+            format!("/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}/pods/runtime-pod"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(missing_path))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "code": 404, "reason": "NotFound"
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("PUT"))
+            .and(path(&receipt_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(receipt))
+            .mount(&server)
+            .await;
+
+        assert!(
+            !ensure_child_runtime_certified(
+                &client,
+                &owner,
+                &management_pool(POOL_UID, POOL_GENERATION),
+                "agents",
+                "child-instance-uid",
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                &test_managed_identity(),
+            )
+            .await
+            .expect("absence checkpoint")
+        );
+        let requests = server.received_requests().await.unwrap();
+        let update: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method.as_str() == "PUT")
+                .expect("receipt certification update")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(update["data"]["phase"], "Certified");
     }
 
     /// The outer freshness and full-capacity gates must stand down exactly
@@ -9859,6 +10484,8 @@ pub(crate) mod tests {
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
             placement_enabled: true,
+            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
+            managed_runtime_identity: None,
         });
 
         let mut pool = management_pool(POOL_UID, POOL_GENERATION);
@@ -14650,7 +15277,8 @@ pub(crate) mod tests {
                 "size": 1,
                 "ttl": "9h",
                 "backend": { "type": "k3s" },
-                "cluster": { "version": "v1.32.0" }
+                "cluster": { "version": "v1.32.0" },
+                "bootstraps": [{ "name": "kobe-agent-sandbox-v1-0-0" }]
             },
             "status": {
                 "phase": "Healthy",
@@ -14808,6 +15436,80 @@ current-context: child
         replaced.metadata.uid = Some("replacement-secret-uid".into());
         let replaced = child_kubeconfig_secret_observation(&replaced, NS, instance).unwrap();
         assert!(require_exact_child_kubeconfig_secret(recorded, digest, &replaced).is_err());
+    }
+
+    /// k3s reserves `{instance}-kubeconfig` under the ClusterInstance
+    /// controller owner. That controller owner is composition-safe even when
+    /// kubectl apply leaves extra non-controller metadata; a foreign
+    /// controller is not.
+    #[tokio::test]
+    async fn child_kubeconfig_observation_accepts_exact_instance_controller_owner() {
+        let server = MockServer::start().await;
+        let lease = child_placed_lease("child-lease-uid");
+        let instance = lease
+            .status
+            .as_ref()
+            .and_then(|status| status.target.as_ref())
+            .and_then(|target| target.child_cluster_instance.as_ref())
+            .unwrap();
+
+        let mut owned = child_kubeconfig_secret_json(&server, "child-kubeconfig-secret-uid");
+        owned["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "name": "kobe-abc123",
+            "uid": "child-instance-uid",
+            "controller": true,
+            "blockOwnerDeletion": true
+        }]);
+        let owned: Secret = serde_json::from_value(owned).unwrap();
+        child_kubeconfig_secret_observation(&owned, NS, instance).unwrap();
+
+        let mut unnamed_namespace = owned.clone();
+        unnamed_namespace.metadata.namespace = None;
+        child_kubeconfig_secret_observation(&unnamed_namespace, NS, instance).unwrap();
+
+        let mut dropped_controller = owned.clone();
+        dropped_controller
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()[0]
+            .controller = None;
+        child_kubeconfig_secret_observation(&dropped_controller, NS, instance).unwrap();
+
+        let mut foreign = owned.clone();
+        foreign.metadata.owner_references.as_mut().unwrap()[0].uid = "other-instance".into();
+        let foreign_error = match child_kubeconfig_secret_observation(&foreign, NS, instance) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("foreign ClusterInstance owner must fail closed"),
+        };
+        assert!(
+            foreign_error.contains("unsafe provenance"),
+            "{foreign_error}"
+        );
+
+        let mut extra = owned.clone();
+        extra.metadata.owner_references.as_mut().unwrap().push(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                name: "publisher".into(),
+                uid: "pod-uid".into(),
+                controller: Some(false),
+                ..Default::default()
+            },
+        );
+        child_kubeconfig_secret_observation(&extra, NS, instance).unwrap();
+
+        let mut foreign_controller = extra;
+        foreign_controller
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()[1]
+            .controller = Some(true);
+        assert!(child_kubeconfig_secret_observation(&foreign_controller, NS, instance).is_err());
     }
 
     /// The first Secret observation may hash bytes for the checkpoint, but it

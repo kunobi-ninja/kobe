@@ -7,7 +7,7 @@
 // arbitrary kubectl context, and it refuses an existing cluster name before
 // creation, so cleanup cannot delete resources belonging to another run.
 
-const releaseFixture = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
+const releaseFixture = "charts/kobe/files/agent-sandbox-v1.0.0.yaml";
 const releaseSha256 =
 	"3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
 const taggedImage =

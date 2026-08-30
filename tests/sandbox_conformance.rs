@@ -2,13 +2,10 @@
 //!
 //! # One suite, two placements
 //!
-//! Every scenario here runs its behaviour against a management-placement pool
-//! and then proves the child-cluster pool's **current ship-state boundary**:
-//! child placement has no in-child certification and teardown receipt
-//! protocol yet, so its pool must refuse every lease fail-closed — and each
-//! scenario asserts exactly that refusal for the lease it would otherwise
-//! run under. When in-child certification lands, the child arm goes back to
-//! executing the scenario itself, restoring full equivalence coverage.
+//! Every scenario here runs the same behaviour against a management-placement
+//! pool and a child-cluster pool. The child leg therefore proves the complete
+//! in-child certification, execution, and teardown receipt protocol rather
+//! than a weaker management-only approximation.
 //!
 //! The one-suite shape is still the point: two copies of a suite would prove
 //! nothing about equivalence — they would drift, and the drift would be
@@ -122,42 +119,13 @@ macro_rules! both_placements {
             scenario(Placement::Management)
                 .await
                 .unwrap_or_else(|error| panic!("[{}] {error:#}", Placement::Management.label()));
-            // Child placement deliberately ships fail-closed: no in-child
-            // certification and teardown receipt protocol exists yet, so the
-            // honest child-placement property every scenario can prove today
-            // is that the uncertified pool REFUSES the lease the scenario
-            // would otherwise run under. When in-child certification lands,
-            // this arm goes back to running the scenario itself.
-            assert_child_placement_refuses_leases()
+            scenario(Placement::ChildCluster)
                 .await
                 .unwrap_or_else(|error| {
                     panic!("[{}] {error:#}", Placement::ChildCluster.label())
                 });
         }
     };
-}
-
-/// The child-placement ship-state boundary, proven at the API surface: an
-/// uncertified pool must refuse admission with the fail-closed 503 before any
-/// pending lease exists — never accept-and-strand.
-async fn assert_child_placement_refuses_leases() -> anyhow::Result<()> {
-    let api = Api::as_caller(token());
-    let (status, body) = api
-        .json(
-            reqwest::Method::POST,
-            "/v1/sandbox-leases",
-            Some(serde_json::json!({
-                "pool": pool_for(Placement::ChildCluster),
-                "ttl": "5m"
-            })),
-        )
-        .await?;
-    anyhow::ensure!(
-        status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "an uncertified child pool must refuse leases fail-closed with 503, \
-         got HTTP {status} {body}"
-    );
-    Ok(())
 }
 
 fn require_e2e() {

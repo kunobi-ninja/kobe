@@ -80,7 +80,8 @@
           "type": "string",
           "enum": [
             "disabled",
-            "external"
+            "external",
+            "managed"
           ]
         },
         "leaseRetention": {

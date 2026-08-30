@@ -1757,31 +1757,48 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             }
 
-            let mut recycling_status = terminal_status.clone();
-            recycling_status.phase = LeasePhase::Recycling;
-            if diag_url.is_some() {
-                recycling_status.diagnostics_url = diag_url;
-            }
+            // Field-level transition only. Replacing `/status` re-serializes the
+            // whole object and omits `skip_serializing_if` Nones, which drops
+            // live `teardownAttemptId` / receipt / creationManifest and the CRD
+            // rejects the write with 422. Child sandboxes then stay Releasing
+            // and fill the admission quota.
+            let mut recycling_view = terminal_status.clone();
+            recycling_view.phase = LeasePhase::Recycling;
             let conditions = derive_lease_conditions(
-                &recycling_status,
+                &recycling_view,
                 &terminal_status.conditions,
                 None,
                 &chrono::Utc::now().to_rfc3339(),
             );
-            recycling_status.conditions = conditions;
             let lease_rv = terminal_lease
                 .resource_version()
                 .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
-            let patch = json_patch(serde_json::json!([
-                { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-                { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
-                { "op": "test", "path": "/status/phase", "value": terminal_status.phase },
-                { "op": "test", "path": "/status/binding", "value": resolved.binding },
-                { "op": "add", "path": "/status", "value": recycling_status }
-            ]));
-            leases_api
+            let mut operations = vec![
+                serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+                serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv }),
+                serde_json::json!({ "op": "test", "path": "/status/phase", "value": terminal_status.phase }),
+                serde_json::json!({ "op": "test", "path": "/status/binding", "value": resolved.binding }),
+                serde_json::json!({ "op": "add", "path": "/status/phase", "value": "Recycling" }),
+                serde_json::json!({ "op": "add", "path": "/status/conditions", "value": conditions }),
+            ];
+            if let Some(url) = diag_url {
+                operations.push(serde_json::json!({
+                    "op": "add",
+                    "path": "/status/diagnosticsUrl",
+                    "value": url
+                }));
+            }
+            let patch = json_patch(serde_json::Value::Array(operations));
+            match leases_api
                 .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
-                .await?;
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if optimistic_conflict(&error) => {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                }
+                Err(error) => return Err(error.into()),
+            }
             debug!(cluster = %cluster_name, "Marked exact ClusterInstance recycling");
 
             Ok(Action::requeue(std::time::Duration::from_secs(10)))

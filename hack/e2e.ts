@@ -17,20 +17,10 @@ const DEMO_OTHER_TOKEN_SECRET = "e2e-other-token";
 const DEMO_OTHER_POLICY = "e2e-other-token";
 const DEMO_SANDBOX_POOL_MANAGEMENT = "e2e-sandbox-management-trusted";
 const DEMO_SANDBOX_POOL_CHILD = "e2e-sandbox-child-k3s-trusted";
-const DEMO_SANDBOX_BOOTSTRAP = "agent-sandbox-v1-0-0";
-// Kobe's external mode installs nothing: the harness plays the operator and
-// applies the pinned upstream release itself, to the management cluster
-// directly and to child clusters through an ordinary BootstrapConfig.
-const SANDBOX_RUNTIME_FIXTURE = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
-const SANDBOX_RUNTIME_SHA256 = "3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
-const SANDBOX_RUNTIME_TAGGED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0";
-const SANDBOX_RUNTIME_PINNED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd";
-const SANDBOX_RUNTIME_CRDS = [
-  "sandboxclaims.extensions.agents.x-k8s.io",
-  "sandboxes.agents.x-k8s.io",
-  "sandboxtemplates.extensions.agents.x-k8s.io",
-  "sandboxwarmpools.extensions.agents.x-k8s.io",
-];
+// The default `kobe` release publishes this retained managed BootstrapConfig.
+// The E2E harness consumes the chart output instead of maintaining a second
+// operator-authored runtime bundle.
+const DEMO_SANDBOX_BOOTSTRAP = "kobe-agent-sandbox-v1-0-0";
 const SANDBOX_REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
 const SANDBOX_REGISTRY_LABEL = "kobe.kunobi.ninja/e2e-sandbox-registry";
 const DEMO_K0S_POOL = "e2e-k0s";
@@ -1064,7 +1054,7 @@ async function installChart(args: Args): Promise<void> {
     `podAnnotations.e2e-rollout=${rolloutNonce}`,
   ];
   if (args.sandboxConformance) {
-    command.push("--set", "agentSandbox.mode=external");
+    command.push("--set", "agentSandbox.mode=managed");
   }
   await runCommand(command, {
     step: `failed to install Helm release '${args.release}'`,
@@ -1072,66 +1062,6 @@ async function installChart(args: Args): Promise<void> {
   });
 }
 
-function pinnedSandboxRuntime(): string {
-  const source = readFileSync(SANDBOX_RUNTIME_FIXTURE, "utf8");
-  const digest = new Bun.CryptoHasher("sha256").update(source).digest("hex");
-  if (digest !== SANDBOX_RUNTIME_SHA256) {
-    throw new Error(`pinned Agent Sandbox release fixture digest drifted: ${digest}`);
-  }
-  const pinned = source.replaceAll(SANDBOX_RUNTIME_TAGGED_IMAGE, SANDBOX_RUNTIME_PINNED_IMAGE);
-  if (!pinned.includes(SANDBOX_RUNTIME_PINNED_IMAGE) || pinned.includes(SANDBOX_RUNTIME_TAGGED_IMAGE)) {
-    throw new Error("pinned Agent Sandbox runtime image was not pinned to its digest");
-  }
-  return pinned;
-}
-
-// Kobe's startup validation is read-only and fails closed, so the operator
-// install must be complete before the chart deploys the operator.
-async function installSandboxRuntime(cluster: string): Promise<void> {
-  step("Installing the pinned Agent Sandbox runtime (operator role)");
-  const manifestPath = `${process.env.RUNNER_TEMP ?? "/tmp"}/kobe-e2e-agent-sandbox-runtime.yaml`;
-  await Bun.write(manifestPath, pinnedSandboxRuntime());
-  try {
-    await runCommand(
-      ["kubectl", "--context", kubeContext(cluster), "apply", "--server-side", "--field-manager=kobe-e2e-operator", "-f", manifestPath],
-      { step: "failed to install the pinned Agent Sandbox runtime" },
-    );
-  } finally {
-    rmSync(manifestPath, { force: true });
-  }
-  for (const crd of SANDBOX_RUNTIME_CRDS) {
-    await runCommand(
-      ["kubectl", "--context", kubeContext(cluster), "wait", "--for=condition=Established", `crd/${crd}`, "--timeout=90s"],
-      { step: `Agent Sandbox CRD ${crd} did not establish` },
-    );
-  }
-  await runCommand(
-    ["kubectl", "--context", kubeContext(cluster), "wait", "--for=condition=Available", "deployment/agent-sandbox-controller", "-n", "agent-sandbox-system", "--timeout=180s"],
-    { step: "Agent Sandbox controller did not become Available" },
-  );
-}
-
-// Child clusters receive the same pinned release through a generic
-// operator-authored BootstrapConfig that the k3s ClusterPool names explicitly.
-async function applySandboxBootstrap(cluster: string, namespace: string): Promise<void> {
-  step(`Publishing operator BootstrapConfig ${DEMO_SANDBOX_BOOTSTRAP}`);
-  const bootstrap = {
-    apiVersion: "kobe.kunobi.ninja/v1alpha1",
-    kind: "BootstrapConfig",
-    metadata: { name: DEMO_SANDBOX_BOOTSTRAP, namespace },
-    spec: { files: { "agent-sandbox-v1.0.0.yaml": pinnedSandboxRuntime() } },
-  };
-  const manifestPath = `${process.env.RUNNER_TEMP ?? "/tmp"}/kobe-e2e-agent-sandbox-bootstrap.json`;
-  await Bun.write(manifestPath, JSON.stringify(bootstrap));
-  try {
-    await runCommand(
-      ["kubectl", "--context", kubeContext(cluster), "apply", "--server-side", "--field-manager=kobe-e2e-operator", "-f", manifestPath],
-      { step: `failed to publish BootstrapConfig ${DEMO_SANDBOX_BOOTSTRAP}` },
-    );
-  } finally {
-    rmSync(manifestPath, { force: true });
-  }
-}
 
 export function sandboxConformanceManifest(namespace: string, fixture: SandboxFixture): string {
   const poolSpec = (placement: string) => `spec:
@@ -1291,7 +1221,7 @@ spec:
 # Modeled on deploy/profiles/e2e-direct-k3s.yaml but with the shared-Postgres
 # backend.datastore block dropped (the kunobi-postgres secret doesn't exist in
 # kind) so each k3s instance uses embedded SQLite. Ordinary e2e keeps it bare;
-# --sandbox-conformance adds the operator-published pinned runtime bootstrap
+# --sandbox-conformance consumes the chart-published pinned runtime bootstrap
 # and the run-owned fixture registry mirror. scaling.minReady=1 warms one member.
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
@@ -1785,7 +1715,7 @@ for ns in $(kubectl --context "$CTX" get namespace -l kobe.kunobi.ninja/backend=
   kubectl --context "$CTX" delete namespace "$ns" --ignore-not-found >/dev/null 2>&1 || true
 done
 kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_K3S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} ${DEMO_VCLUSTER_POOL} ${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
-kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} ${DEMO_SANDBOX_BOOTSTRAP} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true`,
@@ -1794,9 +1724,6 @@ kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BAC
       step: "failed to clean up existing local demo pool resources",
     },
   );
-  if (sandboxFixture) {
-    await applySandboxBootstrap(cluster, namespace);
-  }
   await runCommand(
     ["/bin/sh", "-lc", `cat <<'EOF' | kubectl --context ${kubeContext(cluster)} apply -f -
 ${bootstrapManifest(namespace, sandboxFixture)}EOF`],
@@ -1876,9 +1803,6 @@ async function up(args: Args): Promise<void> {
   await runCommand(["/bin/sh", "-lc", `kubectl --context ${kubeContext(args.cluster)} create namespace ${args.namespace} --dry-run=client -o yaml | kubectl --context ${kubeContext(args.cluster)} apply -f -`], {
     step: `failed to ensure namespace '${args.namespace}'`,
   });
-  if (sandboxFixture) {
-    await installSandboxRuntime(args.cluster);
-  }
   await installChart(args);
   await bootstrapLocalResources(args.cluster, args.namespace, sandboxFixture);
   await writeLocalCliConfig();
@@ -1937,12 +1861,11 @@ function assertCertifiedPool(pool: ConformanceObject, name: string): void {
 }
 
 /// Return the current-generation pool condition that cannot converge without
-/// an explicit product/protocol change.
+/// operator intervention.
 ///
 /// Most `Ready=False` reasons are ordinary certification progress and must be
-/// allowed to reconcile. `CleanupBlocked` and `CompositionEligible` are
-/// deliberately terminal, fail-closed boundaries: waiting the full CI timeout
-/// cannot change either one and hides the exact reason maintainers need.
+/// allowed to reconcile. `CleanupBlocked` is terminal: waiting the full CI
+/// timeout cannot change it and hides the exact reason maintainers need.
 export function sandboxPoolCertificationBlocker(
   pool: ConformanceObject,
   name: string,
@@ -1954,49 +1877,35 @@ export function sandboxPoolCertificationBlocker(
     || pool.status?.observedGeneration !== generation
     || ready?.observedGeneration !== generation
     || ready.status !== "False"
-    || !["CleanupBlocked", "CompositionEligible"].includes(ready.reason ?? "")
+    || ready.reason !== "CleanupBlocked"
   ) {
     return undefined;
   }
   return `SandboxPool/${name} is fail-closed at ${ready.reason}: ${ready.message ?? "no detail"}`;
 }
 
-/// Child placement's converged terminal until in-child certification exists:
-/// current-generation status with Ready=False and reason CompositionEligible.
-/// CleanupBlocked stays a hard failure; every other reason keeps reconciling.
-async function waitForChildFailClosedBoundary(args: Args, name: string): Promise<void> {
-  const deadline = Date.now() + args.timeoutSeconds * 1000;
-  let lastError = `SandboxPool/${name} has not reported its fail-closed boundary`;
-  while (Date.now() < deadline) {
-    let current: ConformanceObject;
-    try {
-      current = await kubectlJson<ConformanceObject>(args, [
-        "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
-      ]);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      await Bun.sleep(1_000);
-      continue;
-    }
-    const generation = current.metadata?.generation;
-    const ready = (current.status?.conditions ?? []).find((condition) => condition.type === "Ready");
-    requireConformance(
-      !(ready?.reason === "CleanupBlocked" && ready.observedGeneration === generation),
-      `SandboxPool/${name} is fail-closed at CleanupBlocked: ${ready?.message ?? "no detail"}`,
-    );
-    if (
-      generation !== undefined
-      && current.status?.observedGeneration === generation
-      && ready?.observedGeneration === generation
-      && ready.status === "False"
-      && ready.reason === "CompositionEligible"
-    ) {
-      return;
-    }
-    lastError = `SandboxPool/${name} has not converged on CompositionEligible (now ${ready?.reason ?? "none"}: ${ready?.message ?? ""})`;
-    await Bun.sleep(1_000);
+/// Return why a child pool has not reached its current-generation admission
+/// boundary. Child runtime readiness is certified later, inside the exact
+/// cluster allocated for a tenant lease.
+export function childPoolCompositionEligibilityError(
+  pool: ConformanceObject,
+  name: string,
+): string | undefined {
+  const generation = pool.metadata?.generation;
+  if (generation === undefined) return `SandboxPool/${name} has no generation`;
+  if (pool.status?.observedGeneration !== generation) {
+    return `SandboxPool/${name} status is stale (observed ${pool.status?.observedGeneration ?? "none"}, current ${generation})`;
   }
-  throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
+  const ready = (pool.status?.conditions ?? []).filter((condition) => condition.type === "Ready");
+  if (ready.length !== 1) return `SandboxPool/${name} must have exactly one Ready condition`;
+  if (
+    ready[0].status !== "False"
+    || ready[0].observedGeneration !== generation
+    || ready[0].reason !== "CompositionEligible"
+  ) {
+    return `SandboxPool/${name} has not reached CompositionEligible (now ${ready[0].reason ?? "unknown"}: ${ready[0].message ?? ""})`;
+  }
+  return undefined;
 }
 
 async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
@@ -2026,10 +1935,34 @@ async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
   throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
 }
 
+async function waitForChildCompositionEligibility(args: Args, name: string): Promise<void> {
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastError = `SandboxPool/${name} has not reported composition eligibility`;
+  while (Date.now() < deadline) {
+    let current: ConformanceObject;
+    try {
+      current = await kubectlJson<ConformanceObject>(args, [
+        "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+      ]);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await Bun.sleep(1_000);
+      continue;
+    }
+    const blocker = sandboxPoolCertificationBlocker(current, name);
+    requireConformance(blocker === undefined, blocker ?? "unreachable certification blocker");
+    const eligibilityError = childPoolCompositionEligibilityError(current, name);
+    if (eligibilityError === undefined) return;
+    lastError = eligibilityError;
+    await Bun.sleep(1_000);
+  }
+  throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
+}
+
 /// Privileged setup evidence for #76, deliberately separate from the public
 /// contract suite. It proves the harness created the exact two identities,
-/// managed runtime, receipt-capable child pool, and both current-generation
-/// SandboxPool certifications before any caller assertion is allowed to run.
+/// managed runtime, receipt-capable child pool, management certification, and
+/// current child composition boundary before any caller assertion can run.
 async function sandboxConformancePreflight(args: Args): Promise<void> {
   const state = loadState();
   requireConformance(state, "no e2e state exists; run `up --sandbox-conformance` first");
@@ -2134,14 +2067,8 @@ async function sandboxConformancePreflight(args: Args): Promise<void> {
   ], { step: `ClusterPool/${DEMO_K3S_POOL} did not retain one Ready child fixture` });
 
   await waitForCertifiedPool(args, DEMO_SANDBOX_POOL_MANAGEMENT);
-  // Child placement's decided ship-state is fail-closed: no in-child
-  // certification and teardown receipt protocol exists yet, so the child
-  // pool's converged, honest terminal is CompositionEligible with Ready
-  // withheld — demanding "certified" here would demand a protocol the
-  // product deliberately does not have. The suite proves the matching API
-  // boundary (child leases are refused) on every scenario.
-  await waitForChildFailClosedBoundary(args, DEMO_SANDBOX_POOL_CHILD);
-  step("Management placement is certified; child placement holds its fail-closed boundary");
+  await waitForChildCompositionEligibility(args, DEMO_SANDBOX_POOL_CHILD);
+  step("Management placement is certified; child placement is composition eligible");
 }
 
 async function down(args: Args): Promise<void> {

@@ -169,13 +169,25 @@ async fn run() -> anyhow::Result<()> {
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
     let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
 
-    // External mode is operator-owned. Before mounting Sandbox routes, perform
-    // only read-only API/schema compatibility checks; startup must never create
-    // a sacrificial Claim or assume one particular controller deployment.
-    // Transient apiserver faults retry inside a bounded window; only an absent
-    // or incompatible runtime aborts, immediately.
+    // External mode remains GET-only. Managed mode additionally authenticates
+    // the chart-owned controller. The pool reconciler owns live canaries.
     if agent_sandbox_mode.enabled() {
-        match sandbox_runtime::validate_external_runtime_with_retry(&client).await {
+        let validation = match agent_sandbox_mode {
+            sandbox_runtime::AgentSandboxMode::Managed => {
+                match sandbox_runtime::ManagedRuntimeIdentity::from_env() {
+                    Ok(identity) => {
+                        sandbox_runtime::validate_managed_runtime_with_retry(&client, &identity)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            sandbox_runtime::AgentSandboxMode::External => {
+                sandbox_runtime::validate_external_runtime_with_retry(&client).await
+            }
+            sandbox_runtime::AgentSandboxMode::Disabled => Ok(()),
+        };
+        match validation {
             Ok(()) => info!(?agent_sandbox_mode, "Agent Sandbox APIs validated"),
             Err(err) => {
                 error!(reason = err.reason_code(), "{err}");

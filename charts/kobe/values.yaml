@@ -119,7 +119,12 @@ containerSecurityContext:
 #             mode. Kobe owns none of that installation and performs read-only
 #             API/schema compatibility checks. Child clusters may use a generic
 #             operator-authored BootstrapConfig explicitly referenced by their
-#             ClusterPool; Kobe does not ship or inject an installer.
+#             ClusterPool.
+#
+#   managed   Helm installs the exact v1.0.0 runtime, retains its CRDs/RBAC/
+#             webhook/controller on uninstall, and publishes a retained
+#             BootstrapConfig for disposable child k3s pools. Kobe authenticates
+#             the release owner and pinned digest before using either runtime.
 agentSandbox:
   mode: disabled
   # Aggregate object ceiling across every caller. This namespace contains only

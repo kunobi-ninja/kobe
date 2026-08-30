@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   bootstrapManifest,
+  childPoolCompositionEligibilityError,
   decodeKeystrokes,
   forwardingAddress,
   guestImagesForBackend,
@@ -65,7 +66,7 @@ test("the conformance manifest contains two exact placements and a pullable runn
   const pools = sandboxConformanceManifest("kobe-system", fixture);
 
   expect(manifest.match(/^kind: SandboxPool$/gm)).toHaveLength(2);
-  expect(manifest).toContain("name: agent-sandbox-v1-0-0");
+  expect(manifest).toContain("name: kobe-agent-sandbox-v1-0-0");
   expect(manifest).toContain('"127.0.0.1:32001":');
   expect(manifest).toContain('"http://172.19.0.9:5000"');
   expect(pools).toContain("type: management");
@@ -98,11 +99,18 @@ test("the conformance preflight reports durable pool blockers without waiting fo
   expect(sandboxPoolCertificationBlocker(pool("CleanupBlocked", "approval required"), "management"))
     .toBe("SandboxPool/management is fail-closed at CleanupBlocked: approval required");
   expect(sandboxPoolCertificationBlocker(pool("CompositionEligible", "child receipt missing"), "child"))
-    .toBe("SandboxPool/child is fail-closed at CompositionEligible: child receipt missing");
+    .toBeUndefined();
   expect(sandboxPoolCertificationBlocker(pool("CanaryRunning", "still reconciling"), "management"))
     .toBeUndefined();
   expect(sandboxPoolCertificationBlocker(pool("CleanupBlocked", "stale", 6), "management"))
     .toBeUndefined();
+
+  expect(childPoolCompositionEligibilityError(pool("CompositionEligible", "exact bootstrap accepted"), "child"))
+    .toBeUndefined();
+  expect(childPoolCompositionEligibilityError(pool("CanaryRunning", "wrong boundary"), "child"))
+    .toContain("has not reached CompositionEligible");
+  expect(childPoolCompositionEligibilityError(pool("CompositionEligible", "stale", 6), "child"))
+    .toContain("status is stale");
 });
 
 // ---------------------------------------------------------------------------

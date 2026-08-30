@@ -363,7 +363,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
         None => {
             let pending = TeardownReceipt {
                 schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
-                attempt_id: uuid::Uuid::new_v4().to_string(),
+                attempt_id: durable_teardown_attempt_id(&lease),
                 lease: binding.lease.clone(),
                 instance: manifest.instance.clone(),
                 pool: binding.pool.clone(),
@@ -2742,7 +2742,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         None => {
             let receipt = TeardownReceipt {
                 schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
-                attempt_id: uuid::Uuid::new_v4().to_string(),
+                attempt_id: durable_teardown_attempt_id(&lease),
                 lease: binding.lease.clone(),
                 instance: manifest.instance.clone(),
                 pool: binding.pool.clone(),
@@ -3118,6 +3118,21 @@ async fn resolve_verified_backend<B: ClusterBackend + Clone>(
     factory.backend_for_provenance(provenance).ok()
 }
 
+/// Reuse the attempt nonce the lease controller already persisted, if any.
+///
+/// Terminal VerifiedDestroy leases write `status.teardownAttemptId` before
+/// token deletion. Starting a second UUID here is rejected by CRD validation
+/// (`teardownAttemptId` may change only with a new InProgress receipt after a
+/// non-InProgress predecessor), which stranded child clusters in Recycling.
+fn durable_teardown_attempt_id(lease: &ClusterLease) -> String {
+    lease
+        .status
+        .as_ref()
+        .and_then(|status| status.teardown_attempt_id.clone())
+        .filter(|attempt| !attempt.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// Write the receipt onto the lease, fenced to the exact lease UID.
 async fn record_teardown_receipt<B: ClusterBackend>(
     ctx: &InstanceContext<B>,
@@ -3166,11 +3181,30 @@ async fn record_teardown_receipt<B: ClusterBackend>(
         {
             anyhow::bail!("a destructive attempt must begin as durable InProgress evidence");
         }
-        operations.push(serde_json::json!({
-            "op": "add",
-            "path": "/status/teardownAttemptId",
-            "value": persisted_receipt.attempt_id
-        }));
+        match lease
+            .status
+            .as_ref()
+            .and_then(|status| status.teardown_attempt_id.as_deref())
+            .filter(|attempt| !attempt.trim().is_empty())
+        {
+            Some(existing) if existing == persisted_receipt.attempt_id => {
+                operations.push(serde_json::json!({
+                    "op": "test",
+                    "path": "/status/teardownAttemptId",
+                    "value": existing
+                }));
+            }
+            Some(_) => {
+                anyhow::bail!(
+                    "InProgress receipt must reuse the durable teardown attempt already on the lease"
+                );
+            }
+            None => operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/status/teardownAttemptId",
+                "value": persisted_receipt.attempt_id
+            })),
+        }
     }
     operations.push(serde_json::json!({
         "op": "add",
@@ -4660,6 +4694,52 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn in_progress_receipt_reuses_durable_teardown_attempt_id() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let mut lease = teardown_surface_lease(LeasePhase::Released, "lease-uid", &binding, None);
+        lease.status.as_mut().unwrap().teardown_attempt_id = Some("attempt-surface".into());
+        let mut receipt = teardown_surface_receipt(&binding);
+        receipt.outcome = TeardownOutcome::InProgress;
+        receipt.completed_at = None;
+        receipt.checks.clear();
+        let mut updated = lease.clone();
+        updated.status.as_mut().unwrap().teardown_receipt = Some(receipt.clone());
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-surface/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&updated))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        record_teardown_receipt(&ctx, &lease, &receipt, "test-ns", None)
+            .await
+            .expect("existing attempt id is reused");
+
+        let patches: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 1);
+        let operations = patches[0].as_array().expect("json patch");
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/status/teardownAttemptId"
+                && operation["value"] == "attempt-surface"
+        }));
+        assert!(operations.iter().all(|operation| {
+            operation["path"] != "/status/teardownAttemptId" || operation["op"] != "add"
+        }));
     }
 
     fn leased_surface_instance(

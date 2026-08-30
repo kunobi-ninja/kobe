@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 
 const chart = "charts/kobe";
-const releaseFixture = "hack/fixtures/agent-sandbox-v1.0.0.yaml";
+const releaseFixture = "charts/kobe/files/agent-sandbox-v1.0.0.yaml";
 const releaseSha256 =
 	"3a22f89ca1d1d6084e0a351797224842ee413641d6945f9e5b2cb5e1f6cf026c";
 const taggedImage =
 	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0";
+const pinnedImage =
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd";
 const upstreamCrds = new Set([
 	"sandboxclaims.extensions.agents.x-k8s.io",
 	"sandboxes.agents.x-k8s.io",
@@ -221,17 +223,18 @@ invariant(
 );
 
 // -----------------------------------------------------------------------------
-// The chart owns no part of the runtime. Neither mode may render upstream
-// objects, and the retired managed mode must fail values validation instead of
-// silently rendering nothing.
+// Disabled and external own no runtime objects. Managed renders the exact
+// retained release and its child BootstrapConfig from the same vendored bytes.
 // -----------------------------------------------------------------------------
 
-const [disabledYaml, externalYaml] = await Promise.all([
+const [disabledYaml, externalYaml, managedYaml] = await Promise.all([
 	helm("disabled"),
 	helm("external"),
+	helm("managed"),
 ]);
 const disabled = parseDocuments(disabledYaml);
 const external = parseDocuments(externalYaml);
+const managed = parseDocuments(managedYaml);
 // The split teardown authority is OPT-IN. Its required admission policies and
 // RBAC are not shipped yet, so rendering it by default CrashLoops the pod and,
 // because the operator would then declare KOBE_PROCESS_ROLE, also disables the
@@ -631,14 +634,37 @@ const evidenceRule = generalRules.find(
 		Array.isArray(rule.resources) &&
 		rule.resources.includes("verifiedteardownevidence"),
 );
-invariant(evidenceRule, "general control plane cannot authenticate teardown evidence");
+invariant(evidenceRule, "combined control plane cannot authenticate teardown evidence");
 invariant(
 	Array.isArray(evidenceRule.verbs) &&
-		["get", "list", "watch"].every((verb) => evidenceRule.verbs.includes(verb)) &&
-		["create", "update", "patch", "delete"].every(
+		["get", "list", "watch", "create"].every((verb) =>
+			evidenceRule.verbs.includes(verb),
+		) &&
+		["update", "patch", "delete"].every(
 			(verb) => !evidenceRule.verbs.includes(verb),
 		),
-	"general control plane can mutate teardown evidence",
+	"combined control plane must create evidence and must not rewrite or delete it",
+);
+
+const splitOperatorRole = objectNamed(externalSplit, "ClusterRole", "kobe");
+invariant(splitOperatorRole, "split render omitted the lifecycle ClusterRole");
+const splitEvidenceRule = (
+	(splitOperatorRole.rules ?? []) as Record<string, unknown>[]
+).find(
+	(rule) =>
+		Array.isArray(rule.resources) &&
+		rule.resources.includes("verifiedteardownevidence"),
+);
+invariant(splitEvidenceRule, "split control plane cannot authenticate teardown evidence");
+invariant(
+	Array.isArray(splitEvidenceRule.verbs) &&
+		["get", "list", "watch"].every((verb) =>
+			splitEvidenceRule.verbs.includes(verb),
+		) &&
+		["create", "update", "patch", "delete"].every(
+			(verb) => !splitEvidenceRule.verbs.includes(verb),
+		),
+	"split control plane can mutate teardown evidence",
 );
 
 
@@ -664,7 +690,89 @@ for (const [mode, documents] of [
 	);
 }
 
-await helmRejects("managed");
+const managedDigest = sha256(source.replaceAll(taggedImage, pinnedImage));
+const managedRuntime = managed.filter((document) => {
+	const name = String(metadata(document).name);
+	return (
+		(document.kind === "CustomResourceDefinition" && upstreamCrds.has(name)) ||
+		(document.kind === "Deployment" && name === "agent-sandbox-controller")
+	);
+});
+invariant(managedRuntime.length === 5, "managed runtime is incomplete");
+for (const object of managedRuntime) {
+	invariant(
+		annotations(object)["helm.sh/resource-policy"] === "keep" &&
+			annotations(object)["kobe.kunobi.ninja/agent-sandbox-owner"] ===
+				"kobe-system/kobe" &&
+			annotations(object)[
+				"kobe.kunobi.ninja/agent-sandbox-manifest-sha256"
+			] === managedDigest,
+		`managed ${String(object.kind)}/${String(metadata(object).name)} lost retained exact ownership`,
+	);
+}
+const managedController = objectNamed(
+	managed,
+	"Deployment",
+	"agent-sandbox-controller",
+);
+invariant(managedController, "managed controller is missing");
+const managedControllerPod = (
+	(managedController.spec as Record<string, unknown>).template as Record<
+		string,
+		unknown
+	>
+).spec as Record<string, unknown>;
+invariant(
+	(managedControllerPod.containers as Record<string, unknown>[]).some(
+		(container) =>
+			container.name === "agent-sandbox-controller" &&
+			container.image === pinnedImage,
+	),
+	"managed controller image is not pinned by digest",
+);
+const bootstrap = objectNamed(
+	managed,
+	"BootstrapConfig",
+	"kobe-agent-sandbox-v1-0-0",
+);
+invariant(bootstrap, "managed child BootstrapConfig is missing");
+invariant(
+	annotations(bootstrap)["helm.sh/resource-policy"] === "keep" &&
+		annotations(bootstrap)["kobe.kunobi.ninja/agent-sandbox-owner"] ===
+			"kobe-system/kobe" &&
+		annotations(bootstrap)[
+			"kobe.kunobi.ninja/agent-sandbox-manifest-sha256"
+		] === managedDigest,
+	"managed child BootstrapConfig identity drifted",
+);
+const bootstrapSpec = bootstrap.spec as Record<string, unknown>;
+const bootstrapFiles = bootstrapSpec.files as Record<string, unknown>;
+invariant(
+	bootstrapSpec.job === undefined &&
+		Object.keys(bootstrapFiles).length === 1 &&
+		typeof bootstrapFiles["agent-sandbox-v1.0.0.yaml"] === "string",
+	"managed child bootstrap is not a declarative single-file bundle",
+);
+const childRuntime = parseDocuments(
+	String(bootstrapFiles["agent-sandbox-v1.0.0.yaml"]),
+);
+invariant(
+	childRuntime.filter(
+		(document) =>
+			document.kind === "CustomResourceDefinition" &&
+			upstreamCrds.has(String(metadata(document).name)),
+	).length === 4,
+	"child bootstrap does not carry all required CRDs",
+);
+invariant(
+	!managed.some(
+		(document) =>
+			document.kind === "Job" &&
+			String(metadata(document).name).includes("agent-sandbox-canary"),
+	),
+	"managed Helm render contains operational canary logic",
+);
+
 await helmRejects("invalid");
 
 // -----------------------------------------------------------------------------

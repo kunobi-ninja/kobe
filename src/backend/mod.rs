@@ -1571,7 +1571,40 @@ async fn check_scheduling_probe(
     }
 }
 
-/// Apply an addon manifest inside a virtual cluster using server-side apply.
+/// Require exact prior ownership before reconciling a managed retained object.
+///
+/// Ordinary addons retain their existing SSA behavior. The check activates
+/// only when the desired object carries Kobe's complete managed-runtime
+/// identity pair. A missing half is malformed; an existing object without the
+/// exact pair is foreign and must never be silently adopted by a privileged
+/// child bootstrap.
+fn managed_addon_identity(object: &kube::api::DynamicObject) -> Result<Option<(String, String)>> {
+    let annotations = object.annotations();
+    match (
+        annotations.get(crate::sandbox_runtime::MANAGED_OWNER_ANNOTATION),
+        annotations.get(crate::sandbox_runtime::MANAGED_DIGEST_ANNOTATION),
+    ) {
+        (None, None) => Ok(None),
+        (Some(owner), Some(digest)) if !owner.is_empty() && digest.len() == 64 => {
+            Ok(Some((owner.clone(), digest.clone())))
+        }
+        _ => anyhow::bail!(
+            "managed Agent Sandbox object carries an incomplete owner/digest identity"
+        ),
+    }
+}
+
+fn managed_addon_adoption_is_safe(
+    desired: &kube::api::DynamicObject,
+    existing: &kube::api::DynamicObject,
+) -> Result<bool> {
+    let Some(expected) = managed_addon_identity(desired)? else {
+        return Ok(true);
+    };
+    Ok(managed_addon_identity(existing)?.as_ref() == Some(&expected))
+}
+
+/// Apply one addon manifest inside a virtual cluster using server-side apply.
 pub async fn apply_addon_impl(vc_client: &Client, addon: &Addon) -> Result<()> {
     let manifest = match (&addon.manifest, &addon.url) {
         (Some(m), _) => m.clone(),
@@ -1640,6 +1673,28 @@ pub async fn apply_addon_impl(vc_client: &Client, addon: &Addon) -> Result<()> {
         };
 
         let obj_name = obj.name_any();
+        if managed_addon_identity(&obj)?.is_some() {
+            match api.get(&obj_name).await {
+                Ok(existing) if !managed_addon_adoption_is_safe(&obj, &existing)? => {
+                    anyhow::bail!(
+                        "Refusing to adopt foreign managed Agent Sandbox resource {}/{} for addon {}",
+                        types.kind,
+                        obj_name,
+                        addon.name
+                    );
+                }
+                Ok(_) => {}
+                Err(kube::Error::Api(kube_error)) if kube_error.code == 404 => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to preflight managed addon {} resource {}/{}",
+                            addon.name, types.kind, obj_name
+                        )
+                    });
+                }
+            }
+        }
         api.patch(
             &obj_name,
             &PatchParams::apply("kobe-operator"),
@@ -1994,6 +2049,65 @@ current-context: default
         assert!(rendered.contains("name: second"));
         assert!(rendered.find("name: first") < rendered.find("name: second"));
         assert!(!rendered.contains("# ignored"));
+    }
+
+    fn managed_object(owner: Option<&str>, digest: Option<&str>) -> kube::api::DynamicObject {
+        let mut annotations = serde_json::Map::new();
+        if let Some(owner) = owner {
+            annotations.insert(
+                crate::sandbox_runtime::MANAGED_OWNER_ANNOTATION.into(),
+                serde_json::Value::String(owner.into()),
+            );
+        }
+        if let Some(digest) = digest {
+            annotations.insert(
+                crate::sandbox_runtime::MANAGED_DIGEST_ANNOTATION.into(),
+                serde_json::Value::String(digest.into()),
+            );
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "agent-sandbox-system",
+                "annotations": annotations,
+            }
+        }))
+        .unwrap()
+    }
+
+    /// A privileged managed bootstrap may resume its own exact manifest, but
+    /// never claim a same-named runtime that predates or belongs to another
+    /// Kobe release.
+    #[test]
+    fn managed_addon_refuses_foreign_or_drifted_ownership() {
+        let digest = "a".repeat(64);
+        let other_digest = "b".repeat(64);
+        let desired = managed_object(Some("kobe-system/kobe"), Some(&digest));
+
+        assert!(
+            managed_addon_adoption_is_safe(
+                &desired,
+                &managed_object(Some("kobe-system/kobe"), Some(&digest)),
+            )
+            .unwrap()
+        );
+        assert!(!managed_addon_adoption_is_safe(&desired, &managed_object(None, None)).unwrap());
+        assert!(
+            !managed_addon_adoption_is_safe(
+                &desired,
+                &managed_object(Some("other/release"), Some(&digest)),
+            )
+            .unwrap()
+        );
+        assert!(
+            !managed_addon_adoption_is_safe(
+                &desired,
+                &managed_object(Some("kobe-system/kobe"), Some(&other_digest)),
+            )
+            .unwrap()
+        );
+        assert!(managed_addon_identity(&managed_object(Some("partial"), None)).is_err());
     }
 
     #[tokio::test]

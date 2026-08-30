@@ -122,3 +122,56 @@ kobe-sync sidecar image reference.
 {{- $tag := .Values.kobeSync.image.tag | default (printf "v%s" .Chart.AppVersion) -}}
 {{- printf "%s:%s" $repo $tag -}}
 {{- end }}
+
+{{/*
+Exact upstream Agent Sandbox release consumed by managed mode. The vendored
+asset remains byte-for-byte upstream; only the controller image is replaced
+with the release digest before any object is rendered or bootstrapped.
+*/}}
+{{- define "kobe.agentSandboxPinnedSource" -}}
+{{- .Files.Get "files/agent-sandbox-v1.0.0.yaml"
+    | replace "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.0" "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:bdde1a3150bd385f7318c974c1516e880b4f826b6b51a3e7f127c2f8c95b55cd" -}}
+{{- end }}
+
+{{- define "kobe.agentSandboxManifestDigest" -}}
+{{- include "kobe.agentSandboxPinnedSource" . | sha256sum -}}
+{{- end }}
+
+{{- define "kobe.agentSandboxOwner" -}}
+{{- printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- end }}
+
+{{- define "kobe.agentSandboxBootstrapName" -}}
+{{- printf "%s-agent-sandbox-v1-0-0" (include "kobe.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+Render the pinned manifest with an exact Kobe release owner and source digest.
+Child bootstrap deliberately omits Helm's keep annotation; the disposable
+child cluster owns its own lifetime. The management install retains every
+resource because upstream CRDs/RBAC/webhook state cannot be safely rolled back
+by an ordinary `helm uninstall`.
+*/}}
+{{- define "kobe.agentSandboxManagedManifest" -}}
+{{- $root := index . "root" -}}
+{{- $keep := index . "keep" -}}
+{{- $owner := include "kobe.agentSandboxOwner" $root -}}
+{{- $digest := include "kobe.agentSandboxManifestDigest" $root -}}
+{{- $source := include "kobe.agentSandboxPinnedSource" $root -}}
+{{- range $document := splitList "\n---\n" $source -}}
+{{- $object := fromYaml $document -}}
+{{- if and $object (hasKey $object "kind") -}}
+{{- $metadata := get $object "metadata" | default dict -}}
+{{- $annotations := get $metadata "annotations" | default dict -}}
+{{- $_ := set $annotations "kobe.kunobi.ninja/agent-sandbox-owner" $owner -}}
+{{- $_ := set $annotations "kobe.kunobi.ninja/agent-sandbox-manifest-sha256" $digest -}}
+{{- if $keep -}}
+{{- $_ := set $annotations "helm.sh/resource-policy" "keep" -}}
+{{- end -}}
+{{- $_ := set $metadata "annotations" $annotations -}}
+{{- $_ := set $object "metadata" $metadata -}}
+---
+{{ toYaml $object }}
+{{ end }}
+{{ end }}
+{{- end }}

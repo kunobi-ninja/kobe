@@ -3540,7 +3540,10 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     if let Err(err) = pool.spec.validate() {
         return sandbox_infra_error("SandboxPool configuration is invalid", err);
     }
-    if let Err(err) = crate::sandbox::require_current_sandbox_pool_ready(&pool) {
+    let child_composition_eligible = child_pool_allocation_is_certified(&pool);
+    if let Err(err) = crate::sandbox::require_current_sandbox_pool_ready(&pool)
+        && !child_composition_eligible
+    {
         warn!(pool = %request.pool, error = %err, "Sandbox admission refused an uncertified pool");
         return sandbox_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4298,6 +4301,13 @@ pub(crate) async fn caller_sandbox_summaries<B: ClusterBackend>(
             }
         })
         .collect())
+}
+
+/// Child pool status authorizes only allocating its exclusive internal
+/// cluster. Runtime certification remains a mandatory composition checkpoint
+/// before the first upstream tenant Claim is created.
+fn child_pool_allocation_is_certified(pool: &SandboxPool) -> bool {
+    crate::sandbox::current_child_pool_allocation_authority(pool).is_some()
 }
 
 #[tracing::instrument(skip_all)]
@@ -6244,40 +6254,16 @@ fn sandbox_placement_authority_for_admission(
             Ok(None)
         }
         SandboxPlacement::ChildCluster { cluster_pool_ref } => {
-            let status = pool
-                .status
-                .as_ref()
-                .ok_or_else(|| "child SandboxPool has no status".to_string())?;
-            let authority = recorded.ok_or_else(|| {
-                "child SandboxPool has no certified placementAuthority".to_string()
-            })?;
-            let namespace = pool
-                .namespace()
-                .ok_or_else(|| "SandboxPool has no namespace".to_string())?;
-            if authority.api_version != "kobe.kunobi.ninja/v1alpha1"
-                || authority.kind != "ClusterPool"
-                || authority.namespace != namespace
-                || authority.name != *cluster_pool_ref
-                || authority.uid.is_empty()
-                || authority.generation < 1
-            {
-                return Err(
-                    "child SandboxPool placementAuthority does not match its exact ClusterPool"
-                        .into(),
-                );
-            }
-            let composition_eligible = status.conditions.iter().any(|condition| {
-                condition.condition_type == "Ready"
-                    && condition.status == crate::crd::SandboxConditionStatus::False
-                    && condition.reason == "CompositionEligible"
-                    && condition.observed_generation == pool.metadata.generation
-            });
-            if !composition_eligible {
-                return Err(
-                    "child SandboxPool placementAuthority lacks current CompositionEligible status"
-                        .into(),
-                );
-            }
+            // Child admission authorizes only acquisition of the exclusive
+            // internal ClusterLease. The composition reconciler must still
+            // certify a real create/delete canary inside that exact child
+            // before it creates the caller's upstream SandboxClaim.
+            let authority = crate::sandbox::current_child_pool_allocation_authority(pool)
+                .ok_or_else(|| {
+                    format!(
+                        "child SandboxPool has no current CompositionEligible authority for ClusterPool {cluster_pool_ref}"
+                    )
+                })?;
             Ok(Some(authority.clone()))
         }
     }
@@ -8635,11 +8621,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn composition_eligible_child_pool_remains_closed_to_http_admission() {
-        let server = MockServer::start().await;
-        mount_sandbox_crds(&server).await;
-        mount_absent_cluster_pool(&server, "agent-small").await;
+    #[test]
+    fn composition_eligible_child_pool_authorizes_only_internal_allocation() {
         let mut pool = pool_json();
         pool["spec"]["placement"] = serde_json::json!({
             "type": "childCluster",
@@ -8660,39 +8643,9 @@ mod tests {
             "message": "discovery only",
             "observedGeneration": 1
         }]);
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
-            .mount(&server)
-            .await;
-
-        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
-            State(test_state(&server)),
-            identity(),
-            Json(CreateSandboxLeaseRequest {
-                pool: "agent-small".into(),
-                ttl: Some("1h".into()),
-                alias: None,
-                idempotency_key: None,
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter(|request| {
-                    request.method.as_str() == "POST"
-                        && request.url.path().ends_with("/sandboxleases")
-                })
-                .count(),
-            0
-        );
+        let pool: SandboxPool = serde_json::from_value(pool).unwrap();
+        assert!(child_pool_allocation_is_certified(&pool));
+        assert!(crate::sandbox::require_current_sandbox_pool_ready(&pool).is_err());
     }
 
     #[test]
