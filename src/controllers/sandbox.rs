@@ -5665,10 +5665,7 @@ async fn release_child_composition(
     let internal: Api<crate::crd::ClusterLease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
-        Ok(current)
-            if current.uid().as_deref() == Some(recorded.uid.as_str())
-                && current.metadata.generation == recorded.generation =>
-        {
+        Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
             match ensure_internal_lease_fenced(&internal, &current, lease).await? {
                 InternalHandleFence::Ready => {}
                 InternalHandleFence::Patched => {
@@ -6763,7 +6760,6 @@ fn validated_child_receipt_token(
     let binding = status.binding.as_ref()?;
     if lease.name_any() != recorded_lease.name
         || lease.uid().as_deref() != Some(recorded_lease.uid.as_str())
-        || lease.metadata.generation != recorded_lease.generation
         || binding.lease.name != recorded_lease.name
         || binding.lease.uid.as_deref() != Some(recorded_lease.uid.as_str())
         || binding.pool.name != recorded_pool.name
@@ -8917,7 +8913,6 @@ fn composition_handle_matches_consumer(
     child.uid().as_deref() == Some(recorded.uid.as_str())
         && child.name_any() == recorded.name
         && child.namespace() == recorded.namespace
-        && child.metadata.generation == recorded.generation
         && crate::controllers::sandbox_child::internal_lease_is_for_sandbox(child, consumer)
         && child.spec.requester.identity == consumer_uid
         && child
