@@ -3548,7 +3548,7 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
         return sandbox_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "SandboxPool is not ready for new leases",
-            None,
+            Some(err.to_string()),
         );
     }
     let pool_reference = match sandbox_pool_reference(&pool) {
@@ -9408,6 +9408,18 @@ mod tests {
                 .unwrap();
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{verb} {uri}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            assert_eq!(
+                value["error"], "Unauthorized",
+                "{verb} {uri} must name the failure: {value}"
+            );
+            assert_eq!(
+                value["detail"], "missing Authorization header",
+                "{verb} {uri} must say why: {value}"
+            );
         }
     }
 

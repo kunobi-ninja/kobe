@@ -32,21 +32,22 @@ use sha2::{Digest, Sha256};
 
 use super::config::{CliConfig, ResolvedConfig};
 use super::{
-    OutputFormat, authed_client, get_auth_header, get_auth_header_noninteractive, print_json,
-    with_auth,
+    OutputFormat, authed_client, get_auth_header_for_output, get_auth_header_noninteractive,
+    print_json, with_auth,
 };
 
 async fn sandbox_auth_header(
     config: &ResolvedConfig,
     method: &str,
     path: &str,
-    body: &[u8],
+    _body: &[u8],
     output: OutputFormat,
 ) -> Result<Option<String>> {
-    match output {
-        OutputFormat::Text => get_auth_header(config, method, path, body).await,
-        OutputFormat::Json => get_auth_header_noninteractive(config, method, path, body).await,
-    }
+    // The server extracts AuthIdentity from request parts and verifies SSH
+    // signatures against an empty body (`validate_ssh(..., None)`). Signing the
+    // JSON payload here 401s every sandbox POST. Same workaround as
+    // `lease_create` / `extend_lease`.
+    get_auth_header_for_output(config, method, path, b"", output).await
 }
 
 /// Exit code for Kobe's own failures.
@@ -540,6 +541,26 @@ const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9 * 6
 /// until this fresh window (measured from the transport failure) has elapsed.
 const CREATE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9 * 60);
 const CREATE_RECOVERY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn format_create_http_detail(status: reqwest::StatusCode, raw: &str) -> String {
+    if raw.is_empty() {
+        return if status == reqwest::StatusCode::UNAUTHORIZED {
+            "empty body; SSH signature or Authorization was rejected".into()
+        } else {
+            "empty body".into()
+        };
+    }
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            let error = value["error"].as_str()?.to_string();
+            Some(match value["detail"].as_str() {
+                Some(detail) if !detail.is_empty() => format!("{error} — {detail}"),
+                _ => error,
+            })
+        })
+        .unwrap_or_else(|| raw.to_string())
+}
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const READY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1204,12 +1225,17 @@ async fn create_sandbox_lease(
         .map(|value| value.to_str().map(str::to_owned));
     let payload = tokio::time::timeout_at(deadline, response.bytes()).await;
     if !status.is_success() {
-        let detail = match payload {
+        let raw = match payload {
             Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_string(),
             Ok(Err(error)) => format!("response body failed: {error}"),
             Err(_) => "response body exceeded the create deadline".to_string(),
         };
+        let detail = format_create_http_detail(status, &raw);
         let error = anyhow::anyhow!("could not create a sandbox (HTTP {status}): {detail}");
+        // Recover only when the POST itself may still be committing. A finished
+        // 401/403/503 with a body is the server's last word (pool not ready,
+        // bad SSH signature) and must print immediately — not poll 404s for
+        // nine minutes.
         if ambiguous_send.is_some() {
             return recover_expected_lease(
                 config,
@@ -1219,25 +1245,6 @@ async fn create_sandbox_lease(
                 format!("{error:#}"),
             )
             .await;
-        }
-        if status.is_server_error() {
-            // A server-side failure can be returned while a Kubernetes CREATE
-            // whose response was uncertain is still becoming observable. Do
-            // not let cleanup turn an immediate 404 into false absence proof:
-            // settle the deterministic handle first, then report the original
-            // create failure so `run` releases that exact object.
-            return match recover_expected_lease(
-                config,
-                expected_lease,
-                tokio::time::Instant::now() + CREATE_SETTLE_TIMEOUT,
-                output,
-                format!("{error:#}"),
-            )
-            .await
-            {
-                Ok(_) => Err(CreateFailure::ambiguous(error)),
-                Err(failure) => Err(failure),
-            };
         }
         return Err(CreateFailure::definite(error));
     }
@@ -1983,6 +1990,23 @@ pub async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_error_detail_prints_json_error_immediately() {
+        let raw = r#"{"error":"SandboxPool is not ready for new leases","detail":"Ready is False (CleanupBlocked)"}"#;
+        assert_eq!(
+            format_create_http_detail(reqwest::StatusCode::SERVICE_UNAVAILABLE, raw),
+            "SandboxPool is not ready for new leases — Ready is False (CleanupBlocked)"
+        );
+    }
+
+    #[test]
+    fn create_error_detail_explains_empty_401() {
+        assert_eq!(
+            format_create_http_detail(reqwest::StatusCode::UNAUTHORIZED, ""),
+            "empty body; SSH signature or Authorization was rejected"
+        );
+    }
 
     fn response(state: &str, exit_code: Option<i32>) -> ExecutionResponse {
         ExecutionResponse {

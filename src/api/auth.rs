@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use jsonwebtoken::Algorithm;
 use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
 use kunobi_auth::server::{
@@ -801,12 +804,40 @@ pub enum AuthError {
 impl AuthError {
     /// HTTP status for this error: credential rejections are `401`, server-side
     /// faults are `500`.
-    fn status_code(&self) -> axum::http::StatusCode {
+    fn status_code(&self) -> StatusCode {
         match self {
-            AuthError::InvalidToken(_) => axum::http::StatusCode::UNAUTHORIZED,
-            AuthError::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            AuthError::InvalidToken(_) => StatusCode::UNAUTHORIZED,
+            AuthError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    fn into_response(self) -> Response {
+        let status = self.status_code();
+        let error = if status == StatusCode::UNAUTHORIZED {
+            "Unauthorized"
+        } else {
+            "Internal auth error"
+        };
+        (
+            status,
+            Json(serde_json::json!({
+                "error": error,
+                "detail": self.to_string(),
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn missing_authorization() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized",
+            "detail": "missing Authorization header",
+        })),
+    )
+        .into_response()
 }
 
 /// Map a kunobi-auth error to kobe's, preserving the 4xx/5xx distinction: kunobi
@@ -827,7 +858,7 @@ fn map_kunobi_auth_error(e: kunobi_auth::AuthError) -> AuthError {
 impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::AppState<B>>
     for AuthIdentity
 {
-    type Rejection = axum::http::StatusCode;
+    type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -837,7 +868,7 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
             .headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
-            .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+            .ok_or_else(missing_authorization)?;
 
         // SSH-Signature path
         if let Some(ssh_header) = auth_header.strip_prefix("SSH-Signature ") {
@@ -859,14 +890,21 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
                         error = %e,
                         "SSH authentication failed"
                     );
-                    e.status_code()
+                    e.into_response()
                 });
         }
 
         // Bearer token path (existing OIDC/JWT)
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized",
+                    "detail": "Authorization must be Bearer or SSH-Signature",
+                })),
+            )
+                .into_response()
+        })?;
 
         let method = parts.method.as_str();
         let path_with_query = parts
@@ -883,7 +921,7 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
                 status = e.status_code().as_u16(),
                 "Bearer authentication failed"
             );
-            e.status_code()
+            e.into_response()
         })
     }
 }
