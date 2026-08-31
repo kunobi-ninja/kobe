@@ -271,3 +271,128 @@ pub(crate) fn lease_when_label(lease: &LeaseSummary) -> String {
         lease_phase_label(lease)
     }
 }
+
+/// Released and expired records stay on the server for audit retention.
+/// Text `kobe status` hides them unless `--all`. Recycling still occupies
+/// capacity, so it stays visible.
+pub(crate) fn is_status_hidden_phase(phase: &str) -> bool {
+    matches!(phase.to_ascii_lowercase().as_str(), "released" | "expired")
+}
+
+/// Shorten a lease id for text columns. `sandbox-68c264e7eac6158b20edc7c9`
+/// becomes `sandbox-68c264e7…7c9`. JSON keeps the full id.
+pub(crate) fn short_lease_id(id: &str) -> String {
+    const HEAD: usize = 8;
+    const TAIL: usize = 3;
+    let Some(split) = id.find('-') else {
+        return id.to_string();
+    };
+    let (prefix, rest) = id.split_at(split + 1);
+    if rest.len() <= HEAD + TAIL + 1 {
+        return id.to_string();
+    }
+    format!("{prefix}{}…{}", &rest[..HEAD], &rest[rest.len() - TAIL..])
+}
+
+/// One status cell: phase, plus TTL or queue when that is not the same word.
+pub(crate) fn lease_glance_label(lease: &LeaseSummary) -> String {
+    let phase = lease_phase_label(lease);
+    if is_status_hidden_phase(&lease.phase) {
+        return phase;
+    }
+    if lease.phase.eq_ignore_ascii_case("pending") && lease.queue_position > 0 {
+        return format!("{phase}  queue #{}", lease.queue_position);
+    }
+    let Some(expires_at) = lease.expires_at.as_deref() else {
+        return phase;
+    };
+    let when = format_relative_time(expires_at);
+    if when == "expired" || when == phase {
+        return phase;
+    }
+    let remaining = when.strip_suffix(" left").unwrap_or(&when);
+    format!("{phase}  {remaining}")
+}
+
+/// One text `kobe status` lease row: short id, optional alias, pool, glance.
+pub(crate) fn format_lease_status_line(lease: &LeaseSummary) -> String {
+    let id = short_lease_id(&lease.id);
+    let glance = lease_glance_label(lease);
+    match lease.alias.as_deref().filter(|alias| !alias.is_empty()) {
+        Some(alias) => format!("{id}  {alias}  {}  {glance}", lease.profile),
+        None => format!("{id}  {}  {glance}", lease.profile),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease(id: &str, phase: &str, expires_at: Option<&str>, queue: u32) -> LeaseSummary {
+        LeaseSummary {
+            id: id.into(),
+            phase: phase.into(),
+            resource_kind: "Sandbox".into(),
+            capabilities: Vec::new(),
+            profile: "agent-trusted".into(),
+            cluster_name: None,
+            expires_at: expires_at.map(str::to_string),
+            queue_position: queue,
+            requester: None,
+            kubeconfig_path: None,
+            alias: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn short_lease_id_keeps_prefix_and_tail() {
+        assert_eq!(
+            short_lease_id("sandbox-68c264e7eac6158b20edc7c9"),
+            "sandbox-68c264e7…7c9"
+        );
+        assert_eq!(short_lease_id("lease-abc"), "lease-abc");
+        assert_eq!(short_lease_id("lease-a1b2c3d4e5f6"), "lease-a1b2c3d4e5f6");
+        assert_eq!(short_lease_id("nohyphen"), "nohyphen");
+    }
+
+    #[test]
+    fn status_line_includes_alias_when_set() {
+        let mut named = lease("sandbox-68c264e7eac6158b20edc7c9", "Ready", None, 0);
+        named.alias = Some("pr-106".into());
+        assert_eq!(
+            format_lease_status_line(&named),
+            "sandbox-68c264e7…7c9  pr-106  agent-trusted  ready"
+        );
+        let unnamed = lease("sandbox-68c264e7eac6158b20edc7c9", "Released", None, 0);
+        assert_eq!(
+            format_lease_status_line(&unnamed),
+            "sandbox-68c264e7…7c9  agent-trusted  released"
+        );
+    }
+
+    #[test]
+    fn glance_label_does_not_repeat_expired() {
+        let expired = lease("sandbox-x", "Expired", Some("2020-01-01T00:00:00Z"), 0);
+        assert_eq!(lease_glance_label(&expired), "expired");
+        let released = lease("sandbox-x", "Released", Some("2020-01-01T00:00:00Z"), 0);
+        assert_eq!(lease_glance_label(&released), "released");
+    }
+
+    #[test]
+    fn glance_label_ready_shows_remaining_ttl() {
+        let expires = (chrono::Utc::now() + chrono::Duration::minutes(95)).to_rfc3339();
+        let ready = lease("sandbox-x", "Ready", Some(&expires), 0);
+        let label = lease_glance_label(&ready);
+        assert!(
+            label.starts_with("ready  1h "),
+            "expected remaining hours, got {label}"
+        );
+    }
+
+    #[test]
+    fn glance_label_pending_queue() {
+        let pending = lease("sandbox-x", "Pending", None, 3);
+        assert_eq!(lease_glance_label(&pending), "pending  queue #3");
+    }
+}

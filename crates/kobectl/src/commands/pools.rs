@@ -122,6 +122,24 @@ pub(crate) async fn fetch_pool_for_config_with_output(
     Ok(response.json().await?)
 }
 
+/// Ready is always shown. Other counters only when non-zero.
+pub(crate) fn format_pool_counts(pool: &PoolSummary) -> String {
+    let mut parts = vec![format!("ready {}", pool.ready)];
+    for (label, value) in [
+        ("leased", pool.leased),
+        ("creating", pool.creating),
+        ("recycling", pool.recycling),
+        ("quarantined", pool.quarantined),
+        ("unhealthy", pool.unhealthy),
+        ("queue", pool.queue_depth),
+    ] {
+        if value > 0 {
+            parts.push(format!("{label} {value}"));
+        }
+    }
+    parts.join("  ")
+}
+
 pub(crate) fn format_policy(pool: &PoolSummary) -> Option<String> {
     let Some(policy) = &pool.policy else {
         return None;
@@ -169,15 +187,7 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
 
         let phase = pool.phase.as_deref().unwrap_or("Unknown");
         println!("{indent}{}  {}  {phase}", pool.name, pool.resource_kind);
-        println!(
-            "{indent}  ready {}  leased {}  creating {}  recycling {}  quarantined {}  queue {}",
-            pool.ready,
-            pool.leased,
-            pool.creating,
-            pool.recycling,
-            pool.quarantined,
-            pool.queue_depth
-        );
+        println!("{indent}  {}", format_pool_counts(pool));
         if let Some(policy) = format_policy(pool) {
             println!("{indent}  {policy}");
         }
@@ -197,7 +207,7 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolSummary, format_policy, recycling_leases_by_pool};
+    use super::{PoolSummary, format_policy, format_pool_counts, recycling_leases_by_pool};
     use crate::commands::leases::LeaseSummary;
 
     #[test]
@@ -232,6 +242,31 @@ mod tests {
         assert!(pool.is_sandbox());
         assert!(pool.supports("exec"));
         assert!(!pool.supports("kubeconfig"));
+    }
+
+    #[test]
+    fn format_pool_counts_hides_zeros() {
+        let pool: PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "agent-trusted",
+            "resourceKind": "Sandbox",
+            "ready": 4,
+            "leased": 0,
+            "creating": 0,
+            "recycling": 0,
+            "quarantined": 0,
+            "queueDepth": 0
+        }))
+        .unwrap();
+        assert_eq!(format_pool_counts(&pool), "ready 4");
+
+        let busy: PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "ci-k3s-kunobi",
+            "ready": 4,
+            "leased": 5,
+            "creating": 2
+        }))
+        .unwrap();
+        assert_eq!(format_pool_counts(&busy), "ready 4  leased 5  creating 2");
     }
 
     #[test]

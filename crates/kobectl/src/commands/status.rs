@@ -3,8 +3,8 @@ use serde::Serialize;
 
 use super::config::{AuthMode, CliConfig};
 use super::leases::{
-    LeaseSummary, fetch_all_leases, fetch_lease, lease_cluster_label, lease_phase_label,
-    lease_when_label,
+    LeaseSummary, fetch_all_leases, fetch_lease, format_lease_status_line, is_status_hidden_phase,
+    lease_cluster_label,
 };
 use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
 use super::purge::live_lease_ids;
@@ -48,6 +48,13 @@ struct StatusOutput {
     orphan_kubeconfigs: Vec<String>,
 }
 
+fn format_status_header(endpoint: &str, endpoint_version: &str, auth_summary: &str) -> String {
+    format!(
+        "{endpoint}  cli {}  api {endpoint_version}  {auth_summary}",
+        cli_version()
+    )
+}
+
 fn auth_error_hint(error: &str) -> Option<&'static str> {
     if error.contains("found in SSH agent") {
         Some("check SSH_AUTH_SOCK and ssh-add -l")
@@ -56,10 +63,35 @@ fn auth_error_hint(error: &str) -> Option<&'static str> {
     }
 }
 
+fn hidden_lease_counts(leases: &[LeaseSummary]) -> (usize, usize) {
+    let mut released = 0;
+    let mut expired = 0;
+    for lease in leases {
+        match lease.phase.to_ascii_lowercase().as_str() {
+            "released" => released += 1,
+            "expired" => expired += 1,
+            _ => {}
+        }
+    }
+    (released, expired)
+}
+
+fn format_hidden_lease_parts(released: usize, expired: usize) -> String {
+    let mut parts = Vec::new();
+    if expired > 0 {
+        parts.push(format!("{expired} expired"));
+    }
+    if released > 0 {
+        parts.push(format!("{released} released"));
+    }
+    parts.join(", ")
+}
+
 pub async fn status(
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
+    show_all: bool,
 ) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
@@ -156,48 +188,61 @@ pub async fn status(
         });
     }
 
-    println!();
-    println!("\x1b[1mkobe\x1b[0m");
-    println!("  cli version: {}", cli_version());
-    if let Some(target) = &config.target {
-        println!("  target: {target}");
-    }
-    println!("  endpoint: {endpoint}");
-    println!("  endpoint version: {endpoint_version}");
+    println!(
+        "{}",
+        format_status_header(endpoint, endpoint_version, &auth_summary)
+    );
     super::version::warn_if_cli_behind_endpoint(endpoint_version);
-    println!();
 
-    println!("\x1b[1mAuth\x1b[0m");
-    println!("  {auth_summary}");
     if let Some(err) = &auth_error {
-        println!("  failed: {err}");
+        println!("auth failed: {err}");
         if let Some(hint) = auth_error_hint(err) {
-            println!("  hint: {hint}");
+            println!("hint: {hint}");
         }
         println!();
         return Ok(());
     }
     println!();
 
-    println!("\x1b[1mLeases\x1b[0m");
-    if leases.is_empty() {
-        println!("  none");
+    let (hidden_released, hidden_expired) = hidden_lease_counts(&leases);
+    let hidden = hidden_released + hidden_expired;
+    let mut visible: Vec<&LeaseSummary> = if show_all {
+        leases.iter().collect()
     } else {
-        for lease in &leases {
+        leases
+            .iter()
+            .filter(|lease| !is_status_hidden_phase(&lease.phase))
+            .collect()
+    };
+    if show_all {
+        visible.sort_by_key(|lease| is_status_hidden_phase(&lease.phase));
+    }
+
+    println!("\x1b[1mLeases\x1b[0m");
+    if visible.is_empty() {
+        if hidden == 0 {
+            println!("  none");
+        } else {
             println!(
-                "  {:<32}  {:<12}  {:<9}  {:<12}  {}",
-                lease.id,
-                lease.profile,
-                lease.resource_kind,
-                lease_phase_label(lease),
-                lease_when_label(lease)
+                "  none live  ({}; `kobe status --all` to list)",
+                format_hidden_lease_parts(hidden_released, hidden_expired)
             );
+        }
+    } else {
+        for lease in visible {
+            println!("  {}", format_lease_status_line(lease));
             if !lease.is_sandbox() {
                 println!("    cluster: {}", lease_cluster_label(lease));
             }
             if let Some(kubeconfig_path) = lease.kubeconfig_path.as_deref() {
                 println!("    config:  {kubeconfig_path}");
             }
+        }
+        if !show_all && hidden > 0 {
+            println!(
+                "  ({} hidden; `kobe status --all`)",
+                format_hidden_lease_parts(hidden_released, hidden_expired)
+            );
         }
     }
     if !orphan_kubeconfigs.is_empty() {
@@ -277,6 +322,71 @@ mod tests {
     /// `ssh-add -l`), not something they typed wrong. Attaching that hint to
     /// unrelated auth failures would send people chasing their agent when the
     /// real problem is an expired token or a bad issuer.
+    #[test]
+    fn status_header_is_one_line() {
+        let line = format_status_header("https://kobe.example", "main", "ssh SHA256:DpBgx...hSK8");
+        assert!(
+            !line.contains('\n'),
+            "header must be a single glance line, got {line:?}"
+        );
+        assert!(line.contains("https://kobe.example"));
+        assert!(line.contains("cli "));
+        assert!(line.contains("api main"));
+        assert!(line.contains("ssh "));
+    }
+
+    #[test]
+    fn hidden_lease_parts_name_released_and_expired() {
+        let leases = vec![
+            LeaseSummary {
+                id: "sandbox-a".into(),
+                phase: "Expired".into(),
+                resource_kind: "Sandbox".into(),
+                capabilities: Vec::new(),
+                profile: "agent-trusted".into(),
+                cluster_name: None,
+                expires_at: None,
+                queue_position: 0,
+                requester: None,
+                kubeconfig_path: None,
+                alias: None,
+                metadata: None,
+            },
+            LeaseSummary {
+                id: "sandbox-b".into(),
+                phase: "Released".into(),
+                resource_kind: "Sandbox".into(),
+                capabilities: Vec::new(),
+                profile: "agent-trusted".into(),
+                cluster_name: None,
+                expires_at: None,
+                queue_position: 0,
+                requester: None,
+                kubeconfig_path: None,
+                alias: None,
+                metadata: None,
+            },
+            LeaseSummary {
+                id: "sandbox-c".into(),
+                phase: "Ready".into(),
+                resource_kind: "Sandbox".into(),
+                capabilities: Vec::new(),
+                profile: "agent-trusted".into(),
+                cluster_name: None,
+                expires_at: None,
+                queue_position: 0,
+                requester: None,
+                kubeconfig_path: None,
+                alias: None,
+                metadata: None,
+            },
+        ];
+        assert_eq!(hidden_lease_counts(&leases), (1, 1));
+        assert_eq!(format_hidden_lease_parts(1, 2), "2 expired, 1 released");
+        assert_eq!(format_hidden_lease_parts(0, 3), "3 expired");
+        assert_eq!(format_hidden_lease_parts(1, 0), "1 released");
+    }
+
     #[test]
     fn the_ssh_hint_is_offered_only_for_the_failure_it_explains() {
         assert!(
