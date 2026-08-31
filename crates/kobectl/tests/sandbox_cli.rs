@@ -916,46 +916,17 @@ fn lost_create_body_recovers_location_without_reposting_and_cleans_up() {
 }
 
 #[test]
-fn create_server_failure_settles_a_late_parent_before_cleanup() {
-    let lease = Arc::new(Mutex::new(String::new()));
-    let visible = Arc::new(AtomicBool::new(false));
-    let deleted = Arc::new(AtomicBool::new(false));
-    let gets = Arc::new(Mutex::new(0usize));
-    let known = Arc::clone(&lease);
-    let parent_visible = Arc::clone(&visible);
-    let released = Arc::clone(&deleted);
-    let recovery_gets = Arc::clone(&gets);
+fn create_finished_503_fails_immediately_without_settle() {
     let server = Server::start(move |request, stream| {
         if request.method == "POST" && request.path == "/v1/sandbox-leases" {
-            let (_, id) = keyed_lease(&request.body);
-            *known.lock().unwrap() = id;
-            // The handler reports failure before its uncertain Kubernetes
-            // CREATE is observable to a subsequent GET.
-            reply(stream, 503, &[], "checkpoint failed");
-        } else if request.method == "DELETE" {
-            assert!(
-                parent_visible.load(Ordering::SeqCst),
-                "cleanup must not accept 404 before the uncertain parent settles"
+            reply(
+                stream,
+                503,
+                &[],
+                r#"{"error":"SandboxPool is not ready for new leases","detail":"Ready is False (CleanupBlocked)"}"#,
             );
-            released.store(true, Ordering::SeqCst);
-            reply(stream, 204, &[], "");
-        } else if request.method == "GET" {
-            let mut count = recovery_gets.lock().unwrap();
-            *count += 1;
-            if *count == 1 {
-                reply(stream, 404, &[], "");
-                return;
-            }
-            parent_visible.store(true, Ordering::SeqCst);
-            let id = known.lock().unwrap().clone();
-            let phase = if released.load(Ordering::SeqCst) {
-                "Releasing"
-            } else {
-                "Pending"
-            };
-            reply(stream, 200, &[], &lease_body(&id, phase));
         } else {
-            panic!("create failure must skip execution: {request:?}");
+            panic!("finished 503 must not recover or execute: {request:?}");
         }
     });
     let (_directory, child) = spawn_child(
@@ -969,11 +940,14 @@ fn create_server_failure_settles_a_late_parent_before_cleanup() {
     assert!(output.stderr.is_empty());
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["outcome"], "createError");
-    assert_eq!(json["cleanup"]["released"], true);
-    assert!(json["lease"].as_str().unwrap().starts_with("sandbox-"));
-    assert!(*gets.lock().unwrap() >= 3);
-    assert!(visible.load(Ordering::SeqCst));
-    assert!(deleted.load(Ordering::SeqCst));
+    assert!(json["cleanup"].is_null());
+    assert!(json["lease"].is_null());
+    let error = json["error"].as_str().expect("createError carries error");
+    assert!(error.contains("503"), "{error}");
+    assert!(
+        error.contains("SandboxPool is not ready for new leases"),
+        "{error}"
+    );
 }
 
 #[test]
