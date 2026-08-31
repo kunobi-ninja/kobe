@@ -97,7 +97,7 @@ description: Configure the kobe CLI, lease your first cluster, and release it wh
 kobe status
 ```
 
-Shows your active leases together with pool availability. For raw lease data, call `GET /v1/leases`.
+Shows your live leases together with pool availability. Released and expired records are omitted from text; pass `--all` or use `-o json` / `GET /v1/leases` for the full inventory.
 
 ## What happens when a lease expires
 

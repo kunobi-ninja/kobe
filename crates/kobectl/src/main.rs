@@ -29,7 +29,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show status overview
-    Status,
+    Status {
+        /// Include released and expired leases in text output. JSON always
+        /// includes the full inventory.
+        #[arg(long)]
+        all: bool,
+    },
     /// Show CLI and endpoint versions
     Version,
     /// Authenticate with the Kobe service.
@@ -380,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
     let output = cli.output;
 
     match cli.command {
-        Commands::Status => commands::status(target, endpoint, output).await,
+        Commands::Status { all } => commands::status(target, endpoint, output, all).await,
         Commands::Version => commands::version(target, endpoint, output).await,
         Commands::Login { device } => commands::login(target, endpoint, device).await,
         Commands::Logout => commands::logout(target, endpoint).await,

@@ -34,11 +34,12 @@ description: All kobe CLI commands with flags and examples.
 
 ```sh
 kobe status
+kobe status --all
 ```
 
-Queries `GET /v1/status` on the configured endpoint. Shows the operator version, available auth methods, active sessions, and pool summary. Does not require authentication.
+Queries `GET /v1/status` on the configured endpoint. Shows the operator version, available auth methods, your leases, and pool summary. `GET /v1/status` itself does not require authentication; lease and pool rows do.
 
-Useful for verifying connectivity and checking which auth methods the endpoint accepts before logging in.
+Text output hides released and expired leases (they stay on the server for retention). Pass `--all` to list them. JSON (`-o json`) always includes the full inventory.
 
 Authenticated pool rows include the pool phase and a `quarantined` count. A
 non-zero count means cleanup evidence is incomplete and that capacity remains
@@ -132,7 +133,7 @@ When `--ensure` reuses an existing named lease, that lease keeps its original me
 kobe status
 ```
 
-The current CLI does not expose a standalone `kobe leases` command anymore. Use `kobe status` for an endpoint summary plus your active leases, or query `GET /v1/leases` directly.
+The current CLI does not expose a standalone `kobe leases` command anymore. Use `kobe status` for an endpoint summary plus your live leases. Released and expired records are omitted from text unless you pass `--all`. Query `GET /v1/leases` or `kobe status -o json` for the full inventory.
 
 ---
 
