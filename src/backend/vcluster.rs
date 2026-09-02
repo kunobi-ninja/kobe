@@ -353,6 +353,24 @@ impl VclusterBackend {
         );
         root.insert(Value::from("controlPlane"), Value::Mapping(control_plane));
 
+        // Chart 0.34.0 defaults `rbac.enableVolumeSnapshotRules.enabled` to
+        // `auto`, which renders snapshot.storage.k8s.io rules into the
+        // vcluster Role and ClusterRole whenever private nodes are off. The
+        // operator installs the release under its own service account, and
+        // RBAC escalation prevention refuses to grant what the grantor does
+        // not hold, so every install fails before a pod exists. Kobe pools
+        // never sync volume snapshots; leave those rules out rather than
+        // widen the operator's grant. A pool that needs them can set the key
+        // back through `VclusterConfig.values`, which is merged last.
+        let mut volume_snapshot_rules = Mapping::new();
+        volume_snapshot_rules.insert(Value::from("enabled"), Value::from(false));
+        let mut rbac = Mapping::new();
+        rbac.insert(
+            Value::from("enableVolumeSnapshotRules"),
+            Value::Mapping(volume_snapshot_rules),
+        );
+        root.insert(Value::from("rbac"), Value::Mapping(rbac));
+
         let body = serde_yaml_ng::to_string(&Value::Mapping(root))
             // Serializing a mapping of plain scalars cannot fail; fall back to
             // an empty document rather than panicking in a reconcile.
@@ -887,6 +905,29 @@ mod tests {
             v["controlPlane"]["distro"]["k8s"]["version"].as_str(),
             Some("v1.32.3"),
             "a missing `v` must be added, got: {yaml}"
+        );
+    }
+
+    /// Chart 0.34.0 renders snapshot.storage.k8s.io rules by default, and the
+    /// operator's service account does not hold them. Kubernetes refuses to
+    /// let a grantor hand out permissions it lacks, so with the chart default
+    /// every vcluster install died at the ClusterRole and no instance ever
+    /// reached Ready. Kobe pools never sync volume snapshots, so the defaults
+    /// have to switch the rules off explicitly.
+    #[tokio::test]
+    async fn default_values_leave_out_snapshot_rbac_the_operator_cannot_delegate() {
+        let b = offline_backend(None);
+        let cfg = ClusterConfig {
+            version: "v1.32.3".to_string(),
+            servers: 1,
+            ..Default::default()
+        };
+        let yaml = b.default_values_yaml("foo", &cfg);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            v["rbac"]["enableVolumeSnapshotRules"]["enabled"].as_bool(),
+            Some(false),
+            "snapshot RBAC must be disabled, not left to the chart's `auto`, got: {yaml}"
         );
     }
 

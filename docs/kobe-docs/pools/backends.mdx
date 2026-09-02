@@ -95,6 +95,8 @@ Values that do not name a real tag fail visibly, as an `ImagePullBackOff` on the
 
 > **Changed behaviour.** Earlier releases ignored `cluster.version` on this backend entirely, so every vcluster pool silently ran the chart default regardless of what its manifest said. If your pool carries a version that was never taking effect, check it names a real tag before upgrading — it now will.
 
+**Volume snapshot RBAC.** The operator installs each release under its own service account, and Kubernetes refuses to let it grant permissions it does not hold. Chart 0.34.0 renders `snapshot.storage.k8s.io` rules by default, so the operator sets `rbac.enableVolumeSnapshotRules.enabled: false`. Kobe pools do not sync volume snapshots. If a pool needs them, set the key back in `values` and grant the operator the matching rules.
+
 **When to use:** High density and low per-cluster overhead without maintaining an in-house syncer. Note that fidelity boundaries (cloud identity such as IRSA, syncer coverage, version skew) are inherited from vcluster — route tenants who need full cluster semantics to a real-cluster backend.
 
 ## vkobe (on hold)
