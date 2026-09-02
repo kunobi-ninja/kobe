@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::config::ResolvedConfig;
-use super::{OutputFormat, authed_client, get_auth_header, get_auth_header_for_output, with_auth};
+use super::{
+    OutputFormat, Reaching, authed_client, get_auth_header, get_auth_header_for_output, with_auth,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,7 +77,8 @@ pub(crate) async fn fetch_leases_path(
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to list leases (HTTP {})", response.status());
@@ -96,7 +99,8 @@ async fn fetch_sandbox_leases_with_output(
         &token,
     )
     .send()
-    .await?;
+    .await
+    .reaching(config)?;
     let status = response.status();
     if matches!(status.as_u16(), 403 | 404 | 501) {
         return Ok(Vec::new());
@@ -139,7 +143,8 @@ pub(crate) async fn fetch_all_leases_with_output(
         let token = get_auth_header_for_output(config, "GET", path, b"", output).await?;
         let response = with_auth(authed_client().get(format!("{endpoint}{path}")), &token)
             .send()
-            .await?;
+            .await
+            .reaching(config)?;
         if !response.status().is_success() {
             anyhow::bail!("Failed to list leases (HTTP {})", response.status());
         }
@@ -211,7 +216,8 @@ pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Resu
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
 
     if !response.status().is_success() {
         anyhow::bail!(
