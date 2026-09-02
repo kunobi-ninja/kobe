@@ -208,10 +208,15 @@ is yours.
 An interactive session inside the sandbox.
 
 ```bash
+kobe attach                          # pick from your attachable leases
 kobe attach dev                      # attach to the running process
 kobe attach dev -- /bin/bash         # start a shell instead
 kobe attach dev --no-tty -- command  # run without allocating a terminal
 ```
+
+With no lease, `kobe attach` takes the only attachable lease you hold, or opens
+a picker when there are several. Leases that cannot serve `attach` — a cluster
+lease, for one — are not offered.
 
 The terminal goes into raw mode, so **Ctrl-C reaches your workload** rather
 than killing `kobe`. Resizing the window is forwarded, so a shell inside keeps

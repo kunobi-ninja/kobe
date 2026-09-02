@@ -59,6 +59,22 @@ pub async fn require_pool_capability(
 
 /// Resolve an exact ID, alias, or unique pool selector and reject an
 /// incompatible operation before it reaches a kind-specific route.
+/// Resolve a lease for a capability when the caller named none.
+///
+/// `kobe attach` with no argument: one attachable lease is taken, several open
+/// the picker, none is an error naming the verb. Kept beside
+/// [`require_lease_capability`] so a named lease and an unnamed one answer the
+/// same question about what the lease can serve.
+pub async fn pick_lease_with_capability(
+    capability: &str,
+    target_override: Option<&str>,
+    endpoint_override: Option<&str>,
+    output: OutputFormat,
+) -> anyhow::Result<String> {
+    let config = config::CliConfig::load()?.resolve(target_override, endpoint_override)?;
+    select::resolve_lease_for_capability(&config, capability, output).await
+}
+
 pub async fn require_lease_capability(
     selector: &str,
     capability: &str,

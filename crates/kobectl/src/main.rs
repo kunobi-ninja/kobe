@@ -89,8 +89,10 @@ enum Commands {
         execution: String,
     },
     /// Attach to a lease that supports `attach`.
+    ///
+    /// With no lease, picks the only attachable one or opens a picker.
     Attach {
-        lease: String,
+        lease: Option<String>,
         #[arg(long)]
         container: Option<String>,
         #[arg(long)]
@@ -267,7 +269,7 @@ enum SandboxAction {
     ///
     /// With no command, attaches to the container's existing process.
     Attach {
-        lease: String,
+        lease: Option<String>,
         #[arg(long)]
         container: Option<String>,
         /// Run without allocating a terminal.
@@ -527,10 +529,6 @@ async fn main() -> anyhow::Result<()> {
             no_tty,
             command,
         } => {
-            let lease =
-                commands::require_lease_capability(&lease, "attach", target, endpoint, output)
-                    .await
-                    .unwrap_or_else(|error| exit_resource_error(error, output));
             dispatch_resource_action(
                 SandboxAction::Attach {
                     lease,
@@ -688,6 +686,19 @@ async fn dispatch_resource_action(
             no_tty,
             command,
         } => {
+            // One resolution point for both spellings: a named lease must
+            // advertise `attach`, and an unnamed one opens the picker over
+            // the leases that do.
+            let lease = match lease {
+                Some(lease) => {
+                    commands::require_lease_capability(&lease, "attach", target, endpoint, output)
+                        .await
+                }
+                None => {
+                    commands::pick_lease_with_capability("attach", target, endpoint, output).await
+                }
+            }
+            .unwrap_or_else(|error| exit_resource_error(error, output));
             commands::sandbox_transport::attach(
                 &lease,
                 &command,

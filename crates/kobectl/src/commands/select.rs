@@ -97,6 +97,80 @@ fn select(
     }
 }
 
+/// Render lease candidates for the interactive picker.
+///
+/// Shared so every picker describes a lease the same way: whichever command
+/// opened it, the caller is choosing between the same rows.
+fn picker_items(candidates: &[LeaseSummary]) -> Vec<PickerItem> {
+    candidates
+        .iter()
+        .map(|lease| PickerItem {
+            primary: format!(
+                "{}  {}  {}",
+                lease.id,
+                lease.profile,
+                lease_when_label(lease)
+            ),
+            secondary: format!(
+                "kind: {}   phase: {}   resource: {}",
+                lease.resource_kind,
+                lease_phase_label(lease),
+                lease_cluster_label(lease)
+            ),
+        })
+        .collect()
+}
+
+/// Active leases that advertise `capability`.
+///
+/// Both halves matter. A released lease is gone, and a lease that never
+/// advertised the verb cannot serve it: cluster leases carry `kubeconfig`, not
+/// `attach`, so offering one in an attach picker would be offering a choice
+/// that can only fail.
+fn serving(leases: Vec<LeaseSummary>, capability: &str) -> Vec<LeaseSummary> {
+    leases
+        .into_iter()
+        .filter(is_active)
+        .filter(|lease| {
+            lease
+                .capabilities
+                .iter()
+                .any(|advertised| advertised == capability)
+        })
+        .collect()
+}
+
+/// Resolve a lease that advertises `capability`, with no target given.
+///
+/// `kobe attach` with no argument is the case where the caller knows they want
+/// a session but not which lease. Only leases that actually serve the verb are
+/// offered: a cluster lease never advertises `attach`, and listing one would
+/// be offering a choice that can only fail.
+pub(crate) async fn resolve_lease_for_capability(
+    config: &ResolvedConfig,
+    capability: &str,
+    output: OutputFormat,
+) -> Result<String> {
+    let capable = serving(fetch_all_leases(config).await?, capability);
+
+    if capable.is_empty() {
+        anyhow::bail!("No active lease supports `{capability}`. `kobe ls` shows what you hold.");
+    }
+
+    match select(capable, None, output, OnAmbiguous::Reject)? {
+        Selection::Resolved(id) => Ok(id),
+        Selection::NeedsPicker(candidates) => {
+            let items = picker_items(&candidates);
+            let selected = run_picker(
+                &format!("Select a lease to {capability}"),
+                "↑/↓ to move · Enter to select · q to cancel",
+                &items,
+            )?;
+            Ok(candidates[selected].id.clone())
+        }
+    }
+}
+
 /// Resolve a user-supplied selector to a concrete lease id.
 ///
 /// Precedence:
@@ -120,23 +194,7 @@ pub(crate) async fn resolve_lease_id(
     match select(active, target, output, on_ambiguous)? {
         Selection::Resolved(id) => Ok(id),
         Selection::NeedsPicker(candidates) => {
-            let items: Vec<PickerItem> = candidates
-                .iter()
-                .map(|lease| PickerItem {
-                    primary: format!(
-                        "{}  {}  {}",
-                        lease.id,
-                        lease.profile,
-                        lease_when_label(lease)
-                    ),
-                    secondary: format!(
-                        "kind: {}   phase: {}   resource: {}",
-                        lease.resource_kind,
-                        lease_phase_label(lease),
-                        lease_cluster_label(lease)
-                    ),
-                })
-                .collect();
+            let items = picker_items(&candidates);
             let selected = run_picker(
                 "Select a lease",
                 "↑/↓ to move · Enter to select · q to cancel",
@@ -177,6 +235,38 @@ mod tests {
             alias: None,
             metadata: None,
         }
+    }
+
+    /// An attach picker must only offer leases that can actually attach.
+    ///
+    /// Cluster leases advertise `kubeconfig` and never `attach`, so listing
+    /// one would be offering a choice that fails after the user commits to
+    /// it. Released leases are gone regardless of what they once advertised.
+    #[test]
+    fn only_active_leases_advertising_the_verb_are_offered() {
+        let attachable = |id: &str, phase: &str| {
+            let mut lease = lease(id, "agent-small", phase);
+            lease.resource_kind = "Sandbox".to_string();
+            lease.capabilities = vec!["lease".to_string(), "attach".to_string()];
+            lease
+        };
+
+        let offered = serving(
+            vec![
+                attachable("sbx-ready", "Ready"),
+                // Right verb, but the lease is over.
+                attachable("sbx-released", "Released"),
+                // Active, but a cluster lease cannot serve attach.
+                lease("cluster-1", "e2e-k3s", "Bound"),
+            ],
+            "attach",
+        );
+
+        let ids: Vec<&str> = offered.iter().map(|lease| lease.id.as_str()).collect();
+        assert_eq!(ids, vec!["sbx-ready"]);
+
+        // A verb nothing advertises yields nothing rather than everything.
+        assert!(serving(vec![attachable("sbx-ready", "Ready")], "port-forward").is_empty());
     }
 
     fn resolved(sel: Selection) -> String {
