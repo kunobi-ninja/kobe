@@ -384,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = cli.endpoint.as_deref();
     let output = cli.output;
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Status { all } => commands::status(target, endpoint, output, all).await,
         Commands::Version => commands::version(target, endpoint, output).await,
         Commands::Login { device } => commands::login(target, endpoint, device).await,
@@ -611,6 +611,15 @@ async fn main() -> anyhow::Result<()> {
             }
             None => print_config_help(),
         },
+    };
+    // One place decides how a failure reaches the caller: every command
+    // prints the same `kobe:` prefix in text mode and the same structured
+    // body under `--output json`. Returning the error to `main` instead
+    // printed anyhow's own `Error:` for everything except the sandbox
+    // actions, which routed through here already.
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => exit_resource_error(error, output),
     }
 }
 

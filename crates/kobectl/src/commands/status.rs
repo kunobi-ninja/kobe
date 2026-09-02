@@ -9,7 +9,9 @@ use super::leases::{
 use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
 use super::purge::live_lease_ids;
 use super::state::{find_orphan_kubeconfigs, resolve_kubeconfig_path};
-use super::{OutputFormat, authed_client, cli_version, get_auth_header, print_json, with_auth};
+use super::{
+    OutputFormat, Reaching, authed_client, cli_version, get_auth_header, print_json, with_auth,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,7 +108,8 @@ pub async fn status(
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/status")), &token)
         .send()
-        .await?;
+        .await
+        .reaching(&config)?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to get status (HTTP {})", response.status());

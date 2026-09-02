@@ -376,6 +376,132 @@ fn apply_tofu_result(
 }
 
 /// Build an HTTP request with optional auth.
+/// Why a request never reached the server, in terms the caller can act on.
+///
+/// `reqwest` errors arrive as a chain — request, then connect, then the
+/// operating system's resolver text — and printing the chain gives the caller
+/// three clauses of plumbing and no idea what to do. Nothing below the top
+/// layer is theirs to fix; what is theirs is the endpoint, the VPN, and
+/// whether the server is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unreachable {
+    Dns,
+    Refused,
+    TimedOut,
+    Tls,
+    Other,
+}
+
+impl Unreachable {
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Dns => "the host name does not resolve",
+            Self::Refused => "nothing is listening there",
+            Self::TimedOut => "the connection timed out",
+            Self::Tls => "the TLS handshake failed",
+            Self::Other => "the connection failed",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Dns => {
+                "A private cluster resolves only from its network: connect the VPN, or check the endpoint for a typo."
+            }
+            Self::Refused => {
+                "The name resolves, so the address is reachable but nothing answered. Check that the kobe ingress is up."
+            }
+            Self::TimedOut => {
+                "The address is routable but silent, which usually means a firewall or a missing VPN route."
+            }
+            Self::Tls => {
+                "The server's certificate was rejected. Check that the endpoint host matches the certificate."
+            }
+            Self::Other => "Check the endpoint and that the kobe server is reachable from here.",
+        }
+    }
+}
+
+/// Classify a transport failure.
+///
+/// The typed predicates carry the bucket; the resolver's own words are the
+/// only place DNS is distinguishable from a refused connection, because both
+/// surface as `is_connect`. Matching that text is unlovely but it is the
+/// difference between "connect the VPN" and "the server is down", which is
+/// the entire value of the message.
+pub(crate) fn classify_unreachable(error: &reqwest::Error) -> Unreachable {
+    if error.is_timeout() {
+        return Unreachable::TimedOut;
+    }
+
+    let mut chain = String::new();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        chain.push_str(&current.to_string().to_ascii_lowercase());
+        chain.push(' ');
+        source = current.source();
+    }
+
+    if chain.contains("dns error") || chain.contains("failed to lookup address") {
+        Unreachable::Dns
+    } else if chain.contains("connection refused") {
+        Unreachable::Refused
+    } else if chain.contains("timed out") {
+        Unreachable::TimedOut
+    } else if chain.contains("certificate") || chain.contains("tls") {
+        Unreachable::Tls
+    } else {
+        // Including `is_connect` with no recognisable cause: the bucket is
+        // the same, and a hint that guesses would be worse than a general one.
+        Unreachable::Other
+    }
+}
+
+/// Render the message a caller sees when kobe cannot be reached.
+pub(crate) fn unreachable_message(
+    endpoint: &str,
+    target: Option<&str>,
+    kind: Unreachable,
+) -> String {
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or(endpoint);
+    let origin = match target {
+        Some(target) => format!("target    {target}"),
+        None => "target    (none: endpoint given directly)".to_string(),
+    };
+    format!(
+        "cannot reach kobe at {host}: {summary}\n\n  endpoint  {endpoint}\n  {origin}\n\n  {hint}\n  `kobe config view` shows where this endpoint came from.",
+        summary = kind.summary(),
+        hint = kind.hint(),
+    )
+}
+
+/// Attach the reachability explanation to a failed request.
+pub(crate) trait Reaching<T> {
+    fn reaching(self, config: &ResolvedConfig) -> anyhow::Result<T>;
+}
+
+impl<T> Reaching<T> for Result<T, reqwest::Error> {
+    fn reaching(self, config: &ResolvedConfig) -> anyhow::Result<T> {
+        self.map_err(|error| {
+            if error.is_builder() || error.is_body() || error.is_decode() {
+                // Not a reachability problem; the caller's own message is
+                // better than a story about the network.
+                return anyhow::Error::new(error);
+            }
+            anyhow::anyhow!(unreachable_message(
+                &config.endpoint,
+                config.target.as_deref(),
+                classify_unreachable(&error),
+            ))
+        })
+    }
+}
+
 pub(crate) fn authed_client() -> reqwest::Client {
     reqwest::Client::new()
 }
@@ -388,6 +514,65 @@ pub(crate) fn with_auth(
     match auth_header {
         Some(h) => builder.header("Authorization", h),
         None => builder,
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    /// The message names the host, what failed, and where the endpoint came
+    /// from. A caller who sees it should not have to run anything to know
+    /// which of their machines is wrong.
+    #[test]
+    fn an_unreachable_message_names_the_host_target_and_remedy() {
+        let message = unreachable_message(
+            "https://kobe.zur1-worker1.int-pro.zondax.io",
+            Some("int-pro"),
+            Unreachable::Dns,
+        );
+        assert!(
+            message.starts_with("cannot reach kobe at kobe.zur1-worker1.int-pro.zondax.io: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("the host name does not resolve"),
+            "{message}"
+        );
+        assert!(message.contains("int-pro"), "{message}");
+        assert!(message.contains("VPN"), "{message}");
+        // The operating system's resolver text is exactly what this replaces.
+        assert!(!message.contains("nodename"), "{message}");
+        assert!(!message.contains("servname"), "{message}");
+
+        // An endpoint passed directly has no target to name, and must say so
+        // rather than printing an empty field.
+        let direct = unreachable_message("http://127.0.0.1:8080", None, Unreachable::Refused);
+        assert!(direct.contains("endpoint given directly"), "{direct}");
+        assert!(direct.contains("nothing is listening there"), "{direct}");
+        // Host extraction keeps the port and drops the scheme and path.
+        assert!(direct.contains("at 127.0.0.1:8080:"), "{direct}");
+    }
+
+    /// DNS and a refused connection both arrive as `is_connect`, and they ask
+    /// the caller to do completely different things. Distinguishing them is
+    /// the whole point of classifying.
+    #[test]
+    fn resolver_and_refusal_are_told_apart() {
+        assert_eq!(Unreachable::Dns.summary(), "the host name does not resolve");
+        assert_eq!(Unreachable::Refused.summary(), "nothing is listening there");
+        assert_ne!(Unreachable::Dns.hint(), Unreachable::Refused.hint());
+        // Every bucket offers something to do next.
+        for kind in [
+            Unreachable::Dns,
+            Unreachable::Refused,
+            Unreachable::TimedOut,
+            Unreachable::Tls,
+            Unreachable::Other,
+        ] {
+            assert!(!kind.hint().is_empty(), "{kind:?} has no hint");
+            assert!(!kind.summary().is_empty(), "{kind:?} has no summary");
+        }
     }
 }
 
