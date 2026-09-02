@@ -217,6 +217,22 @@ The terminal goes into raw mode, so **Ctrl-C reaches your workload** rather
 than killing `kobe`. Resizing the window is forwarded, so a shell inside keeps
 rendering to the size you can actually see.
 
+Input is forwarded **byte for byte**, so a full-screen program on the far side
+works as it would locally: function keys, alt combinations, mouse reporting,
+bracketed paste and the kitty keyboard protocol all reach it. That is what
+lets you run a multiplexer or an editor inside a sandbox:
+
+```bash
+kobe attach dev -- zellij attach --create kobe
+```
+
+Running the multiplexer inside the sandbox also means your session survives a
+disconnect: reattaching resumes it rather than starting over.
+
+<Callout type="info">
+Byte transparency needs a Unix client and a terminal. Elsewhere `kobe` falls back to decoding keystrokes and re-encoding them, which carries ordinary typing, arrows and control keys but not mouse or paste.
+</Callout>
+
 The terminal is restored on every exit path, including a panic — a process
 that dies in raw mode leaves you with a terminal that does not echo.
 
