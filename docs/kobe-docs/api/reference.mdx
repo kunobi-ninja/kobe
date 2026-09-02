@@ -488,6 +488,11 @@ lease returns `204 No Content`. A `Quarantined` lease returns `409 Conflict`:
 cleanup is still uncertain, so its capacity remains unavailable rather than
 being reported as released.
 
+The intent write is fenced on the lease as read, so a controller write that
+lands in between makes the API re-read and try again. If the lease is still
+changing after a few attempts, the API answers `409 Conflict` with reason
+`conflict_retryable`; retry the release.
+
 ### `POST /v1/sandbox-leases/:id/executions`
 
 Reserves the execution before starting its process, so retrying the same

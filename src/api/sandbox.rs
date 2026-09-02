@@ -4658,6 +4658,16 @@ fn parse_lease_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|value| value.with_timezone(&chrono::Utc))
 }
 
+/// How many times a release re-reads the lease after its fenced patch loses
+/// to a controller write before telling the caller to retry.
+///
+/// The controller writes a lease a handful of times between admission and
+/// readiness; a cancellation that lands in that window loses once or twice,
+/// not five times. The backoff grows linearly per attempt, so the whole
+/// budget is about a second.
+const RELEASE_FENCE_ATTEMPTS: u32 = 5;
+const RELEASE_FENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[tracing::instrument(skip_all)]
 pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -4668,139 +4678,175 @@ pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
         return response;
     }
     let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
-        Ok(Some(lease)) => lease,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
-    };
-    let policy = policy_for(&identity);
-    if !is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Release, &policy) {
-        return sandbox_error(
-            StatusCode::FORBIDDEN,
-            "Sandbox release is not allowed",
-            None,
-        );
-    }
+    // Each pass reads the lease and fences the release patch on that read's
+    // resourceVersion, so the patch loses whenever the controller wrote the
+    // lease in between. That is routine right after admission, while the
+    // controller is still recording placement, and it is exactly when a
+    // caller cancels a lease it no longer wants. A lost fence is not an
+    // outage: re-read and decide again against the current lease. Every early
+    // return in the pass is made on the fresh read, so a retry never writes
+    // intent over newer terminal state.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
+        };
+        let policy = policy_for(&identity);
+        if !is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Release, &policy) {
+            return sandbox_error(
+                StatusCode::FORBIDDEN,
+                "Sandbox release is not allowed",
+                None,
+            );
+        }
 
-    let phase = lease
-        .status
-        .as_ref()
-        .map(|status| status.phase)
-        .unwrap_or_default();
-    if phase == SandboxLeasePhase::Quarantined {
-        // The cluster release path reports the identical condition as
-        // `TeardownQuarantined`; the sandbox path now carries the same bounded
-        // reason instead of free text alone.
-        return sandbox_error_with_reason(
-            StatusCode::CONFLICT,
-            "Sandbox cleanup is quarantined",
-            Some("Cleanup remains uncertain; capacity has not been released".into()),
-            "teardown_quarantined",
-        );
-    }
-    if matches!(
-        phase,
-        SandboxLeasePhase::Released | SandboxLeasePhase::Expired
-    ) {
-        return StatusCode::NO_CONTENT.into_response();
-    }
+        let phase = lease
+            .status
+            .as_ref()
+            .map(|status| status.phase)
+            .unwrap_or_default();
+        if phase == SandboxLeasePhase::Quarantined {
+            // The cluster release path reports the identical condition as
+            // `TeardownQuarantined`; the sandbox path now carries the same bounded
+            // reason instead of free text alone.
+            return sandbox_error_with_reason(
+                StatusCode::CONFLICT,
+                "Sandbox cleanup is quarantined",
+                Some("Cleanup remains uncertain; capacity has not been released".into()),
+                "teardown_quarantined",
+            );
+        }
+        if matches!(
+            phase,
+            SandboxLeasePhase::Released | SandboxLeasePhase::Expired
+        ) {
+            return StatusCode::NO_CONTENT.into_response();
+        }
 
-    if lease
-        .annotations()
-        .get(SANDBOX_ADMISSION_ANNOTATION)
-        .map(String::as_str)
-        != Some(SANDBOX_ADMISSION_ADMITTED)
-    {
-        let reservations: Api<Lease> =
-            Api::namespaced(state.client.clone(), &state.sandbox_reservation_namespace);
-        if pristine_pending_lease(&lease).is_ok() {
-            let admission = lease
-                .annotations()
-                .get(SANDBOX_ADMISSION_ANNOTATION)
-                .map(String::as_str);
-            if !matches!(
-                admission,
-                Some(SANDBOX_ADMISSION_PENDING) | Some(SANDBOX_ADMISSION_CANCELLED)
-            ) {
-                match pristine_parent_has_no_live_reservations(&reservations, &lease).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return sandbox_error(
-                            StatusCode::CONFLICT,
-                            "Sandbox admission state is ambiguous",
-                            Some(
-                                "Lease retained because live admission reservations still exist"
-                                    .into(),
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        return sandbox_infra_error(
-                            "Failed to prove unadmitted Sandbox reservations absent",
-                            err,
-                        );
+        if lease
+            .annotations()
+            .get(SANDBOX_ADMISSION_ANNOTATION)
+            .map(String::as_str)
+            != Some(SANDBOX_ADMISSION_ADMITTED)
+        {
+            let reservations: Api<Lease> =
+                Api::namespaced(state.client.clone(), &state.sandbox_reservation_namespace);
+            if pristine_pending_lease(&lease).is_ok() {
+                let admission = lease
+                    .annotations()
+                    .get(SANDBOX_ADMISSION_ANNOTATION)
+                    .map(String::as_str);
+                if !matches!(
+                    admission,
+                    Some(SANDBOX_ADMISSION_PENDING) | Some(SANDBOX_ADMISSION_CANCELLED)
+                ) {
+                    match pristine_parent_has_no_live_reservations(&reservations, &lease).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return sandbox_error(
+                                StatusCode::CONFLICT,
+                                "Sandbox admission state is ambiguous",
+                                Some(
+                                    "Lease retained because live admission reservations still exist"
+                                        .into(),
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            return sandbox_infra_error(
+                                "Failed to prove unadmitted Sandbox reservations absent",
+                                err,
+                            );
+                        }
                     }
                 }
+                return match delete_exact_pending_lease(&leases, &reservations, &lease).await {
+                    Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                    Err(err) => {
+                        sandbox_infra_error("Failed to remove unadmitted Sandbox lease", err)
+                    }
+                };
             }
-            return match delete_exact_pending_lease(&leases, &reservations, &lease).await {
+
+            let persisted = match proven_active_release_shape(&lease, &state.namespace) {
+                Ok(persisted) => persisted,
+                Err(_) => {
+                    return sandbox_error(
+                        StatusCode::CONFLICT,
+                        "Sandbox admission state is ambiguous",
+                        Some(
+                            "Lease retained; active or corrupt state requires verified teardown"
+                                .into(),
+                        ),
+                    );
+                }
+            };
+            return match repair_admitted_release_intent(&leases, &reservations, &lease, &persisted)
+                .await
+            {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(err) => sandbox_infra_error("Failed to remove unadmitted Sandbox lease", err),
+                Err(err) => sandbox_infra_error(
+                    "Failed to repair Sandbox admission for verified teardown",
+                    err,
+                ),
             };
         }
+        if phase == SandboxLeasePhase::Releasing {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        if lease
+            .annotations()
+            .contains_key(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
+        {
+            return StatusCode::NO_CONTENT.into_response();
+        }
 
-        let persisted = match proven_active_release_shape(&lease, &state.namespace) {
-            Ok(persisted) => persisted,
-            Err(_) => {
-                return sandbox_error(
-                    StatusCode::CONFLICT,
-                    "Sandbox admission state is ambiguous",
-                    Some(
-                        "Lease retained; active or corrupt state requires verified teardown".into(),
-                    ),
-                );
-            }
+        let Some(resource_version) = lease.resource_version() else {
+            return sandbox_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Sandbox lease has no resourceVersion",
+                None,
+            );
         };
-        return match repair_admitted_release_intent(&leases, &reservations, &lease, &persisted)
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": resource_version,
+                "annotations": {
+                    SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION: chrono::Utc::now().to_rfc3339()
+                }
+            }
+        });
+        match leases
+            .patch(&id, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(err) => sandbox_infra_error(
-                "Failed to repair Sandbox admission for verified teardown",
-                err,
-            ),
-        };
-    }
-    if phase == SandboxLeasePhase::Releasing {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    if lease
-        .annotations()
-        .contains_key(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
-    {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
-    let Some(resource_version) = lease.resource_version() else {
-        return sandbox_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Sandbox lease has no resourceVersion",
-            None,
-        );
-    };
-    let patch = serde_json::json!({
-        "metadata": {
-            "resourceVersion": resource_version,
-            "annotations": {
-                SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION: chrono::Utc::now().to_rfc3339()
+            Ok(_) => return StatusCode::NO_CONTENT.into_response(),
+            Err(kube::Error::Api(api)) if api.code == 409 => {
+                if attempt >= RELEASE_FENCE_ATTEMPTS {
+                    warn!(
+                        lease = %id,
+                        attempts = attempt,
+                        "Sandbox release fence kept losing to controller writes"
+                    );
+                    return sandbox_error_with_reason(
+                        StatusCode::CONFLICT,
+                        "Sandbox lease changed during release",
+                        Some("retry the release against the current lease".into()),
+                        "conflict_retryable",
+                    );
+                }
+                info!(
+                    lease = %id,
+                    attempt,
+                    "Sandbox release fence lost to a controller write; re-reading"
+                );
+                tokio::time::sleep(RELEASE_FENCE_BACKOFF * attempt).await;
             }
+            Err(err) => return sandbox_infra_error("Failed to request Sandbox release", err),
         }
-    });
-    match leases
-        .patch(&id, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => sandbox_infra_error("Failed to request Sandbox release", err),
     }
 }
 
@@ -13905,6 +13951,137 @@ mod tests {
                 .is_some()
         );
         assert!(body.get("status").is_none());
+    }
+
+    /// The controller writes a fresh lease several times between admission
+    /// and readiness. A caller cancelling in that window used to be told the
+    /// service was unavailable, because the fenced intent patch lost to one
+    /// of those writes and the 409 was reported as infrastructure failure.
+    /// The release must re-read and fence again on the current lease.
+    #[tokio::test]
+    async fn release_re_reads_when_its_fence_loses_to_a_controller_write() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let lease_path = sandbox_lease_path("sandbox-racing");
+        // Every read hands out the current lease and then simulates the
+        // controller writing it, so the first fenced patch is stale by the
+        // time it lands and only the second matches.
+        let state = Arc::new(std::sync::Mutex::new(lease_json(
+            "sandbox-racing",
+            "alice@example.com",
+            "Pending",
+        )));
+        let get_state = Arc::clone(&state);
+        Mock::given(method("GET"))
+            .and(path(lease_path.clone()))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut lease = get_state.lock().unwrap();
+                let served = lease.clone();
+                lease["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(200).set_body_json(served)
+            })
+            .mount(&server)
+            .await;
+        let patch_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path(lease_path.clone()))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let current = patch_state.lock().unwrap();
+                if body["metadata"]["resourceVersion"] != current["metadata"]["resourceVersion"] {
+                    return ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "reason": "Conflict",
+                        "message": "the object has been modified; please apply your changes to the latest version and try again",
+                        "code": 409
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(current.clone())
+            })
+            .mount(&server)
+            .await;
+
+        let response = release_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path("sandbox-racing".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let requests = server.received_requests().await.unwrap();
+        let fences: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["metadata"]
+                    ["resourceVersion"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            fences,
+            vec![serde_json::json!("1"), serde_json::json!("2")],
+            "the retry must fence on the re-read lease, not repeat the stale patch"
+        );
+        let reads = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == lease_path)
+            .count();
+        assert_eq!(reads, 2, "each attempt decides against a fresh read");
+    }
+
+    /// A fence that keeps losing is a contended lease, not an outage. The
+    /// caller is told to retry against current state, with the same bounded
+    /// reason extension uses, instead of a 503 that reads as a broken API.
+    #[tokio::test]
+    async fn release_reports_a_persistently_lost_fence_as_a_retryable_conflict() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let lease_path = sandbox_lease_path("sandbox-contended");
+        Mock::given(method("GET"))
+            .and(path(lease_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "sandbox-contended",
+                "alice@example.com",
+                "Ready",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(lease_path.clone()))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "message": "the object has been modified",
+                "code": 409
+            })))
+            .mount(&server)
+            .await;
+
+        let response = release_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path("sandbox-contended".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "conflict_retryable", "{body}");
+
+        let requests = server.received_requests().await.unwrap();
+        let patches = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .count();
+        assert_eq!(
+            patches, RELEASE_FENCE_ATTEMPTS as usize,
+            "the fence budget is spent before the caller is asked to retry"
+        );
     }
 
     #[tokio::test]
