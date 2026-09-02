@@ -154,7 +154,9 @@ pub(crate) async fn resolve_lease_for_capability(
     let capable = serving(fetch_all_leases(config).await?, capability);
 
     if capable.is_empty() {
-        anyhow::bail!("No active lease supports `{capability}`. `kobe ls` shows what you hold.");
+        anyhow::bail!(
+            "No active lease supports `{capability}`. `kobe status` lists what you hold."
+        );
     }
 
     match select(capable, None, output, OnAmbiguous::Reject)? {
