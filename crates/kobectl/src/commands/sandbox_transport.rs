@@ -272,7 +272,116 @@ async fn open_stream(config: &ResolvedConfig, path: &str, output: OutputFormat) 
 }
 
 /// Copy between this terminal and the stream until one of them ends.
+/// Write one server frame to the local terminal.
+///
+/// Returns the end reason once the session is over, so both input paths share
+/// one definition of "the stream said we are done".
+fn apply_server_frame(message: &Message) -> Option<String> {
+    match parse_server_frame(message) {
+        Some(ServerFrame::Stdout(bytes)) => {
+            let mut out = std::io::stdout();
+            out.write_all(&bytes).ok();
+            out.flush().ok();
+            None
+        }
+        Some(ServerFrame::Stderr(bytes)) => {
+            let mut err = std::io::stderr();
+            err.write_all(&bytes).ok();
+            err.flush().ok();
+            None
+        }
+        Some(ServerFrame::Ended { reason }) => Some(reason),
+        // A channel this client does not know. Ignored so a server that adds
+        // one does not break a client that never needed it.
+        Some(ServerFrame::Unknown) | None => None,
+    }
+}
+
 async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
+    #[cfg(unix)]
+    if tty {
+        return pump_raw(socket).await;
+    }
+    pump_key_events(socket, tty).await
+}
+
+/// Forward stdin byte for byte, interpreting nothing.
+///
+/// A full-screen program on the far side — zellij, tmux, vim — negotiates its
+/// own input modes by writing escape sequences that reach the real terminal,
+/// which then answers on stdin. Mouse reporting, bracketed paste, focus events
+/// and the kitty keyboard protocol all work that way. A client that decodes
+/// keystrokes and re-encodes them cannot participate: it drops every sequence
+/// its own key table has no name for, so the remote program enables a mode and
+/// then never hears from it. Copying the bytes through is both simpler and
+/// strictly more capable.
+///
+/// The cost is that resizes no longer arrive as decoded events, because
+/// nothing is decoding. `SIGWINCH` carries them instead.
+#[cfg(unix)]
+async fn pump_raw(socket: &mut Socket) -> Result<String> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // A dedicated thread rather than `tokio::io::stdin()`: a read cancelled by
+    // `select!` can lose whatever it had already taken from the fd, and the
+    // bytes it would lose are the user's keystrokes. Handing them to a channel
+    // makes the branch cancel-safe, because a receive that loses the race
+    // leaves the message queued.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.blocking_send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut resized =
+        signal(SignalKind::window_change()).context("could not watch for terminal resizes")?;
+
+    loop {
+        tokio::select! {
+            inbound = socket.next() => {
+                let Some(message) = inbound else {
+                    return Ok("closed".to_string());
+                };
+                let message = message.context("stream failed")?;
+                if let Some(reason) = apply_server_frame(&message) {
+                    return Ok(reason);
+                }
+            }
+            outbound = receiver.recv() => {
+                // stdin at EOF is not the end of the session: the workload may
+                // still be writing. Stop forwarding and keep rendering.
+                let Some(bytes) = outbound else { continue };
+                socket.send(client_frame(CHANNEL_STDIN, &bytes)).await?;
+            }
+            _ = resized.recv() => {
+                if let Ok((width, height)) = crossterm::terminal::size()
+                    && let Some(frame) = resize_frame(width, height) {
+                    socket.send(frame).await?;
+                }
+            }
+        }
+    }
+}
+
+/// Decode key events and re-encode them as bytes.
+///
+/// The fallback where no `SIGWINCH` exists. Lossy by construction — see
+/// [`key_to_bytes`] — so it is only reached off Unix, or when there is no tty
+/// to put in raw mode.
+async fn pump_key_events(socket: &mut Socket, tty: bool) -> Result<String> {
     use crossterm::event::{Event, EventStream};
 
     let mut events = EventStream::new();
@@ -283,22 +392,8 @@ async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
                     return Ok("closed".to_string());
                 };
                 let message = message.context("stream failed")?;
-                match parse_server_frame(&message) {
-                    Some(ServerFrame::Stdout(bytes)) => {
-                        let mut out = std::io::stdout();
-                        out.write_all(&bytes).ok();
-                        out.flush().ok();
-                    }
-                    Some(ServerFrame::Stderr(bytes)) => {
-                        let mut err = std::io::stderr();
-                        err.write_all(&bytes).ok();
-                        err.flush().ok();
-                    }
-                    Some(ServerFrame::Ended { reason }) => return Ok(reason),
-                    // A channel this client does not know. Ignored so a server
-                    // that adds one does not break a client that never needed
-                    // it.
-                    Some(ServerFrame::Unknown) | None => {}
+                if let Some(reason) = apply_server_frame(&message) {
+                    return Ok(reason);
                 }
             }
             event = events.next(), if tty => {
@@ -651,6 +746,48 @@ mod tests {
 
         assert!(websocket_url("ftp://example", "/v1/x").is_err());
         assert!(websocket_url("not a url", "/v1/x").is_err());
+    }
+
+    /// Both input paths end the session on the same frame.
+    ///
+    /// The raw and key-event loops used to carry their own copy of this match;
+    /// a reason recognised by one and not the other would have left a caller
+    /// attached to a session the server considered finished.
+    #[test]
+    fn only_an_end_frame_ends_the_session() {
+        // A malformed error payload still ends the session, carrying the raw
+        // text: a reason this client cannot parse is more useful to whoever
+        // reads it than silently staying attached to a finished session.
+        assert_eq!(
+            apply_server_frame(&Message::Binary(vec![CHANNEL_ERROR, b'{'].into())),
+            Some("{".to_string())
+        );
+        assert_eq!(
+            apply_server_frame(&Message::Close(None)),
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            apply_server_frame(&Message::Binary(
+                [&[CHANNEL_ERROR][..], br#"{"reason":"completed"}"#]
+                    .concat()
+                    .into()
+            )),
+            Some("completed".to_string())
+        );
+        // Output is written through, never treated as terminal.
+        assert_eq!(
+            apply_server_frame(&Message::Binary(vec![CHANNEL_STDOUT, b'h'].into())),
+            None
+        );
+        assert_eq!(
+            apply_server_frame(&Message::Binary(vec![CHANNEL_STDERR, b'h'].into())),
+            None
+        );
+        // A channel this client has never heard of must not end the session.
+        assert_eq!(
+            apply_server_frame(&Message::Binary(vec![99, b'x'].into())),
+            None
+        );
     }
 
     /// Ctrl-C reaches the workload rather than killing the CLI.
