@@ -706,6 +706,60 @@ impl Drop for LeasedSandbox {
 // ---------------------------------------------------------------------------
 
 both_placements!(
+    /// Bytes the caller's terminal emits arrive at the workload unchanged.
+    ///
+    /// `attach` used to decode keystrokes into key events and re-encode them
+    /// from a small table, so anything the table had no name for was dropped
+    /// on the floor: function keys, alt combinations, mouse reporting,
+    /// bracketed paste. A full-screen program negotiates those modes by
+    /// writing escape sequences that reach the real terminal, and then waits
+    /// for replies that could never arrive.
+    ///
+    /// The three sequences here are chosen because the old encoder produced
+    /// none of them. `crossterm` parses F5 and alt-x into key codes the table
+    /// returned `None` for, and never modelled an SGR mouse report at all.
+    /// Asserting on their exact hex is what distinguishes "forwarded" from
+    /// "re-encoded into something plausible".
+    a_terminals_own_bytes_reach_the_workload_unchanged,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        // F5, then alt-x, then an SGR mouse press at column 10 row 5.
+        let sent = "\\x1b[15~\\x1bx\\x1b[<0;10;5M";
+        let expected = "1b5b31357e1b781b5b3c303b31303b354d";
+
+        // Raw mode on the remote too: in cooked mode `head` would wait for a
+        // line terminator that a mouse report never contains. Hexdumping is
+        // what makes an assertion possible at all — a transcript carrying the
+        // literal bytes would be indistinguishable from one that lost them.
+        let script = "stty raw -echo; head -c 17 | od -An -tx1 | tr -d ' \\n'";
+        let transcript = harness(&[
+            "attach-pty",
+            "--lease",
+            &sandbox.id,
+            "--send",
+            sent,
+            "--expect",
+            expected,
+            "--timeout",
+            "120",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .await?;
+        anyhow::ensure!(
+            transcript.contains(expected),
+            "the workload did not receive the exact bytes typed: {transcript}"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
     a_lease_becomes_ready_and_reports_the_same_shape,
     |placement| async move {
         let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
