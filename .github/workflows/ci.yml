@@ -56,8 +56,20 @@ on:
     - cron: "0 3 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A scheduled or dispatched run is the only thing that exercises the full
+  # matrix, and it takes hours. Sharing one group with pushes to the same ref
+  # meant any merge to main killed the nightly mid-flight: it happened twice in
+  # two days, and each time the vcluster and vkobe-etcd legs died before
+  # reporting, so a conformance fix landed with no end-to-end proof at all.
+  #
+  # Give the slow runs a group of their own and never cancel them. Push and PR
+  # runs keep superseding each other, which is right — a newer commit makes an
+  # older run irrelevant — but nothing they do can now interrupt the matrix.
+  group: >-
+    ${{ github.workflow }}-${{ github.ref }}-${{
+    (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    && 'full' || 'fast' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   checks:
