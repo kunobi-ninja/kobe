@@ -299,6 +299,22 @@ pub struct SandboxTemplateSpec {
     #[serde(default)]
     #[schemars(length(max = 64))]
     pub exposed_ports: Vec<SandboxPortSpec>,
+    /// Command a bare `kobe attach` runs in `defaultContainer`.
+    ///
+    /// Absent means attach joins the container's own process, which is right
+    /// for a workload that is already a session. A pool whose image ships a
+    /// multiplexer wants the opposite: `["zellij", "attach", "--create",
+    /// "kobe"]` makes a reconnect resume the session instead of starting a
+    /// second one, which is the difference between a sandbox that survives a
+    /// dropped laptop and one that does not.
+    ///
+    /// This only decides what happens when the caller asks for nothing in
+    /// particular. An explicit `-- argv` still wins, and so does attaching to
+    /// a pool that declares nothing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 16), inner(length(min = 1, max = 4096)))]
+    pub attach_command: Option<Vec<String>>,
+
     /// Absolute path to `kobe-runner` inside `defaultContainer`, when the
     /// administrator's image ships one.
     ///
@@ -1198,6 +1214,7 @@ mod tests {
                     port: 3000,
                 }],
                 runner_path: None,
+                attach_command: None,
             },
             isolation: SandboxIsolation::TrustedRunc {},
             readiness: SandboxReadinessRequirements {

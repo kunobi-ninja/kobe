@@ -1011,6 +1011,7 @@ mod tests {
             container: "agent".into(),
             ports: vec![],
             runner_path: None,
+            attach_command: None,
         }
     }
 

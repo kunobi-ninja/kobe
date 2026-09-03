@@ -191,6 +191,28 @@ proof that target capacity is safe to reuse. An execution that crossed
 `startedAt` therefore holds one active slot until that exact Sandbox target is
 destroyed.
 
+## `attachCommand`
+
+A bare `kobe attach` joins the container's own process. For an image whose job
+is to host sessions that is the wrong landing place: the caller gets the idle
+process, and reconnecting starts over instead of resuming. Declare what attach
+should run instead:
+
+```yaml
+  template:
+    defaultContainer: agent
+    attachCommand: ["zellij", "attach", "--create", "kobe"]
+```
+
+Now `kobe attach dev` lands in a multiplexer session that outlives the
+connection, so a dropped laptop costs nothing. The caller's own `-- argv` still
+wins, and a pool that declares nothing keeps the existing behaviour.
+
+The command comes from the pool, never the caller, for the same reason
+`runnerPath` does: it becomes an exec under Kobe's credential. Declaring it
+also changes which subresource attach calls, from `pods/attach` to `pods/exec`,
+so the grant it needs is the `exec` verb either way.
+
 Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` returns
 `501 Not Implemented` in both modes. That is deliberate: selecting wait mode
 must not silently remove working-directory, exact-exit-code, process-group
