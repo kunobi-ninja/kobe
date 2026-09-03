@@ -1889,6 +1889,50 @@ fn admitted_pending_is_allocation_free(
         && crate::api::sandbox::admitted_reservation_provenance_is_valid(lease)
 }
 
+/// Whether a release can still prove that no create was ever authorised.
+///
+/// [`admitted_pending_is_allocation_free`] answers the same question but only
+/// for the exact admission shape, which survives until the controller's first
+/// status write — an interval of well under a second. That was the entire
+/// window in which an early cancel could be proven harmless, and a caller who
+/// lost it was quarantined for having been slow, holding pool capacity for a
+/// Sandbox that never existed.
+///
+/// This covers the rest of the pre-create window. `observedGeneration` and
+/// `phase = Provisioning` are expected here: they are the controller saying it
+/// has started, not that it has built anything. What must still hold is that
+/// nothing was ever *named*. `target` is written in the same fenced patch that
+/// records a child handle, and `sandbox_lease_authorizes_allocation` refuses
+/// every create once a release reason or an allocation fence is present, so an
+/// unnamed target plus a drained fence is the durable statement that no POST
+/// was issued and none can be.
+///
+/// A recorded `ChildCluster` placement is excluded: it is only ever written
+/// together with the handle reference, so it means a `ClusterLease` was
+/// created and the child path owns that teardown.
+fn pre_create_is_allocation_free(
+    lease: &SandboxLease,
+    status: &crate::crd::SandboxLeaseStatus,
+) -> bool {
+    matches!(
+        status.phase,
+        crate::crd::SandboxLeasePhase::Pending | crate::crd::SandboxLeasePhase::Provisioning
+    ) && status.ready_at.is_none()
+        && status.expires_at.is_none()
+        && status.release_cause.is_none()
+        && status.target.is_none()
+        && !matches!(
+            status.placement,
+            Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. })
+        )
+        && status.claim_cleanup_fence.is_none()
+        && status.sandbox_claim_tombstone.is_none()
+        && status.allocation_fence.is_none()
+        && status.conditions.is_empty()
+        && sandbox_finalizer_present(lease)
+        && crate::api::sandbox::admitted_reservation_provenance_is_valid(lease)
+}
+
 fn claim_reference_has_expected_shape(
     reference: &crate::crd::SandboxObjectReference,
     namespace: &str,
@@ -4346,6 +4390,112 @@ async fn admission_only_management_footprint_absent(
         .await
 }
 
+/// Prove nothing was created for a lease cancelled before any create.
+///
+/// The obligation is deliberately heavier than the admission-only proof. That
+/// one can lean on the exact admission shape; this one cannot, because the
+/// controller has already written to the lease. So it asks for two absences
+/// rather than one: the management Claim family, and the deterministic child
+/// handle. Either placement could have been chosen by the time the release
+/// landed, and until a `target` names one, neither can be ruled out by shape
+/// alone.
+///
+/// The 404s are only meaningful because the caller waited. The allocation
+/// fence has drained by the time this runs, and `sandbox_lease_authorizes_allocation`
+/// refuses every create once that fence exists, so nothing can appear behind
+/// the check. Without the drain these would be the "a 404 cannot distinguish
+/// never-created from GC'd-before-checkpoint" mistake this whole protocol
+/// exists to avoid.
+async fn pre_create_footprint_absent(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    tombstone: &SandboxObjectReference,
+    prior_claim_uid: Option<&str>,
+) -> TargetFootprintCheck {
+    let status = lease.status.clone().unwrap_or_default();
+    if status.claim_cleanup_fence != Some(crate::crd::SandboxClaimCleanupFence::PreCreateV1)
+        || status.ready_at.is_some()
+        || status.expires_at.is_some()
+        || status.target.is_some()
+        || matches!(
+            status.placement,
+            Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. })
+        )
+        || prior_claim_uid.is_some()
+        || status.sandbox_claim_tombstone.as_ref() != Some(tombstone)
+        || !recorded_reference_is_exact(
+            tombstone,
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &ctx.namespace,
+        )
+        || tombstone.name != claim_name(&lease.name_any())
+    {
+        return TargetFootprintCheck::Quarantine("pre_create_provenance_invalid");
+    }
+
+    // The child handle carries a whole nested cluster. Its deterministic name
+    // is the only thing that could exist without a `target` to point at it, so
+    // an unreadable answer here withholds capacity rather than guessing.
+    let internal: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let handle = crate::controllers::sandbox_child::internal_lease_name(&lease.name_any());
+    match internal.get(&handle).await {
+        Ok(_) => return TargetFootprintCheck::Quarantine("pre_create_child_handle_present"),
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(_) => return TargetFootprintCheck::Retry("pre_create_child_handle_unreadable"),
+    }
+
+    // Same management-side scans the admission-only proof performs: the
+    // tombstone occupies the deterministic Claim name, and nothing claims
+    // descent from it.
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
+    let check = claim_labelled_sandboxes_absent(&sandboxes, &tombstone.uid, None).await;
+    if check != TargetFootprintCheck::Verified {
+        return check;
+    }
+
+    for (api, present, unverifiable, transient) in [
+        (
+            Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &core_resource("Pod", "pods"),
+            ),
+            "pre_create_sandbox_owned_pod_present",
+            "pod_owner_chain_unverifiable",
+            "pod_owner_chain_transient",
+        ),
+        (
+            Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &core_resource("Service", "services"),
+            ),
+            "pre_create_sandbox_owned_service_present",
+            "service_owner_chain_unverifiable",
+            "service_owner_chain_transient",
+        ),
+    ] {
+        let check = unresolved_sandbox_children_absent(
+            &api,
+            &sandboxes,
+            tombstone,
+            present,
+            unverifiable,
+            transient,
+        )
+        .await;
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &[tombstone.uid.as_str()], None)
+        .await
+}
+
 /// Record the exact tombstone as the sole management Claim identity when the
 /// pre-POST cleanup protocol proves no active Claim could have disappeared.
 ///
@@ -4375,6 +4525,16 @@ async fn checkpoint_never_started_management_claim(
             TargetFootprintCheck::Verified => finish_release(lease, ctx, reason).await,
             TargetFootprintCheck::Retry(check) => {
                 debug!(lease = %lease.name_any(), check, "admission-only footprint proof will retry");
+                Ok(Action::requeue(std::time::Duration::from_secs(10)))
+            }
+            TargetFootprintCheck::Quarantine(check) => quarantine_lease(lease, ctx, check).await,
+        };
+    }
+    if next.claim_cleanup_fence == Some(crate::crd::SandboxClaimCleanupFence::PreCreateV1) {
+        return match pre_create_footprint_absent(lease, ctx, tombstone, prior_claim_uid).await {
+            TargetFootprintCheck::Verified => finish_release(lease, ctx, reason).await,
+            TargetFootprintCheck::Retry(check) => {
+                debug!(lease = %lease.name_any(), check, "pre-create footprint proof will retry");
                 Ok(Action::requeue(std::time::Duration::from_secs(10)))
             }
             TargetFootprintCheck::Quarantine(check) => quarantine_lease(lease, ctx, check).await,
@@ -4450,6 +4610,8 @@ async fn drive_release(
         next.release_cause = proposed_cause;
         if admitted_pending_is_allocation_free(lease, &status) {
             next.claim_cleanup_fence = Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1);
+        } else if pre_create_is_allocation_free(lease, &status) {
+            next.claim_cleanup_fence = Some(crate::crd::SandboxClaimCleanupFence::PreCreateV1);
         }
         if patch_lease_status_fenced(ctx, lease, &next).await? {
             info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
@@ -13193,6 +13355,221 @@ pub(crate) mod tests {
             )
             .await,
             1
+        );
+    }
+
+    /// Cancelling one controller pass later must still release capacity.
+    ///
+    /// The admission-only proof expires the instant the controller writes
+    /// `phase = Provisioning` and `observedGeneration`, which it does to every
+    /// admitted lease within a second. A caller who cancelled just after that
+    /// had nothing left to prove absence with and was quarantined for it,
+    /// holding a pool slot for a Sandbox that was never built. That is the
+    /// nightly `cancelling_while_provisioning_leaves_nothing_behind` failure.
+    #[tokio::test]
+    async fn cancel_after_the_provisioning_checkpoint_still_releases_capacity() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        // No child handle was ever created; the pre-create proof must confirm
+        // that itself rather than assume it.
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let tombstone = tombstone_claim_json("pre-create-tombstone-uid", None);
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(&tombstone))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&tombstone))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .and(query_param(
+                "labelSelector",
+                format!("{UPSTREAM_CLAIM_UID_LABEL}=pre-create-tombstone-uid"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": "SandboxList", "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = freshly_admitted_lease();
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Provisioning;
+            status.observed_generation = Some(1);
+            status.placement = Some(crate::crd::ResolvedSandboxPlacement::Management {});
+        }
+        // The window this fix is about: past the admission shape, before any
+        // create.
+        assert!(!admitted_pending_is_allocation_free(
+            &lease,
+            lease.status.as_ref().unwrap()
+        ));
+        assert!(pre_create_is_allocation_free(
+            &lease,
+            lease.status.as_ref().unwrap()
+        ));
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+
+        let mut phases = Vec::new();
+        for pass in 0..16 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .expect("pre-create cancellation must converge");
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            if let Some(latest) = statuses.get(before).cloned() {
+                lease.status =
+                    Some(serde_json::from_value(latest).expect("typed pre-create checkpoint"));
+                lease.metadata.resource_version = Some(format!("pre-create-rv-{pass}"));
+            }
+            let phase = lease.status.as_ref().unwrap().phase;
+            phases.push(phase);
+            if phase == crate::crd::SandboxLeasePhase::Released {
+                break;
+            }
+        }
+
+        let status = lease.status.as_ref().unwrap();
+        assert_eq!(
+            status.phase,
+            crate::crd::SandboxLeasePhase::Released,
+            "cancelling before any create must release, phases: {phases:?}"
+        );
+        assert_eq!(
+            status.release_cause,
+            Some(crate::crd::SandboxReleaseCause::Requested),
+            "a caller-requested cancel is not an expiry"
+        );
+        assert!(
+            !phases.contains(&crate::crd::SandboxLeasePhase::Quarantined),
+            "capacity must never be withheld for a Sandbox that was never built: {phases:?}"
+        );
+        assert_eq!(
+            status.claim_cleanup_fence,
+            Some(crate::crd::SandboxClaimCleanupFence::PreCreateV1)
+        );
+    }
+
+    /// The proof must fail closed when the child handle actually exists.
+    ///
+    /// A child handle is a whole nested cluster. If one was created before the
+    /// cancel landed, "nothing was built" is false, and releasing the slot
+    /// would hand a tenant's capacity to the next caller while the cluster is
+    /// still running. This is the property that separates proving absence from
+    /// assuming it.
+    #[tokio::test]
+    async fn a_live_child_handle_refuses_the_pre_create_proof() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "kobe-sbx-sbx-1",
+                    "namespace": NS,
+                    "uid": "live-child-handle-uid",
+                    "resourceVersion": "7"
+                },
+                "spec": { "profile": "child-pool" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut lease = freshly_admitted_lease();
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Provisioning;
+            status.observed_generation = Some(1);
+        }
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+
+        let mut released = false;
+        for pass in 0..16 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone()).await;
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            if let Some(latest) = statuses.get(before).cloned() {
+                lease.status =
+                    Some(serde_json::from_value(latest).expect("typed child-handle checkpoint"));
+                lease.metadata.resource_version = Some(format!("child-handle-rv-{pass}"));
+            }
+            if lease.status.as_ref().unwrap().phase == crate::crd::SandboxLeasePhase::Released {
+                released = true;
+                break;
+            }
+        }
+
+        assert!(
+            !released,
+            "a lease whose child handle exists must not release its slot"
         );
     }
 
