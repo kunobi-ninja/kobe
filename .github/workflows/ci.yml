@@ -11,6 +11,11 @@ on:
     paths:
       - "src/**"
       - "crates/**"
+      # The conformance suite lives here. Without it a PR that only touches
+      # `tests/` triggers no run at all, so its required check never reports
+      # and the PR is blocked forever — and a change that broke the suite
+      # would reach main unexamined.
+      - "tests/**"
       - "charts/**"
       - "Cargo.toml"
       - "Cargo.lock"
