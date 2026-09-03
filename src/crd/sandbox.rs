@@ -887,6 +887,24 @@ pub enum SandboxClaimCleanupFence {
     /// inert tombstone plus empty descendant scans without inventing target
     /// provenance for workload that never started.
     AdmissionOnlyV1,
+    /// Release won after the controller had checkpointed provisioning but
+    /// before any create was authorised: no target was ever named, so no
+    /// Claim and no child `ClusterLease` POST can have been issued.
+    ///
+    /// Weaker than [`Self::AdmissionOnlyV1`], which requires the exact
+    /// admission shape and is only reachable in the moment between admission
+    /// and the controller's first status write. That interval is far too
+    /// narrow to be the only pre-create proof: the first write sets
+    /// `phase = Provisioning` and `observedGeneration`, and a caller who
+    /// cancels immediately after it lands had, until this variant existed,
+    /// nothing to prove absence with and was quarantined for it.
+    ///
+    /// The obligation is correspondingly stronger. Verification waits for the
+    /// allocation fence to drain, then requires BOTH the inert Claim tombstone
+    /// with empty descendant scans AND a verified 404 on the deterministic
+    /// child handle name. The drain is what makes those 404s mean "nothing was
+    /// created and nothing can be" rather than "I did not find it".
+    PreCreateV1,
     /// A management Claim cleanup finalizer was durable before the first POST,
     /// or an exact non-deleting legacy Claim was atomically migrated to that
     /// ownerless/finalized shape before this checkpoint was written.

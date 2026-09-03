@@ -247,6 +247,7 @@ spec:
                 description: Durable management-Claim deletion fence understood by this controller.
                 enum:
                 - AdmissionOnlyV1
+                - PreCreateV1
                 - FinalizerV1
                 nullable: true
                 type: string
