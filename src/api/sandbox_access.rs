@@ -65,6 +65,10 @@ pub struct SandboxTarget {
     /// execution contract — including exact exit status and `cwd` — and that
     /// API refuses one rather than approximating it with a raw exec stream.
     pub runner_path: Option<String>,
+    /// What a bare `attach` runs, when the pool declares one. `None` means
+    /// attach joins the container's own process, which is the behaviour of a
+    /// pool that has said nothing about multiplexers.
+    pub attach_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +320,9 @@ pub fn target_from_provenance(
         // It becomes `argv[0]` of an exec, so a caller who could name it could
         // run anything in the container under Kobe's own credential.
         runner_path: pool.spec.template.runner_path.clone(),
+        // Same provenance as `runner_path`: the pool that admitted the lease,
+        // never the caller. It becomes an exec argv under Kobe's credential.
+        attach_command: pool.spec.template.attach_command.clone(),
     })
 }
 

@@ -2094,9 +2094,36 @@ async fn pod_identity_holds(
 /// Resolution happens *before* the WebSocket handshake completes on purpose:
 /// a denial has to be an HTTP status the caller's client understands, not a
 /// close frame delivered a moment after a successful-looking upgrade.
+/// What the caller asked an upgrade to do, before the pool is known.
+///
+/// The operation cannot be chosen here: whether `attach` ends up calling
+/// `pods/attach` or `pods/exec` depends on the pool's declared attach command,
+/// and the pool is only resolved inside [`prepare_upgrade`]. Minting the wrong
+/// credential and discovering it after the socket upgraded was a guaranteed
+/// 403 on a connection the caller had already been told was fine.
+#[derive(Debug, Clone)]
+enum UpgradeIntent {
+    /// `attach`, carrying whatever argv the caller supplied.
+    Attach(Option<Vec<String>>),
+    PortForward,
+}
+
+impl UpgradeIntent {
+    /// Label for denial records made before the operation is known.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Attach(_) => "attach",
+            Self::PortForward => "port-forward",
+        }
+    }
+}
+
 struct UpgradeContext {
     target: crate::api::sandbox_access::SandboxTarget,
     container: String,
+    /// Argv the upgrade will actually run: the caller's, else the pool's
+    /// declared attach command, else nothing at all.
+    command: Option<Vec<String>>,
     scoped: kube::Client,
     /// The registration claimed before the upgrade. Held here so the slot is
     /// never released between being taken and the stream starting.
@@ -2294,11 +2321,41 @@ fn sandbox_verb_denied(
     ))
 }
 
+/// Settle the argv an upgrade will run, and the subresource it therefore calls.
+///
+/// Kept pure and separate because the two answers must agree: the credential
+/// minted covers `pods/exec` or `pods/attach`, and choosing one while calling
+/// the other is a 403 on a socket the caller has already been told is fine.
+fn resolve_attach_intent(
+    intent: &UpgradeIntent,
+    declared: Option<&[String]>,
+) -> (
+    Option<Vec<String>>,
+    crate::api::sandbox_credentials::SandboxOperation,
+) {
+    use crate::api::sandbox_credentials::SandboxOperation;
+
+    let command = match intent {
+        // The caller's argv wins; the pool's declared command fills in only
+        // when they asked for nothing in particular.
+        UpgradeIntent::Attach(caller) => {
+            caller.clone().or_else(|| declared.map(<[String]>::to_vec))
+        }
+        UpgradeIntent::PortForward => None,
+    };
+    let operation = match (intent, &command) {
+        (UpgradeIntent::PortForward, _) => SandboxOperation::PortForward,
+        (UpgradeIntent::Attach(_), Some(_)) => SandboxOperation::Exec,
+        (UpgradeIntent::Attach(_), None) => SandboxOperation::Attach,
+    };
+    (command, operation)
+}
+
 async fn prepare_upgrade<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
     id: &str,
-    operation: crate::api::sandbox_credentials::SandboxOperation,
+    intent: UpgradeIntent,
     requested_container: Option<&str>,
 ) -> Result<UpgradeContext, Response> {
     use crate::api::sandbox_access as access;
@@ -2311,8 +2368,14 @@ async fn prepare_upgrade<B: ClusterBackend>(
     let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, id, identity).await {
             Ok(resolved) => resolved,
-            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+            Err(denied) => return Err(access_denied(identity, id, intent.label(), denied)),
         };
+
+    // Now the pool is known, so the argv is too. A pool that declares an
+    // attach command turns a bare attach into an exec of that command, which
+    // is what lets a sandbox hand back a multiplexer session instead of its
+    // idle process. The caller's own argv still wins.
+    let (command, operation) = resolve_attach_intent(&intent, target.attach_command.as_deref());
     if let Some(response) = sandbox_verb_denied(
         identity,
         &lease,
@@ -2366,6 +2429,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
     Ok(UpgradeContext {
         target,
         container,
+        command,
         scoped,
         guard,
     })
@@ -2384,7 +2448,6 @@ async fn sandbox_attach<B: ClusterBackend>(
     RawQuery(query): RawQuery,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> Response {
-    use crate::api::sandbox_credentials::SandboxOperation;
     use crate::api::sandbox_transport as transport;
 
     let query = match parse_attach_query(query.as_deref()) {
@@ -2404,20 +2467,16 @@ async fn sandbox_attach<B: ClusterBackend>(
         );
     }
 
-    // The operation is chosen by which subresource this request will actually
-    // call: `pods/exec` with a command, `pods/attach` without. Minting an exec
-    // credential and then calling attach was a guaranteed 403 on a socket that
-    // had already upgraded cleanly.
-    let operation = if query.command.is_some() {
-        SandboxOperation::Exec
-    } else {
-        SandboxOperation::Attach
-    };
+    // Which subresource this calls — `pods/exec` with a command, `pods/attach`
+    // without — decides which credential to mint, and the pool may supply the
+    // command, so both are settled inside `prepare_upgrade` once the pool is
+    // known. Minting an exec credential and then calling attach was a
+    // guaranteed 403 on a socket that had already upgraded cleanly.
     let context = match prepare_upgrade(
         &state,
         &identity,
         &id,
-        operation,
+        UpgradeIntent::Attach(query.command.clone()),
         query.container.as_deref(),
     )
     .await
@@ -2428,6 +2487,7 @@ async fn sandbox_attach<B: ClusterBackend>(
 
     let principal = identity.identity.clone();
     upgrade.on_upgrade(move |mut socket| async move {
+        let command = context.command;
         let guard = context.guard;
         let revoked = guard.cancelled();
 
@@ -2461,7 +2521,7 @@ async fn sandbox_attach<B: ClusterBackend>(
 
         let attached = transport::bounded_setup(
             async {
-                match query.command.as_ref() {
+                match command.as_ref() {
                     Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
                     None => pods.attach(&context.target.pod_name, &params).await,
                 }
@@ -2512,11 +2572,10 @@ async fn sandbox_port_forward<B: ClusterBackend>(
     Query(query): Query<SandboxPortForwardQuery>,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> Response {
-    use crate::api::sandbox_credentials::SandboxOperation;
     use crate::api::sandbox_transport as transport;
 
     let context =
-        match prepare_upgrade(&state, &identity, &id, SandboxOperation::PortForward, None).await {
+        match prepare_upgrade(&state, &identity, &id, UpgradeIntent::PortForward, None).await {
             Ok(context) => context,
             Err(response) => return response,
         };
@@ -7862,6 +7921,49 @@ mod tests {
         );
     }
 
+    /// A pool that ships a multiplexer decides what a bare attach lands in.
+    ///
+    /// Without this, `kobe attach` joins the container's own process, and for
+    /// an image whose job is to host sessions that is the one thing you do not
+    /// want: the caller gets the idle process, and a reconnect starts over
+    /// instead of resuming. The pool's command also changes which subresource
+    /// is called, so the credential minted has to follow it — minting attach
+    /// and then calling exec is a 403 on an already-upgraded socket.
+    #[test]
+    fn a_pool_attach_command_is_used_only_when_the_caller_names_none() {
+        use crate::api::sandbox_credentials::SandboxOperation;
+
+        let declared = vec!["zellij".to_string(), "attach".to_string()];
+
+        // Nothing from the caller: the pool's command fills in, and the
+        // operation follows it to exec.
+        let (command, operation) =
+            resolve_attach_intent(&UpgradeIntent::Attach(None), Some(&declared));
+        assert_eq!(command.as_deref(), Some(declared.as_slice()));
+        assert_eq!(operation, SandboxOperation::Exec);
+
+        // The caller's argv wins over the pool's.
+        let caller = vec!["/bin/sh".to_string()];
+        let (command, operation) = resolve_attach_intent(
+            &UpgradeIntent::Attach(Some(caller.clone())),
+            Some(&declared),
+        );
+        assert_eq!(command.as_deref(), Some(caller.as_slice()));
+        assert_eq!(operation, SandboxOperation::Exec);
+
+        // A pool that declares nothing keeps today's behaviour exactly:
+        // attach joins the container's process through `pods/attach`.
+        let (command, operation) = resolve_attach_intent(&UpgradeIntent::Attach(None), None);
+        assert_eq!(command, None);
+        assert_eq!(operation, SandboxOperation::Attach);
+
+        // Port-forward never runs a command, whatever the pool declared.
+        let (command, operation) =
+            resolve_attach_intent(&UpgradeIntent::PortForward, Some(&declared));
+        assert_eq!(command, None);
+        assert_eq!(operation, SandboxOperation::PortForward);
+    }
+
     fn pool_json() -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -9247,8 +9349,6 @@ mod tests {
     /// tunnel, because every data-plane route resolved ownership and stopped.
     #[tokio::test]
     async fn a_lease_only_grant_cannot_exec_read_logs_attach_or_forward() {
-        use crate::api::sandbox_credentials::SandboxOperation;
-
         let server = MockServer::start().await;
         mount_extendable(&server, extendable_lease_json("sandbox-verbs", 0)).await;
         let mut restricted = identity();
@@ -9311,14 +9411,14 @@ mod tests {
         // Attach and port-forward share one upgrade path, so both are proven
         // through it. Attach requires `exec`: an interactive shell is not a
         // weaker grant than a one-shot command.
-        for operation in [SandboxOperation::Attach, SandboxOperation::PortForward] {
+        for intent in [UpgradeIntent::Attach(None), UpgradeIntent::PortForward] {
             let denied =
-                prepare_upgrade(&test_state(&server), &restricted, id, operation, None).await;
+                prepare_upgrade(&test_state(&server), &restricted, id, intent.clone(), None).await;
             let response = denied.err().expect("upgrade must be refused");
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
-                "{operation:?} without the verb"
+                "{intent:?} without the verb"
             );
         }
     }

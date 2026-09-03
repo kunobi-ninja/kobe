@@ -131,6 +131,28 @@ spec:
                   Restricted template translated into the controller-owned upstream
                   `SandboxTemplate`; this is intentionally not a `PodSpec` escape hatch.
                 properties:
+                  attachCommand:
+                    description: |-
+                      Command a bare `kobe attach` runs in `defaultContainer`.
+
+                      Absent means attach joins the container's own process, which is right
+                      for a workload that is already a session. A pool whose image ships a
+                      multiplexer wants the opposite: `["zellij", "attach", "--create",
+                      "kobe"]` makes a reconnect resume the session instead of starting a
+                      second one, which is the difference between a sandbox that survives a
+                      dropped laptop and one that does not.
+
+                      This only decides what happens when the caller asks for nothing in
+                      particular. An explicit `-- argv` still wins, and so does attaching to
+                      a pool that declares nothing here.
+                    items:
+                      maxLength: 4096
+                      minLength: 1
+                      type: string
+                    maxItems: 16
+                    minItems: 1
+                    nullable: true
+                    type: array
                   containers:
                     description: |-
                       Complete bounded set of containers. Environment, mounts, security

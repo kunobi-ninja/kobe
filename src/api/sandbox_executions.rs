@@ -1375,6 +1375,9 @@ fn cleanup_target(
         container: recorded.container.clone(),
         ports: vec![],
         runner_path: Some(recorded.runner_path.clone()),
+        attach_command: None,
+        // An execution replays a recorded target; attach never runs through
+        // this path, so there is nothing for a pool default to fill in.
     })
 }
 
@@ -1972,6 +1975,7 @@ mod tests {
             container: "workspace".into(),
             ports: vec![],
             runner_path: Some("/kobe-runner".into()),
+            attach_command: None,
         }
     }
 
@@ -2456,6 +2460,7 @@ mod tests {
             container: "agent".into(),
             ports: vec![],
             runner_path: Some("/kobe-runner".into()),
+            attach_command: None,
         };
         let mut running = build_execution_record(
             "test-ns",

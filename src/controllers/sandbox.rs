@@ -9768,6 +9768,7 @@ pub(crate) mod tests {
                         port: 3000,
                     }],
                     runner_path: None,
+                    attach_command: None,
                 },
                 isolation: SandboxIsolation::TrustedRunc {},
                 readiness: SandboxReadinessRequirements {
