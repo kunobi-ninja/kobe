@@ -5828,15 +5828,42 @@ async fn release_child_composition(
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
         Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
-            match ensure_internal_lease_fenced(&internal, &current, lease).await? {
-                InternalHandleFence::Ready => {}
-                InternalHandleFence::Patched => {
-                    info!(lease = %name, "fenced exact child handle before release");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
-                }
-                InternalHandleFence::Foreign => {
+            // A handle that is already terminating is not somebody else's.
+            //
+            // `internal_lease_ownership` reports Foreign for any handle
+            // carrying a deletionTimestamp, which is right where it gates
+            // ADOPTION — placement must never adopt a dying handle. Here it is
+            // wrong: the uid was pinned one line above, so this is provably the
+            // handle this lease recorded, and the retention finalizer is what
+            // keeps a deleted handle readable and patchable precisely so
+            // teardown can still consume its proof.
+            //
+            // Without this the release quarantines its own composition and
+            // withholds the pool slot forever, which is the nightly
+            // `cancelling_while_provisioning_leaves_nothing_behind` failure.
+            // The post-proof path already gets this right; only the pre-proof
+            // path was missing it.
+            if current.metadata.deletion_timestamp.is_some() {
+                if !internal_handle_retention_fence_matches(
+                    &current,
+                    lease,
+                    chrono::Utc::now(),
+                    true,
+                ) {
                     return quarantine_lease(lease, ctx, "child_composition_identity_changed")
                         .await;
+                }
+            } else {
+                match ensure_internal_lease_fenced(&internal, &current, lease).await? {
+                    InternalHandleFence::Ready => {}
+                    InternalHandleFence::Patched => {
+                        info!(lease = %name, "fenced exact child handle before release");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                    }
+                    InternalHandleFence::Foreign => {
+                        return quarantine_lease(lease, ctx, "child_composition_identity_changed")
+                            .await;
+                    }
                 }
             }
             let recorded_pool = recorded_child_pool(&status, &ctx.namespace);
@@ -17060,6 +17087,145 @@ current-context: child
             checkpoint["placement"]["clusterPool"]["uid"],
             "cluster-pool-uid"
         );
+    }
+
+    /// A handle that is already terminating is not somebody else's.
+    ///
+    /// `internal_lease_ownership` calls any handle carrying a
+    /// deletionTimestamp Foreign, which is correct where it gates adoption —
+    /// placement must never adopt a dying handle. On the release path it was
+    /// wrong: the uid is pinned from the recorded reference first, so the
+    /// object is provably this lease's own composition, and the retention
+    /// finalizer exists precisely to keep a deleted handle readable so
+    /// teardown can still consume its proof.
+    ///
+    /// The nightly caught this as
+    /// `cancelling_while_provisioning_leaves_nothing_behind` quarantining with
+    /// `child_composition_identity_changed`, holding the pool slot forever.
+    /// The post-proof path had always handled it; only the pre-proof path had
+    /// not.
+    #[tokio::test]
+    async fn a_terminating_child_handle_is_still_this_leases_own_composition() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        let attempt = "terminating-attempt-1";
+        let proof = "2026-09-04T00:00:00Z";
+        let mut proven = child_cluster_lease("child-lease-uid", "Released", None);
+        proven["status"]["teardownAttemptId"] = attempt.into();
+        proven["status"]["unboundReleaseVerifiedAt"] = proof.into();
+        proven["status"]["conditions"] = serde_json::json!([{
+            "type": "AllocationAbsent",
+            "status": "True",
+            "reason": "NeverBound",
+            "message": format!("release attempt {attempt} proved no reciprocal allocation existed"),
+            "lastTransitionTime": proof,
+        }]);
+        proven["metadata"]["annotations"]
+            [crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION] =
+            format!("{attempt}:{proof}").into();
+        // The condition under test: deleted, but retained by its finalizer and
+        // with its tombstone identity intact.
+        proven["metadata"]["deletionTimestamp"] = "2026-09-04T00:10:00Z".into();
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(proven))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            // Cancelled while provisioning: the handle was created but never
+            // bound, so no instance was ever recorded.
+            if let Some(target) = status.target.as_mut() {
+                target.child_cluster_instance = None;
+            }
+        }
+
+        let mut phases = Vec::new();
+        for pass in 0..12 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone()).await;
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            if let Some(latest) = statuses.get(before).cloned() {
+                lease.status = Some(serde_json::from_value(latest).unwrap());
+                lease.metadata.resource_version = Some(format!("terminating-rv-{pass}"));
+            }
+            let phase = lease.status.as_ref().unwrap().phase;
+            phases.push(phase);
+            if phase == crate::crd::SandboxLeasePhase::Released {
+                break;
+            }
+        }
+
+        assert!(
+            !phases.contains(&crate::crd::SandboxLeasePhase::Quarantined),
+            "a lease must not quarantine its own terminating handle: {phases:?}"
+        );
+    }
+
+    /// The relaxation is bounded by the tombstone, not by the uid alone.
+    ///
+    /// Pinning the uid proves the object is the one recorded; it does not
+    /// prove the object is still intact. A terminating handle whose retention
+    /// identity has been stripped cannot be reasoned about, so it must still
+    /// withhold capacity.
+    #[tokio::test]
+    async fn a_terminating_child_handle_with_a_broken_tombstone_still_quarantines() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        let mut corrupted = child_cluster_lease("child-lease-uid", "Pending", None);
+        corrupted["metadata"]["deletionTimestamp"] = "2026-09-04T00:10:00Z".into();
+        // The retention finalizer is what keeps a deleted handle readable.
+        // Without it the tombstone shape is not satisfied.
+        corrupted["metadata"]["finalizers"] = serde_json::json!([]);
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(corrupted))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        }
+
+        for _ in 0..6 {
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone()).await;
+            if recorded_phases(&server)
+                .await
+                .iter()
+                .any(|phase| phase == "Quarantined")
+            {
+                return;
+            }
+        }
+        panic!("a terminating handle with no retention identity must withhold capacity");
     }
 
     /// An uncheckpointed Pending handle is real provenance but not an
