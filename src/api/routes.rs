@@ -88,6 +88,10 @@ pub struct AppState<B: ClusterBackend> {
     /// request `iroh` transport are then rejected at admission, never silently
     /// served over WebSocket.
     pub iroh_endpoint: Option<iroh::Endpoint>,
+    /// Replica-local one-shot tickets for iroh sessions. Empty when the
+    /// endpoint is `None`; still present so tests can exercise mint/claim
+    /// without binding UDP.
+    pub iroh_sessions: crate::iroh_transport::IrohSessionHub,
 }
 
 /// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
@@ -4004,6 +4008,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         (build_router(state), server)
@@ -4038,6 +4043,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -4131,6 +4137,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -4669,6 +4676,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -4766,6 +4774,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -4865,6 +4874,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -4974,6 +4984,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -5058,6 +5069,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(
@@ -5170,6 +5182,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         Mock::given(method("GET"))
@@ -5640,6 +5653,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
         (state, server)
     }

@@ -371,6 +371,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Start HTTP server immediately (all replicas serve API + health) ──
+    let iroh_sessions = crate::iroh_transport::IrohSessionHub::default();
     let state = AppState {
         client: client.clone(),
         authenticator: authenticator.clone(),
@@ -385,11 +386,17 @@ async fn run() -> anyhow::Result<()> {
         shutdown: shutdown.clone(),
         sandbox_enabled: agent_sandbox_mode.enabled(),
         iroh_endpoint: iroh_endpoint.clone(),
+        iroh_sessions: iroh_sessions.clone(),
     };
 
     // Close the iroh endpoint once shutdown starts so P2P sessions drain with
-    // the HTTP server instead of outliving the process.
+    // the HTTP server instead of outliving the process. The accept loop
+    // returns when `close` makes `accept()` yield `None`.
     if let Some(endpoint) = iroh_endpoint {
+        tokio::spawn(crate::iroh_transport::accept_loop(
+            endpoint.clone(),
+            iroh_sessions,
+        ));
         let shutdown_signal = shutdown.clone();
         tokio::spawn(async move {
             shutdown_signal.cancelled().await;

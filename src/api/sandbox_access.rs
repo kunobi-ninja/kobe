@@ -35,7 +35,9 @@
 use kube::ResourceExt;
 use kube::api::Api;
 
-use crate::crd::{ResolvedSandboxPlacement, SandboxLease, SandboxLeasePhase, SandboxPool};
+use crate::crd::{
+    ResolvedSandboxPlacement, SandboxLease, SandboxLeasePhase, SandboxPool, SandboxTransport,
+};
 
 /// One exact, fully identified Sandbox target.
 ///
@@ -69,6 +71,10 @@ pub struct SandboxTarget {
     /// attach joins the container's own process, which is the behaviour of a
     /// pool that has said nothing about multiplexers.
     pub attach_command: Option<Vec<String>>,
+    /// Data-plane transport the admitting pool selected. Copied here so attach
+    /// and port-forward do not re-read the pool after resolution, and so a
+    /// later pool edit cannot silently change a live lease's transport.
+    pub transport: SandboxTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +329,7 @@ pub fn target_from_provenance(
         // Same provenance as `runner_path`: the pool that admitted the lease,
         // never the caller. It becomes an exec argv under Kobe's credential.
         attach_command: pool.spec.template.attach_command.clone(),
+        transport: pool.spec.transport,
     })
 }
 

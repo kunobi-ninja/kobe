@@ -1378,6 +1378,7 @@ fn cleanup_target(
         attach_command: None,
         // An execution replays a recorded target; attach never runs through
         // this path, so there is nothing for a pool default to fill in.
+        transport: crate::crd::SandboxTransport::Direct,
     })
 }
 
@@ -1976,6 +1977,7 @@ mod tests {
             ports: vec![],
             runner_path: Some("/kobe-runner".into()),
             attach_command: None,
+            transport: crate::crd::SandboxTransport::Direct,
         }
     }
 
@@ -2461,6 +2463,7 @@ mod tests {
             ports: vec![],
             runner_path: Some("/kobe-runner".into()),
             attach_command: None,
+            transport: crate::crd::SandboxTransport::Direct,
         };
         let mut running = build_execution_record(
             "test-ns",

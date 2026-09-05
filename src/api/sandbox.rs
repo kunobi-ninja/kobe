@@ -29,7 +29,7 @@ use crate::backend::ClusterBackend;
 use crate::crd::{
     ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
     SandboxPlacement, SandboxPlacementAuthority, SandboxPool, SandboxPoolReference,
-    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxVerb,
+    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxTransport, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
@@ -102,6 +102,10 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             get(sandbox_port_forward::<B>),
         )
         .route(
+            "/v1/sandbox-leases/{id}/session",
+            post(sandbox_session::<B>),
+        )
+        .route(
             "/v1/sandbox-leases/{id}/executions",
             post(create_sandbox_execution::<B>),
         )
@@ -123,6 +127,7 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             "/v1/leases/{id}/port-forward",
             get(sandbox_port_forward::<B>),
         )
+        .route("/v1/leases/{id}/session", post(sandbox_session::<B>))
         .route(
             "/v1/leases/{id}/executions",
             post(create_sandbox_execution::<B>),
@@ -2467,6 +2472,10 @@ async fn sandbox_attach<B: ClusterBackend>(
         );
     }
 
+    if let Err(response) = refuse_websocket_on_iroh_pool(&state, &identity, &id, "attach").await {
+        return response;
+    }
+
     // Which subresource this calls — `pods/exec` with a command, `pods/attach`
     // without — decides which credential to mint, and the pool may supply the
     // command, so both are settled inside `prepare_upgrade` once the pool is
@@ -2574,6 +2583,12 @@ async fn sandbox_port_forward<B: ClusterBackend>(
 ) -> Response {
     use crate::api::sandbox_transport as transport;
 
+    if let Err(response) =
+        refuse_websocket_on_iroh_pool(&state, &identity, &id, "port-forward").await
+    {
+        return response;
+    }
+
     let context =
         match prepare_upgrade(&state, &identity, &id, UpgradeIntent::PortForward, None).await {
             Ok(context) => context,
@@ -2651,6 +2666,268 @@ async fn sandbox_port_forward<B: ClusterBackend>(
             "Sandbox stream"
         );
     })
+}
+
+/// WebSocket attach/port-forward on an `iroh` pool would be a silent
+/// downgrade of the transport the administrator chose. Refuse with a
+/// bounded reason the CLI can branch on.
+async fn refuse_websocket_on_iroh_pool<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    operation: &'static str,
+) -> Result<(), Response> {
+    match crate::api::sandbox_access::resolve_sandbox_target(
+        &state.client,
+        &state.namespace,
+        id,
+        identity,
+    )
+    .await
+    {
+        Ok((_, target)) if target.transport == SandboxTransport::Iroh => {
+            Err(sandbox_error_with_reason(
+                StatusCode::CONFLICT,
+                "SandboxPool uses iroh transport",
+                Some(format!(
+                    "POST /v1/sandbox-leases/{id}/session for a dial ticket"
+                )),
+                "iroh_transport",
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(denied) => Err(access_denied(identity, id, operation, denied)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SandboxSessionRequest {
+    /// `attach` or `port-forward`.
+    operation: String,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    container: Option<String>,
+    #[serde(default)]
+    tty: bool,
+    #[serde(default)]
+    port: Option<String>,
+}
+
+/// Mint a one-shot iroh ticket after the same authorization as the WebSocket
+/// upgrade. Direct pools are refused: they keep the existing WS URL.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_session<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Json(request): Json<SandboxSessionRequest>,
+) -> Response {
+    let (intent, tty, port) = match request.operation.as_str() {
+        "attach" => {
+            if let Some(command) = request.command.as_ref()
+                && (command.is_empty() || command.iter().any(String::is_empty))
+            {
+                return sandbox_error(
+                    StatusCode::BAD_REQUEST,
+                    "command must be non-empty argv",
+                    None,
+                );
+            }
+            (
+                UpgradeIntent::Attach(request.command.clone()),
+                request.tty,
+                None,
+            )
+        }
+        "port-forward" => {
+            let Some(port) = request.port.clone() else {
+                return sandbox_error(
+                    StatusCode::BAD_REQUEST,
+                    "port-forward session requires port",
+                    None,
+                );
+            };
+            (UpgradeIntent::PortForward, false, Some(port))
+        }
+        other => {
+            return sandbox_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown session operation: {other}"),
+                None,
+            );
+        }
+    };
+
+    let target = match crate::api::sandbox_access::resolve_sandbox_target(
+        &state.client,
+        &state.namespace,
+        &id,
+        &identity,
+    )
+    .await
+    {
+        Ok((_, target)) => target,
+        Err(denied) => return access_denied(&identity, &id, intent.label(), denied),
+    };
+    if target.transport != SandboxTransport::Iroh {
+        return sandbox_error_with_reason(
+            StatusCode::CONFLICT,
+            "SandboxPool uses direct transport",
+            Some("open the WebSocket attach or port-forward URL".into()),
+            "direct_transport",
+        );
+    }
+    let Some(endpoint) = state.iroh_endpoint.clone() else {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SandboxPool requests iroh transport but the operator has it disabled",
+            None,
+        );
+    };
+
+    let context =
+        match prepare_upgrade(&state, &identity, &id, intent, request.container.as_deref()).await {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
+
+    let resolved_port = if let Some(port) = port.as_deref() {
+        match context.target.resolve_port(port) {
+            Ok(port) => Some(port),
+            Err(denied) => return access_denied(&identity, &id, "port-forward", denied),
+        }
+    } else {
+        None
+    };
+
+    let (ticket, rx) = state.iroh_sessions.mint();
+    let relay = crate::iroh_transport::operator_config_from_env()
+        .map(|cfg| cfg.as_offer_string())
+        .unwrap_or_else(|_| "public".into());
+    let offer = crate::iroh_transport::IrohSessionOffer::new(&endpoint, ticket, relay);
+    let principal = identity.identity.clone();
+    let lease_id = id.clone();
+
+    tokio::spawn(async move {
+        serve_iroh_session(rx, context, tty, resolved_port, principal, lease_id).await;
+    });
+
+    (StatusCode::OK, Json(offer)).into_response()
+}
+
+async fn serve_iroh_session(
+    rx: tokio::sync::oneshot::Receiver<crate::iroh_transport::IrohLink>,
+    context: UpgradeContext,
+    tty: bool,
+    port: Option<u16>,
+    principal: String,
+    id: String,
+) {
+    use crate::api::sandbox_transport as transport;
+
+    let mut link = match tokio::time::timeout(transport::STREAM_SETUP_TIMEOUT, rx).await {
+        Ok(Ok(link)) => link,
+        _ => return,
+    };
+
+    let guard = context.guard;
+    let revoked = guard.cancelled();
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+
+    match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+        Ok(true) => {}
+        Ok(false) | Err(transport::StreamEnd::TargetError) => {
+            transport::close_with_iroh(&mut link, transport::StreamEnd::TargetError).await;
+            return;
+        }
+        Err(end) => {
+            transport::close_with_iroh(&mut link, end).await;
+            return;
+        }
+    }
+
+    let operation = if let Some(port) = port {
+        let mut forwarder = match transport::bounded_setup(
+            pods.portforward(&context.target.pod_name, &[port]),
+            &revoked,
+        )
+        .await
+        {
+            Ok(Ok(forwarder)) => forwarder,
+            Ok(Err(_)) | Err(transport::StreamEnd::TargetError) => {
+                transport::close_with_iroh(&mut link, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with_iroh(&mut link, end).await;
+                return;
+            }
+        };
+        let Some(mut stream) = forwarder.take_stream(port) else {
+            transport::close_with_iroh(&mut link, transport::StreamEnd::TargetError).await;
+            return;
+        };
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end = transport::pump_duplex_iroh(&mut link, &mut stream, &mut limits, revoked).await;
+        transport::close_with_iroh(&mut link, end).await;
+        ("port-forward", end)
+    } else {
+        let params = kube::api::AttachParams::default()
+            .container(&context.container)
+            .stdin(true)
+            .stdout(true)
+            .stderr(!tty)
+            .tty(tty);
+        let attached = transport::bounded_setup(
+            async {
+                match context.command.as_ref() {
+                    Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
+                    None => pods.attach(&context.target.pod_name, &params).await,
+                }
+            },
+            &revoked,
+        )
+        .await;
+        let mut attached = match attached {
+            Ok(Ok(attached)) => attached,
+            Ok(Err(_)) | Err(transport::StreamEnd::TargetError) => {
+                transport::close_with_iroh(&mut link, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with_iroh(&mut link, end).await;
+                return;
+            }
+        };
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end =
+            transport::pump_attached_iroh(&mut link, &mut attached, &mut limits, revoked).await;
+        attached.abort();
+        transport::close_with_iroh(&mut link, end).await;
+        ("attach", end)
+    };
+
+    info!(
+        principal = %principal,
+        lease = %id,
+        pod_uid = %context.target.pod_uid,
+        operation = operation.0,
+        outcome = "closed",
+        reason = operation.1.code(),
+        caller_fault = operation.1.is_caller_fault(),
+        "Sandbox iroh stream"
+    );
 }
 
 /// How long one exec may run before it is abandoned.
@@ -3072,6 +3349,15 @@ struct SandboxLeaseResponse {
     target: Option<SandboxTargetProvenance>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conditions: Vec<SandboxCondition>,
+    /// Data-plane transport for attach/port-forward. Omitted when `direct` so
+    /// existing clients keep parsing. Present as `iroh` when the admitting
+    /// pool selected the P2P path.
+    #[serde(default, skip_serializing_if = "is_direct_transport")]
+    transport: SandboxTransport,
+}
+
+fn is_direct_transport(transport: &SandboxTransport) -> bool {
+    *transport == SandboxTransport::Direct
 }
 
 #[derive(Debug, Serialize)]
@@ -3347,6 +3633,7 @@ fn pending_sandbox_lease_response(
         placement: None,
         target: None,
         conditions: Vec::new(),
+        transport: SandboxTransport::Direct,
     }
 }
 
@@ -4459,7 +4746,17 @@ pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
         );
     }
 
-    (StatusCode::OK, Json(sandbox_lease_response(lease, None))).into_response()
+    let pool_name = lease.spec.pool_ref.name.clone();
+    let pool_uid = lease.spec.pool_ref.uid.clone();
+    let mut body = sandbox_lease_response(lease, None);
+    let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    if let Ok(pool) = pools.get(&pool_name).await
+        && pool.uid().as_deref() == Some(pool_uid.as_str())
+    {
+        body.transport = pool.spec.transport;
+    }
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Request body for [`extend_sandbox_lease`].
@@ -5153,6 +5450,7 @@ fn sandbox_lease_response(
         placement: status.placement,
         target: status.target.map(caller_visible_provenance),
         conditions: status.conditions,
+        transport: SandboxTransport::Direct,
     }
 }
 
@@ -7886,6 +8184,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         }
     }
 
@@ -7934,6 +8233,61 @@ mod tests {
             parse_attach_query(Some("tty=true&tty=false")).unwrap_err(),
             AttachQueryError::DuplicateParameter("tty")
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_pool_refuses_an_iroh_session_ticket() {
+        let server = MockServer::start().await;
+        mount_extendable(&server, extendable_lease_json("sandbox-direct", 0)).await;
+        let response = sandbox_session::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path("sandbox-direct".into()),
+            Json(SandboxSessionRequest {
+                operation: "attach".into(),
+                command: None,
+                container: None,
+                tty: false,
+                port: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "direct_transport");
+    }
+
+    #[tokio::test]
+    async fn an_iroh_pool_refuses_the_websocket_attach_url() {
+        let server = MockServer::start().await;
+        let mut pool = pool_json();
+        pool["spec"]["transport"] = serde_json::json!("iroh");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(sandbox_lease_path("sandbox-iroh")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(extendable_lease_json("sandbox-iroh", 0)),
+            )
+            .mount(&server)
+            .await;
+
+        let denied = refuse_websocket_on_iroh_pool(
+            &test_state(&server),
+            &identity(),
+            "sandbox-iroh",
+            "attach",
+        )
+        .await
+        .expect_err("iroh pools must not upgrade WebSocket");
+        assert_eq!(denied.status(), StatusCode::CONFLICT);
+        let body = response_json(denied).await;
+        assert_eq!(body["reason"], "iroh_transport");
     }
 
     /// A pool that ships a multiplexer decides what a bare attach lands in.
