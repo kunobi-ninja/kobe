@@ -161,6 +161,8 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                 alias: command.name,
                 expires_at: detail.expires_at.as_deref(),
                 capabilities: &actions,
+                transport: detail.transport.as_deref(),
+                iroh: detail.iroh.as_ref(),
             },
             command.output,
         )?;
@@ -681,6 +683,8 @@ mod tests {
             queue_position: 0,
             metadata: None,
             kubeconfig: Some("apiVersion: v1".to_string()),
+            transport: None,
+            iroh: None,
         };
 
         assert!(lease_is_usable(&detail));

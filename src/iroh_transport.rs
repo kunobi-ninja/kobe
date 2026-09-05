@@ -222,6 +222,27 @@ impl IrohOperatorConfig {
     }
 }
 
+/// How a caller reaches this replica's iroh endpoint.
+///
+/// Shown on lease list/get so `kobe status` can print the node ID without
+/// opening a session. The node ID is replica-local: another replica has a
+/// different one, and a restart currently mints a new key.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IrohDial {
+    pub node_id: String,
+    pub relay: String,
+}
+
+impl IrohDial {
+    pub fn from_endpoint(endpoint: &Endpoint, relay: String) -> Self {
+        Self {
+            node_id: endpoint.id().to_string(),
+            relay,
+        }
+    }
+}
+
 /// What REST returns after minting a ticket. The client dials `node_id` with
 /// `alpn` and writes the decoded ticket as the first blob.
 #[derive(Debug, Clone, Serialize)]

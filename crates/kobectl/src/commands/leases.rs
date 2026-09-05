@@ -6,7 +6,7 @@ use super::{
     OutputFormat, Reaching, authed_client, get_auth_header, get_auth_header_for_output, with_auth,
 };
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LeaseSummary {
     pub id: String,
@@ -33,6 +33,20 @@ pub(crate) struct LeaseSummary {
     /// Caller-supplied descriptive JSON metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Sandbox data-plane. Absent or `direct` means WebSocket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// How to reach the operator over iroh when `transport` is `iroh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<IrohDial>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IrohDial {
+    pub node_id: String,
+    #[serde(default)]
+    pub relay: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +69,10 @@ pub(crate) struct LeaseDetail {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub kubeconfig: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub iroh: Option<IrohDial>,
 }
 
 fn default_resource_kind() -> String {
@@ -324,9 +342,25 @@ pub(crate) fn lease_glance_label(lease: &LeaseSummary) -> String {
 pub(crate) fn format_lease_status_line(lease: &LeaseSummary) -> String {
     let id = short_lease_id(&lease.id);
     let glance = lease_glance_label(lease);
-    match lease.alias.as_deref().filter(|alias| !alias.is_empty()) {
+    let mut line = match lease.alias.as_deref().filter(|alias| !alias.is_empty()) {
         Some(alias) => format!("{id}  {alias}  {}  {glance}", lease.profile),
         None => format!("{id}  {}  {glance}", lease.profile),
+    };
+    if lease.transport.as_deref() == Some("iroh") {
+        match lease.iroh.as_ref() {
+            Some(iroh) if !iroh.node_id.is_empty() => {
+                line.push_str(&format!("  iroh {}", short_iroh_node(&iroh.node_id)));
+            }
+            _ => line.push_str("  iroh"),
+        }
+    }
+    line
+}
+
+fn short_iroh_node(node_id: &str) -> String {
+    match node_id.char_indices().nth(8) {
+        Some((idx, _)) => format!("{}…", &node_id[..idx]),
+        None => node_id.to_string(),
     }
 }
 
@@ -348,7 +382,24 @@ mod tests {
             kubeconfig_path: None,
             alias: None,
             metadata: None,
+            transport: None,
+            iroh: None,
         }
+    }
+
+    #[test]
+    fn iroh_leases_show_transport_and_short_node_id() {
+        let mut lease = lease("sandbox-1", "Ready", None, 0);
+        lease.transport = Some("iroh".into());
+        lease.iroh = Some(IrohDial {
+            node_id: "abcdef0123456789deadbeef".into(),
+            relay: "public".into(),
+        });
+        let line = format_lease_status_line(&lease);
+        assert!(line.contains("iroh abcdef01…"), "{line}");
+        lease.iroh = None;
+        let line = format_lease_status_line(&lease);
+        assert!(line.ends_with("iroh"), "{line}");
     }
 
     #[test]

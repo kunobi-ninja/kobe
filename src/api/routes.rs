@@ -27,7 +27,7 @@ use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
     CIDRClaim, CIDRClaimPhase, ClusterInstance, ClusterInstancePhase, ClusterLease,
     ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase, Requester,
-    SandboxPool, SandboxVerb,
+    SandboxPool, SandboxTransport, SandboxVerb,
 };
 use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
@@ -611,6 +611,17 @@ struct LeaseSummary {
     /// and `alias` when a shared-pool listing contains another tenant's lease.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<serde_json::Value>,
+    /// Sandbox data-plane. Omitted for cluster leases and for `direct`.
+    #[serde(skip_serializing_if = "is_direct_or_absent")]
+    transport: Option<SandboxTransport>,
+    /// How to reach this replica over iroh. Omitted unless `transport` is iroh
+    /// and this process has an endpoint bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iroh: Option<crate::iroh_transport::IrohDial>,
+}
+
+fn is_direct_or_absent(transport: &Option<SandboxTransport>) -> bool {
+    !matches!(transport, Some(SandboxTransport::Iroh))
 }
 
 /// Query parameters for `GET /v1/leases` (#107 P2).
@@ -1672,6 +1683,8 @@ async fn list_leases<B: ClusterBackend>(
                         requester: None,
                         alias,
                         metadata: c.spec.metadata.as_deref().cloned(),
+                        transport: None,
+                        iroh: None,
                     }
                 })
                 .collect();
@@ -1700,6 +1713,8 @@ async fn list_leases<B: ClusterBackend>(
                                 requester: None,
                                 alias: lease.alias,
                                 metadata: None,
+                                transport: Some(lease.transport),
+                                iroh: lease.iroh,
                             })
                         }));
                     }
@@ -2950,6 +2965,8 @@ async fn list_pool_leases<B: ClusterBackend>(
                         requester: None,
                         alias: lease.alias,
                         metadata: None,
+                        transport: Some(lease.transport),
+                        iroh: lease.iroh,
                     })
                     .collect();
                 return (StatusCode::OK, Json(summaries)).into_response();
@@ -3012,6 +3029,8 @@ fn pool_lease_summary(lease: &ClusterLease, caller_identity: &str) -> LeaseSumma
         metadata: own
             .then(|| lease.spec.metadata.as_deref().cloned())
             .flatten(),
+        transport: None,
+        iroh: None,
     }
 }
 

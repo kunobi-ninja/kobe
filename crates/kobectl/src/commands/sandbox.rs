@@ -405,6 +405,10 @@ struct SandboxLeaseResponse {
     alias: Option<String>,
     #[serde(default)]
     expires_at: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    iroh: Option<super::leases::IrohDial>,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +423,10 @@ struct LeaseOutput<'a> {
     ttl: Option<&'a str>,
     alias: Option<&'a str>,
     expires_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iroh: Option<&'a super::leases::IrohDial>,
 }
 
 const SANDBOX_CAPABILITIES: &[&str] = &[
@@ -782,6 +790,8 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
                 alias: command.alias,
                 expires_at: None,
                 capabilities: &actions,
+                transport: None,
+                iroh: None,
             },
             command.output,
         );
@@ -822,6 +832,8 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
             alias: ready.alias.as_deref().or(command.alias),
             expires_at: ready.expires_at.as_deref(),
             capabilities: &actions,
+            transport: ready.transport.as_deref(),
+            iroh: ready.iroh.as_ref(),
         },
         command.output,
     )?;
@@ -854,6 +866,8 @@ pub(crate) struct LeasePrint<'a> {
     pub alias: Option<&'a str>,
     pub expires_at: Option<&'a str>,
     pub capabilities: &'a [String],
+    pub transport: Option<&'a str>,
+    pub iroh: Option<&'a super::leases::IrohDial>,
 }
 
 pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) -> Result<()> {
@@ -867,6 +881,12 @@ pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) ->
                 println!("Expires: {expires_at}");
             }
             println!("Actions: {}", lease.capabilities.join(", "));
+            if let Some(transport) = lease.transport {
+                println!("Transport: {transport}");
+            }
+            if let Some(iroh) = lease.iroh {
+                println!("Iroh:     {}  ({})", iroh.node_id, iroh.relay);
+            }
             if let Some(next) = next_sandbox_hint(lease.id, lease.phase, lease.capabilities) {
                 println!("Next:    {next}");
             }
@@ -882,6 +902,8 @@ pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) ->
             ttl: lease.ttl,
             alias: lease.alias,
             expires_at: lease.expires_at,
+            transport: lease.transport,
+            iroh: lease.iroh,
         }),
     }
 }

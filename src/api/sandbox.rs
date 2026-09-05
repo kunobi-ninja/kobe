@@ -3354,10 +3354,73 @@ struct SandboxLeaseResponse {
     /// pool selected the P2P path.
     #[serde(default, skip_serializing_if = "is_direct_transport")]
     transport: SandboxTransport,
+    /// How to reach this replica over iroh. Omitted for `direct` pools and
+    /// when this process has no endpoint bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iroh: Option<crate::iroh_transport::IrohDial>,
 }
 
 fn is_direct_transport(transport: &SandboxTransport) -> bool {
     *transport == SandboxTransport::Direct
+}
+
+fn iroh_dial_for<B: ClusterBackend>(
+    state: &AppState<B>,
+    transport: SandboxTransport,
+) -> Option<crate::iroh_transport::IrohDial> {
+    if transport != SandboxTransport::Iroh {
+        return None;
+    }
+    let endpoint = state.iroh_endpoint.as_ref()?;
+    let relay = crate::iroh_transport::operator_config_from_env()
+        .map(|cfg| cfg.as_offer_string())
+        .unwrap_or_else(|_| "public".into());
+    Some(crate::iroh_transport::IrohDial::from_endpoint(
+        endpoint, relay,
+    ))
+}
+
+/// Map pool UID → transport for list responses. A missing or unreadable
+/// pool list is treated as every lease being `direct` rather than failing
+/// the caller's inventory.
+async fn pool_uid_transports(
+    client: &kube::Client,
+    namespace: &str,
+) -> std::collections::HashMap<String, SandboxTransport> {
+    let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
+    match pools.list(&ListParams::default()).await {
+        Ok(listed) => listed
+            .iter()
+            .filter_map(|pool| Some((pool.uid()?.to_string(), pool.spec.transport)))
+            .collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+fn sandbox_lease_summary(
+    lease: &SandboxLease,
+    transports: &std::collections::HashMap<String, SandboxTransport>,
+    iroh: Option<&crate::iroh_transport::IrohDial>,
+) -> SandboxLeaseSummary {
+    let status = lease.status.clone().unwrap_or_default();
+    let transport = transports
+        .get(&lease.spec.pool_ref.uid)
+        .copied()
+        .unwrap_or(SandboxTransport::Direct);
+    SandboxLeaseSummary {
+        id: lease.name_any(),
+        resource_kind: "Sandbox",
+        phase: status.phase.to_string(),
+        pool: lease.spec.pool_ref.name.clone(),
+        alias: lease.spec.alias.clone(),
+        expires_at: status.expires_at.clone(),
+        transport,
+        iroh: if transport == SandboxTransport::Iroh {
+            iroh.cloned()
+        } else {
+            None
+        },
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3371,6 +3434,10 @@ pub(crate) struct SandboxLeaseSummary {
     pub alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_direct_transport")]
+    pub transport: SandboxTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<crate::iroh_transport::IrohDial>,
 }
 
 /// Error body for every Sandbox route denial.
@@ -3634,6 +3701,7 @@ fn pending_sandbox_lease_response(
         target: None,
         conditions: Vec::new(),
         transport: SandboxTransport::Direct,
+        iroh: None,
     }
 }
 
@@ -4645,21 +4713,13 @@ pub(crate) async fn caller_sandbox_summaries<B: ClusterBackend>(
     }
     let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let items = leases.list(&requester_list_params(identity)).await?;
+    let transports = pool_uid_transports(&state.client, &state.namespace).await;
+    let iroh = iroh_dial_for(state, SandboxTransport::Iroh);
     Ok(items
         .iter()
         .filter(|lease| principal_matches(&lease.spec.requester, identity))
         .filter(|lease| is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Lease, &policy))
-        .map(|lease| {
-            let status = lease.status.clone().unwrap_or_default();
-            SandboxLeaseSummary {
-                id: lease.name_any(),
-                resource_kind: "Sandbox",
-                phase: status.phase.to_string(),
-                pool: lease.spec.pool_ref.name.clone(),
-                alias: lease.spec.alias.clone(),
-                expires_at: status.expires_at.clone(),
-            }
-        })
+        .map(|lease| sandbox_lease_summary(lease, &transports, iroh.as_ref()))
         .collect())
 }
 
@@ -4698,23 +4758,15 @@ pub(crate) async fn list_sandbox_leases<B: ClusterBackend>(
     let params = requester_list_params(&identity);
     match leases.list(&params).await {
         Ok(items) => {
+            let transports = pool_uid_transports(&state.client, &state.namespace).await;
+            let iroh = iroh_dial_for(&state, SandboxTransport::Iroh);
             let response: Vec<_> = items
                 .iter()
                 .filter(|lease| principal_matches(&lease.spec.requester, &identity))
                 .filter(|lease| {
                     is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Lease, &policy)
                 })
-                .map(|lease| {
-                    let status = lease.status.clone().unwrap_or_default();
-                    SandboxLeaseSummary {
-                        id: lease.name_any(),
-                        resource_kind: "Sandbox",
-                        phase: status.phase.to_string(),
-                        pool: lease.spec.pool_ref.name.clone(),
-                        alias: lease.spec.alias.clone(),
-                        expires_at: status.expires_at,
-                    }
-                })
+                .map(|lease| sandbox_lease_summary(lease, &transports, iroh.as_ref()))
                 .collect();
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -4755,6 +4807,7 @@ pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
     {
         body.transport = pool.spec.transport;
     }
+    body.iroh = iroh_dial_for(&state, body.transport);
 
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -5451,6 +5504,7 @@ fn sandbox_lease_response(
         target: status.target.map(caller_visible_provenance),
         conditions: status.conditions,
         transport: SandboxTransport::Direct,
+        iroh: None,
     }
 }
 
@@ -8288,6 +8342,26 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::CONFLICT);
         let body = response_json(denied).await;
         assert_eq!(body["reason"], "iroh_transport");
+    }
+
+    #[test]
+    fn list_summaries_surface_iroh_dial_only_for_iroh_pools() {
+        let lease: SandboxLease =
+            serde_json::from_value(lease_json("sandbox-list", "alice@example.com", "Ready"))
+                .unwrap();
+        let dial = crate::iroh_transport::IrohDial {
+            node_id: "abcdef0123456789".into(),
+            relay: "public".into(),
+        };
+        let mut transports = std::collections::HashMap::new();
+        let direct = sandbox_lease_summary(&lease, &transports, Some(&dial));
+        assert_eq!(direct.transport, SandboxTransport::Direct);
+        assert!(direct.iroh.is_none());
+
+        transports.insert(lease.spec.pool_ref.uid.clone(), SandboxTransport::Iroh);
+        let iroh = sandbox_lease_summary(&lease, &transports, Some(&dial));
+        assert_eq!(iroh.transport, SandboxTransport::Iroh);
+        assert_eq!(iroh.iroh.as_ref().unwrap().node_id, "abcdef0123456789");
     }
 
     /// A pool that ships a multiplexer decides what a bare attach lands in.
