@@ -386,7 +386,11 @@ jobs:
   docker-dry-run:
     if: github.event_name == 'pull_request'
     needs: checks
-    runs-on: kunobi-runners-large
+    # The general pool. `bake` builds inside the dind sidecar, and dind is
+    # configured identically on both pools (2 cpu, 4Gi, 20Gi ephemeral), so the
+    # reserved node's larger runner container buys this job nothing. It only
+    # checks out the tree and drives buildx.
+    runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
