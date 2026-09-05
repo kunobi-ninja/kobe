@@ -62,8 +62,9 @@ impl RelayConfig {
             RelayConfig::Custom(urls) => {
                 let map = iroh::RelayMap::empty();
                 for url in urls {
-                    let url: iroh::RelayUrl =
-                        url.parse().with_context(|| format!("invalid iroh relay URL: {url}"))?;
+                    let url: iroh::RelayUrl = url
+                        .parse()
+                        .with_context(|| format!("invalid iroh relay URL: {url}"))?;
                     let cfg = std::sync::Arc::new(iroh::RelayConfig::new(url.clone(), None));
                     map.insert(url, cfg);
                 }
@@ -94,10 +95,7 @@ pub async fn bind_endpoint(config: &IrohTransportConfig) -> Result<Endpoint> {
     if let Some(key) = &config.secret_key {
         builder = builder.secret_key(key.clone());
     }
-    builder
-        .bind()
-        .await
-        .context("bind iroh operator endpoint")
+    builder.bind().await.context("bind iroh operator endpoint")
 }
 
 /// Wait until the endpoint is online (usable for dial/accept), or time out.

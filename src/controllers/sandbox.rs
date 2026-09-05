@@ -9422,7 +9422,7 @@ pub(crate) mod tests {
         SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary, SandboxIsolation,
         SandboxLeaseSpec, SandboxLeaseStatus, SandboxPoolReference, SandboxPoolSpec,
         SandboxPortSpec, SandboxPrincipal, SandboxReadinessRequirements, SandboxResourceQuantity,
-        SandboxTemplateSpec,
+        SandboxTemplateSpec, SandboxTransport,
     };
     use kube::api::ObjectMeta;
     use wiremock::matchers::{method, path, query_param};
@@ -9939,6 +9939,7 @@ pub(crate) mod tests {
                 max_ttl: "8h".into(),
                 provisioning_timeout: "10m".into(),
                 placement: SandboxPlacement::Management {},
+                transport: SandboxTransport::Direct,
                 template: SandboxTemplateSpec {
                     default_container: "agent".into(),
                     containers: vec![SandboxContainerSpec {

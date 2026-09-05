@@ -1362,7 +1362,7 @@ mod tests {
     use crate::crd::{
         SandboxCondition, SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary,
         SandboxIsolation, SandboxPlacement, SandboxPoolStatus, SandboxPortSpec,
-        SandboxReadinessRequirements, SandboxResourceQuantity,
+        SandboxReadinessRequirements, SandboxResourceQuantity, SandboxTransport,
     };
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -1380,6 +1380,7 @@ mod tests {
             max_ttl: "8h".into(),
             provisioning_timeout: "10m".into(),
             placement: SandboxPlacement::Management {},
+            transport: SandboxTransport::Direct,
             template: SandboxTemplateSpec {
                 default_container: "agent".into(),
                 containers: vec![SandboxContainerSpec {
