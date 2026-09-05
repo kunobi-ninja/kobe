@@ -130,6 +130,93 @@ function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
 	return fatal;
 }
 
+/// Wait until the RBAC authorizer itself grants the identity.
+///
+/// The single `kubectl apply` below installs the admission policies AND
+/// `rbac.yaml` — the bindings both usernames patch status through. Only the
+/// policies were waited for, and policy type-checking is done by a different
+/// controller than the authorizer's cache refresh: the two are independent and
+/// unordered.
+///
+/// That matters because authorization runs BEFORE validating admission. Inside
+/// the propagation window the first status patch fails with `is forbidden`
+/// rather than succeeding, and the forged-write assertion sees an RBAC 403
+/// instead of the policy's message — so a binding that had not propagated
+/// reads as the policy being wrong.
+///
+/// `auth can-i` is a SubjectAccessReview evaluated by the same authorizer the
+/// real request will meet, so this is the condition itself rather than a proxy.
+async function waitForAuthorizedIdentity(username: string): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	let lastObservation = "authorizer never answered";
+	while (Date.now() < deadline) {
+		const result = await kubectl(
+			[
+				"auth",
+				"can-i",
+				"patch",
+				"clusterleases.kobe.kunobi.ninja",
+				"--subresource=status",
+				`--as=${username}`,
+				"-n",
+				namespace,
+			],
+			{ allowFailure: true },
+		);
+		if (result.stdout.trim() === "yes") {
+			return;
+		}
+		// Never leave this empty: an empty diagnostic is what made the original
+		// failure take an hour to read.
+		lastObservation =
+			result.stdout.trim() ||
+			result.stderr.trim() ||
+			"no output, exit " + String(result.exitCode);
+		await Bun.sleep(500);
+	}
+	throw new Error(
+		`RBAC did not grant ${username} status patch within 60s: ${lastObservation}`,
+	);
+}
+
+/// Wait until the policy actually rejects a write, not merely until it parses.
+///
+/// `waitForTypeCheckedPolicy` proves the API server has type-checked the
+/// policy, which its own comment notes is not the same as the binding being
+/// live on the admission path. Between those two moments a forged write still
+/// succeeds, and every assertion below reads that as the control plane having
+/// forged a teardown proof.
+///
+/// That window is not theoretical: this job passed at 15:30 UTC and failed at
+/// 03:12 UTC on the identical commit, reporting an empty message because the
+/// forged patch had returned success and therefore written nothing to stderr.
+///
+/// Probing with a write the policy must reject is the only signal the API
+/// server offers, and it is the same evidence the assertions themselves rely
+/// on.
+async function waitForEnforcingPolicy(
+	username: string,
+	probe: () => Promise<CommandResult>,
+	expected: string,
+): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	let lastObservation = "policy never rejected the probe write";
+	while (Date.now() < deadline) {
+		const result = await probe();
+		if (result.exitCode !== 0 && result.stderr.includes(expected)) {
+			return;
+		}
+		lastObservation =
+			result.exitCode === 0
+				? "probe write was ADMITTED (policy not yet enforcing)"
+				: `probe rejected for another reason: ${result.stderr.trim()}`;
+		await Bun.sleep(500);
+	}
+	throw new Error(
+		`admission policy did not become enforcing for ${username}: ${lastObservation}`,
+	);
+}
+
 /// Wait for the API server's documented type-check completion signals.
 ///
 /// ValidatingAdmissionPolicy does not promise an `Accepted=True` condition.
@@ -237,6 +324,12 @@ try {
 	await Promise.all([
 		waitForTypeCheckedPolicy(authorityPolicyName),
 		waitForTypeCheckedPolicy(firewallPolicyName),
+		// The same apply installed rbac.yaml. Authorization runs before
+		// validating admission, so an unpropagated binding fails the first
+		// patch outright and makes the forged-write assertion read an RBAC 403
+		// as the policy misbehaving.
+		waitForAuthorizedIdentity(controlPlaneUsername),
+		waitForAuthorizedIdentity(authorityUsername),
 	]);
 
 	const lease = JSON.stringify({
@@ -253,6 +346,20 @@ try {
 	await kubectl(["create", "-f", "-"], { stdin: lease });
 
 	await patchLeaseStatus(controlPlaneUsername, { phase: "Pending" });
+
+	// Type-checked is not enforcing. Prove the binding is live on the admission
+	// path before reading a successful write as a forged proof.
+	await waitForEnforcingPolicy(
+		controlPlaneUsername,
+		() =>
+			patchLeaseStatus(
+				controlPlaneUsername,
+				{ phase: "Pending", teardownAttemptId: "enforcement-probe" },
+				true,
+			),
+		"only the teardown authority may change status.teardownAttemptId",
+	);
+
 	const forged = await patchLeaseStatus(
 		controlPlaneUsername,
 		{ phase: "Pending", teardownAttemptId: "forged-attempt" },
@@ -261,7 +368,10 @@ try {
 	assert(
 		forged.exitCode !== 0 &&
 			forged.stderr.includes("only the teardown authority may change status.teardownAttemptId"),
-		`control plane forged teardown proof or failed unexpectedly: ${forged.stderr}`,
+		forged.exitCode === 0
+			? "control plane FORGED a teardown proof: the patch was admitted"
+			: "control plane patch was rejected for the wrong reason: " +
+				(forged.stderr.trim() || "<no stderr>"),
 	);
 
 	await patchLeaseStatus(authorityUsername, {
