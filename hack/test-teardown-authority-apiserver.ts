@@ -130,6 +130,49 @@ function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
 	return fatal;
 }
 
+/// Wait until the RBAC authorizer itself grants the identity.
+///
+/// The single `kubectl apply` below installs the admission policies AND
+/// `rbac.yaml` — the bindings both usernames patch status through. Only the
+/// policies were waited for, and policy type-checking is done by a different
+/// controller than the authorizer's cache refresh: the two are independent and
+/// unordered.
+///
+/// That matters because authorization runs BEFORE validating admission. Inside
+/// the propagation window the first status patch fails with `is forbidden`
+/// rather than succeeding, and the forged-write assertion sees an RBAC 403
+/// instead of the policy's message — so a binding that had not propagated
+/// reads as the policy being wrong.
+///
+/// `auth can-i` is a SubjectAccessReview evaluated by the same authorizer the
+/// real request will meet, so this is the condition itself rather than a proxy.
+async function waitForAuthorizedIdentity(username: string): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	let lastObservation = "authorizer never answered";
+	while (Date.now() < deadline) {
+		const result = await kubectl(
+			[
+				"auth",
+				"can-i",
+				"patch",
+				"clusterleases.kobe.kunobi.ninja/status",
+				`--as=${username}`,
+				"-n",
+				namespace,
+			],
+			{ allowFailure: true },
+		);
+		if (result.stdout.trim() === "yes") {
+			return;
+		}
+		lastObservation = result.stdout.trim() || result.stderr.trim();
+		await Bun.sleep(500);
+	}
+	throw new Error(
+		`RBAC did not grant ${username} status patch within 60s: ${lastObservation}`,
+	);
+}
+
 /// Wait until the policy actually rejects a write, not merely until it parses.
 ///
 /// `waitForTypeCheckedPolicy` proves the API server has type-checked the
@@ -275,6 +318,12 @@ try {
 	await Promise.all([
 		waitForTypeCheckedPolicy(authorityPolicyName),
 		waitForTypeCheckedPolicy(firewallPolicyName),
+		// The same apply installed rbac.yaml. Authorization runs before
+		// validating admission, so an unpropagated binding fails the first
+		// patch outright and makes the forged-write assertion read an RBAC 403
+		// as the policy misbehaving.
+		waitForAuthorizedIdentity(controlPlaneUsername),
+		waitForAuthorizedIdentity(authorityUsername),
 	]);
 
 	const lease = JSON.stringify({
