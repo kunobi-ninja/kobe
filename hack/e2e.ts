@@ -1724,12 +1724,55 @@ kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BAC
       step: "failed to clean up existing local demo pool resources",
     },
   );
+  await waitForDemoPoolsGone(cluster, namespace);
   await runCommand(
     ["/bin/sh", "-lc", `cat <<'EOF' | kubectl --context ${kubeContext(cluster)} apply -f -
 ${bootstrapManifest(namespace, sandboxFixture)}EOF`],
     {
       step: "failed to apply local demo token/policy/pool",
     },
+  );
+}
+
+/// Prove the demo pools are actually gone before re-applying their names.
+///
+/// Every delete above is suffixed `|| true`, which swallows a delete that
+/// timed out waiting on a finalizer exactly as if it had succeeded. Re-applying
+/// the same names then adopts a terminating object instead of creating a fresh
+/// one, and the failure surfaces much later as a pool that never goes Ready.
+async function waitForDemoPoolsGone(
+  cluster: string,
+  namespace: string,
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  let lastObservation = "objects were never listed";
+  while (Date.now() < deadline) {
+    const remaining = await runCommand(
+      [
+        "kubectl",
+        "--context",
+        kubeContext(cluster),
+        "get",
+        "clusterpools.kobe.kunobi.ninja,clusterinstances.kobe.kunobi.ninja",
+        "-n",
+        namespace,
+        "-o",
+        "name",
+      ],
+      { allowFailure: true },
+    );
+    const names = remaining.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line.includes("demo"));
+    if (remaining.exitCode === 0 && names.length === 0) {
+      return;
+    }
+    lastObservation = names.join(", ") || remaining.stderr.trim();
+    await Bun.sleep(500);
+  }
+  throw new Error(
+    `demo pools did not finish deleting within 60s, refusing to re-apply over them: ${lastObservation}`,
   );
 }
 
@@ -2747,7 +2790,82 @@ async function injectRbacRevocation(args: Args): Promise<void> {
   await kubectl(args, ["patch", "clusterrole", name, "--type=merge", "-p", JSON.stringify({ rules })], {
     step: `failed to narrow ClusterRole '${name}'`,
   });
+  // The patch is in etcd; the authorizer may still be answering from a stale
+  // cache. Returning here lets the operator get one more successful read and
+  // verify a teardown the scenario needs to be unverifiable.
+  await waitForAuthorizerVerdict(args, await operatorSubject(args), UNVERIFIABLE_TEARDOWN_REVOCATIONS, "no");
   step(`Injected '${args.failure}' into ClusterRole '${name}'`);
+}
+
+/// Wait until the authorizer actually reflects a ClusterRole change.
+///
+/// `kubectl patch` returning proves the object is in etcd, not that the
+/// apiserver's RBAC authorizer has refreshed its cache. That gap inverts the
+/// meaning of the `teardown-unverifiable` scenario: if the operator's
+/// verification `get` runs inside the window it SUCCEEDS, teardown verifies,
+/// the lease reaches Released, and the assertion reports "an unverifiable
+/// teardown reported Released, releasing capacity it could not prove free" —
+/// a capacity-safety violation in the operator that never happened.
+///
+/// `auth can-i` is a SubjectAccessReview evaluated by the same authorizer
+/// instance the operator's own request will meet, so this waits on the exact
+/// condition rather than a proxy for it.
+async function waitForAuthorizerVerdict(
+  args: Args,
+  subject: string,
+  targets: ReadonlyArray<RevocationTarget>,
+  want: "yes" | "no",
+): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastObservation = "authorizer never answered";
+  while (Date.now() < deadline) {
+    const verdicts = await Promise.all(
+      targets.map((target) =>
+        kubectl(
+          args,
+          [
+            "auth",
+            "can-i",
+            target.verb,
+            `${target.resource}.${target.apiGroup}`,
+            `--as=${subject}`,
+            "-n",
+            args.namespace,
+          ],
+          { allowFailure: true },
+        ),
+      ),
+    );
+    const answers = verdicts.map((verdict) => verdict.stdout.trim());
+    if (answers.every((answer) => answer === want)) {
+      return;
+    }
+    lastObservation = answers.join(", ");
+    await Bun.sleep(500);
+  }
+  throw new Error(
+    `authorizer did not report '${want}' for ${subject} within 30s: ${lastObservation}`,
+  );
+}
+
+/// The identity the operator's own API calls carry.
+async function operatorSubject(args: Args): Promise<string> {
+  const account = await kubectl(
+    args,
+    [
+      "get",
+      "deployment",
+      "-n",
+      args.namespace,
+      "-l",
+      `app.kubernetes.io/name=kobe,app.kubernetes.io/instance=${args.release}`,
+      "-o",
+      "jsonpath={.items[0].spec.template.spec.serviceAccountName}",
+    ],
+    { step: "failed to resolve the operator ServiceAccount" },
+  );
+  const name = account.stdout.trim() || "kobe";
+  return `system:serviceaccount:${args.namespace}:${name}`;
 }
 
 type ServiceList = {
@@ -2813,8 +2931,48 @@ async function injectChildApiUnreachable(args: Args): Promise<void> {
       ],
       { step: `failed to sever Service '${service.namespace}/${service.name}'` },
     );
+    await waitForServiceDrained(args, service.namespace, service.name);
   }
   step(`Injected '${args.failure}' for ClusterInstance '${instance}'`);
+}
+
+/// Wait until a severed Service actually stops routing.
+///
+/// Patching the selector puts the change in etcd; the endpoints controller and
+/// kube-proxy have not yet converged, so the child API stays reachable for a
+/// window. Returning inside it means "the operator cannot reach the child" is
+/// asserted while it still can.
+async function waitForServiceDrained(
+  args: Args,
+  namespace: string,
+  name: string,
+): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastObservation = "endpoints were never read";
+  while (Date.now() < deadline) {
+    const slices = await kubectl(
+      args,
+      [
+        "get",
+        "endpointslices",
+        "-n",
+        namespace,
+        "-l",
+        `kubernetes.io/service-name=${name}`,
+        "-o",
+        "jsonpath={.items[*].endpoints[*].addresses[*]}",
+      ],
+      { allowFailure: true },
+    );
+    lastObservation = slices.stdout.trim();
+    if (slices.exitCode === 0 && lastObservation === "") {
+      return;
+    }
+    await Bun.sleep(500);
+  }
+  throw new Error(
+    `Service ${namespace}/${name} still had endpoints after 30s: ${lastObservation}`,
+  );
 }
 
 /// Resolve the child cluster behind a lease, by reading the CR.
@@ -2889,6 +3047,14 @@ async function clearFailure(args: Args): Promise<void> {
         JSON.stringify({ rules: state.clusterRole.rules }),
       ],
       { step: `failed to restore ClusterRole '${state.clusterRole.name}'` },
+    );
+    // Mirror of the injection wait: the restore is only meaningful once the
+    // authorizer grants again, or the next step races the recovery.
+    await waitForAuthorizerVerdict(
+      args,
+      await operatorSubject(args),
+      UNVERIFIABLE_TEARDOWN_REVOCATIONS,
+      "yes",
     );
   }
 
