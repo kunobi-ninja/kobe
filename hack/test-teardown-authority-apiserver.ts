@@ -130,6 +130,44 @@ function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
 	return fatal;
 }
 
+/// Wait until the policy actually rejects a write, not merely until it parses.
+///
+/// `waitForTypeCheckedPolicy` proves the API server has type-checked the
+/// policy, which its own comment notes is not the same as the binding being
+/// live on the admission path. Between those two moments a forged write still
+/// succeeds, and every assertion below reads that as the control plane having
+/// forged a teardown proof.
+///
+/// That window is not theoretical: this job passed at 15:30 UTC and failed at
+/// 03:12 UTC on the identical commit, reporting an empty message because the
+/// forged patch had returned success and therefore written nothing to stderr.
+///
+/// Probing with a write the policy must reject is the only signal the API
+/// server offers, and it is the same evidence the assertions themselves rely
+/// on.
+async function waitForEnforcingPolicy(
+	username: string,
+	probe: () => Promise<CommandResult>,
+	expected: string,
+): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	let lastObservation = "policy never rejected the probe write";
+	while (Date.now() < deadline) {
+		const result = await probe();
+		if (result.exitCode !== 0 && result.stderr.includes(expected)) {
+			return;
+		}
+		lastObservation =
+			result.exitCode === 0
+				? "probe write was ADMITTED (policy not yet enforcing)"
+				: `probe rejected for another reason: ${result.stderr.trim()}`;
+		await Bun.sleep(500);
+	}
+	throw new Error(
+		`admission policy did not become enforcing for ${username}: ${lastObservation}`,
+	);
+}
+
 /// Wait for the API server's documented type-check completion signals.
 ///
 /// ValidatingAdmissionPolicy does not promise an `Accepted=True` condition.
@@ -253,6 +291,20 @@ try {
 	await kubectl(["create", "-f", "-"], { stdin: lease });
 
 	await patchLeaseStatus(controlPlaneUsername, { phase: "Pending" });
+
+	// Type-checked is not enforcing. Prove the binding is live on the admission
+	// path before reading a successful write as a forged proof.
+	await waitForEnforcingPolicy(
+		controlPlaneUsername,
+		() =>
+			patchLeaseStatus(
+				controlPlaneUsername,
+				{ phase: "Pending", teardownAttemptId: "enforcement-probe" },
+				true,
+			),
+		"only the teardown authority may change status.teardownAttemptId",
+	);
+
 	const forged = await patchLeaseStatus(
 		controlPlaneUsername,
 		{ phase: "Pending", teardownAttemptId: "forged-attempt" },
@@ -261,7 +313,10 @@ try {
 	assert(
 		forged.exitCode !== 0 &&
 			forged.stderr.includes("only the teardown authority may change status.teardownAttemptId"),
-		`control plane forged teardown proof or failed unexpectedly: ${forged.stderr}`,
+		forged.exitCode === 0
+			? "control plane FORGED a teardown proof: the patch was admitted"
+			: "control plane patch was rejected for the wrong reason: " +
+				(forged.stderr.trim() || "<no stderr>"),
 	);
 
 	await patchLeaseStatus(authorityUsername, {
