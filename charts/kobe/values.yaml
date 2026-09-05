@@ -127,6 +127,17 @@ containerSecurityContext:
 #             the release owner and pinned digest before using either runtime.
 agentSandbox:
   mode: disabled
+  # Iroh P2P data-plane relay selection (#197). The binary always ships iroh;
+  # this only decides which relays the operator endpoint uses.
+  #
+  #   public    (default) Public n0 relays. Session bytes are end-to-end
+  #             encrypted QUIC, so a relay observes metadata only (addresses,
+  #             timing), never session content — but it is an external
+  #             dependency without an SLA.
+  #   disabled  No endpoint is bound. Pools requesting `iroh` transport are
+  #             refused at admission, never silently served over WebSocket.
+  #   <urls>    Comma-separated relay URLs for a self-hosted relay map.
+  irohRelay: public
   # Aggregate object ceiling across every caller. This namespace contains only
   # admission tokens plus distributed operation gates/principal ledgers, so
   # the quota cannot starve unrelated leader elections. Each live Sandbox can

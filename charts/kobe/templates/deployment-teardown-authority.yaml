@@ -44,6 +44,10 @@ spec:
               value: "teardown-authority"
             - name: AGENT_SANDBOX_MODE
               value: "disabled"
+            # The authority never serves sessions; it must not hold relay
+            # connections open.
+            - name: KOBE_IROH_RELAY
+              value: "disabled"
             - name: OPERATOR_NAMESPACE
               value: {{ .Values.operatorNamespace | quote }}
             - name: POD_NAMESPACE

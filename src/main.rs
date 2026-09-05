@@ -209,6 +209,38 @@ async fn run() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
+    // Iroh P2P data-plane endpoint (#197). Config is refused at STARTUP for the
+    // same reason as the Agent Sandbox mode above: a misconfigured relay must
+    // fail boot, not the first iroh session. Default is the public relay;
+    // `disabled` binds nothing and makes iroh pools inadmissible. A bind
+    // failure degrades to no-endpoint (direct pools keep working; iroh pools
+    // are refused explicitly at admission) rather than killing the operator.
+    let iroh_endpoint = match crate::iroh_transport::operator_config_from_env() {
+        Err(reason) => {
+            error!(reason = %reason, "invalid KOBE_IROH_RELAY");
+            std::process::exit(1);
+        }
+        Ok(crate::iroh_transport::IrohOperatorConfig::Disabled) => {
+            info!("iroh transport disabled; pools requesting iroh will be refused");
+            None
+        }
+        Ok(crate::iroh_transport::IrohOperatorConfig::Enabled(relay)) => {
+            let config = crate::iroh_transport::IrohTransportConfig {
+                relay,
+                secret_key: None,
+            };
+            match crate::iroh_transport::bind_endpoint(&config).await {
+                Ok(endpoint) => {
+                    info!(node_id = %endpoint.id(), "iroh operator endpoint bound");
+                    Some(endpoint)
+                }
+                Err(err) => {
+                    error!(error = %err, "iroh endpoint bind failed; iroh pools will be refused");
+                    None
+                }
+            }
+        }
+    };
     if agent_sandbox_mode.enabled() {
         let policy_name = match std::env::var("KOBE_SANDBOX_LEDGER_POLICY_NAME") {
             Ok(value) if crate::pool::is_valid_k8s_name(&value) => value,
@@ -352,7 +384,18 @@ async fn run() -> anyhow::Result<()> {
         sandbox_admission_limiter: Default::default(),
         shutdown: shutdown.clone(),
         sandbox_enabled: agent_sandbox_mode.enabled(),
+        iroh_endpoint: iroh_endpoint.clone(),
     };
+
+    // Close the iroh endpoint once shutdown starts so P2P sessions drain with
+    // the HTTP server instead of outliving the process.
+    if let Some(endpoint) = iroh_endpoint {
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal.cancelled().await;
+            endpoint.close().await;
+        });
+    }
 
     let app = build_router(state);
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());

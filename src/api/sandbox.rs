@@ -3599,6 +3599,20 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     if let Err(err) = pool.spec.validate() {
         return sandbox_infra_error("SandboxPool configuration is invalid", err);
     }
+    // Iroh pools need a bound operator endpoint (#197). Refuse explicitly:
+    // serving them over WebSocket instead would be a silent downgrade of the
+    // transport the pool administrator chose.
+    if let Err(detail) = crate::iroh_transport::require_iroh_available(
+        pool.spec.transport,
+        state.iroh_endpoint.is_some(),
+    ) {
+        warn!(pool = %request.pool, "Sandbox admission refused an iroh pool with no operator endpoint");
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SandboxPool requests iroh transport but the operator has it disabled",
+            Some(detail.to_string()),
+        );
+    }
     let child_composition_eligible = child_pool_allocation_is_certified(&pool);
     if let Err(err) = crate::sandbox::require_current_sandbox_pool_ready(&pool)
         && !child_composition_eligible
@@ -7871,6 +7885,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
         }
     }
 
