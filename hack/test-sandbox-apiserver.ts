@@ -166,14 +166,48 @@ async function waitForTeardownFencePolicy(): Promise<void> {
 			policy.status?.observedGeneration === policy.metadata?.generation &&
 			policy.status?.typeChecking !== undefined
 		) {
-			const probe = await kubectl(
-				["create", "-f", "-", "--validate=false", "--dry-run=server"],
+			// Probe with the identity the assertions use, not as admin.
+			// The same apply installed tenant's Role and RoleBinding, and
+			// authorization runs before validating admission: an unpropagated
+			// binding answers `is forbidden` instead of the fence message, so
+			// the deny assertion reads the fence as wrong and — worse — the
+			// allow assertion reads a plain RBAC 403 as the fence being
+			// over-broad. Require BOTH outcomes in one iteration, which is
+			// exactly the conjunction the assertions depend on.
+			const denied = await kubectl(
+				[
+					"create",
+					"-f",
+					"-",
+					"--validate=false",
+					"--dry-run=server",
+					`--as=${tenantUsername}`,
+				],
 				{
 					stdin: ownedPod("blocked-descendant", blockedOwnerUid),
 					allowFailure: true,
 				},
 			);
-			if (probe.stderr.includes(teardownFenceMessage)) return;
+			const allowed = await kubectl(
+				[
+					"create",
+					"-f",
+					"-",
+					"--validate=false",
+					"--dry-run=server",
+					`--as=${tenantUsername}`,
+				],
+				{
+					stdin: ownedPod("unrelated-descendant", "22222222-2222-2222-2222-222222222222"),
+					allowFailure: true,
+				},
+			);
+			if (
+				denied.stderr.includes(teardownFenceMessage) &&
+				allowed.exitCode === 0
+			) {
+				return;
+			}
 		}
 		await Bun.sleep(500);
 	}
@@ -412,9 +446,38 @@ async function waitForAdmissionLedgerControls(): Promise<void> {
 				],
 				{ stdin: configMap(quotaCanaryName), allowFailure: true },
 			);
+			// Both probes above run as the operator, so they prove the
+			// operator's path only. Two later assertions read the tenant's
+			// RBAC and the operator's SelfSubjectAccessReview grant, both
+			// applied in the same manifest — and an unpropagated binding
+			// answers `is forbidden` before admission ever runs, which reads
+			// as the ledger policy misbehaving. Require those too.
+			const tenantProbe = await kubectl(
+				[
+					"create",
+					"-f",
+					"-",
+					"--validate=false",
+					"--dry-run=server",
+					`--as=${tenantUsername}`,
+				],
+				{ stdin: coordinationLease("ledger-readiness-probe"), allowFailure: true },
+			);
+			const reviewGrant = await kubectl(
+				[
+					"auth",
+					"can-i",
+					"create",
+					"selfsubjectaccessreviews.authorization.k8s.io",
+					`--as=${operatorUsername}`,
+				],
+				{ allowFailure: true },
+			);
 			if (
 				policyProbe.stderr.includes(policyCanaryMessage) &&
-				quotaProbe.stderr.toLowerCase().includes("exceeded quota")
+				quotaProbe.stderr.toLowerCase().includes("exceeded quota") &&
+				tenantProbe.stderr.includes("only the operator may mutate the Sandbox ledger") &&
+				reviewGrant.stdout.trim() === "yes"
 			) {
 				return;
 			}
