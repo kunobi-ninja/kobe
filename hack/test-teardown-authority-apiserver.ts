@@ -155,7 +155,8 @@ async function waitForAuthorizedIdentity(username: string): Promise<void> {
 				"auth",
 				"can-i",
 				"patch",
-				"clusterleases.kobe.kunobi.ninja/status",
+				"clusterleases.kobe.kunobi.ninja",
+				"--subresource=status",
 				`--as=${username}`,
 				"-n",
 				namespace,
@@ -165,7 +166,12 @@ async function waitForAuthorizedIdentity(username: string): Promise<void> {
 		if (result.stdout.trim() === "yes") {
 			return;
 		}
-		lastObservation = result.stdout.trim() || result.stderr.trim();
+		// Never leave this empty: an empty diagnostic is what made the original
+		// failure take an hour to read.
+		lastObservation =
+			result.stdout.trim() ||
+			result.stderr.trim() ||
+			"no output, exit " + String(result.exitCode);
 		await Bun.sleep(500);
 	}
 	throw new Error(
