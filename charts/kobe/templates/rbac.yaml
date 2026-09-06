@@ -119,15 +119,37 @@ rules:
   # boundary, including the readiness canary, which runs under this identity —
   # a failure no unit test can see, because RBAC and that gate only apply
   # against a real apiserver.
+  #
+  # The remaining verbs are held to be DELEGATED, not used. The vcluster chart
+  # creates a Role granting its syncer the full set on these subresources, and
+  # RBAC escalation prevention refuses any rule the installer does not itself
+  # hold. The operator installs that release under this identity, so a verb
+  # missing here fails the whole `helm install` — which is what left the
+  # vcluster conformance leg red. `delete`, `patch`, `update`, `list` and
+  # `watch` have no meaning the apiserver acts on for a connection
+  # subresource; `get` and `create` above are the capability.
   - apiGroups: [""]
     resources: ["pods/exec", "pods/attach", "pods/portforward"]
-    verbs: ["get", "create"]
+    verbs: ["get", "create", "delete", "patch", "update", "list", "watch"]
   # Sandbox log reads (#81). Separate from `pods` above because `pods/log` is
   # its own resource to RBAC — and worth stating explicitly: this is the verb
   # that lets the operator return a workload's own output to its lease holder.
+  # `list` and `watch` are delegation-only, for the same vcluster Role.
   - apiGroups: [""]
     resources: ["pods/log"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
+  # Delegation-only, and the one grant here that is a real capability rather
+  # than a formality: `pods/ephemeralcontainers` permits attaching a debug
+  # container to a running Pod, and `pods/resize` permits in-place resource
+  # changes. The operator calls neither. Both are in the Role the vcluster
+  # chart creates, so it cannot install without holding them.
+  #
+  # They are namespaced to wherever this ClusterRole is bound, so the bound
+  # scope is the bound on this. Dropping `vcluster` from the supported
+  # backends is what it would take to drop these.
+  - apiGroups: [""]
+    resources: ["pods/ephemeralcontainers", "pods/resize"]
+    verbs: ["patch", "update"]
   # Per-lease scoped credentials (#81). Kobe mints a ServiceAccount whose Role
   # names exactly one Pod, then a short-lived token for it, and reaches the
   # tenant's Sandbox as THAT identity rather than as itself.
@@ -158,6 +180,22 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The rest of what the vcluster syncer's Role names, held only so the
+  # operator can create that Role. RBAC escalation prevention refuses any rule
+  # the installer does not hold itself, and the check is per verb per resource,
+  # so one gap fails the entire `helm install`.
+  #
+  # `events.k8s.io` is a separate API group from the core `events` above, and
+  # holding one says nothing about the other.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create"]
   # PodDisruptionBudgets — the k3s backend creates a PDB for HA control
   # planes (servers>1) and deletes it on every recycle. Without these verbs
   # the recycle loop's `delete()` fails with 403 Forbidden (RBAC is checked
