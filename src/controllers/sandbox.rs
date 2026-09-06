@@ -5638,7 +5638,26 @@ async fn release_child_composition(
                             })
                         })
                         || unbound_child_release_is_proven(&unrecorded, recorded_instance);
-                if unrecorded_status.teardown_receipt.is_some() && !proof_is_exact {
+                // A receipt is only a mismatch once there is something to
+                // check it against. A handle that bound before the outer
+                // Sandbox checkpointed its pool and instance has no recorded
+                // identity yet, and cancelling while provisioning is how that
+                // window is reached: teardown produces a receipt, the
+                // checkpoint never happened.
+                //
+                // The recovery below is written for exactly that handle. It
+                // resolves the pool and instance from the reciprocal binding,
+                // never from the receipt, checkpoints them and returns, and
+                // the recorded path revalidates the receipt on the next pass
+                // with the exact identities in hand. Quarantining here makes
+                // that recovery unreachable and withholds capacity for a
+                // handle that was never in doubt.
+                let identity_is_recoverable = unrecorded_status.binding.is_some()
+                    && !(recorded_pool.is_some() && recorded_instance.is_some());
+                if unrecorded_status.teardown_receipt.is_some()
+                    && !proof_is_exact
+                    && !identity_is_recoverable
+                {
                     return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
                 }
 
@@ -17076,6 +17095,77 @@ current-context: child
             .rev()
             .find_map(status_value_of)
             .expect("complete child recovery checkpoint");
+        assert_eq!(
+            checkpoint["target"]["childClusterLease"]["uid"],
+            "child-lease-uid"
+        );
+        assert_eq!(
+            checkpoint["target"]["childClusterInstance"]["uid"],
+            "child-instance-uid"
+        );
+        assert_eq!(
+            checkpoint["placement"]["clusterPool"]["uid"],
+            "cluster-pool-uid"
+        );
+    }
+
+    /// A receipt does not make the recovery above unreachable.
+    ///
+    /// Cancelling while provisioning reaches a window where the child bound
+    /// and tore down — leaving a receipt — before the outer Sandbox ever
+    /// checkpointed the pool and instance that receipt has to be validated
+    /// against. `validated_child_receipt_token` deliberately reconstructs no
+    /// expected field from the receipt itself, so with nothing recorded it
+    /// cannot match, and the pre-proof path quarantined on that alone.
+    ///
+    /// The identities are recoverable from the reciprocal binding, which is
+    /// what the recovery does, and the recorded path revalidates the receipt
+    /// on the next pass with them in hand. Quarantining first only withheld
+    /// the pool slot forever.
+    ///
+    /// The nightly caught this as
+    /// `cancelling_while_provisioning_leaves_nothing_behind` quarantining with
+    /// `child_receipt_does_not_match`.
+    #[tokio::test]
+    async fn an_unrecorded_child_receipt_recovers_identity_before_it_can_mismatch() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Recycling",
+                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        // The window this test exists for: torn down, never checkpointed.
+        status.placement = None;
+        status.target = None;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let checkpoint = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("complete child recovery checkpoint");
+        assert_ne!(
+            checkpoint["phase"], "Quarantined",
+            "a receipt that has nothing recorded to match yet is not a mismatch"
+        );
         assert_eq!(
             checkpoint["target"]["childClusterLease"]["uid"],
             "child-lease-uid"
