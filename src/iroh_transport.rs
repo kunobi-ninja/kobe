@@ -87,6 +87,9 @@ pub enum RelayConfig {
     /// Operator-run relays, by URL.
     Custom(Vec<String>),
     /// No relays: direct UDP only. Fails behind NAT by construction.
+    /// Constructed by tests and by a future `KOBE_IROH_RELAY` mapping; production
+    /// `"disabled"` currently means no endpoint at all (`IrohOperatorConfig`).
+    #[allow(dead_code)]
     Disabled,
 }
 
@@ -359,6 +362,7 @@ pub async fn read_blob<R: AsyncReadExt + Unpin>(
 }
 
 /// Write the raw ticket bytes as the first blob on a newly opened stream.
+#[cfg(test)]
 pub async fn write_ticket<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     ticket_hex: &str,

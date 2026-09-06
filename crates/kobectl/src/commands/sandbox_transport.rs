@@ -693,7 +693,7 @@ async fn request_iroh_session(
     if !response.status().is_success() {
         anyhow::bail!("iroh session was refused (HTTP {})", response.status());
     }
-    Ok(response.json().await.context("iroh session offer")?)
+    response.json().await.context("iroh session offer")
 }
 
 async fn write_blob<W: tokio::io::AsyncWriteExt + Unpin>(
