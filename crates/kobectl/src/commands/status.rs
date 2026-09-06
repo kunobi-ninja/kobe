@@ -302,6 +302,8 @@ async fn enrich_leases(
                 kubeconfig_path,
                 alias: lease.alias,
                 metadata: detail.metadata.or(lease.metadata),
+                transport: detail.transport.or(lease.transport),
+                iroh: detail.iroh.or(lease.iroh),
             }),
             Err(_) => enriched.push(LeaseSummary {
                 kubeconfig_path,
@@ -354,6 +356,8 @@ mod tests {
                 kubeconfig_path: None,
                 alias: None,
                 metadata: None,
+                transport: None,
+                iroh: None,
             },
             LeaseSummary {
                 id: "sandbox-b".into(),
@@ -368,6 +372,8 @@ mod tests {
                 kubeconfig_path: None,
                 alias: None,
                 metadata: None,
+                transport: None,
+                iroh: None,
             },
             LeaseSummary {
                 id: "sandbox-c".into(),
@@ -382,6 +388,8 @@ mod tests {
                 kubeconfig_path: None,
                 alias: None,
                 metadata: None,
+                transport: None,
+                iroh: None,
             },
         ];
         assert_eq!(hidden_lease_counts(&leases), (1, 1));

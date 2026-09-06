@@ -27,7 +27,7 @@ use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
     CIDRClaim, CIDRClaimPhase, ClusterInstance, ClusterInstancePhase, ClusterLease,
     ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase, Requester,
-    SandboxPool, SandboxVerb,
+    SandboxPool, SandboxTransport, SandboxVerb,
 };
 use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
@@ -83,6 +83,15 @@ pub struct AppState<B: ClusterBackend> {
     /// validated at startup. Disabled deployments do not mount Sandbox HTTP
     /// routes, so they cannot admit leases that no controller will reconcile.
     pub sandbox_enabled: bool,
+    /// Operator-side iroh endpoint for P2P session bytes (#197). `None` when
+    /// the operator disabled iroh (`KOBE_IROH_RELAY=disabled`); pools that
+    /// request `iroh` transport are then rejected at admission, never silently
+    /// served over WebSocket.
+    pub iroh_endpoint: Option<iroh::Endpoint>,
+    /// Replica-local one-shot tickets for iroh sessions. Empty when the
+    /// endpoint is `None`; still present so tests can exercise mint/claim
+    /// without binding UDP.
+    pub iroh_sessions: crate::iroh_transport::IrohSessionHub,
 }
 
 /// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
@@ -602,6 +611,17 @@ struct LeaseSummary {
     /// and `alias` when a shared-pool listing contains another tenant's lease.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<serde_json::Value>,
+    /// Sandbox data-plane. Omitted for cluster leases and for `direct`.
+    #[serde(skip_serializing_if = "is_direct_or_absent")]
+    transport: Option<SandboxTransport>,
+    /// How to reach this replica over iroh. Omitted unless `transport` is iroh
+    /// and this process has an endpoint bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iroh: Option<crate::iroh_transport::IrohDial>,
+}
+
+fn is_direct_or_absent(transport: &Option<SandboxTransport>) -> bool {
+    !matches!(transport, Some(SandboxTransport::Iroh))
 }
 
 /// Query parameters for `GET /v1/leases` (#107 P2).
@@ -1663,6 +1683,8 @@ async fn list_leases<B: ClusterBackend>(
                         requester: None,
                         alias,
                         metadata: c.spec.metadata.as_deref().cloned(),
+                        transport: None,
+                        iroh: None,
                     }
                 })
                 .collect();
@@ -1691,6 +1713,8 @@ async fn list_leases<B: ClusterBackend>(
                                 requester: None,
                                 alias: lease.alias,
                                 metadata: None,
+                                transport: Some(lease.transport),
+                                iroh: lease.iroh,
                             })
                         }));
                     }
@@ -2941,6 +2965,8 @@ async fn list_pool_leases<B: ClusterBackend>(
                         requester: None,
                         alias: lease.alias,
                         metadata: None,
+                        transport: Some(lease.transport),
+                        iroh: lease.iroh,
                     })
                     .collect();
                 return (StatusCode::OK, Json(summaries)).into_response();
@@ -3003,6 +3029,8 @@ fn pool_lease_summary(lease: &ClusterLease, caller_identity: &str) -> LeaseSumma
         metadata: own
             .then(|| lease.spec.metadata.as_deref().cloned())
             .flatten(),
+        transport: None,
+        iroh: None,
     }
 }
 
@@ -3998,6 +4026,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         (build_router(state), server)
@@ -4031,6 +4061,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -4123,6 +4155,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -4660,6 +4694,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -4756,6 +4792,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -4854,6 +4892,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -4962,6 +5002,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -5045,6 +5087,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(
@@ -5156,6 +5200,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
 
         Mock::given(method("GET"))
@@ -5625,6 +5671,8 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
+            iroh_endpoint: None,
+            iroh_sessions: Default::default(),
         };
         (state, server)
     }

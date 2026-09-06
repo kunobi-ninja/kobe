@@ -45,6 +45,10 @@ tokio-tungstenite = { version = "0.28", features = [
   "connect",
   "rustls-tls-webpki-roots",
 ], default-features = false }
+# P2P data-plane for `attach` / `port-forward` when the lease's pool selected
+# iroh (#197). tls-ring matches reqwest/tungstenite so rustls does not panic
+# on two providers. Metrics/portmapper stay off to keep the Windows tree slim.
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # A direct dependency ONLY so the CLI can choose its crypto provider. reqwest
 # selects ring; tokio-tungstenite's rustls feature pulls aws-lc-rs. With two

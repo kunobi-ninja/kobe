@@ -179,7 +179,12 @@ pub fn parse_caller_frame(message: &Message) -> Result<CallerFrame, StreamEnd> {
         // silently-mangled bytes to a shell.
         Message::Text(_) => return Err(StreamEnd::ProtocolViolation),
     };
+    parse_caller_payload(payload)
+}
 
+/// Parse one channel-framed payload, shared by WebSocket messages and iroh
+/// blobs after the ticket handshake.
+pub fn parse_caller_payload(payload: &[u8]) -> Result<CallerFrame, StreamEnd> {
     let Some((&channel, body)) = payload.split_first() else {
         // An empty frame has no channel, so there is no way to know what the
         // caller meant by it.
@@ -607,6 +612,265 @@ pub async fn pump_attached(
                         }
                     }
                     Some(Err(_)) => return StreamEnd::TargetError,
+                }
+            }
+        }
+    }
+}
+
+async fn send_iroh_channel(
+    send: &mut iroh::endpoint::SendStream,
+    channel: u8,
+    payload: &[u8],
+) -> Result<(), StreamEnd> {
+    let mut frame = Vec::with_capacity(payload.len() + 1);
+    frame.push(channel);
+    frame.extend_from_slice(payload);
+    crate::iroh_transport::write_blob(send, &frame)
+        .await
+        .map_err(|_| StreamEnd::Completed)
+}
+
+async fn next_iroh_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<CallerFrame, StreamEnd> {
+    match crate::iroh_transport::read_blob(recv).await {
+        Ok(None) => Ok(CallerFrame::Close),
+        Ok(Some(blob)) => parse_caller_payload(&blob),
+        Err(_) => Err(StreamEnd::Completed),
+    }
+}
+
+/// Tell an iroh caller why their stream ended, then finish the send side.
+pub async fn close_with_iroh(link: &mut crate::iroh_transport::IrohLink, end: StreamEnd) {
+    debug!(reason = end.code(), "closing Sandbox iroh stream");
+    let payload = format!(r#"{{"reason":"{}"}}"#, end.code());
+    let close = async {
+        let _ = send_iroh_channel(&mut link.send, CHANNEL_ERROR, payload.as_bytes()).await;
+        let _ = link.send.finish();
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(1), close).await;
+}
+
+/// Same pump as [`pump_attached`], over an iroh stream instead of a WebSocket.
+pub async fn pump_attached_iroh(
+    link: &mut crate::iroh_transport::IrohLink,
+    attached: &mut kube::api::AttachedProcess,
+    limits: &mut StreamLimits,
+    revoked: CancellationToken,
+) -> StreamEnd {
+    let mut stdin = attached.stdin();
+    let mut stdout = attached.stdout();
+    let mut stderr = attached.stderr();
+    let mut resize = attached.terminal_size();
+
+    let mut out_buffer = vec![0u8; 32 * 1024];
+    let mut err_buffer = vec![0u8; 32 * 1024];
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if let Err(end) = limits.check(now) {
+            return end;
+        }
+        let deadline = limits.next_deadline(now);
+
+        let stdout_read = async {
+            match stdout.as_mut() {
+                Some(stream) => Some(stream.read(&mut out_buffer).await),
+                None => std::future::pending().await,
+            }
+        };
+        let stderr_read = async {
+            match stderr.as_mut() {
+                Some(stream) => Some(stream.read(&mut err_buffer).await),
+                None => std::future::pending().await,
+            }
+        };
+
+        tokio::select! {
+            _ = revoked.cancelled() => return StreamEnd::Revoked,
+            _ = tokio::time::sleep(deadline) => {
+                return limits
+                    .check(tokio::time::Instant::now())
+                    .err()
+                    .unwrap_or(StreamEnd::IdleTimeout);
+            }
+            inbound = next_iroh_frame(&mut link.recv) => {
+                let frame = match inbound {
+                    Ok(frame) => frame,
+                    Err(end) => return end,
+                };
+                match frame {
+                    CallerFrame::Close => return StreamEnd::Completed,
+                    CallerFrame::Stdin(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if let Err(end) =
+                            limits.record(bytes.len(), tokio::time::Instant::now())
+                        {
+                            return end;
+                        }
+                        let Some(stdin) = stdin.as_mut() else {
+                            return StreamEnd::ProtocolViolation;
+                        };
+                        if let Err(end) = bounded_io(
+                            stdin.write_all(&bytes),
+                            limits,
+                            &revoked,
+                            StreamEnd::TargetError,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                    CallerFrame::Resize { width, height } => {
+                        let Some(resize) = resize.as_mut() else {
+                            return StreamEnd::ProtocolViolation;
+                        };
+                        if let Err(end) = bounded_io(
+                            resize.send(kube::api::TerminalSize { width, height }),
+                            limits,
+                            &revoked,
+                            StreamEnd::TargetError,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                }
+            }
+            read = stdout_read => {
+                match read {
+                    Some(Ok(0)) | None => {
+                        stdout = None;
+                        if stderr.is_none() {
+                            return StreamEnd::Completed;
+                        }
+                    }
+                    Some(Ok(count)) => {
+                        if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
+                            return end;
+                        }
+                        if let Err(end) = bounded_io(
+                            send_iroh_channel(&mut link.send, CHANNEL_STDOUT, &out_buffer[..count]),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                    Some(Err(_)) => return StreamEnd::TargetError,
+                }
+            }
+            read = stderr_read => {
+                match read {
+                    Some(Ok(0)) | None => {
+                        stderr = None;
+                        if stdout.is_none() {
+                            return StreamEnd::Completed;
+                        }
+                    }
+                    Some(Ok(count)) => {
+                        if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
+                            return end;
+                        }
+                        if let Err(end) = bounded_io(
+                            send_iroh_channel(&mut link.send, CHANNEL_STDERR, &err_buffer[..count]),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                    Some(Err(_)) => return StreamEnd::TargetError,
+                }
+            }
+        }
+    }
+}
+
+/// Same pump as [`pump_duplex`], over an iroh stream instead of a WebSocket.
+pub async fn pump_duplex_iroh<S>(
+    link: &mut crate::iroh_transport::IrohLink,
+    target: &mut S,
+    limits: &mut StreamLimits,
+    revoked: CancellationToken,
+) -> StreamEnd
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; 32 * 1024];
+    loop {
+        let now = tokio::time::Instant::now();
+        if let Err(end) = limits.check(now) {
+            return end;
+        }
+        let deadline = limits.next_deadline(now);
+
+        tokio::select! {
+            _ = revoked.cancelled() => return StreamEnd::Revoked,
+            _ = tokio::time::sleep(deadline) => {
+                return limits
+                    .check(tokio::time::Instant::now())
+                    .err()
+                    .unwrap_or(StreamEnd::IdleTimeout);
+            }
+            inbound = next_iroh_frame(&mut link.recv) => {
+                let frame = match inbound {
+                    Ok(frame) => frame,
+                    Err(end) => return end,
+                };
+                match frame {
+                    CallerFrame::Close => return StreamEnd::Completed,
+                    CallerFrame::Resize { .. } => return StreamEnd::ProtocolViolation,
+                    CallerFrame::Stdin(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if let Err(end) =
+                            limits.record(bytes.len(), tokio::time::Instant::now())
+                        {
+                            return end;
+                        }
+                        if let Err(end) = bounded_io(
+                            target.write_all(&bytes),
+                            limits,
+                            &revoked,
+                            StreamEnd::TargetError,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                }
+            }
+            read = target.read(&mut buffer) => {
+                match read {
+                    Ok(0) => return StreamEnd::Completed,
+                    Ok(count) => {
+                        if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
+                            return end;
+                        }
+                        if let Err(end) = bounded_io(
+                            send_iroh_channel(&mut link.send, CHANNEL_STDOUT, &buffer[..count]),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                    }
+                    Err(_) => return StreamEnd::TargetError,
                 }
             }
         }

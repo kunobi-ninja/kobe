@@ -69,6 +69,14 @@ pub struct SandboxPoolSpec {
     /// placement mutually exclusive in both JSON and generated OpenAPI.
     pub placement: SandboxPlacement,
 
+    /// Data-plane transport for attach/exec/port-forward sessions (#197).
+    /// `direct` (default) is the current WebSocket path terminated at the API
+    /// server; `iroh` opts the pool into the P2P QUIC transport. Admission
+    /// rejects `iroh` where the operator has not enabled it — never silently
+    /// downgrades to `direct`.
+    #[serde(default)]
+    pub transport: SandboxTransport,
+
     /// Restricted template translated into the controller-owned upstream
     /// `SandboxTemplate`; this is intentionally not a `PodSpec` escape hatch.
     pub template: SandboxTemplateSpec,
@@ -211,6 +219,23 @@ impl SandboxPoolSpec {
 
         Ok(())
     }
+}
+
+/// Data-plane transport for a pool's attach/exec/port-forward sessions (#197).
+///
+/// The control plane (REST admission, scoped credentials) is unaffected: this
+/// only selects how session *bytes* move. `Direct` is the WebSocket path
+/// terminated at the API server; `Iroh` is P2P QUIC through the operator's
+/// iroh endpoint (public relay by default).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxTransport {
+    /// WebSocket sessions via the API server. The default.
+    #[default]
+    Direct,
+    /// P2P sessions via iroh. Requires the operator to have iroh enabled;
+    /// admission must reject this otherwise, never fall back to `Direct`.
+    Iroh,
 }
 
 /// Exactly one place in which a SandboxPool may be reconciled.
@@ -1188,6 +1213,7 @@ mod tests {
             max_ttl: "8h".into(),
             provisioning_timeout: "10m".into(),
             placement: SandboxPlacement::Management {},
+            transport: SandboxTransport::Direct,
             template: SandboxTemplateSpec {
                 default_container: "agent".into(),
                 containers: vec![SandboxContainerSpec {
@@ -1355,6 +1381,21 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn transport_defaults_to_direct_and_roundtrips() {
+        // Pre-#197 pools omit the field: they must keep working as `direct`.
+        assert_eq!(SandboxTransport::default(), SandboxTransport::Direct);
+        assert_eq!(
+            serde_json::from_value::<SandboxTransport>(serde_json::json!("direct")).unwrap(),
+            SandboxTransport::Direct
+        );
+        assert_eq!(
+            serde_json::from_value::<SandboxTransport>(serde_json::json!("iroh")).unwrap(),
+            SandboxTransport::Iroh
+        );
+        assert!(serde_json::from_value::<SandboxTransport>(serde_json::json!("quic")).is_err());
     }
 
     #[test]

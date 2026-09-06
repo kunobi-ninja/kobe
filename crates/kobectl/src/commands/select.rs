@@ -236,6 +236,8 @@ mod tests {
             kubeconfig_path: None,
             alias: None,
             metadata: None,
+            transport: None,
+            iroh: None,
         }
     }
 

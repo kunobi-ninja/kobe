@@ -1012,6 +1012,7 @@ mod tests {
             ports: vec![],
             runner_path: None,
             attach_command: None,
+            transport: crate::crd::SandboxTransport::Direct,
         }
     }
 

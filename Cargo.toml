@@ -156,6 +156,11 @@ http = "1"
 libc = "0.2"
 regex = "1"
 
+# P2P data-plane transport for Sandbox attach/exec/port-forward (#197).
+# Compiled into the binary unconditionally; activated per-pool at runtime via
+# `SandboxPool.spec.transport`. Public relay by default, overridable.
+iroh = "1"
+
 # The wire contract with the in-container Sandbox runner (#82). A path
 # dependency on the runner crate rather than a second copy of the types: two
 # hand-maintained definitions of a wire format drift, and the drift shows up as

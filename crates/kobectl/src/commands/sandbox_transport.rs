@@ -32,7 +32,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::config::{CliConfig, ResolvedConfig};
-use super::{OutputFormat, get_auth_header, get_auth_header_noninteractive};
+use super::{
+    OutputFormat, Reaching, authed_client, get_auth_header, get_auth_header_for_output,
+    get_auth_header_noninteractive, with_auth,
+};
 
 pub const CHANNEL_STDIN: u8 = 0;
 pub const CHANNEL_STDOUT: u8 = 1;
@@ -94,6 +97,10 @@ pub fn parse_server_frame(message: &Message) -> Option<ServerFrame> {
         }
         _ => return None,
     };
+    parse_server_payload(payload)
+}
+
+fn parse_server_payload(payload: &[u8]) -> Option<ServerFrame> {
     let (&channel, body) = payload.split_first()?;
     Some(match channel {
         CHANNEL_STDOUT => ServerFrame::Stdout(body.to_vec()),
@@ -202,6 +209,10 @@ pub async fn attach(
     }
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
+
+    if lease_uses_iroh(&config, lease, output).await {
+        return attach_iroh(&config, lease, command, container, tty).await;
+    }
 
     let mut path = format!("/v1/sandbox-leases/{lease}/attach?tty={tty}");
     if let Some(container) = container {
@@ -511,6 +522,7 @@ pub async fn port_forward(
         "/v1/sandbox-leases/{lease}/port-forward?port={}",
         urlencoding_minimal(remote)
     );
+    let iroh = lease_uses_iroh(&config, lease, output).await;
 
     // One connection at a time, on purpose. Concurrency here would need one
     // upstream stream per local connection, and each of those counts against
@@ -518,14 +530,28 @@ pub async fn port_forward(
     // exhaust it and the failures would look like the sandbox misbehaving.
     loop {
         let (mut local, peer) = listener.accept().await.context("accept failed")?;
-        let mut socket = match open_stream(&config, &path, output).await {
-            Ok(socket) => socket,
-            Err(error) => {
-                report_port_forward_error(output, lease, peer, &format!("{error:#}"))?;
-                continue;
+        let result = if iroh {
+            match dial_iroh_session(
+                &config,
+                lease,
+                output,
+                serde_json::json!({
+                    "operation": "port-forward",
+                    "port": remote,
+                }),
+            )
+            .await
+            {
+                Ok(mut link) => pump_connection_iroh(&mut local, &mut link).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            match open_stream(&config, &path, output).await {
+                Ok(mut socket) => pump_connection(&mut local, &mut socket).await,
+                Err(error) => Err(error),
             }
         };
-        if let Err(error) = pump_connection(&mut local, &mut socket).await {
+        if let Err(error) = result {
             report_port_forward_error(output, lease, peer, &format!("{error:#}"))?;
         }
     }
@@ -583,6 +609,387 @@ async fn pump_connection(local: &mut tokio::net::TcpStream, socket: &mut Socket)
             inbound = socket.next() => {
                 let Some(message) = inbound else { return Ok(()) };
                 match parse_server_frame(&message?) {
+                    Some(ServerFrame::Stdout(bytes)) | Some(ServerFrame::Stderr(bytes)) => {
+                        local.write_all(&bytes).await?;
+                    }
+                    Some(ServerFrame::Ended { reason }) => {
+                        if end_is_failure(&reason) {
+                            anyhow::bail!("forward ended: {reason}");
+                        }
+                        return Ok(());
+                    }
+                    Some(ServerFrame::Unknown) | None => {}
+                }
+            }
+        }
+    }
+}
+
+/// ALPN must match the operator's `kobe-sandbox/1`. Duplicated rather than
+/// shared: this crate cannot depend on the operator binary.
+const KOBE_SANDBOX_ALPN: &[u8] = b"kobe-sandbox/1";
+const MAX_BLOB_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IrohSessionOffer {
+    node_id: String,
+    ticket: String,
+    #[serde(default)]
+    relay: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LeaseTransportView {
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+async fn lease_uses_iroh(config: &ResolvedConfig, lease: &str, output: OutputFormat) -> bool {
+    let path = format!("/v1/sandbox-leases/{lease}");
+    let token = match get_auth_header_for_output(config, "GET", &path, b"", output).await {
+        Ok(token) => token,
+        Err(_) => return false,
+    };
+    let response = match with_auth(
+        authed_client().get(format!("{}{path}", config.endpoint.as_str())),
+        &token,
+    )
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    match response.json::<LeaseTransportView>().await {
+        Ok(body) => body.transport.as_deref() == Some("iroh"),
+        Err(_) => false,
+    }
+}
+
+async fn request_iroh_session(
+    config: &ResolvedConfig,
+    lease: &str,
+    output: OutputFormat,
+    body: serde_json::Value,
+) -> Result<IrohSessionOffer> {
+    let path = format!("/v1/sandbox-leases/{lease}/session");
+    let encoded = serde_json::to_vec(&body).context("session body")?;
+    // SSH signatures are verified against an empty body on this API.
+    let token = get_auth_header_for_output(config, "POST", &path, b"", output).await?;
+    let response = with_auth(
+        authed_client()
+            .post(format!("{}{path}", config.endpoint.as_str()))
+            .header("content-type", "application/json")
+            .body(encoded),
+        &token,
+    )
+    .send()
+    .await
+    .reaching(config)?;
+    if !response.status().is_success() {
+        anyhow::bail!("iroh session was refused (HTTP {})", response.status());
+    }
+    response.json().await.context("iroh session offer")
+}
+
+async fn write_blob<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    if data.len() > MAX_BLOB_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "iroh blob exceeds MAX_BLOB_BYTES",
+        ));
+    }
+    let len = u32::try_from(data.len()).expect("len fits u32");
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(data).await?;
+    writer.flush().await
+}
+
+async fn read_blob<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_BLOB_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "iroh blob length is not a usable frame",
+        ));
+    }
+    let mut data = vec![0u8; len];
+    reader.read_exact(&mut data).await?;
+    Ok(Some(data))
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        anyhow::bail!("ticket is not hex");
+    }
+    (0..input.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&input[i..i + 2], 16).context("ticket is not hex"))
+        .collect()
+}
+
+fn relay_mode(configured: &str) -> Result<iroh::RelayMode> {
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "" | "public" => Ok(iroh::RelayMode::Default),
+        "disabled" => Ok(iroh::RelayMode::Disabled),
+        urls => {
+            let map = iroh::RelayMap::empty();
+            for url in urls
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+            {
+                let parsed: iroh::RelayUrl = url
+                    .parse()
+                    .with_context(|| format!("invalid iroh relay URL: {url}"))?;
+                let cfg = std::sync::Arc::new(iroh::RelayConfig::new(parsed.clone(), None));
+                map.insert(parsed, cfg);
+            }
+            Ok(iroh::RelayMode::Custom(map))
+        }
+    }
+}
+
+struct IrohLink {
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    _conn: iroh::endpoint::Connection,
+    _endpoint: iroh::Endpoint,
+}
+
+async fn dial_iroh_session(
+    config: &ResolvedConfig,
+    lease: &str,
+    output: OutputFormat,
+    body: serde_json::Value,
+) -> Result<IrohLink> {
+    let offer = request_iroh_session(config, lease, output, body).await?;
+    let node: iroh::EndpointId = offer
+        .node_id
+        .parse()
+        .context("iroh node id from the session offer is not valid")?;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .relay_mode(relay_mode(&offer.relay)?)
+        .bind()
+        .await
+        .context("bind local iroh endpoint")?;
+    if offer.relay != "disabled" {
+        tokio::time::timeout(std::time::Duration::from_secs(30), endpoint.online())
+            .await
+            .context("local iroh endpoint did not come online")?;
+    }
+    let conn = endpoint
+        .connect(node, KOBE_SANDBOX_ALPN)
+        .await
+        .context("dial operator iroh endpoint")?;
+    let (mut send, recv) = conn.open_bi().await.context("open iroh stream")?;
+    let ticket = decode_hex(&offer.ticket)?;
+    write_blob(&mut send, &ticket)
+        .await
+        .context("send iroh session ticket")?;
+    Ok(IrohLink {
+        send,
+        recv,
+        _conn: conn,
+        _endpoint: endpoint,
+    })
+}
+
+async fn attach_iroh(
+    config: &ResolvedConfig,
+    lease: &str,
+    command: &[String],
+    container: Option<&str>,
+    tty: bool,
+) -> Result<i32> {
+    let mut body = serde_json::json!({
+        "operation": "attach",
+        "tty": tty,
+    });
+    if !command.is_empty() {
+        body["command"] = serde_json::json!(command);
+    }
+    if let Some(container) = container {
+        body["container"] = serde_json::json!(container);
+    }
+    let mut link = dial_iroh_session(config, lease, OutputFormat::Text, body).await?;
+    let _raw = if tty {
+        Some(RawModeGuard::enter()?)
+    } else {
+        None
+    };
+    if tty
+        && let Ok((width, height)) = crossterm::terminal::size()
+        && width > 0
+        && height > 0
+    {
+        let payload = format!(r#"{{"width":{width},"height":{height}}}"#);
+        let mut frame = Vec::with_capacity(payload.len() + 1);
+        frame.push(CHANNEL_RESIZE);
+        frame.extend_from_slice(payload.as_bytes());
+        write_blob(&mut link.send, &frame).await.ok();
+    }
+    let reason = pump_terminal_iroh(&mut link, tty).await?;
+    if end_is_failure(&reason) {
+        eprintln!("kobe: session ended: {reason}");
+        return Ok(super::sandbox::CLI_FAILURE_EXIT);
+    }
+    Ok(0)
+}
+
+fn apply_server_blob(payload: &[u8]) -> Option<String> {
+    match parse_server_payload(payload) {
+        Some(ServerFrame::Stdout(bytes)) => {
+            let mut out = std::io::stdout();
+            out.write_all(&bytes).ok();
+            out.flush().ok();
+            None
+        }
+        Some(ServerFrame::Stderr(bytes)) => {
+            let mut err = std::io::stderr();
+            err.write_all(&bytes).ok();
+            err.flush().ok();
+            None
+        }
+        Some(ServerFrame::Ended { reason }) => Some(reason),
+        Some(ServerFrame::Unknown) | None => None,
+    }
+}
+
+async fn pump_terminal_iroh(link: &mut IrohLink, tty: bool) -> Result<String> {
+    #[cfg(unix)]
+    if tty {
+        return pump_raw_iroh(link).await;
+    }
+    pump_key_events_iroh(link).await
+}
+
+#[cfg(unix)]
+async fn pump_raw_iroh(link: &mut IrohLink) -> Result<String> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.blocking_send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut resized =
+        signal(SignalKind::window_change()).context("could not watch for terminal resizes")?;
+
+    loop {
+        tokio::select! {
+            inbound = read_blob(&mut link.recv) => {
+                let Some(payload) = inbound.context("iroh stream failed")? else {
+                    return Ok("closed".to_string());
+                };
+                if let Some(reason) = apply_server_blob(&payload) {
+                    return Ok(reason);
+                }
+            }
+            outbound = receiver.recv() => {
+                let Some(bytes) = outbound else { continue };
+                let mut frame = Vec::with_capacity(bytes.len() + 1);
+                frame.push(CHANNEL_STDIN);
+                frame.extend_from_slice(&bytes);
+                write_blob(&mut link.send, &frame).await?;
+            }
+            _ = resized.recv() => {
+                if let Ok((width, height)) = crossterm::terminal::size()
+                    && width > 0
+                    && height > 0
+                {
+                    let payload = format!(r#"{{"width":{width},"height":{height}}}"#);
+                    let mut frame = Vec::with_capacity(payload.len() + 1);
+                    frame.push(CHANNEL_RESIZE);
+                    frame.extend_from_slice(payload.as_bytes());
+                    write_blob(&mut link.send, &frame).await?;
+                }
+            }
+        }
+    }
+}
+
+async fn pump_key_events_iroh(link: &mut IrohLink) -> Result<String> {
+    use crossterm::event::{Event, EventStream};
+    use futures_util::StreamExt;
+
+    let mut events = EventStream::new();
+    loop {
+        tokio::select! {
+            inbound = read_blob(&mut link.recv) => {
+                let Some(payload) = inbound.context("iroh stream failed")? else {
+                    return Ok("closed".to_string());
+                };
+                if let Some(reason) = apply_server_blob(&payload) {
+                    return Ok(reason);
+                }
+            }
+            event = events.next() => {
+                let Some(event) = event else { continue };
+                let Event::Key(key) = event.context("keyboard")? else { continue };
+                if let Some(bytes) = key_to_bytes(&key) {
+                    let mut frame = Vec::with_capacity(bytes.len() + 1);
+                    frame.push(CHANNEL_STDIN);
+                    frame.extend_from_slice(&bytes);
+                    write_blob(&mut link.send, &frame).await?;
+                }
+            }
+        }
+    }
+}
+
+async fn pump_connection_iroh(
+    local: &mut tokio::net::TcpStream,
+    link: &mut IrohLink,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = vec![0u8; 32 * 1024];
+    loop {
+        tokio::select! {
+            read = local.read(&mut buffer) => {
+                match read? {
+                    0 => return Ok(()),
+                    count => {
+                        let mut frame = Vec::with_capacity(count + 1);
+                        frame.push(CHANNEL_STDIN);
+                        frame.extend_from_slice(&buffer[..count]);
+                        write_blob(&mut link.send, &frame).await?;
+                    }
+                }
+            }
+            inbound = read_blob(&mut link.recv) => {
+                let Some(payload) = inbound? else { return Ok(()) };
+                match parse_server_payload(&payload) {
                     Some(ServerFrame::Stdout(bytes)) | Some(ServerFrame::Stderr(bytes)) => {
                         local.write_all(&bytes).await?;
                     }

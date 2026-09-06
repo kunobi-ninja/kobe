@@ -985,6 +985,12 @@ fn json_attach_is_refused_and_port_forward_errors_are_machine_events() {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
             ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/sandbox-leases/sandbox-test") => reply(
+                stream,
+                200,
+                &[],
+                &json!({"id":"sandbox-test","phase":"Ready","pool":"agents"}).to_string(),
+            ),
             _ => {
                 *observed.lock().unwrap() += 1;
                 reply(stream, 403, &[], "forward denied");
