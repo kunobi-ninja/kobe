@@ -312,6 +312,18 @@ spec:
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.container == p.container && other.port == p.port).size() == 1)'
                 - message: exposed port names must contain a letter and cannot contain consecutive hyphens
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, p.name.matches(''.*[a-z].*'') && !p.name.contains(''--''))'
+              transport:
+                default: direct
+                description: |-
+                  Data-plane transport for attach/exec/port-forward sessions (#197).
+                  `direct` (default) is the current WebSocket path terminated at the API
+                  server; `iroh` opts the pool into the P2P QUIC transport. Admission
+                  rejects `iroh` where the operator has not enabled it — never silently
+                  downgrades to `direct`.
+                enum:
+                - direct
+                - iroh
+                type: string
               warmCapacity:
                 description: Desired number of unclaimed upstream Sandboxes kept warm.
                 format: uint32
