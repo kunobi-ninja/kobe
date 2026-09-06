@@ -206,7 +206,14 @@ const HELM_REPO_ALIAS: &str = "kobe-loft-sh";
 /// reads helm's stderr in full before this applies. That is acceptable here
 /// because helm is a trusted local binary whose diagnostics are small; it is
 /// not a defence against a hostile subprocess.
-const HELM_STDERR_LIMIT: usize = 800;
+///
+/// 800 was too small for the errors that matter most. An RBAC escalation
+/// denial enumerates every rule the installer may not grant, one per line,
+/// and helm reports several such errors together — the vcluster conformance
+/// leg failed for three weeks on a message that was cut off partway through
+/// the first of two. Sizing this to hold that class of failure whole is the
+/// difference between a diagnosis and a rerun.
+const HELM_STDERR_LIMIT: usize = 4000;
 
 /// Describe how a process ended, without asserting an exit code it may not have.
 ///
