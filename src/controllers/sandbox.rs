@@ -5550,6 +5550,71 @@ async fn cleanup_child_executions_after_proof(
 /// The quota slot returns only once a receipt proves the exact recorded
 /// instance gone. The disappearance of a name is not evidence — a same-named
 /// replacement is fresh capacity, not proof that the original was destroyed.
+/// Checkpoint the child instance identity this lease never recorded.
+///
+/// A sandbox cancelled while provisioning records its child handle before the
+/// pool has bound an instance, so `child_cluster_instance` stays empty while a
+/// teardown receipt already exists. [`validated_child_receipt_token`] requires
+/// that reference and returns `None` without it, which reads as a mismatch on
+/// a receipt already proven authoritative — and no retry can change it.
+///
+/// The identity is resolved from the reciprocal binding, never from the
+/// receipt, so a receipt still cannot certify its own scope.
+async fn recover_child_instance_identity(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    status: &crate::crd::SandboxLeaseStatus,
+    recorded: &crate::crd::SandboxObjectReference,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let resolution = {
+        let client = ctx.client.clone();
+        let namespace = ctx.namespace.clone();
+        let lease_name = recorded.name.clone();
+        let lease_uid = recorded.uid.clone();
+        tokio::spawn(async move {
+            crate::lease_binding::resolve_lease_binding(
+                &client,
+                &namespace,
+                &lease_name,
+                &lease_uid,
+                crate::lease_binding::BindingResolveMode::Lifecycle,
+            )
+            .await
+        })
+        .await
+    };
+    let resolved = match resolution {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            warn!(lease = %name, reason = error.reason_code(), "recorded child binding is not reciprocally valid");
+            return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable").await;
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "child binding resolver task did not complete");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    };
+    let mut next = status.clone();
+    let Some(target) = next.target.as_mut() else {
+        return quarantine_lease(lease, ctx, "child_composition_provenance_invalid").await;
+    };
+    target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "ClusterInstance".into(),
+        namespace: Some(ctx.namespace.clone()),
+        name: resolved.binding.instance.name.clone(),
+        uid: resolved.binding.instance.uid.clone(),
+        generation: Some(resolved.binding.instance.observed_generation),
+    });
+    if patch_lease_status_fenced(ctx, lease, &next).await? {
+        info!(lease = %name, "recovered the child instance identity before teardown");
+    } else {
+        debug!(lease = %name, "child instance recovery checkpoint lost a status race");
+    }
+    Ok(Action::await_change())
+}
+
 async fn release_child_composition(
     lease: &SandboxLease,
     ctx: &SandboxContext,
@@ -5920,6 +5985,31 @@ async fn release_child_composition(
                         return Ok(Action::requeue(std::time::Duration::from_secs(15)));
                     }
                 };
+                // The instance identity can be missing here for the same
+                // reason the receipt exists. A sandbox cancelled while
+                // provisioning checkpoints its handle before the pool has
+                // bound an instance, so `child_cluster_instance` is never
+                // written. `validated_child_receipt_token` requires it and
+                // returns None without it — a mismatch verdict on a receipt
+                // this controller has just proven authoritative against the
+                // immutable evidence object. No retry can change that, so the
+                // release quarantines, the pool slot is withheld forever, and
+                // the lease re-enters this path on every reconcile.
+                //
+                // Recover it the way the pre-checkpoint path does: from the
+                // reciprocal binding, never from the receipt, so a receipt
+                // still cannot certify its own scope. Validation then runs on
+                // the next pass with the exact identity in hand, and a genuine
+                // mismatch still quarantines below.
+                if recorded_instance.is_none() {
+                    // Boxed for the same reason the evidence lookup above is:
+                    // this teardown future is already broad and runs on a
+                    // normal Tokio worker stack.
+                    return Box::pin(recover_child_instance_identity(
+                        lease, ctx, &status, recorded,
+                    ))
+                    .await;
+                }
                 let Some(token) = validated_child_receipt_token(
                     &current,
                     receipt,
@@ -17673,6 +17763,54 @@ current-context: child
             1,
             "the receipt handle is removed only after its proof is durable"
         );
+    }
+
+    /// An instance this lease never recorded is recoverable, not a mismatch.
+    ///
+    /// Cancelling while provisioning checkpoints the child handle before the
+    /// pool has bound an instance, so `child_cluster_instance` is never
+    /// written. `validated_child_receipt_token` requires it and returns None
+    /// without it — a mismatch verdict on a receipt already proven
+    /// authoritative against its immutable evidence object. Nothing about that
+    /// changes on a retry, so the lease quarantined, withheld the pool slot
+    /// forever, and re-entered the same path on every reconcile.
+    ///
+    /// The identity comes from the reciprocal binding, never from the receipt,
+    /// so a receipt still cannot certify its own scope.
+    ///
+    /// The nightly caught this as
+    /// `cancelling_while_provisioning_leaves_nothing_behind` quarantining with
+    /// `child_receipt_does_not_match`.
+    #[tokio::test]
+    async fn a_receipt_recovers_the_unrecorded_instance_instead_of_quarantining() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        mount_child_handle_cleanup(
+            &server,
+            2,
+            Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+        )
+        .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        // The window this test exists for: handle recorded, instance not.
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_instance = None;
+
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
+
+        let phases = recorded_phases(&server).await;
+        assert!(
+            !phases.iter().any(|phase| phase == "Quarantined"),
+            "an instance that was never recorded is recoverable, not a receipt mismatch: {phases:?}"
+        );
+        assert_eq!(phases.last().map(String::as_str), Some("Released"));
     }
 
     /// Receipt-backed fallback still retires the durable execution inventory
