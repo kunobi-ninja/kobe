@@ -171,7 +171,21 @@ pub(crate) async fn resolve_lease_binding(
     if lease_uid != expected_lease_uid || lease.name_any() != lease_name {
         return Err(BindingResolutionError::LeaseUidMismatch);
     }
-    if lease.metadata.deletion_timestamp.is_some() {
+    // A terminating handle is disqualifying for ACCESS and expected for
+    // LIFECYCLE. Access hands a tenant a live cluster, so a lease on its way
+    // out must not resolve. Lifecycle work is teardown — release, expiry,
+    // recycling — and deletion is where that progression ends; the uid was
+    // pinned immediately above, so a deleting lease here is provably the
+    // caller's own, and the retention finalizer keeps it readable precisely so
+    // teardown can still consume its proof.
+    //
+    // Rejecting it in both modes made Lifecycle unable to do the work it
+    // exists for: the Sandbox release path could not recover the child
+    // instance identity from a handle that was already terminating, quarantined
+    // as `child_binding_identity_unverifiable`, and withheld the pool slot
+    // forever. Same reasoning as #192, which fixed the ownership check for the
+    // same class of handle.
+    if mode == BindingResolveMode::Access && lease.metadata.deletion_timestamp.is_some() {
         return Err(BindingResolutionError::LeaseDeleting);
     }
 
@@ -616,6 +630,23 @@ mod tests {
         pool: serde_json::Value,
         expected_uid: &str,
     ) -> Result<ResolvedLeaseBinding, BindingResolutionError> {
+        resolve_objects_in_mode(
+            lease,
+            instance,
+            pool,
+            expected_uid,
+            BindingResolveMode::Access,
+        )
+        .await
+    }
+
+    async fn resolve_objects_in_mode(
+        lease: serde_json::Value,
+        instance: serde_json::Value,
+        pool: serde_json::Value,
+        expected_uid: &str,
+        mode: BindingResolveMode,
+    ) -> Result<ResolvedLeaseBinding, BindingResolutionError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -640,14 +671,54 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::testutil::mock_k8s_client(&server);
-        resolve_lease_binding(
-            &client,
-            "test-ns",
-            "lease-a",
-            expected_uid,
+        resolve_lease_binding(&client, "test-ns", "lease-a", expected_uid, mode).await
+    }
+
+    /// A terminating handle is disqualifying for `Access` and expected for
+    /// `Lifecycle`.
+    ///
+    /// Access hands a tenant a live cluster, so a lease on its way out must not
+    /// resolve. Lifecycle work is teardown, and deletion is where release,
+    /// expiry and recycling end; the uid is pinned before this check, so a
+    /// deleting lease is provably the caller's own, and the retention finalizer
+    /// keeps it readable precisely so teardown can consume its proof.
+    ///
+    /// Rejecting it in both modes made Lifecycle unable to do the work it
+    /// exists for. The nightly caught it as
+    /// `cancelling_while_provisioning_leaves_nothing_behind` quarantining with
+    /// `child_binding_identity_unverifiable`, reason `lease_deleting`, holding
+    /// the pool slot forever.
+    #[tokio::test]
+    async fn a_terminating_lease_resolves_for_lifecycle_but_not_access() {
+        let (_binding, mut lease, instance, pool) = exact_objects();
+        lease["metadata"]["deletionTimestamp"] = "2026-09-07T18:00:00Z".into();
+
+        let denied = resolve_objects_in_mode(
+            lease.clone(),
+            instance.clone(),
+            pool.clone(),
+            "lease-uid",
             BindingResolveMode::Access,
         )
+        .await;
+        assert!(
+            matches!(denied, Err(BindingResolutionError::LeaseDeleting)),
+            "a tenant must not be handed a lease on its way out, got {denied:?}"
+        );
+
+        let resolved = resolve_objects_in_mode(
+            lease,
+            instance,
+            pool,
+            "lease-uid",
+            BindingResolveMode::Lifecycle,
+        )
         .await
+        .expect("teardown must still resolve its own terminating handle");
+        assert_eq!(
+            resolved.instance.metadata.uid.as_deref(),
+            Some("instance-uid")
+        );
     }
 
     #[tokio::test]
