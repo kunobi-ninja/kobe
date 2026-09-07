@@ -5723,7 +5723,18 @@ async fn release_child_composition(
                     && !proof_is_exact
                     && !identity_is_recoverable
                 {
-                    return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
+                    // Distinct from the recorded path's verdict below. Both
+                    // read "the receipt does not match", but they are reached
+                    // under opposite conditions — here nothing was
+                    // checkpointed, there everything was — and a shared string
+                    // cost a day of reading logs that could not tell them
+                    // apart.
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        "child_receipt_does_not_match_precheckpoint",
+                    )
+                    .await;
                 }
 
                 let mut next = status.clone();
@@ -17215,7 +17226,10 @@ current-context: child
     ///
     /// The nightly caught this as
     /// `cancelling_while_provisioning_leaves_nothing_behind` quarantining with
-    /// `child_receipt_does_not_match`.
+    /// `child_receipt_does_not_match`, which this path now reports under its
+    /// own name, `child_receipt_does_not_match_precheckpoint` — the shared
+    /// string was why the failure was first read as this path when it was the
+    /// recorded one.
     #[tokio::test]
     async fn an_unrecorded_child_receipt_recovers_identity_before_it_can_mismatch() {
         let (ctx, server) = test_context().await;
