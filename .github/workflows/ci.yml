@@ -594,7 +594,13 @@ jobs:
             kubectl --context "$CTX" exec -n kobe-system "$POD" -c workspace -v=8 \
               --as "system:serviceaccount:kobe-system:${SA:-kobe}" -- /bin/true 2>&1 | tail -30 || true
           fi
-          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 400 --all-containers || true
+          # A quarantine loop writes ~90 lines a second, so 400 lines was about
+          # four seconds of this controller — enough to show the symptom and
+          # never the cause. The full history, including rotated files from
+          # before a restart, is in the kind-logs artifact below; say so here,
+          # because a truncated tail reads like a complete record.
+          echo "== operator log (tail; FULL history incl. rotated files is in the kind-logs artifact) =="
+          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 4000 --all-containers || true
           mkdir -p /tmp/kind-logs
           mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
 
