@@ -199,11 +199,24 @@ async function waitForEnforcingPolicy(
 	probe: () => Promise<CommandResult>,
 	expected: string,
 ): Promise<void> {
-	const deadline = Date.now() + 60_000;
+	// 60s was not enough on a loaded apiserver: kobe#204 failed here with the
+	// probe still ADMITTED, on a version-bump-only change that could not have
+	// caused it. The budget is not the interesting number though — how long
+	// this actually takes is, and nothing recorded it, so any replacement
+	// would be another guess. Report the elapsed time on success so the next
+	// person sizes this from observations instead.
+	const budgetMs = 180_000;
+	const started = Date.now();
+	const deadline = started + budgetMs;
+	let attempts = 0;
 	let lastObservation = "policy never rejected the probe write";
 	while (Date.now() < deadline) {
+		attempts += 1;
 		const result = await probe();
 		if (result.exitCode !== 0 && result.stderr.includes(expected)) {
+			console.log(
+				`    policy enforcing for ${username} after ${Date.now() - started}ms (${attempts} probes)`,
+			);
 			return;
 		}
 		lastObservation =
@@ -213,7 +226,8 @@ async function waitForEnforcingPolicy(
 		await Bun.sleep(500);
 	}
 	throw new Error(
-		`admission policy did not become enforcing for ${username}: ${lastObservation}`,
+		`admission policy did not become enforcing for ${username} within ${budgetMs}ms ` +
+			`(${attempts} probes): ${lastObservation}`,
 	);
 }
 
