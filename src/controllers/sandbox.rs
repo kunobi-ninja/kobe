@@ -5642,18 +5642,48 @@ async fn release_child_composition(
         Some(recorded) => recorded.clone(),
         None => match internal_api.get(&derived).await {
             Ok(unrecorded) => {
-                match ensure_internal_lease_fenced(&internal_api, &unrecorded, lease).await? {
-                    InternalHandleFence::Ready => {}
-                    InternalHandleFence::Patched => {
-                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
-                    }
-                    InternalHandleFence::Foreign => {
+                // A terminating handle is still this lease's own, here as much
+                // as on the recorded path. `ensure_internal_lease_fenced` fails
+                // closed on anything already deleting, which is right where it
+                // gates adoption and wrong on release: the retention finalizer
+                // keeps a deleted handle readable precisely so teardown can
+                // consume its proof.
+                //
+                // Nothing is recorded on this path, so there is no uid to pin
+                // against — the tombstone is what establishes identity. The
+                // retention fence checks the derived name, the namespace, the
+                // absence of owner references, the managed-by and tombstone
+                // labels, and the sandbox-lease-uid label naming this exact
+                // lease. That is a stronger statement than the uid alone, and
+                // it is what #192 relied on for the recorded path.
+                if unrecorded.metadata.deletion_timestamp.is_some() {
+                    if !internal_handle_retention_fence_matches(
+                        &unrecorded,
+                        lease,
+                        chrono::Utc::now(),
+                        true,
+                    ) {
                         return quarantine_lease(
                             lease,
                             ctx,
                             "child_composition_identity_unverifiable",
                         )
                         .await;
+                    }
+                } else {
+                    match ensure_internal_lease_fenced(&internal_api, &unrecorded, lease).await? {
+                        InternalHandleFence::Ready => {}
+                        InternalHandleFence::Patched => {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                        }
+                        InternalHandleFence::Foreign => {
+                            return quarantine_lease(
+                                lease,
+                                ctx,
+                                "child_composition_identity_unverifiable",
+                            )
+                            .await;
+                        }
                     }
                 }
                 let Some(unrecorded_uid) = unrecorded.uid().filter(|uid| !uid.is_empty()) else {
@@ -17377,6 +17407,96 @@ current-context: child
         assert!(
             !phases.contains(&crate::crd::SandboxLeasePhase::Quarantined),
             "a lease must not quarantine its own terminating handle: {phases:?}"
+        );
+    }
+
+    /// Predicted sibling of the case above, on the pre-checkpoint path.
+    ///
+    /// `ensure_internal_lease_fenced` fails closed on anything already
+    /// deleting. #192 added a deletion branch before the fence on the RECORDED
+    /// release path; the path taken when nothing was checkpointed calls the
+    /// same fence with no such branch. A handle that is both unrecorded and
+    /// terminating should therefore be called Foreign and quarantined, for the
+    /// same wrong reason and with the same withheld pool slot.
+    ///
+    /// Written to check that prediction before fixing anything.
+    #[tokio::test]
+    async fn a_terminating_handle_is_still_ours_when_nothing_was_recorded() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        let attempt = "terminating-attempt-1";
+        let proof = "2026-09-04T00:00:00Z";
+        let mut proven = child_cluster_lease("child-lease-uid", "Released", None);
+        proven["status"]["teardownAttemptId"] = attempt.into();
+        proven["status"]["unboundReleaseVerifiedAt"] = proof.into();
+        proven["status"]["conditions"] = serde_json::json!([{
+            "type": "AllocationAbsent",
+            "status": "True",
+            "reason": "NeverBound",
+            "message": format!("release attempt {attempt} proved no reciprocal allocation existed"),
+            "lastTransitionTime": proof,
+        }]);
+        proven["metadata"]["annotations"]
+            [crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION] =
+            format!("{attempt}:{proof}").into();
+        proven["metadata"]["deletionTimestamp"] = "2026-09-04T00:10:00Z".into();
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(proven))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            // The difference from the case above: the handle reference itself
+            // was never checkpointed, so the release takes the recovery path.
+            if let Some(target) = status.target.as_mut() {
+                target.child_cluster_lease = None;
+                target.child_cluster_instance = None;
+            }
+        }
+
+        let mut phases = Vec::new();
+        for pass in 0..12 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone()).await;
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            if let Some(latest) = statuses.get(before).cloned() {
+                lease.status = Some(serde_json::from_value(latest).unwrap());
+                lease.metadata.resource_version = Some(format!("unrecorded-rv-{pass}"));
+            }
+            let phase = lease.status.as_ref().unwrap().phase;
+            phases.push(phase);
+            if phase == crate::crd::SandboxLeasePhase::Released {
+                break;
+            }
+        }
+
+        assert!(
+            !phases.contains(&crate::crd::SandboxLeasePhase::Quarantined),
+            "an unrecorded terminating handle is still this lease's own: {phases:?}"
         );
     }
 
