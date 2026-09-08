@@ -233,7 +233,23 @@ target "agent-workspace" {
   }
 }
 
+# The runner context is repointed at `runner-push` rather than inherited as
+# `target:runner`. `runner` and `runner-push` deliberately share one local cache
+# directory, which is harmless only while they never appear in the same bake
+# group. Inheriting `target:runner` here put BOTH in the `push` group, so two
+# targets exported to `.tmp/buildx-cache/runner` concurrently and raced on the
+# ingest files:
+#
+#   ERROR: target runner: failed to solve: error writing layer blob:
+#     rename .tmp/buildx-cache/runner/ingest/.../startedat.tmp ...: no such file
+#
+# The `default` group has no `runner-push`, so `runner` builds once there and
+# `docker-dry-run` stayed green — the break only ever appeared on a publish.
+# Pointing at `runner-push` keeps exactly one runner target in this group.
 target "agent-workspace-push" {
   inherits = ["agent-workspace"]
-  output   = ["type=registry"]
+  contexts = {
+    runner = "target:runner-push"
+  }
+  output = ["type=registry"]
 }
