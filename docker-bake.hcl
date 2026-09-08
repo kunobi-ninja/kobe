@@ -76,11 +76,11 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator", "kobe-sync", "runner"]
+  targets = ["operator", "kobe-sync", "runner", "agent-workspace"]
 }
 
 group "push" {
-  targets = ["operator-push", "kobe-sync-push", "runner-push"]
+  targets = ["operator-push", "kobe-sync-push", "runner-push", "agent-workspace-push"]
 }
 
 # =============================================================================
@@ -204,4 +204,36 @@ target "sandbox-e2e" {
   tags       = [SANDBOX_E2E_IMAGE]
   cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/sandbox-e2e"]
   cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/sandbox-e2e,mode=max"]
+}
+
+# =============================================================================
+# Agent workspace image
+#
+# Consumes `runner` as a named context for the same reason `sandbox-e2e` does:
+# the binary that ships inside a Sandbox image must be the exact statically
+# linked one this repo publishes, not a separately compiled copy.
+#
+# Unlike `sandbox-e2e` this target IS in `default` and `push` — it is a product
+# image that SandboxPools reference by tag, not a test fixture.
+# =============================================================================
+target "agent-workspace" {
+  dockerfile = "docker/agent-workspace.Dockerfile"
+  context    = "."
+  contexts = {
+    runner = "target:runner"
+  }
+  platforms  = [PLATFORM]
+  tags       = tags("kobe-agent-workspace")
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/agent-workspace"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/agent-workspace,mode=max"]
+  args = {
+    BUILD_VERSION = BUILD_VERSION
+    BUILD_COMMIT  = BUILD_COMMIT
+    BUILD_DATE    = BUILD_DATE
+  }
+}
+
+target "agent-workspace-push" {
+  inherits = ["agent-workspace"]
+  output   = ["type=registry"]
 }
