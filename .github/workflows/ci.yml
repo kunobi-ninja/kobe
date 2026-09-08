@@ -99,6 +99,18 @@ jobs:
       - name: Set up mise
         uses: jdx/mise-action@v4
         with:
+          # Without a version the action installs the newest release, which can
+          # be advertised before its release assets exist: v0.43.1's tag run
+          # died five retries deep on a 404 for a linux-x64 tarball belonging to
+          # a version that had not been published, while the newest real release
+          # was the one before it. Every job here sets up mise, so that failure
+          # blocked all of CI and the release with it.
+          #
+          # Only consider releases that have been out long enough to be
+          # complete. This keeps floating on latest, so nothing goes stale the
+          # way a pinned version would, and skips the window where the two
+          # disagree.
+          minimum_release_age: 24h
           install: false
           cache: true
 
@@ -286,6 +298,8 @@ jobs:
       - name: Set up pinned contract-test tools
         uses: jdx/mise-action@v4
         with:
+          # See the first `Set up mise` above.
+          minimum_release_age: 24h
           install: false
           cache: true
 
@@ -345,6 +359,8 @@ jobs:
       - name: Set up pinned runtime-contract tools
         uses: jdx/mise-action@v4
         with:
+          # See the first `Set up mise` above.
+          minimum_release_age: 24h
           install: false
           cache: true
 
@@ -499,6 +515,9 @@ jobs:
       # recipe.
       - name: Set up mise tools
         uses: jdx/mise-action@v4
+        with:
+          # See the first `Set up mise` above.
+          minimum_release_age: 24h
 
       # The vkobe smokes build the `kobe` CLI from source (cargo run -p
       # kobectl), which needs a host C toolchain for proc-macro build scripts —
