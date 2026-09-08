@@ -73,8 +73,24 @@ RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
 # would put that same floating dependency in front of every CI build. Bump it
 # deliberately, with a green build as the gate.
 ARG MISE_VERSION=v2026.9.3
-RUN curl -fsSL https://mise.run \
-      | MISE_VERSION="${MISE_VERSION}" MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+# Fetched to a file rather than piped into `sh`. In `curl ... | sh` the
+# pipeline's exit status is SH's, not curl's, so a download that dies partway
+# leaves sh reading a truncated script, installing nothing, and STILL exiting 0.
+# That is not hypothetical: a publish run failed here with
+#
+#   curl: (18) HTTP/2 stream 1 was not closed cleanly before end of the
+#         underlying stream
+#   /bin/sh: 1: /usr/local/bin/mise: not found
+#
+# Only the version assertion below caught it. Retries absorb the transient
+# case, `test -s` refuses an empty download, and the assertion stays as the
+# backstop that proves the pinned binary is actually on disk.
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        https://mise.run -o /tmp/mise-install.sh \
+    && test -s /tmp/mise-install.sh \
+    && MISE_VERSION="${MISE_VERSION}" MISE_INSTALL_PATH=/usr/local/bin/mise \
+        sh /tmp/mise-install.sh \
+    && rm -f /tmp/mise-install.sh \
     && /usr/local/bin/mise --version | grep -q "${MISE_VERSION#v}"
 
 COPY --from=runner /kobe-runner /kobe-runner
