@@ -12,7 +12,7 @@ description: All kobe CLI commands with flags and examples.
 | `kobe status` | Show endpoint status, auth methods, and pool summary |
 | `kobe version` | Show CLI and endpoint versions |
 | `kobe run` | Lease an executable resource, run one command, release it ([details](/commands/sandbox)) |
-| `kobe exec` | Run a command in a lease that supports `exec` |
+| `kobe exec` | Run a command in a lease that supports `exec` (`--stdin` forwards a secret without putting it in argv) |
 | `kobe logs` | Read output from a lease that supports `logs` |
 | `kobe cancel` | Cancel a running execution |
 | `kobe attach` | Open an interactive session through an `attach` capability |

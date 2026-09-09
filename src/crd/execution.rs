@@ -22,6 +22,14 @@
 //! What is stored is a **digest** of the request. That is enough to answer "is
 //! this the same command as last time?" without ever holding the command.
 //!
+//! stdin is the sharpest case, because it is the one field a caller uses
+//! *specifically* to move a secret out of argv — argv being what the target
+//! apiserver's audit log records verbatim. Persisting the bytes here would take
+//! them straight back out of the audit log and into etcd, which is strictly
+//! worse: etcd copies are read by more people and kept for longer. So stdin
+//! goes into [`request_digest`] and nowhere else, and no field of
+//! [`SandboxExecutionSpec`] or [`SandboxExecutionStatus`] can hold it.
+//!
 //! # Unknown is a real outcome
 //!
 //! If Kobe cannot establish what happened — it crashed between spawning and
@@ -307,6 +315,18 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// idempotency key must agree on all of it — otherwise the second is a
 /// different command wearing the first one's name, and returning the first
 /// one's result would be a wrong answer rather than a cached one.
+///
+/// `stdin` is part of that identity and is hashed rather than kept: two runs of
+/// the same argv differing only in the token they are fed are two different
+/// commands, and answering the second with the first's result would report an
+/// authentication that never happened. Hashing is also the *only* thing done
+/// with those bytes anywhere in Kobe's durable path — see the module
+/// documentation for why they must not survive the request.
+///
+/// `None` for `stdin` contributes nothing to the hash, so a request that
+/// forwards no stdin digests exactly as it did before this parameter existed.
+/// That is what lets a Kobe rollout recognise the records its predecessor
+/// created, and is the same technique `container` and `detached` use.
 #[allow(dead_code)]
 pub fn request_digest(
     argv: &[String],
@@ -314,8 +334,9 @@ pub fn request_digest(
     timeout: &str,
     container: &str,
     detached: bool,
+    stdin: Option<&[u8]>,
 ) -> String {
-    request_digest_with_mode(argv, cwd, timeout, Some(container), Some(detached))
+    request_digest_with_mode(argv, cwd, timeout, Some(container), Some(detached), stdin)
 }
 
 /// Digest emitted before resolved container and lifecycle mode became part of
@@ -324,9 +345,13 @@ pub fn request_digest(
 /// Kept only to recognise exact live records across a rolling upgrade. New
 /// reservations always use [`request_digest`], and callers must also match the
 /// legacy record's explicit `detached` field before this digest is accepted.
+///
+/// No stdin parameter, deliberately: a record from that era cannot have carried
+/// one, so a request that forwards stdin must never be recognised as a retry of
+/// it.
 #[allow(dead_code)]
 pub fn legacy_request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> String {
-    request_digest_with_mode(argv, cwd, timeout, None, None)
+    request_digest_with_mode(argv, cwd, timeout, None, None, None)
 }
 
 fn request_digest_with_mode(
@@ -335,6 +360,7 @@ fn request_digest_with_mode(
     timeout: &str,
     container: Option<&str>,
     detached: Option<bool>,
+    stdin: Option<&[u8]>,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -369,6 +395,16 @@ fn request_digest_with_mode(
         // them as one request could return a wait-mode record to a caller that
         // asked for a reconnectable execution, or vice versa.
         hasher.update([u8::from(detached)]);
+    }
+    if let Some(stdin) = stdin {
+        // Nothing at all when absent, so a no-stdin request keeps digesting the
+        // way the previous release digested it and a rolling upgrade still
+        // recognises its own live records. A marker byte plus a length keeps
+        // "an empty stdin" distinguishable from "no stdin", which are two
+        // different things to hand a process.
+        hasher.update([2u8]);
+        hasher.update((stdin.len() as u64).to_be_bytes());
+        hasher.update(stdin);
     }
     format!("{:x}", hasher.finalize())
 }
@@ -617,6 +653,7 @@ mod tests {
             "60s",
             "workspace",
             false,
+            None,
         );
 
         assert_eq!(
@@ -627,6 +664,7 @@ mod tests {
                 "60s",
                 "workspace",
                 false,
+                None
             ),
             "the same request must digest identically"
         );
@@ -634,11 +672,25 @@ mod tests {
         // Argument boundaries.
         assert_ne!(
             base,
-            request_digest(&["/agentrun".into()], None, "60s", "workspace", false)
+            request_digest(&["/agentrun".into()], None, "60s", "workspace", false, None)
         );
         assert_ne!(
-            request_digest(&["a".into(), "bc".into()], None, "60s", "workspace", false,),
-            request_digest(&["ab".into(), "c".into()], None, "60s", "workspace", false,)
+            request_digest(
+                &["a".into(), "bc".into()],
+                None,
+                "60s",
+                "workspace",
+                false,
+                None
+            ),
+            request_digest(
+                &["ab".into(), "c".into()],
+                None,
+                "60s",
+                "workspace",
+                false,
+                None
+            )
         );
         // Order.
         assert_ne!(
@@ -649,6 +701,7 @@ mod tests {
                 "60s",
                 "workspace",
                 false,
+                None
             )
         );
         // Working directory, including present-but-empty versus absent.
@@ -659,7 +712,8 @@ mod tests {
                 Some("/work"),
                 "60s",
                 "workspace",
-                false
+                false,
+                None,
             )
         );
         assert_ne!(
@@ -670,6 +724,7 @@ mod tests {
                 "60s",
                 "workspace",
                 false,
+                None,
             )
         );
         // Timeout: the same command with a different bound is a different
@@ -682,6 +737,7 @@ mod tests {
                 "600s",
                 "workspace",
                 false,
+                None
             )
         );
         // The resolved container is part of where the command runs.
@@ -693,6 +749,7 @@ mod tests {
                 "60s",
                 "sidecar",
                 false,
+                None
             )
         );
         // Lifecycle mode is part of the request. Returning a wait-mode result
@@ -705,10 +762,128 @@ mod tests {
                 "60s",
                 "workspace",
                 true,
+                None
             )
         );
 
         assert_eq!(base.len(), 64);
+    }
+
+    /// stdin changes the request, and its absence changes nothing.
+    ///
+    /// Both halves matter. Two runs of the same argv fed different tokens are
+    /// two different commands — answering the second with the first's result
+    /// would report an authentication that never happened. And a request with
+    /// no stdin has to digest exactly as it did before the parameter existed,
+    /// or a Kobe rollout would stop recognising the live records its own
+    /// predecessor created and would turn every in-flight retry into a
+    /// conflict.
+    #[test]
+    fn the_request_digest_covers_stdin_without_disturbing_requests_that_have_none() {
+        let argv = vec!["/agent".into(), "run".into()];
+        let digest = |stdin: Option<&[u8]>| {
+            request_digest(&argv, Some("/work"), "60s", "workspace", false, stdin)
+        };
+
+        assert_eq!(
+            digest(None),
+            digest_without_the_stdin_parameter(&argv),
+            "no stdin must contribute nothing at all to the hash"
+        );
+
+        // A different secret is a different command.
+        assert_ne!(digest(Some(b"token-a")), digest(Some(b"token-b")));
+        assert_eq!(digest(Some(b"token-a")), digest(Some(b"token-a")));
+
+        // Present-but-empty is not absent: one hands the process a closed pipe,
+        // the other hands it /dev/null.
+        assert_ne!(digest(Some(b"")), digest(None));
+
+        // Length-prefixed like the argv, so a boundary cannot be moved to make
+        // two different inputs collide.
+        assert_ne!(digest(Some(b"ab")), digest(Some(b"a\0b")));
+
+        // A record from before container/lifecycle identity existed is never
+        // recognised as a retry of a request that forwards stdin.
+        assert_ne!(
+            legacy_request_digest(&argv, Some("/work"), "60s"),
+            digest(Some(b"token-a"))
+        );
+    }
+
+    /// The digest a released Kobe computed for a request with no stdin.
+    ///
+    /// Written out rather than delegating, so the compatibility assertion above
+    /// checks behaviour instead of restating the code under test.
+    fn digest_without_the_stdin_parameter(argv: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update((argv.len() as u64).to_be_bytes());
+        for argument in argv {
+            hasher.update((argument.len() as u64).to_be_bytes());
+            hasher.update(argument.as_bytes());
+        }
+        hasher.update([1u8]);
+        hasher.update(("/work".len() as u64).to_be_bytes());
+        hasher.update(b"/work");
+        hasher.update(("60s".len() as u64).to_be_bytes());
+        hasher.update(b"60s");
+        hasher.update(("workspace".len() as u64).to_be_bytes());
+        hasher.update(b"workspace");
+        hasher.update([0u8]);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// No stored field can carry the stdin bytes.
+    ///
+    /// The record is readable by anyone with `get` on the type, lands in every
+    /// etcd member, and is included in backups. A caller sends stdin precisely
+    /// to keep a secret out of an argv the apiserver audit-logs, so a copy here
+    /// would undo the point of the feature. This is the test that fails if
+    /// somebody later adds a convenient `stdin` field "just for debugging".
+    #[test]
+    fn no_persisted_execution_field_can_carry_stdin() {
+        let secret = "ghp_never-persisted-anywhere";
+        let record = SandboxExecution {
+            metadata: Default::default(),
+            spec: SandboxExecutionSpec {
+                request_digest: request_digest(
+                    &["/agent".into()],
+                    None,
+                    "60s",
+                    "workspace",
+                    false,
+                    Some(secret.as_bytes()),
+                ),
+                ..spec("lease-a", "unused")
+            },
+            status: Some(SandboxExecutionStatus {
+                state: Succeeded,
+                exit_code: Some(0),
+                reason: Some("completed".into()),
+                ..Default::default()
+            }),
+        };
+
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(
+            !encoded.contains(secret),
+            "a persisted execution leaked its stdin: {encoded}"
+        );
+        assert!(
+            !encoded.to_lowercase().contains("stdin"),
+            "no persisted field may even be named for stdin: {encoded}"
+        );
+
+        // The schema the apiserver enforces has no home for it either, so a
+        // client cannot smuggle one past `deny_unknown_fields`.
+        let crd = serde_json::to_value(SandboxExecution::crd()).unwrap();
+        let schema = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"].to_string();
+        assert!(
+            !schema.to_lowercase().contains("stdin"),
+            "the CRD schema declares a place to store stdin: {schema}"
+        );
     }
 
     /// Names are derived and fenced, so the reservation can be a `create`.

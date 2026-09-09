@@ -23,6 +23,13 @@
 //! hash Kobe derived — ever appears as an argument; the command itself travels
 //! on stdin, which nothing on the path records. It is one line, so the runner
 //! never has to wait for an EOF that the exec transport may never deliver.
+//!
+//! The request may carry the supervised process's own stdin for the same
+//! reason. A command that reads a credential — `gh auth login --with-token` —
+//! could otherwise only be given one in a flag, which is precisely the argv
+//! this design exists to keep secrets out of. Those bytes are never written to
+//! the spool: `start` hands them to the supervisor over a pipe and only their
+//! length appears in an argument.
 
 use std::io::BufRead;
 
@@ -66,6 +73,17 @@ enum Commands {
     Supervise {
         #[arg(long)]
         id: String,
+        /// How many bytes of the command's stdin are waiting on this process's
+        /// own stdin.
+        ///
+        /// A count, never the bytes: the count is all the supervisor needs, and
+        /// a count is not a secret. (This argv is an internal re-exec inside
+        /// the container, so it never reaches the apiserver's audit log either
+        /// way.) Absent means the command reads `/dev/null`, exactly as it did
+        /// before stdin forwarding existed — which is also what keeps a
+        /// `supervise` run by hand from blocking on a terminal.
+        #[arg(long)]
+        stdin_bytes: Option<usize>,
     },
     /// Report what one execution is doing.
     Status {
@@ -96,9 +114,9 @@ fn main() {
 
     // `supervise` is the one subcommand that is not a request/response: it IS
     // the long-lived process, and it prints nothing because nobody is reading.
-    if let Commands::Supervise { id } = &cli.command {
+    if let Commands::Supervise { id, stdin_bytes } = &cli.command {
         #[cfg(unix)]
-        supervisor::supervise(&spool, id);
+        supervisor::supervise(&spool, id, *stdin_bytes, std::io::stdin());
         return;
     }
 
@@ -166,6 +184,15 @@ fn start(
     if let Err(code) = validate(&request) {
         return error(code);
     }
+    // Decoded before anything is reserved, and held only in memory from here
+    // on. `validate` has already proved this succeeds; re-deriving the failure
+    // rather than defaulting to "no stdin" is deliberate, because silently
+    // dropping the bytes would start the command with an empty stdin and then
+    // report success.
+    let stdin = match request.stdin_bytes() {
+        Ok(stdin) => stdin,
+        Err(_) => return error(RunnerErrorCode::InvalidRequest),
+    };
 
     match spool.reserve(&request) {
         Ok(Reservation::Created(_start_reservation)) => {
@@ -176,7 +203,7 @@ fn start(
                 // without ever manufacturing the command.
                 std::process::exit(TEST_EXECUTION_CRASH_EXIT_CODE);
             }
-            match spawn_supervisor(state_dir, &request.id) {
+            match spawn_supervisor(state_dir, &request.id, stdin.as_deref()) {
                 Ok(()) if exit_after_spawn_before_ack => {
                     // The reservation and supervisor are both durable, but no
                     // reply is written. Kobe must settle the lost
@@ -259,6 +286,13 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
         // ephemeral disk the whole Pod shares.
         return Err(RunnerErrorCode::InvalidRequest);
     }
+    if request.stdin_bytes().is_err() {
+        // Refused, never truncated to fit. Half a token is still a secret, and
+        // the command that received it would fail somewhere a long way from
+        // the request that caused it. Checked here — before the reservation —
+        // so an unusable stdin cannot spend an idempotency key.
+        return Err(RunnerErrorCode::InvalidRequest);
+    }
     Ok(())
 }
 
@@ -270,8 +304,16 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
 /// afterwards, so the supervisor is reparented to the container's init and
 /// survives the teardown of the exec that started it — which is the entire
 /// reason "detached" means anything.
+///
+/// The command's stdin, when it has any, is handed over through a pipe rather
+/// than through the spool. That is the whole reason this feature is worth
+/// having: a secret that never touches a filesystem cannot be read out of one
+/// later. Only its LENGTH travels as an argument, so the supervisor can read
+/// exactly that many bytes and can tell a short read — a lost secret — from a
+/// caller who asked for an empty stdin.
 #[cfg(unix)]
-fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
+fn spawn_supervisor(state_dir: &str, id: &str, stdin: Option<&[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -295,9 +337,22 @@ fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
         // holding the exec's stdout would keep the connection's pipe open, and
         // the caller's client would wait for a stream that nobody is going to
         // close.
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    match stdin {
+        // A fresh pipe, never this process's own stdin: that descriptor belongs
+        // to the exec connection, and a supervisor holding it would keep the
+        // connection alive after the caller stopped reading.
+        Some(stdin) => {
+            command
+                .arg("--stdin-bytes")
+                .arg(stdin.len().to_string())
+                .stdin(Stdio::piped());
+        }
+        None => {
+            command.stdin(Stdio::null());
+        }
+    }
 
     // SAFETY: `setsid` is async-signal-safe and is the only call between fork
     // and exec. It detaches the supervisor from this process's session, so the
@@ -310,7 +365,24 @@ fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+
+    if let Some(stdin) = stdin {
+        // Written and then closed, in that order, before this process returns.
+        // The supervisor reads exactly this many bytes as its first act, so a
+        // payload larger than the pipe buffer blocks here only until it is
+        // drained. A failure is fatal to the spawn on purpose: the alternative
+        // is a supervisor that starts the command with a truncated secret.
+        let mut sink = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("the supervisor has no stdin to write"))?;
+        sink.write_all(stdin)?;
+        // Explicit, so the supervisor's bounded read cannot be left waiting on
+        // a descriptor that only closes when this process happens to exit.
+        drop(sink);
+    }
+
     // Recorded so a later `status` or `cancel` can tell "still running" from
     // "the supervisor is gone and nobody will ever record an outcome".
     let _ = spool.write_supervisor_pid(id, child.id());
@@ -318,7 +390,7 @@ fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn spawn_supervisor(_state_dir: &str, _id: &str) -> std::io::Result<()> {
+fn spawn_supervisor(_state_dir: &str, _id: &str, _stdin: Option<&[u8]>) -> std::io::Result<()> {
     Err(std::io::Error::other("the runner supervises only on unix"))
 }
 
@@ -487,6 +559,7 @@ mod tests {
             cwd: Some("/work".into()),
             timeout_seconds: 60,
             max_output_bytes: 1024,
+            stdin_base64: None,
         }
     }
 
@@ -558,6 +631,77 @@ mod tests {
             );
         }
         assert!(with(&|r| r.cwd = None).is_ok());
+    }
+
+    /// Stdin that cannot be delivered whole reserves nothing.
+    ///
+    /// Refusing before the reservation is what keeps an oversized or malformed
+    /// secret from spending an idempotency key on a command that could never
+    /// have been given its input. Truncating to fit is the one response that is
+    /// never correct: half a token is still a secret, and the command would
+    /// fail somewhere a long way from the cause.
+    #[test]
+    fn stdin_that_cannot_be_delivered_whole_reserves_nothing() {
+        use base64::Engine;
+        use kobe_runner::protocol::MAX_STDIN_BYTES;
+
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let with = |encoded: Option<String>| {
+            let mut request = request();
+            request.stdin_base64 = encoded;
+            validate(&request)
+        };
+
+        assert!(with(None).is_ok(), "no stdin at all stays valid");
+        assert!(
+            with(Some(String::new())).is_ok(),
+            "an empty stdin is a request"
+        );
+        assert!(with(Some(encode(b"ghp_token"))).is_ok());
+        assert!(with(Some(encode(&vec![b'x'; MAX_STDIN_BYTES]))).is_ok());
+
+        assert_eq!(
+            with(Some(encode(&vec![b'x'; MAX_STDIN_BYTES + 1]))),
+            Err(RunnerErrorCode::InvalidRequest),
+            "one byte past the bound is refused, not trimmed"
+        );
+        assert_eq!(
+            with(Some("not base64!!".into())),
+            Err(RunnerErrorCode::InvalidRequest)
+        );
+    }
+
+    /// A request carrying stdin still has to fit the encoded-request bound.
+    ///
+    /// [`MAX_STDIN_BYTES`] and [`MAX_REQUEST_BYTES`] are two different ceilings
+    /// and both apply. Neither is allowed to become a silent truncation of the
+    /// other.
+    #[test]
+    fn stdin_is_bounded_inside_the_encoded_request_bound() {
+        use base64::Engine;
+        use kobe_runner::protocol::MAX_STDIN_BYTES;
+
+        let mut request = request();
+        request.stdin_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(vec![b'x'; MAX_STDIN_BYTES]));
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        assert!(
+            encoded.len() < MAX_REQUEST_BYTES,
+            "a maximal stdin must still leave room for a command: {} bytes",
+            encoded.len()
+        );
+        assert_eq!(read_start_request(encoded.as_slice()).unwrap(), request);
+
+        // Padding the argv past the whole-request bound is refused by the
+        // reader, before the stdin ceiling is ever consulted.
+        request.argv.push("y".repeat(MAX_REQUEST_BYTES));
+        let mut oversized = serde_json::to_vec(&request).unwrap();
+        oversized.push(b'\n');
+        assert_eq!(
+            read_start_request(oversized.as_slice()).unwrap_err(),
+            RunnerErrorCode::InvalidRequest
+        );
     }
 
     /// Neither bound may be absent, and neither may be unbounded.

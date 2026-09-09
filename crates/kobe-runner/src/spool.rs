@@ -144,7 +144,13 @@ impl Spool {
         let assemble = || -> Result<(), SpoolError> {
             std::fs::write(
                 staging.join(REQUEST_FILE),
-                serde_json::to_vec(request).map_err(|_| SpoolError::Corrupt)?,
+                // Stripped of stdin, deliberately. Those bytes are the one part
+                // of a request that exists to carry a secret, and this file
+                // sits on a filesystem the tenant's workload shares, outlives
+                // the command that needed them, and is re-read by every later
+                // `status` and `cancel` — none of which has any use for them.
+                // The supervisor is handed them in memory instead.
+                serde_json::to_vec(&request.without_stdin()).map_err(|_| SpoolError::Corrupt)?,
             )?;
             // Written before the supervisor exists, so a poll that arrives
             // between the reservation and the spawn finds a state rather than
@@ -470,7 +476,73 @@ mod tests {
             cwd: None,
             timeout_seconds: 60,
             max_output_bytes: 1024,
+            stdin_base64: None,
         }
+    }
+
+    /// A reserved request never puts its stdin on disk.
+    ///
+    /// The whole reason stdin exists on this contract is that a secret must
+    /// not end up somewhere it is recorded. The spool shares a filesystem and
+    /// a UID with the tenant's workload and outlives the command, so writing
+    /// the bytes here would trade an audit-log leak for a longer-lived one.
+    #[test]
+    fn a_reservation_never_writes_stdin_to_the_spool() {
+        use base64::Engine;
+
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+
+        let secret = b"ghp_averysecrettokenvalue";
+        let mut reserved = request("sbxe-1", &["/agent", "run"]);
+        reserved.stdin_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(secret.as_slice()));
+
+        assert!(matches!(
+            spool.reserve(&reserved).unwrap(),
+            Reservation::Created(_)
+        ));
+
+        // Nothing anywhere below the spool root, not just the request file: a
+        // future file that happened to serialise the whole request would be
+        // exactly the regression this pins.
+        let mut seen_files = 0usize;
+        let mut pending = vec![root.path().to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                seen_files += 1;
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(secret.len()).any(|window| window == secret),
+                    "{} holds the raw stdin",
+                    path.display()
+                );
+                assert!(
+                    !String::from_utf8_lossy(&bytes)
+                        .contains(reserved.stdin_base64.as_ref().unwrap()),
+                    "{} holds the encoded stdin",
+                    path.display()
+                );
+            }
+        }
+        assert!(seen_files > 0, "the reservation wrote nothing at all");
+
+        // The rest of the request is still there — the supervisor has to run it.
+        let stored = spool.read_request("sbxe-1").unwrap();
+        assert_eq!(stored.argv, reserved.argv);
+        assert_eq!(stored.stdin_base64, None);
+
+        // And a retry carrying the same stdin is still recognised as a retry,
+        // not as a different command wearing the same id.
+        assert!(matches!(
+            spool.reserve(&reserved).unwrap(),
+            Reservation::AlreadyReserved
+        ));
     }
 
     /// One id reserves at most one command, whoever asks second.

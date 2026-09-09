@@ -158,6 +158,26 @@ struct CreateExecutionRequest {
     /// Return once reserved rather than waiting for the result.
     #[serde(default)]
     detach: bool,
+    /// Base64 bytes to write to the process's stdin, then close.
+    ///
+    /// The one way to give a Sandbox a secret. Everything else a caller can say
+    /// about a command ends up in `command`, and the resulting exec argv is a
+    /// URL the target apiserver audit-logs verbatim — so `gh auth login
+    /// --with-token`, which reads its token from stdin, previously had no
+    /// expression on this API that did not record the token.
+    ///
+    /// Base64 because a credential is not required to be UTF-8 and a JSON
+    /// string is. Absent means the process reads `/dev/null`; an empty string
+    /// means a pipe that is immediately closed, which is a different thing to
+    /// ask for. Bounded once decoded by
+    /// [`MAX_EXECUTION_STDIN_BYTES`](crate::api::sandbox_executions::MAX_EXECUTION_STDIN_BYTES)
+    /// and refused rather than truncated past it: this is a channel for secrets
+    /// and small inputs, not a file transfer.
+    ///
+    /// Never persisted. It is hashed into the execution's request digest and
+    /// forwarded to the runner; no field of the durable record can hold it.
+    #[serde(default)]
+    stdin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +243,24 @@ fn reused_execution_response_status(
     (!execution_is_runner_managed(&execution.spec)).then_some(StatusCode::OK)
 }
 
+/// Decode one caller-supplied stdin payload, or refuse it.
+///
+/// The error carries nothing back but the fact of it. Reporting where the
+/// decode failed, or how many bytes came out, would describe a secret to
+/// whoever can read the response — and the caller already knows what they sent.
+///
+/// The length bound belongs to
+/// [`validate_request`](crate::api::sandbox_executions::validate_request),
+/// which runs on the decoded bytes so a caller who sent too much is told about
+/// the size they actually sent rather than its encoding.
+fn decode_execution_stdin(encoded: &str) -> Result<Vec<u8>, ()> {
+    use base64::Engine;
+
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| ())
+}
+
 fn execution_denied(
     identity: &AuthIdentity,
     lease: &str,
@@ -284,6 +322,21 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "execution", denied),
     };
 
+    // Decoded before anything is reserved. A malformed encoding is the caller's
+    // mistake and must cost them nothing — least of all an idempotency key
+    // spent on a command that could never have been given its input.
+    let stdin = match request.stdin.as_deref().map(decode_execution_stdin) {
+        None => None,
+        Some(Ok(stdin)) => Some(stdin),
+        Some(Err(())) => {
+            return execution_denied(
+                &identity,
+                &id,
+                &executions::ExecutionRequestError::Invalid { what: "stdin" },
+            );
+        }
+    };
+
     let requested = executions::ExecutionRequest {
         argv: request.command,
         cwd: request.cwd,
@@ -292,6 +345,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             .unwrap_or_else(|| DEFAULT_EXECUTION_TIMEOUT.to_string()),
         idempotency_key: request.idempotency_key,
         detached: request.detach,
+        stdin,
     };
 
     // The runner is the execution contract, not just a detached-mode helper.
@@ -331,6 +385,10 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         &requested.argv,
         requested.cwd.as_deref(),
         initial_timeout,
+        // Included, because base64 stdin is part of what has to fit. A bound
+        // proved on a request smaller than the one Kobe will actually send is
+        // not a bound.
+        requested.stdin.as_deref(),
     );
     if crate::api::sandbox_runner::start_line(&candidate_start).is_err() {
         return execution_denied(
@@ -613,6 +671,10 @@ async fn run_with_runner<B: ClusterBackend>(
         &requested.argv,
         requested.cwd.as_deref(),
         timeout,
+        // Carried on the runner's stdin with the rest of the request, and read
+        // back out of the reserved record by nothing: the record holds only a
+        // digest, so this is the last place the bytes exist inside Kobe.
+        requested.stdin.as_deref(),
     );
     let runner_crash = if executions::crash_requested(
         executions::ExecutionCrashWindow::BeforeSpawn,
@@ -8242,6 +8304,46 @@ mod tests {
         }
     }
 
+    /// The execution body accepts stdin as base64 and only as base64.
+    ///
+    /// A credential is not required to be UTF-8 and a JSON string is, so raw
+    /// bytes have no expression here. Decoding before the reservation means a
+    /// caller who encoded badly is told so without spending an idempotency key
+    /// on a command that could never have been given its input — and absent
+    /// stays distinguishable from present-but-empty, which are two different
+    /// things to hand a process.
+    #[test]
+    fn execution_stdin_is_accepted_as_base64_and_refused_otherwise() {
+        let body = |json: &str| serde_json::from_str::<CreateExecutionRequest>(json).unwrap();
+
+        let plain = body(r#"{"command":["/bin/true"],"idempotencyKey":"k"}"#);
+        assert_eq!(plain.stdin, None, "absent means /dev/null");
+
+        let with = body(r#"{"command":["/bin/true"],"idempotencyKey":"k","stdin":"czNjcmV0"}"#);
+        assert_eq!(
+            decode_execution_stdin(with.stdin.as_deref().unwrap()),
+            Ok(b"s3cret".to_vec())
+        );
+
+        let empty = body(r#"{"command":["/bin/true"],"idempotencyKey":"k","stdin":""}"#);
+        assert_eq!(empty.stdin.as_deref(), Some(""));
+        assert_eq!(
+            decode_execution_stdin(""),
+            Ok(Vec::new()),
+            "an empty stdin is a request, not an absent one"
+        );
+
+        // Exact bytes survive, including the ones that are not text.
+        let raw: Vec<u8> = (0u8..=255).collect();
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw)
+        };
+        assert_eq!(decode_execution_stdin(&encoded), Ok(raw));
+
+        assert_eq!(decode_execution_stdin("not base64!!"), Err(()));
+    }
+
     /// The attach query is parsed by hand because axum's `Query` cannot carry
     /// repeated keys into `Option<Vec<String>>`: every value arrives as a
     /// string, so the CLI's `?tty=true&command=bash` used to die inside the
@@ -9842,6 +9944,7 @@ mod tests {
                 container: None,
                 idempotency_key: "kobe-verbs-1".into(),
                 detach: false,
+                stdin: None,
             }),
         )
         .await;

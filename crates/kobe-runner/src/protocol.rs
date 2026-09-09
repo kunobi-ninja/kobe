@@ -68,6 +68,21 @@ pub const MAX_LOG_CHUNK_BYTES: usize = 256 * 1024;
 /// installed runner can only reject after its idempotency key is durable.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// Most stdin one execution may carry to its process.
+///
+/// This is a channel for **secrets and small inputs** — a token for
+/// `gh auth login --with-token`, a password, a short configuration document. It
+/// is emphatically not file transfer: the bytes travel base64-encoded inside
+/// the single start request that [`MAX_REQUEST_BYTES`] bounds as a whole, and
+/// both Kobe and the runner hold them in memory for the duration of the spawn.
+///
+/// Sixteen KiB encodes to just under 22 KiB of base64, which leaves the argv,
+/// the cwd and the JSON scaffolding comfortable room inside the 64 KiB request.
+/// A caller who exceeds it is **refused**, never truncated: half a token is
+/// still a secret, and a command that read half its input and then saw EOF
+/// would fail somewhere a long way from the cause.
+pub const MAX_STDIN_BYTES: usize = 16 * 1024;
+
 /// Hidden runner flag used only by the administrator-driven #82 live gate.
 ///
 /// The process exits after its target-side reservation is durable, but before
@@ -123,6 +138,10 @@ pub fn is_valid_id(id: &str) -> bool {
 /// an argument — and the exec request's argv is a URL that the target
 /// apiserver's audit log records verbatim. stdin is the only channel into the
 /// container that nothing on the way logs.
+///
+/// [`StartRequest::stdin_base64`] extends that same channel one hop further, to
+/// the supervised process itself, so a command that reads a credential from
+/// stdin no longer has to be given one in a flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartRequest {
@@ -143,6 +162,34 @@ pub struct StartRequest {
     /// Per-stream retention cap. Output past it is discarded and the fact is
     /// reported — never silently dropped.
     pub max_output_bytes: u64,
+    /// Bytes to write to the process's stdin, base64, then close.
+    ///
+    /// The whole point of the field: a Sandbox has no other way to receive a
+    /// secret. Everything else a caller can say about a command ends up in
+    /// argv, and the exec request's argv is a URL the target apiserver
+    /// audit-logs verbatim — so `gh auth login --with-token`, which reads its
+    /// token from stdin, was previously only expressible by putting the token
+    /// somewhere it would be recorded. This is the other half of the intent
+    /// that already puts the request itself on the runner's stdin.
+    ///
+    /// Bounded by [`MAX_STDIN_BYTES`], and for secrets rather than files — see
+    /// that constant for why the bound is what it is. Base64 so exact bytes
+    /// survive the JSON: a token is not required to be UTF-8, and a lossy
+    /// conversion here would corrupt a credential in a way nothing downstream
+    /// could diagnose.
+    ///
+    /// **Absent when unused, and that is load-bearing.** A request that carries
+    /// no stdin serialises byte-for-byte as it did before this field existed,
+    /// so a released runner that denies unknown fields still accepts it. A
+    /// request that *does* carry stdin is refused outright by such a runner —
+    /// loudly, before anything is reserved — which is the correct failure for a
+    /// Sandbox image too old to honour it. Silently dropping the field would
+    /// run the command with no stdin at all and report success.
+    ///
+    /// Never persisted. The runner keeps it out of its spool and Kobe keeps it
+    /// out of the `SandboxExecution` record; only a digest of it is durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_base64: Option<String>,
 }
 
 impl StartRequest {
@@ -152,12 +199,71 @@ impl StartRequest {
     /// the id — a retry carries the same id anyway. Timeout remains part of the
     /// v1 identity: changing it would require either a negotiated protocol or a
     /// second authority that an older runner understands.
+    ///
+    /// stdin is excluded, and not by oversight. The comparison runs against the
+    /// request the runner kept in its spool, and the spool deliberately does
+    /// not keep the stdin bytes — see [`StartRequest::without_stdin`]. Nor
+    /// could a digest stored there stand in: the spool shares a UID with the
+    /// tenant's workload, which can forge every file in it. The authority that
+    /// two same-key requests are the same command is Kobe's own request digest,
+    /// which *does* cover stdin and is checked in the API server before this
+    /// runner is ever reached.
     pub fn same_command(&self, other: &Self) -> bool {
         self.argv == other.argv
             && self.cwd == other.cwd
             && self.timeout_seconds == other.timeout_seconds
             && self.max_output_bytes == other.max_output_bytes
     }
+
+    /// The same request with the stdin bytes removed.
+    ///
+    /// What the runner writes to its spool. The spool lives on a filesystem the
+    /// tenant's workload shares, survives the command that needed the secret,
+    /// and is read back by a separate process on every `status` and `cancel` —
+    /// none of which has any use for the bytes. A secret that only ever exists
+    /// in memory cannot be read out of a file later.
+    pub fn without_stdin(&self) -> Self {
+        Self {
+            stdin_base64: None,
+            ..self.clone()
+        }
+    }
+
+    /// The decoded stdin bytes, or why they are unusable.
+    ///
+    /// `Ok(None)` means the caller asked for no stdin at all, which is not the
+    /// same as asking for an empty one: the first leaves the process reading
+    /// `/dev/null`, the second hands it a pipe that is immediately closed. Both
+    /// see EOF, but only the second is a statement the caller made.
+    ///
+    /// The bound is checked on the decoded bytes rather than the encoding, so
+    /// the error a caller gets names the size they actually sent.
+    pub fn stdin_bytes(&self) -> Result<Option<Vec<u8>>, StdinRejected> {
+        use base64::Engine;
+
+        let Some(encoded) = self.stdin_base64.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| StdinRejected::NotBase64)?;
+        if bytes.len() > MAX_STDIN_BYTES {
+            return Err(StdinRejected::TooLarge);
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Why stdin could not be accepted.
+///
+/// Two distinct reasons rather than one, because they are two different
+/// mistakes: a client that encoded badly and a client that sent too much need
+/// to look in different places. Neither is ever repaired by truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinRejected {
+    NotBase64,
+    /// More than [`MAX_STDIN_BYTES`] once decoded.
+    TooLarge,
 }
 
 /// Where one supervised command is.
@@ -432,6 +538,7 @@ mod tests {
             cwd: Some("/work".into()),
             timeout_seconds: 60,
             max_output_bytes: 1024,
+            stdin_base64: None,
         };
         assert!(base.same_command(&base.clone()));
 
@@ -491,6 +598,7 @@ mod tests {
             cwd: None,
             timeout_seconds: 5,
             max_output_bytes: 16,
+            stdin_base64: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: StartRequest = serde_json::from_str(&encoded).unwrap();
@@ -534,6 +642,7 @@ mod tests {
             cwd: Some("/work".into()),
             timeout_seconds: 60,
             max_output_bytes: 1024,
+            stdin_base64: None,
         };
         let emitted = serde_json::to_string(&current).unwrap();
         let released: ReleasedV1StartRequest = serde_json::from_str(&emitted)
@@ -553,5 +662,140 @@ mod tests {
             !emitted.contains("requestDigest"),
             "v1 must not grow a field an older strict runner rejects: {emitted}"
         );
+        assert!(
+            !emitted.contains("stdin"),
+            "a request with no stdin must be byte-identical to the released shape: {emitted}"
+        );
+
+        // A request that DOES carry stdin is refused by the released runner
+        // rather than run without it. Loud is the correct behaviour here: a
+        // Sandbox image too old to forward stdin would otherwise start the
+        // command with an empty one and report success, which for
+        // `gh auth login --with-token` means an unauthenticated agent and no
+        // indication why.
+        let with_stdin = StartRequest {
+            stdin_base64: Some("dG9rZW4=".into()),
+            ..current
+        };
+        let emitted = serde_json::to_string(&with_stdin).unwrap();
+        assert!(
+            serde_json::from_str::<ReleasedV1StartRequest>(&emitted).is_err(),
+            "an older strict runner must refuse stdin rather than silently drop it"
+        );
+    }
+
+    /// stdin is bounded, and the boundary refuses rather than truncates.
+    ///
+    /// Truncation is the failure mode that must never exist here: half a token
+    /// is still a secret, and the command that received it would fail
+    /// somewhere a long way from the request that caused it.
+    #[test]
+    fn oversized_stdin_is_refused_at_the_documented_boundary() {
+        use base64::Engine;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        let mut request = StartRequest {
+            protocol: PROTOCOL_VERSION,
+            id: "sbxe-1".into(),
+            argv: vec!["/agent".into()],
+            cwd: None,
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+            stdin_base64: None,
+        };
+        assert_eq!(request.stdin_bytes(), Ok(None));
+
+        // Absent and present-but-empty are different requests. The first leaves
+        // the process reading /dev/null; the second is a caller deliberately
+        // handing it an immediately-closed pipe.
+        request.stdin_base64 = Some(String::new());
+        assert_eq!(request.stdin_bytes(), Ok(Some(Vec::new())));
+
+        request.stdin_base64 = Some(encode(&vec![b'x'; MAX_STDIN_BYTES]));
+        assert_eq!(
+            request.stdin_bytes().unwrap().unwrap().len(),
+            MAX_STDIN_BYTES,
+            "exactly the bound is accepted"
+        );
+
+        request.stdin_base64 = Some(encode(&vec![b'x'; MAX_STDIN_BYTES + 1]));
+        assert_eq!(request.stdin_bytes(), Err(StdinRejected::TooLarge));
+
+        request.stdin_base64 = Some("not base64!!".into());
+        assert_eq!(request.stdin_bytes(), Err(StdinRejected::NotBase64));
+
+        // The encoded request still has to fit the whole-request bound, so the
+        // stdin ceiling must leave room for a command beside it.
+        let encoded_ceiling = MAX_STDIN_BYTES.div_ceil(3) * 4;
+        assert!(
+            encoded_ceiling + 1024 < MAX_REQUEST_BYTES,
+            "the stdin bound must leave room for argv inside MAX_REQUEST_BYTES"
+        );
+    }
+
+    /// Exact bytes survive, including the ones that are not text.
+    ///
+    /// A credential is not required to be UTF-8, and a lossy conversion at this
+    /// layer would corrupt it in a way nothing downstream could diagnose.
+    #[test]
+    fn stdin_bytes_survive_the_wire_exactly() {
+        use base64::Engine;
+
+        let raw: Vec<u8> = (0u8..=255).collect();
+        let request = StartRequest {
+            protocol: PROTOCOL_VERSION,
+            id: "sbxe-1".into(),
+            argv: vec!["/agent".into()],
+            cwd: None,
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+            stdin_base64: Some(base64::engine::general_purpose::STANDARD.encode(&raw)),
+        };
+        let decoded: StartRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(decoded.stdin_bytes().unwrap().unwrap(), raw);
+    }
+
+    /// The runner's own copy of a request never carries the secret.
+    ///
+    /// `without_stdin` is what reaches the spool, which shares a filesystem
+    /// with the tenant's workload and outlives the command that needed the
+    /// secret. Everything else about the request is preserved, because the
+    /// supervisor still has to run it.
+    #[test]
+    fn a_request_stripped_for_the_spool_keeps_everything_but_the_secret() {
+        let request = StartRequest {
+            protocol: PROTOCOL_VERSION,
+            id: "sbxe-1".into(),
+            argv: vec!["/agent".into(), "run".into()],
+            cwd: Some("/work".into()),
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+            stdin_base64: Some("czNjcmV0".into()),
+        };
+        let stripped = request.without_stdin();
+        assert_eq!(stripped.stdin_base64, None);
+        assert_eq!(
+            stripped,
+            StartRequest {
+                stdin_base64: None,
+                ..request.clone()
+            }
+        );
+
+        let encoded = serde_json::to_string(&stripped).unwrap();
+        assert!(
+            !encoded.contains("czNjcmV0"),
+            "the spool copy leaked: {encoded}"
+        );
+        assert!(
+            !encoded.contains("stdin"),
+            "the spool copy leaked: {encoded}"
+        );
+
+        // And a retry still recognises it as the same command, even though the
+        // stored copy can no longer prove anything about stdin.
+        assert!(stripped.same_command(&request));
+        assert!(request.same_command(&stripped));
     }
 }

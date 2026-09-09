@@ -24,6 +24,16 @@
 //!
 //! Its own session, separate from the supervisor's, is what lets the supervisor
 //! survive the kill it just issued and record the outcome.
+//!
+//! # Why the command's stdin arrives through a pipe and not the spool
+//!
+//! stdin exists on this contract so a Sandbox can receive a secret without it
+//! appearing in argv, which the target apiserver audit-logs verbatim. Passing
+//! those bytes to the supervisor through the spool would move the secret off
+//! the audit log and onto a filesystem the tenant's workload shares and that
+//! outlives the command — a worse place, not a better one. So `start` hands
+//! them over a pipe, this process holds them in memory, writes them to the
+//! command, and closes.
 
 use std::io::{Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -32,7 +42,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ExecutionReport, LogStream, RunnerState, StartRequest, reason};
+use crate::protocol::{
+    ExecutionReport, LogStream, MAX_STDIN_BYTES, RunnerState, StartRequest, reason,
+};
 use crate::spool::{Spool, now_unix_ms};
 
 /// How often the supervisor looks at the world.
@@ -57,7 +69,40 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const OUTPUT_SETTLE: Duration = Duration::from_secs(2);
 
 /// Supervise one reserved execution until it settles, then exit.
-pub fn supervise(spool: &Spool, id: &str) {
+///
+/// `stdin_bytes` says how many bytes of the command's stdin are waiting on
+/// `source` — this process's own stdin in production. They are read first,
+/// before the spool and before anything is spawned: the writer is the `start`
+/// process, which exits as soon as the handover completes, so the bytes have to
+/// be taken while they are still there. `None` means the command reads
+/// `/dev/null`, which is what every execution did before stdin forwarding
+/// existed.
+///
+/// The bytes stay in this process's memory and are never written to the spool.
+/// That is the point of the feature: the request travels on stdin because argv
+/// is audit-logged, and it would be a poor trade to move a secret off the audit
+/// log and onto a disk the tenant's workload shares.
+pub fn supervise(spool: &Spool, id: &str, stdin_bytes: Option<usize>, source: impl Read) {
+    let started_at = now_unix_ms();
+    let stdin = match read_stdin(stdin_bytes, source) {
+        Ok(stdin) => stdin,
+        Err(_) => {
+            // Part of a secret arrived and the rest did not. Running the
+            // command anyway would hand it a truncated credential and then
+            // report whatever it made of that, so nothing is spawned and the
+            // execution settles as the state that never invites a blind retry.
+            let _ = spool.write_report(&ExecutionReport {
+                id: id.to_string(),
+                state: RunnerState::Unknown,
+                started_at_unix_ms: Some(started_at),
+                finished_at_unix_ms: Some(now_unix_ms()),
+                reason: Some(reason::SUPERVISOR_SETUP_FAILED.into()),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
     let request = match spool.read_request(id) {
         Ok(request) => request,
         Err(_) => {
@@ -68,7 +113,6 @@ pub fn supervise(spool: &Spool, id: &str) {
         }
     };
 
-    let started_at = now_unix_ms();
     if enable_child_subreaper().is_err() {
         // A Linux container's PID 1 is not required to reap orphans. Without
         // becoming a subreaper, this process cannot prove that every member of
@@ -83,7 +127,7 @@ pub fn supervise(spool: &Spool, id: &str) {
         });
         return;
     }
-    let mut child = match spawn(&request) {
+    let mut child = match spawn(&request, stdin.is_some()) {
         Ok(child) => child,
         Err(_) => {
             // The command definitely did not run, but this process cannot tell
@@ -105,6 +149,8 @@ pub fn supervise(spool: &Spool, id: &str) {
     // every descendant that has not deliberately left the group — the four
     // compilers a build script spawned before exiting.
     let group = child.id() as i32;
+
+    feed(child.stdin.take(), stdin);
 
     let stdout = pump(
         child.stdout.take(),
@@ -257,8 +303,64 @@ pub fn settle_report(
     }
 }
 
+/// Take the command's stdin off this process's own, exactly.
+///
+/// `read_exact` rather than "read to EOF" for the same reason the request
+/// itself is one line: the number of bytes is known in advance, so waiting for
+/// an EOF is waiting for something a writer is not obliged to deliver promptly.
+/// It is also what turns a partial handover into an error instead of a silently
+/// shorter secret — a short read here is a lost credential, not an empty one.
+fn read_stdin(
+    stdin_bytes: Option<usize>,
+    mut source: impl Read,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(length) = stdin_bytes else {
+        return Ok(None);
+    };
+    if length > MAX_STDIN_BYTES {
+        // The same ceiling Kobe and `start` enforce. A supervisor is only ever
+        // launched by `start`, so reaching this means the argv was tampered
+        // with — and allocating whatever it asked for is not the response.
+        return Err(std::io::Error::other("stdin length exceeds the bound"));
+    }
+    let mut bytes = vec![0u8; length];
+    source.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Hand the bytes to the process, then close its stdin.
+///
+/// On a thread, because the command is under no obligation to read: anything
+/// larger than a pipe buffer would otherwise block the supervisor's wait loop,
+/// and a supervisor that is not looping cannot cancel, time out, or drain
+/// output.
+///
+/// Closing is the half that makes this useful at all. `gh auth login
+/// --with-token` reads its token until EOF; a stdin that was written and left
+/// open would leave it waiting for the timeout to kill it. Dropping the handle
+/// — on every path, including a write that failed because the command already
+/// exited — is what delivers that EOF.
+fn feed(sink: Option<std::process::ChildStdin>, bytes: Option<Vec<u8>>) {
+    let (Some(mut sink), Some(bytes)) = (sink, bytes) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        // A command that exits without reading gives EPIPE here. That is its
+        // choice, not a fault of the execution, and its own exit status is the
+        // outcome that gets reported.
+        let _ = sink.write_all(&bytes);
+        let _ = sink.flush();
+        drop(sink);
+    });
+}
+
 /// Start the command, in a session of its own.
-fn spawn(request: &StartRequest) -> std::io::Result<Child> {
+///
+/// `with_stdin` decides between a pipe this supervisor feeds and `/dev/null`.
+/// The distinction is the caller's to make: a command handed an immediately
+/// closed pipe and one handed `/dev/null` both see EOF, but only the first is
+/// something somebody asked for.
+fn spawn(request: &StartRequest, with_stdin: bool) -> std::io::Result<Child> {
     let mut command = Command::new(&request.argv[0]);
     command.args(&request.argv[1..]);
     if let Some(cwd) = &request.cwd {
@@ -267,9 +369,15 @@ fn spawn(request: &StartRequest) -> std::io::Result<Child> {
         // tenant's own untrusted input.
         command.current_dir(cwd);
     }
-    // No stdin at all. A detached command has no connection to read from, and
-    // an inherited terminal would let it stop on SIGTTIN and look like a hang.
-    command.stdin(Stdio::null());
+    // Never the supervisor's own stdin, and never an inherited terminal: a
+    // detached command has no connection to read from, and a terminal would let
+    // it stop on SIGTTIN and look like a hang. Either a pipe carrying exactly
+    // what the caller supplied, or nothing at all.
+    command.stdin(if with_stdin {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 

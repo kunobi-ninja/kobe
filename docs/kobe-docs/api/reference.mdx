@@ -498,8 +498,8 @@ changing after a few attempts, the API answers `409 Conflict` with reason
 Reserves the execution before starting its process, so retrying the same
 request cannot run a command twice. `idempotencyKey` is required, contains
 1–253 bytes, and must be new for each deliberate execution. Reusing it with
-different command, working directory, timeout, container, or detach intent
-returns `409 Conflict`.
+different command, working directory, timeout, container, stdin, or detach
+intent returns `409 Conflict`.
 
 ```json
 {
@@ -508,13 +508,40 @@ returns `409 Conflict`.
   "timeout": "5m",
   "container": "agent",
   "idempotencyKey": "execution-018f8f4f",
-  "detach": false
+  "detach": false,
+  "stdin": "Z2hwX2V4YW1wbGV0b2tlbg=="
 }
 ```
 
 `command` is an argv array and is never interpreted by a shell. `cwd` and
 `container` are optional. `timeout` defaults to 60 seconds, is capped at one
 hour, and can never extend past the lease expiry.
+
+`stdin` is optional, base64-encoded, and written to the command's standard
+input before it is closed. **It is how you pass a secret to a Sandbox.** The
+exec request Kobe makes against the target cluster puts the command line in a
+URL that the target apiserver's audit log records verbatim, so a token in
+`command` is a token in somebody's log. A token in `stdin` is not: it is
+forwarded to the process and hashed into the execution's request digest, and no
+part of it is stored in the execution record, its status, or etcd.
+
+```sh
+# The token never appears in an argument.
+printf %s "$GITHUB_TOKEN" | base64 | \
+  jq -Rn --argjson cmd '["gh","auth","login","--with-token"]' \
+    '{command: $cmd, idempotencyKey: "execution-018f8f50", stdin: input}'
+```
+
+The command's stdin is **closed** once the bytes are delivered, so a tool that
+reads until EOF — `gh auth login --with-token` does — completes rather than
+waiting for its timeout. Omitting `stdin` leaves the process reading
+`/dev/null`, exactly as before; an empty string gives it a pipe that is
+immediately closed.
+
+This is a channel for secrets and small inputs, not a file transfer: at most
+16 KiB once decoded. More than that is refused with `400`, never truncated —
+half a token is still a secret, and a command that received half of one would
+fail somewhere a long way from the cause.
 
 Wait mode (`detach: false`) returns `200 OK` after the supervised command ends:
 
@@ -540,8 +567,8 @@ Execution states are `Queued`, `Running`, `Succeeded`, `Failed`, `Cancelled`,
 reported one. `Unknown` means Kobe could not establish the outcome and must not
 be treated as permission to rerun effects automatically.
 
-Common failures are `400` for an invalid command, timeout, cwd, or idempotency
-key; `403`/`404` for unavailable lease access; `409` for key reuse with changed
+Common failures are `400` for an invalid command, timeout, cwd, stdin, or
+idempotency key; `403`/`404` for unavailable lease access; `409` for key reuse with changed
 intent and for the per-lifetime execution bound (`reason:
 execution_limit_exhausted` — retrying cannot succeed, request a new lease);
 `501` when the pool has no Kobe runner; and `503` when the execution store or

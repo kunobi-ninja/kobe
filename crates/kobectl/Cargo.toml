@@ -22,6 +22,10 @@ path = "src/main.rs"
 # crates (kube, axum, sqlx, aws-sdk-s3 → aws-lc-sys, kunobi-ha, kunobi-reload).
 # Keeping this tree slim is what makes the Windows (msvc) cross-build viable.
 anyhow = "1"
+# `kobe exec --stdin` encodes the bytes it forwards. Tiny, pure Rust, no
+# platform surface — it does not threaten the Windows cross-build this
+# dependency set is kept slim for.
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

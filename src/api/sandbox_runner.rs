@@ -36,6 +36,12 @@
 //! Only the execution id — a hash Kobe derived — is ever passed as an argument;
 //! the command itself is written to the runner's stdin, which nothing on the
 //! path records.
+//!
+//! The same document may carry the supervised process's own stdin, which is the
+//! only way to give a Sandbox a secret at all: without it, a command that reads
+//! a token — `gh auth login --with-token` — could be driven only by putting
+//! that token in a flag, in the argv that gets audit-logged. Those bytes are
+//! forwarded and hashed; they are never persisted, on either side.
 
 use kobe_runner::protocol::{
     Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
@@ -218,12 +224,23 @@ pub fn bounded_reason(reason: &str) -> String {
 }
 
 /// The request Kobe writes to the runner's stdin.
+///
+/// `stdin` is the caller's bytes for the supervised process, base64-encoded
+/// here and carried inside this one document. It is emitted only when present:
+/// a request that forwards no stdin serialises byte-for-byte as it did before
+/// the field existed, so a Sandbox image older than this Kobe keeps accepting
+/// ordinary executions. One that *does* forward stdin is refused by such an
+/// image — loudly, and before anything is spawned — rather than run without the
+/// input it was meant to receive.
 pub fn start_request(
     id: &str,
     argv: &[String],
     cwd: Option<&str>,
     timeout: std::time::Duration,
+    stdin: Option<&[u8]>,
 ) -> StartRequest {
+    use base64::Engine;
+
     StartRequest {
         protocol: PROTOCOL_VERSION,
         id: id.to_string(),
@@ -233,6 +250,10 @@ pub fn start_request(
         // became one would kill a command before its own bound elapsed.
         timeout_seconds: (timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0)).max(1),
         max_output_bytes: crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES,
+        // Base64 so exact bytes survive the JSON: a credential is not required
+        // to be UTF-8, and a lossy conversion here would corrupt it in a way
+        // that surfaces as an authentication failure far from the cause.
+        stdin_base64: stdin.map(|stdin| base64::engine::general_purpose::STANDARD.encode(stdin)),
     }
 }
 
@@ -657,6 +678,7 @@ mod tests {
             &["/agent".into(), "--token".into(), "s3cret".into()],
             Some("/work"),
             std::time::Duration::from_secs(60),
+            None,
         );
         let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
         assert!(line.contains("s3cret"), "the command travels on stdin");
@@ -827,6 +849,91 @@ mod tests {
         }
     }
 
+    /// A forwarded secret travels on stdin and appears in no argument.
+    ///
+    /// This is the whole reason the field exists. If the bytes reached the
+    /// runner through argv instead, they would be in the exec URL the target
+    /// apiserver audit-logs verbatim — the exact leak `--stdin` is offered to
+    /// avoid, and one nobody could redact after the fact.
+    #[test]
+    fn forwarded_stdin_travels_on_stdin_and_never_in_an_argument() {
+        let secret = b"ghp_a-token-that-must-not-be-audit-logged";
+        let request = start_request(
+            "sbxe-abc123",
+            &["/usr/bin/gh".into(), "auth".into(), "login".into()],
+            None,
+            std::time::Duration::from_secs(60),
+            Some(secret),
+        );
+
+        // Base64 on the wire, so the exact bytes survive JSON.
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(secret.as_slice())
+        };
+        assert_eq!(request.stdin_base64.as_deref(), Some(encoded.as_str()));
+        assert_eq!(request.stdin_bytes().unwrap().unwrap(), secret);
+
+        let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
+        assert!(line.contains(&encoded), "the secret must travel on stdin");
+        assert!(line.ends_with('\n'), "the runner reads exactly one line");
+
+        // The exec argv is unchanged by the presence of stdin: two fixed words.
+        assert_eq!(start_argv("/kobe-runner", None), ["/kobe-runner", "start"]);
+        for argument in start_argv("/kobe-runner", None) {
+            assert!(!argument.contains(&encoded));
+            assert!(!argument.contains("gh"));
+        }
+    }
+
+    /// A request that forwards no stdin is byte-identical to the released one.
+    ///
+    /// A Sandbox image is built by an administrator and can be months older
+    /// than the Kobe talking to it, and the runner denies unknown fields. An
+    /// always-emitted `stdinBase64` — even null — would make every ordinary
+    /// execution fail against every already-deployed image.
+    #[test]
+    fn a_request_without_stdin_stays_wire_compatible_with_an_older_runner() {
+        let without = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        let line = String::from_utf8(start_line(&without).unwrap()).unwrap();
+        assert!(
+            !line.contains("stdin"),
+            "no stdin means no field at all: {line}"
+        );
+
+        let with = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            Some(b"token"),
+        );
+        assert!(
+            String::from_utf8(start_line(&with).unwrap())
+                .unwrap()
+                .contains("stdinBase64"),
+            "and a request that forwards stdin must say so explicitly"
+        );
+
+        // Present-but-empty is not absent: one hands the process a closed pipe,
+        // the other hands it /dev/null.
+        let empty = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            Some(b""),
+        );
+        assert_eq!(empty.stdin_base64.as_deref(), Some(""));
+        assert_ne!(empty, without);
+    }
+
     /// Kobe and the runner share the exact encoded request ceiling.
     #[test]
     fn start_request_bound_includes_the_newline() {
@@ -835,6 +942,7 @@ mod tests {
             &[String::new()],
             None,
             std::time::Duration::from_secs(1),
+            None,
         );
         let base = start_line(&request).unwrap().len();
         request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
@@ -1053,7 +1161,7 @@ mod tests {
     #[test]
     fn a_timeout_is_never_rounded_down() {
         let seconds = |timeout: std::time::Duration| {
-            start_request("sbxe-1", &["/agent".into()], None, timeout).timeout_seconds
+            start_request("sbxe-1", &["/agent".into()], None, timeout, None).timeout_seconds
         };
 
         assert_eq!(seconds(std::time::Duration::from_secs(60)), 60);
@@ -1077,6 +1185,7 @@ mod tests {
             &["/agent".into()],
             None,
             std::time::Duration::from_secs(60),
+            None,
         );
         assert_eq!(
             request.max_output_bytes,
