@@ -210,12 +210,38 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
 /// replicated to every etcd member, and included in backups. So anything
 /// outside the closed vocabulary is replaced rather than truncated: a
 /// truncated secret is still a secret.
+///
+/// The vocabulary is [`kobe_runner::protocol::reason`] itself, matched
+/// literally, because a *shape* check is not a vocabulary. "Nonempty, at most
+/// 64 bytes, lowercase ASCII and underscores" admits `password` and
+/// `ghp_never_persist_this` unchanged, which is precisely the class of string
+/// this function exists to stop. The distinction stopped being theoretical
+/// once a caller could hand the container a secret on stdin: the runner's
+/// spool is written by the workload's own UID (see
+/// [`kobe_runner::spool`]), so a workload that wants its secret in etcd only
+/// has to forge a terminal report carrying it as the reason.
+///
+/// Matching the shared constants rather than a copied list is what keeps this
+/// honest across an upgrade — a reason code renamed on the runner side stops
+/// compiling here instead of silently becoming unrecognised. A *newly added*
+/// code does degrade to `runner_reason_unrecognised` on an older Kobe, and
+/// that is the correct direction: nothing downstream branches on the string,
+/// so the cost is a less precise diagnosis rather than a wrong decision.
 pub fn bounded_reason(reason: &str) -> String {
-    let recognised = !reason.is_empty()
-        && reason.len() <= 64
-        && reason
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+    use kobe_runner::protocol::reason as code;
+
+    let recognised = matches!(
+        reason,
+        code::COMPLETED
+            | code::TIMED_OUT
+            | code::CANCELLED
+            | code::SIGNALLED
+            | code::SPAWN_FAILED
+            | code::SUPERVISOR_NOT_STARTED
+            | code::SUPERVISOR_SETUP_FAILED
+            | code::SUPERVISOR_LOST
+            | code::OUTCOME_UNOBSERVED
+    );
     if recognised {
         reason.to_string()
     } else {
@@ -1150,6 +1176,55 @@ mod tests {
         ] {
             let outcome = outcome_from_report(&report(state));
             assert!(outcome.reason.len() <= 64);
+        }
+    }
+
+    /// Only the runner protocol's own reason codes are ever persisted.
+    ///
+    /// The shape check the vocabulary used to be — nonempty, short, lowercase
+    /// ASCII — admits `password` and `ghp_never_persist_this` unchanged. That
+    /// is a closed vocabulary in the doc-comment only, and stdin forwarding
+    /// gives a workload a secret worth routing through it: the spool is
+    /// writable by the tenant's own UID, so a forged terminal report is the
+    /// tenant's to write.
+    #[test]
+    fn only_the_runner_protocols_own_reason_codes_are_persisted() {
+        use kobe_runner::protocol::reason as code;
+
+        // Every code the runner can actually emit survives unchanged. A fix
+        // that silently retired one of these would turn a real diagnosis into
+        // `runner_reason_unrecognised` on the next upgrade.
+        for recognised in [
+            code::COMPLETED,
+            code::TIMED_OUT,
+            code::CANCELLED,
+            code::SIGNALLED,
+            code::SPAWN_FAILED,
+            code::SUPERVISOR_NOT_STARTED,
+            code::SUPERVISOR_SETUP_FAILED,
+            code::SUPERVISOR_LOST,
+            code::OUTCOME_UNOBSERVED,
+        ] {
+            assert_eq!(
+                bounded_reason(recognised),
+                recognised,
+                "{recognised} is a protocol reason code and must reach the record"
+            );
+        }
+
+        // Each of these passes the old shape check verbatim.
+        for smuggled in [
+            "password",
+            "ghp_never_persist_this",
+            &"a".repeat(64),
+            "completed_",
+            "aws_secret_access_key",
+        ] {
+            assert_eq!(
+                bounded_reason(smuggled),
+                "runner_reason_unrecognised",
+                "reason {smuggled:?} is not a protocol code and must not be persisted"
+            );
         }
     }
 

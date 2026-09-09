@@ -1074,14 +1074,22 @@ fn an_execution_with_no_stdin_still_reads_nothing_and_exits() {
     assert!(read_stream(&scratch, "sbxe-no-stdin", "stdout").is_empty());
 }
 
-/// The secret is never written anywhere under the spool.
+/// The runner itself never puts the secret anywhere under the spool.
 ///
 /// This is the property the whole design exists for. stdin carries a token so
 /// that it does not appear in an argv the apiserver audit-logs; writing it to a
 /// filesystem the tenant's workload shares — and which outlives the command —
 /// would trade one durable copy for another.
+///
+/// The command here neither reads nor echoes its stdin, and that is what makes
+/// the assertion about the *runner*. A command that does echo — `cat` — puts
+/// the bytes in `stdout.log` by doing exactly what it was asked to do, and
+/// captured output is a caller's own decision about their own secret. The
+/// boundary this pins is the one Kobe owns: nothing the runner writes of its
+/// own accord — the request file, the report, the stream files it opens —
+/// contains the bytes.
 #[test]
-fn stdin_is_never_written_to_the_spool() {
+fn the_runner_itself_never_writes_stdin_to_the_spool() {
     let scratch = Scratch::new();
     let secret = b"ghp_never-on-disk-anywhere";
 

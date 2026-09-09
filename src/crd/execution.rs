@@ -323,6 +323,16 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// with those bytes anywhere in Kobe's durable path — see the module
 /// documentation for why they must not survive the request.
 ///
+/// The digest is an **unkeyed** SHA-256, and it is persisted — in
+/// `spec.requestDigest` and in the Lease annotations that survive the record.
+/// Stated plainly because it is a real property and not an implied one: a
+/// high-entropy token is safe under it, but anyone who can read the digest can
+/// test candidate stdin values offline, so a low-entropy secret (a short
+/// password, a PIN) is confirmable rather than merely committed to. Keying it
+/// would need a durable operator secret that survives a rolling upgrade and
+/// stays identical across replicas, which would trade this property for a key
+/// distribution problem that fails less obviously.
+///
 /// `None` for `stdin` contributes nothing to the hash, so a request that
 /// forwards no stdin digests exactly as it did before this parameter existed.
 /// That is what lets a Kobe rollout recognise the records its predecessor
