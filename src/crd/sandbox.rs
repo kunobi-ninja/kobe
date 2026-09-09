@@ -1371,11 +1371,28 @@ pub struct SandboxTargetProvenance {
     /// every retry. A negative that was known at Ready time has to be written
     /// down at Ready time; it cannot be reconstructed from a mutable object.
     ///
-    /// `None` means the lease was placed before this field existed. Those
-    /// leases fall back to the pool-generation derivation, which is what they
-    /// have always used. Nothing backfills it: doing so would mean
-    /// re-observing an already-Ready lease's Pod, and a Pod that has since
-    /// been replaced would then fail a merge that today never runs.
+    /// `None` means the flag was never durably recorded for this lease, which
+    /// is narrower than "this lease was Ready before the field existed".
+    /// Readiness does not consult it: the gates on the Ready path
+    /// (`workload_provenance_is_complete` / `management_provenance_is_complete`)
+    /// ask whether the object identities are recorded, not whether this flag
+    /// is. So a lease whose provenance a previous controller checkpointed
+    /// complete while it was still `Provisioning` would reach Ready under the
+    /// new controller without ever re-entering `observed_provenance`, the
+    /// writer that fills this in. The Ready transition therefore records it
+    /// itself, in the same status write, from the pool already fenced to this
+    /// lease's admitted UID and generation.
+    ///
+    /// What is left in `None` is a lease made Ready by a release older than
+    /// this field, or one whose Ready write landed against a SandboxLease CRD
+    /// that still predates it — the API server prunes the unknown key under
+    /// the default `Warn` validation and answers success, and the status
+    /// writer does not re-read the stored object to notice. Both fall back to
+    /// the pool-generation derivation, which is what they have always used.
+    ///
+    /// Nothing backfills a lease that is ALREADY Ready: that would mean
+    /// re-observing its Pod, and a Pod that has since been replaced would then
+    /// fail a merge that today never runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_required: Option<bool>,
 }
