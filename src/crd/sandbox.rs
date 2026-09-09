@@ -361,9 +361,9 @@ impl JsonSchema for SandboxPlacement {
     validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.start <= p.portRange.end)")
         .message("portRange.start must not exceed portRange.end")
 )]
-// Keeps `portRange` from being spelled as "everything". See
-// [`MAX_PORT_RANGE_SPAN`]: both ends are inclusive, so the span is the
-// difference plus one.
+// Caps how wide ONE band may be, which is not the same as capping the pool —
+// see [`MAX_PORT_RANGE_SPAN`] for why that is deliberate. Both ends are
+// inclusive, so the span is the difference plus one.
 #[x_kube(
     validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.end - p.portRange.start < 8192)")
         .message("portRange may span at most 8192 ports")
@@ -507,14 +507,24 @@ pub struct SandboxResourceCeiling {
     pub max_memory: String,
 }
 
-/// Widest contiguous band one `portRange` may authorize.
+/// Widest contiguous band **one** `portRange` may authorize.
 ///
-/// A cap exists so `portRange` cannot be spelled to mean "everything". The
-/// point of `exposedPorts` is that the administrator decides what is
-/// reachable; a range wide enough to cover the port space would keep the
-/// syntax and discard the decision. This value is large enough to declare the
-/// entire conventional dev-server band (`3000-9999`) in one line, and small
-/// enough that no single range reaches an eighth of the 65535 ports.
+/// The point of `exposedPorts` is that the administrator decides what is
+/// reachable, and a single range wide enough to cover the port space would
+/// keep the syntax while discarding the decision. This value is large enough
+/// to declare the entire conventional dev-server band (`3000-9999`) in one
+/// line, and small enough that no single range reaches an eighth of the 65535
+/// ports.
+///
+/// It is a per-declaration cap and nothing more. `exposedPorts` holds up to 64
+/// entries, so eight adjacent bands still spell the whole port space — the cap
+/// does not make "everything" unwriteable, and it is not a security boundary.
+/// It is a limit on how much one line can do by accident: a typo in a bound,
+/// or a `1-65535` written because it was easier than thinking about the range,
+/// is refused where it is written. An administrator who means to authorize
+/// everything can still say so, deliberately, over several lines that a
+/// reviewer will see. That is the same trade the whole field makes — the
+/// administrator decides, and Kobe only insists the decision be visible.
 pub const MAX_PORT_RANGE_SPAN: u32 = 8192;
 
 /// One TCP port, or one contiguous band of them, declared safe for later
@@ -554,6 +564,17 @@ pub struct SandboxPortSpec {
     /// neither, or both, is refused at admission rather than resolved by
     /// preferring one: a pool whose port declaration is ambiguous is a pool
     /// whose reachable set nobody can state.
+    ///
+    /// "Refused at admission" is a statement about *this* CRD. A both-fields
+    /// entry written against the pre-range CRD is not refused — the API server
+    /// prunes `portRange` as an unknown field under the default `Warn`
+    /// validation and stores a plain `port` entry, so the ambiguity is gone
+    /// before any Rust here can see it and no later check can reconstruct it.
+    /// That direction cannot over-authorize (the surviving number is one the
+    /// administrator wrote), but the band they also wrote is silently absent.
+    /// The defence is `fieldValidation=Strict`, which is `kubectl apply`'s
+    /// default and is documented as a requirement for pool manifests in
+    /// `docs/kobe-docs/pools/sandbox-pools.mdx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub port: Option<u16>,
@@ -604,9 +625,23 @@ impl SandboxPortSpec {
     /// ports can see one. Every such site goes through this rather than
     /// reading `port` directly, which keeps "is this publishable" a decision
     /// made in one place.
+    ///
+    /// Also `None` when *both* fields are set. That shape is refused at
+    /// admission and again in [`SandboxPoolSpec::validate`], so it should not
+    /// reach here — but if one ever does, this helper has to give the same
+    /// answer as the forwarding path, which drops an ambiguous declaration
+    /// rather than repairing it (see
+    /// [`target_from_provenance`](crate::api::sandbox_access::target_from_provenance)).
+    /// Returning `self.port` published the number and silently discarded the
+    /// band, so one invalid declaration had two readings depending on which
+    /// consumer asked, and the manifest's author would have seen the half they
+    /// did not write. Ambiguity resolves to the empty set on both sides.
     #[allow(dead_code)]
     pub fn published_port(&self) -> Option<u16> {
-        self.port
+        match (self.port, self.port_range) {
+            (Some(single), None) => Some(single),
+            _ => None,
+        }
     }
 }
 
@@ -723,6 +758,12 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status.target.childClusterKubeconfigSha256 is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))")
         .message("child kubeconfig Secret identity and payload digest must be checkpointed together"),
+    // Release reads `serviceRequired` back as proof that this lease was never
+    // supposed to own a Service. A value that could be flipped or cleared later
+    // would be proof of nothing, so it is pinned at the API server as well as
+    // in `merge_target_provenance`.
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.serviceRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.serviceRequired) && self.status.target.serviceRequired == oldSelf.status.target.serviceRequired)")
+        .message("status.target.serviceRequired is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == 'v1' && self.status.target.childClusterKubeconfigSecret.kind == 'Secret' && has(self.status.target.childClusterKubeconfigSecret.__namespace__) && has(self.status.target.childClusterInstance.__namespace__) && self.status.target.childClusterKubeconfigSecret.__namespace__ == self.status.target.childClusterInstance.__namespace__ && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + '-kubeconfig' && self.status.target.childClusterKubeconfigSha256.matches('^[0-9a-f]{64}$'))")
         .message("childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)")
@@ -1311,6 +1352,32 @@ pub struct SandboxTargetProvenance {
     /// proves every nested dependent is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<SandboxObjectReference>,
+    /// Whether the exact pool generation that placed this lease published a
+    /// port, and therefore whether [`Self::service`] had to be filled.
+    ///
+    /// Recorded in the same status write as the workload identities, from the
+    /// pool the reconciler has already fenced to this lease's admitted UID and
+    /// generation. Release consults *this* rather than re-deriving the answer
+    /// from whatever the pool says later.
+    ///
+    /// It exists because "no Service was ever required" and "the Service
+    /// identity is missing" are the same absence, and telling them apart at
+    /// release time used to need the original pool generation still to be
+    /// live. Any edit to the pool bumps that generation, so a lease that
+    /// legitimately owned no Service — a pool with no `exposedPorts`, or one
+    /// that declares only a `portRange` — became permanently unreleasable the
+    /// moment its pool was touched: quota, alias, and the finalizer stayed
+    /// held, and the phase oscillated between `Releasing` and `Quarantined` on
+    /// every retry. A negative that was known at Ready time has to be written
+    /// down at Ready time; it cannot be reconstructed from a mutable object.
+    ///
+    /// `None` means the lease was placed before this field existed. Those
+    /// leases fall back to the pool-generation derivation, which is what they
+    /// have always used. Nothing backfills it: doing so would mean
+    /// re-observing an already-Ready lease's Pod, and a Pod that has since
+    /// been replaced would then fail a merge that today never runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_required: Option<bool>,
 }
 
 /// Kubernetes-style condition with the generation from which it was derived.
@@ -1711,6 +1778,49 @@ mod tests {
         assert!(
             !spec.template.requires_service(),
             "a range-only pool must not be held to a Service it never gets"
+        );
+    }
+
+    /// An ambiguous declaration publishes nothing, exactly as the forwarding
+    /// path authorizes nothing from it.
+    ///
+    /// `port` and `portRange` together are refused at admission and again in
+    /// [`SandboxPoolSpec::validate`], so this shape reaches neither consumer on
+    /// any normal path. It is pinned anyway because the two consumers used to
+    /// disagree: `target_from_provenance` dropped the entry while
+    /// `published_port` returned the number, which published a
+    /// `ContainerPort`, a Service port, and a Service *requirement* for a
+    /// declaration the forwarding path treats as empty. One invalid input, two
+    /// answers, and the half that survived was the half the author did not
+    /// write down last.
+    #[test]
+    fn an_ambiguous_port_declaration_publishes_nothing() {
+        let ambiguous = SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: Some(8080),
+            port_range: Some(SandboxPortRange {
+                start: 3000,
+                end: 4000,
+            }),
+        };
+        assert_eq!(
+            ambiguous.published_port(),
+            None,
+            "a declaration that sets both fields must not publish either one"
+        );
+
+        let mut spec = valid_pool_spec();
+        spec.template.exposed_ports = vec![ambiguous];
+        assert_eq!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::PortAndRange("dev".into())),
+            "the shape is still refused where a pool is admitted"
+        );
+        assert_eq!(spec.template.published_ports().count(), 0);
+        assert!(
+            !spec.template.requires_service(),
+            "an ambiguous declaration must not demand a Service that certification would then have to prove"
         );
     }
 
@@ -2198,6 +2308,7 @@ mod tests {
             "childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance",
             "status.childTeardownMode is immutable once recorded",
             "childTeardownMode requires exact child placement and kubeconfig Secret provenance",
+            "status.target.serviceRequired is immutable once recorded",
         ] {
             assert!(
                 validations
@@ -2413,10 +2524,19 @@ mod tests {
     /// way. That is why the docs give an order: apply the CRDs, finish the
     /// operator rollout, then write a range.
     ///
-    /// The second half is what bounds the risk, and is the reason the shape is
-    /// safe to ship: a pool that declares only `port` is byte-identical on the
-    /// wire and still parses under the old struct. The skew is opt-in, one
-    /// pool at a time, and never reaches a pool nobody edited.
+    /// The second half is what makes the shape safe to ship: a pool that
+    /// declares only `port` is byte-identical on the wire and still parses
+    /// under the old struct, so no pool that nobody edited changes meaning.
+    ///
+    /// What that does NOT mean is that the failure is confined to the edited
+    /// pool. Both readers use a *typed collection*: the API's pool listing
+    /// (`Api<SandboxPool>::list`) and the controller's `Controller::new` over
+    /// the same typed `Api`. One undecodable item fails the whole list, so
+    /// during the skew window a single ranged pool can 500 the listing for
+    /// every pool in the namespace and can break the controller's watch at
+    /// startup or relist. The mitigation is the documented order, not a
+    /// narrow blast radius — which is why the rollout note says to finish the
+    /// operator upgrade before writing the first range, in those words.
     #[test]
     fn pre_range_replica_rejects_port_range_but_still_reads_single_ports() {
         #[allow(dead_code)]

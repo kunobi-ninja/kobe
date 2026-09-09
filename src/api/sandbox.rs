@@ -13902,6 +13902,7 @@ mod tests {
             sandbox: Some(reference("Sandbox", "sbx")),
             pod: Some(reference("Pod", "sbx-0")),
             service: Some(reference("Service", "sbx")),
+            service_required: None,
         };
 
         let visible = caller_visible_provenance(target.clone());

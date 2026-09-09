@@ -891,6 +891,17 @@ pub fn merge_target_provenance(
         sandbox: merge_reference("sandbox", &existing.sandbox, proposed.sandbox)?,
         pod: merge_reference("pod", &existing.pod, proposed.pod)?,
         service: merge_reference("service", &existing.service, proposed.service)?,
+        // Monotonic for the same reason every reference above is. The pool
+        // generation is fenced for the life of a lease, so an honest reconcile
+        // always proposes the same answer; a proposal that flips it is a lease
+        // being re-derived against a pool it was never admitted against, and
+        // release would then either demand a Service that never existed or
+        // excuse one that did.
+        service_required: merge_flag(
+            "serviceRequired",
+            &existing.service_required,
+            proposed.service_required,
+        )?,
     })
 }
 
@@ -1142,6 +1153,23 @@ fn merge_string(
         (None, proposed) => Ok(proposed),
         (Some(_), None) => Err(SandboxProvenanceError::ReferenceCleared(field)),
         (Some(current), Some(proposed)) if current == &proposed => Ok(Some(current.clone())),
+        (Some(_), Some(_)) => Err(SandboxProvenanceError::ReferenceChanged(field)),
+    }
+}
+
+/// Same monotonic rule as [`merge_reference`], for a recorded fact rather than
+/// an identity. Clearing is refused as loudly as changing: a flag that can go
+/// back to "unknown" is a flag release cannot rely on, which is the whole
+/// reason it is written down.
+fn merge_flag(
+    field: &'static str,
+    existing: &Option<bool>,
+    proposed: Option<bool>,
+) -> Result<Option<bool>, SandboxProvenanceError> {
+    match (existing, proposed) {
+        (None, proposed) => Ok(proposed),
+        (Some(_), None) => Err(SandboxProvenanceError::ReferenceCleared(field)),
+        (Some(current), Some(proposed)) if *current == proposed => Ok(Some(proposed)),
         (Some(_), Some(_)) => Err(SandboxProvenanceError::ReferenceChanged(field)),
     }
 }
@@ -1678,6 +1706,7 @@ mod tests {
             sandbox: None,
             pod: None,
             service: None,
+            service_required: None,
         }
     }
 
@@ -2122,6 +2151,7 @@ mod tests {
             sandbox: None,
             pod: None,
             service: None,
+            service_required: None,
         };
         assert_eq!(
             merge_target_provenance(Some(&target), target.clone(), &placement, "kobe"),

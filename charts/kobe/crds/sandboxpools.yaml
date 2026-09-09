@@ -304,6 +304,17 @@ spec:
                             neither, or both, is refused at admission rather than resolved by
                             preferring one: a pool whose port declaration is ambiguous is a pool
                             whose reachable set nobody can state.
+
+                            "Refused at admission" is a statement about *this* CRD. A both-fields
+                            entry written against the pre-range CRD is not refused — the API server
+                            prunes `portRange` as an unknown field under the default `Warn`
+                            validation and stores a plain `port` entry, so the ambiguity is gone
+                            before any Rust here can see it and no later check can reconstruct it.
+                            That direction cannot over-authorize (the surviving number is one the
+                            administrator wrote), but the band they also wrote is silently absent.
+                            The defence is `fieldValidation=Strict`, which is `kubectl apply`'s
+                            default and is documented as a requirement for pool manifests in
+                            `docs/kobe-docs/pools/sandbox-pools.mdx`.
                           format: uint16
                           maximum: 65535.0
                           minimum: 1.0

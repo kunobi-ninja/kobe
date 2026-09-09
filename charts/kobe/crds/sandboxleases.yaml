@@ -851,6 +851,34 @@ spec:
                     - name
                     - uid
                     type: object
+                  serviceRequired:
+                    description: |-
+                      Whether the exact pool generation that placed this lease published a
+                      port, and therefore whether [`Self::service`] had to be filled.
+
+                      Recorded in the same status write as the workload identities, from the
+                      pool the reconciler has already fenced to this lease's admitted UID and
+                      generation. Release consults *this* rather than re-deriving the answer
+                      from whatever the pool says later.
+
+                      It exists because "no Service was ever required" and "the Service
+                      identity is missing" are the same absence, and telling them apart at
+                      release time used to need the original pool generation still to be
+                      live. Any edit to the pool bumps that generation, so a lease that
+                      legitimately owned no Service — a pool with no `exposedPorts`, or one
+                      that declares only a `portRange` — became permanently unreleasable the
+                      moment its pool was touched: quota, alias, and the finalizer stayed
+                      held, and the phase oscillated between `Releasing` and `Quarantined` on
+                      every retry. A negative that was known at Ready time has to be written
+                      down at Ready time; it cannot be reconstructed from a mutable object.
+
+                      `None` means the lease was placed before this field existed. Those
+                      leases fall back to the pool-generation derivation, which is what they
+                      have always used. Nothing backfills it: doing so would mean
+                      re-observing an already-Ready lease's Pod, and a Pod that has since
+                      been replaced would then fail a merge that today never runs.
+                    nullable: true
+                    type: boolean
                 required:
                 - namespace
                 type: object
@@ -878,6 +906,8 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSha256) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSha256) && self.status.target.childClusterKubeconfigSha256 == oldSelf.status.target.childClusterKubeconfigSha256)'
         - message: child kubeconfig Secret identity and payload digest must be checkpointed together
           rule: '!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))'
+        - message: status.target.serviceRequired is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.serviceRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.serviceRequired) && self.status.target.serviceRequired == oldSelf.status.target.serviceRequired)'
         - message: childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance
           rule: '!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == ''v1'' && self.status.target.childClusterKubeconfigSecret.kind == ''Secret'' && has(self.status.target.childClusterKubeconfigSecret.__namespace__) && has(self.status.target.childClusterInstance.__namespace__) && self.status.target.childClusterKubeconfigSecret.__namespace__ == self.status.target.childClusterInstance.__namespace__ && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + ''-kubeconfig'' && self.status.target.childClusterKubeconfigSha256.matches(''^[0-9a-f]{64}$''))'
         - message: status.childTeardownMode is immutable once recorded

@@ -172,8 +172,14 @@ instead of predicting every port.
 
 It does not weaken the rule. Undeclared is still unauthorized, and you still
 decide what is declared — a range moves the decision from "which ports" to
-"which band", it does not remove it. Ranges are therefore capped at **8192
-ports**, so `portRange` cannot be spelled to mean "everything".
+"which band", it does not remove it.
+
+A single `portRange` is capped at **8192 ports**. Read that as a limit on how
+much one line can do by accident, not as a ceiling on the pool: `exposedPorts`
+takes up to 64 entries, so eight adjacent bands still spell the whole port
+space. The cap refuses a `1-65535` written because it was easier than thinking
+about the range; it does not stop an administrator who means it and writes it
+out. Kobe insists the decision be visible, not that it be small.
 
 Kobe refuses a bad declaration when the pool is admitted, not when a forward
 is attempted: an entry that sets both fields or neither, a range whose `start`
@@ -188,8 +194,7 @@ published. Port-forward does not need one; it addresses the Pod directly.
 
 `portRange` is a new field on a schema that rejects unknown ones, so an
 operator older than the release that introduced it will refuse to read a pool
-that uses it — and stop reconciling that pool, not just that field. Roll it
-out in order:
+that uses it. Roll it out in order:
 
 1. Apply the new chart's CRD manifests. Helm does not upgrade objects from a
    chart's `crds/` directory, so this step is explicit.
@@ -197,16 +202,50 @@ out in order:
    version. `kobe status` reports the version it is talking to.
 3. Only then write a `portRange` into a `SandboxPool`.
 
-Applying a `portRange` against the older CRD fails at `kubectl apply`: that
-schema requires `port` on every entry, and the API server prunes the field it
-does not know before it checks. That is the loud, harmless failure. The one to
-avoid is applying between steps 1 and 2 — the manifest is accepted and an old
-operator replica cannot parse the pool it now has to reconcile. Pools that
-declare only `port` are unaffected at every step.
+**Do not write a range between steps 1 and 2.** An old operator that cannot
+decode one pool does not simply skip it: it lists `SandboxPool` objects as a
+typed collection, and one undecodable item fails the whole list. So during
+that window a single ranged pool can make the operator's pool watch fail on
+startup or relist, and can turn `kobe pools` into a `500` for every pool in
+the namespace — not just the edited one. Pools that declare only `port` are
+unaffected by the field itself, but they share that list. Finish step 2 first
+and the window never opens.
 
-The same pruning is why a misspelled `portrange` is rejected rather than
-ignored: the unknown key is dropped, the entry is left declaring neither
-shape, and the exactly-one-of rule refuses it.
+Applying a range **before** step 1 is the harmless failure: the older schema
+requires `port` on every entry, the unknown `portRange` is dropped, and the
+write is rejected for the missing `port`.
+
+### Apply pool manifests with strict field validation
+
+`kubectl apply` sends `fieldValidation=Strict` by default, and you should keep
+it that way for `SandboxPool`. Under the API server's default (`Warn`), an
+unknown field is **pruned and the write succeeds** — which means a manifest
+can be accepted as something other than what it says.
+
+The case that matters is a `portRange` written alongside a `port` against the
+older CRD:
+
+```yaml
+exposedPorts:
+  - name: dev
+    container: workspace
+    port: 8080
+    portRange: { start: 3000, end: 4000 }   # dropped by an older CRD
+```
+
+The new CRD rejects that entry outright — exactly one of the two fields, and
+this sets both. The old CRD does not know `portRange`, so a non-strict apply
+prunes it and stores a perfectly ordinary `port: 8080` declaration. Nothing is
+over-authorized: `8080` is a port you wrote. But `3000-4000` is silently not
+there, the ambiguity is gone before any operator can see it, and your manifest
+and the cluster now disagree. Strict validation turns that into an error at
+apply time, which is where you can still read the file that caused it.
+
+The same pruning is why a misspelled `portrange` needs strict validation to be
+caught. Without it the unknown key is dropped: if the entry declared nothing
+else, the exactly-one-of rule still refuses it — but if it also set `port`, it
+is accepted as a plain single-port declaration and the band you meant to write
+is gone.
 
 ## Admission ledger namespace
 

@@ -269,6 +269,39 @@ fn expiry_permits_access(
 /// Pure, so the fencing rules are testable without a cluster, and separated
 /// from the lookup so that no code path can construct a target from anything
 /// other than what placement recorded.
+///
+/// # Identity is pinned; policy is not
+///
+/// The two halves of this function read from deliberately different places,
+/// and the split is the point.
+///
+/// *Which objects* this lease may address comes from `lease.status.target` —
+/// the exact UIDs placement recorded. Nothing here looks an object up by name.
+///
+/// *What a caller may do to them* — the default container, the port
+/// allowlist, `runnerPath`, `attachCommand` — comes from the pool as it exists
+/// **now**, fenced only on its UID. It is deliberately NOT pinned to
+/// `spec.poolRef.generation`, and that is the opposite of what lease
+/// reconciliation does with the same reference.
+///
+/// The reason they differ is that they are answering different questions.
+/// Reconciliation is *building* a workload, and building it against a spec
+/// nobody admitted the caller to would run their code under configuration
+/// they never agreed to; so it pins the generation and refuses to move.
+/// Access is *policy*, and policy is what the administrator believes today.
+/// An administrator who removes a port from a pool is revoking it, and a
+/// revocation that only applies to leases created afterwards is not a
+/// revocation — the live leases are exactly the ones reaching the port. So an
+/// edit takes effect on the next request against every existing lease, in both
+/// directions: a number that was added becomes reachable, a number that was
+/// removed stops resolving.
+///
+/// What that widening cannot do is reach past the pool: a newly authorized
+/// number reaches only the Pod this lease already owns, over a port-forward
+/// into its network namespace, and only if something in that Pod is listening.
+/// The UID fence is what still matters — a pool deleted and recreated under
+/// the same name is a different administrator's decision and is refused
+/// outright, because then "the current pool" is no longer this pool at all.
 pub fn target_from_provenance(
     lease: &SandboxLease,
     pool: &SandboxPool,
@@ -353,18 +386,37 @@ pub fn target_from_provenance(
             .exposed_ports
             .iter()
             .filter(|port| port.container == pool.spec.template.default_container)
-            // A declaration that sets neither field, or both, authorizes
-            // nothing and is dropped rather than repaired. Admission refuses
-            // that shape at the API server and again in
-            // `SandboxPoolSpec::validate`; if one still reaches here, the safe
-            // reading of an ambiguous declaration is the empty one.
+            // Every declaration is re-checked here, at the last place before
+            // it becomes an authorization, rather than trusted because
+            // admission should have checked it. This GET reads the pool
+            // directly and calls no validator, so a pool that reached etcd by
+            // some other route — a CRD applied without the CEL rules, a
+            // restore, a direct write — would otherwise be honoured unchecked.
+            //
+            // A declaration that sets neither field or both authorizes nothing
+            // and is dropped rather than repaired: the safe reading of an
+            // ambiguous declaration is the empty one, and it is the same
+            // reading `SandboxPortSpec::published_port` takes.
+            //
+            // A band is also held to the numbers `SandboxPoolSpec::validate`
+            // holds it to. An inverted band already matched nothing, so that
+            // part is belt-and-braces — but a band wider than
+            // `MAX_PORT_RANGE_SPAN` would have authorized more than any
+            // admissible manifest can express, which is the one case where
+            // skipping the check actually widens the reachable set.
             .filter_map(|port| {
                 let reach = match (port.port, port.port_range) {
-                    (Some(single), None) => DeclaredPortReach::Single(single),
-                    (None, Some(range)) => DeclaredPortReach::Range {
-                        start: range.start,
-                        end: range.end,
-                    },
+                    (Some(single), None) if single != 0 => DeclaredPortReach::Single(single),
+                    (None, Some(range))
+                        if range.start != 0
+                            && range.start <= range.end
+                            && range.span() <= crate::crd::MAX_PORT_RANGE_SPAN =>
+                    {
+                        DeclaredPortReach::Range {
+                            start: range.start,
+                            end: range.end,
+                        }
+                    }
                     _ => return None,
                 };
                 Some(DeclaredPort {
@@ -1068,6 +1120,7 @@ mod tests {
             sandbox: Some(reference("Sandbox", "sbx", "sandbox-uid")),
             pod: Some(reference("Pod", "sbx-0", "pod-uid")),
             service: None,
+            service_required: None,
         });
         lease
     }
@@ -1459,6 +1512,108 @@ mod tests {
                 "{requested:?} must be refused"
             );
         }
+    }
+
+    /// A band that no admissible manifest could express authorizes nothing.
+    ///
+    /// This resolver reads the pool with a plain GET and calls no validator,
+    /// so it is the last fence in front of a pool that reached etcd without
+    /// passing admission — a CRD applied without its CEL rules, an etcd
+    /// restore, a direct write. An inverted band already matched nothing, but
+    /// a band wider than [`crate::crd::MAX_PORT_RANGE_SPAN`], or one anchored
+    /// at the reserved zero, would have been honoured in full: the cap that
+    /// stops `portRange` from being spelled as "everything" only ever ran at
+    /// admission, and forwarding is where it would have mattered.
+    #[test]
+    fn a_band_outside_the_admissible_shape_authorizes_nothing() {
+        let band = |start: u16, end: u16| crate::crd::SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: None,
+            port_range: Some(crate::crd::SandboxPortRange { start, end }),
+        };
+        let cap = u16::try_from(crate::crd::MAX_PORT_RANGE_SPAN).unwrap();
+        let cases = [
+            // Wider than the cap by exactly one port.
+            (band(1, cap + 1), "8000", "a band one port over the cap"),
+            // The whole port space, which is the shape the cap exists for.
+            (band(1, u16::MAX), "8000", "a band covering everything"),
+            // Zero is not a port, so a band anchored at it is not a band.
+            (band(0, 100), "50", "a band starting at zero"),
+            // Already inert, pinned so it stays inert.
+            (band(9999, 3000), "5000", "an inverted band"),
+        ];
+
+        for (declaration, requested, what) in cases {
+            let mut pool = pool();
+            pool.spec.template.exposed_ports = vec![declaration];
+            let target = target_from_provenance(&ready_lease(), &pool, now()).unwrap();
+            assert!(
+                target.ports.is_empty(),
+                "{what} must be dropped, not carried"
+            );
+            assert_eq!(
+                target.resolve_port(requested).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "{what} must authorize nothing"
+            );
+        }
+
+        // The widest band an administrator can actually write still works, so
+        // the check refuses only what admission would have refused.
+        let mut pool = pool();
+        pool.spec.template.exposed_ports = vec![band(1, cap)];
+        assert_eq!(
+            pool.spec.validate(),
+            Ok(()),
+            "the fixture must be exactly the widest band admission accepts"
+        );
+        let target = target_from_provenance(&ready_lease(), &pool, now()).unwrap();
+        assert_eq!(target.resolve_port("8000").unwrap(), 8000);
+    }
+
+    /// A pool edit is a policy change, and it reaches every live lease.
+    ///
+    /// Access resolution fences the pool on UID but deliberately does NOT pin
+    /// `spec.poolRef.generation`, which is the opposite of what lease
+    /// reconciliation does with the same reference. The asymmetry is the
+    /// design: reconciliation is building a workload and must build the one
+    /// that was admitted, while this is policy, and a revocation that applied
+    /// only to future leases would leave the ports reachable on exactly the
+    /// leases already reaching them. Pinned here so the choice cannot be
+    /// quietly reversed by pinning the generation "for consistency".
+    #[test]
+    fn a_pool_edit_changes_what_an_existing_lease_may_reach() {
+        let lease = ready_lease();
+        let mut edited = pool();
+        edited.metadata.generation = Some(lease.spec.pool_ref.generation + 40);
+        edited.spec.template.exposed_ports = vec![crate::crd::SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: Some(5173),
+            port_range: None,
+        }];
+
+        let target = target_from_provenance(&lease, &edited, now()).unwrap();
+        assert_eq!(
+            target.resolve_port("5173").unwrap(),
+            5173,
+            "a newly declared port is reachable on a lease admitted before it"
+        );
+        assert_eq!(
+            target.resolve_port("3000").unwrap_err(),
+            SandboxAccessDenied::NotDeclared { what: "port" },
+            "a withdrawn port is revoked on a lease admitted while it was declared"
+        );
+
+        // The UID fence is what still holds: a pool deleted and recreated
+        // under the same name is a different administrator's decision.
+        let mut recreated = pool();
+        recreated.metadata.uid = Some("pool-uid-2".into());
+        assert_eq!(
+            target_from_provenance(&lease, &recreated, now()).unwrap_err(),
+            SandboxAccessDenied::PoolUnresolvable
+        );
     }
 
     /// The forwardable set is exactly what the pool declared.
