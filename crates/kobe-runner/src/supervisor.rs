@@ -166,8 +166,16 @@ pub fn supervise(spool: &Spool, id: &str, stdin_bytes: Option<usize>, source: im
     // command is already running in a session of its own. A supervisor that
     // gave up here without killing the group would leave that command with no
     // deadline and nobody to reap it — the very failure the whole "outlives the
-    // connection" design exists to make impossible. So the group is torn down
-    // first, and only then is the execution settled.
+    // connection" design exists to make impossible. So teardown is ATTEMPTED
+    // before the execution is settled, in that order.
+    //
+    // Attempted, not guaranteed: [`terminate_group`] signals the group and then
+    // waits at most TERMINATION_GRACE per drain for it to actually leave, and
+    // the call below discards its answer. Signal delivery is not reaping, so a
+    // process that outlives both windows outlives this supervisor too. That is
+    // exactly why the report is `Unknown` — the honest word for a group whose
+    // absence nobody proved — and why the lease, not this function, is the last
+    // line of defence: the Pod dying takes the group with it.
     let helpers = feed(child.stdin.take(), stdin).and_then(|()| {
         let stdout = pump(
             child.stdout.take(),
@@ -196,6 +204,14 @@ pub fn supervise(spool: &Spool, id: &str, stdin_bytes: Option<usize>, source: im
             // same code the pre-spawn setup failures use, and means the same
             // thing to Kobe — this process never reached the point of watching
             // anything, so the target is destroyed rather than reused.
+            //
+            // The write can fail and the error is discarded, so this is a
+            // terminal report ATTEMPTED rather than one guaranteed: a workload
+            // that removed its own `state.lock` gets a refused pump here and
+            // then a `write_report` that cannot take the lock either, and the
+            // supervisor exits leaving `Running` behind. Nothing better can be
+            // done from inside a spool the tenant owns, and Kobe's verdict
+            // deadline is what turns that stale `Running` into `Unknown`.
             let _ = spool.write_report(&ExecutionReport {
                 id: id.to_string(),
                 state: RunnerState::Unknown,

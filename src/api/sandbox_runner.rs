@@ -166,6 +166,13 @@ pub struct RunnerLogChunk {
 ///   `128 + signal` convention because [`crate::crd::SandboxExecutionStatus`]
 ///   requires a code for `Failed`, and `reason = signalled` is what keeps it
 ///   distinguishable from a command that deliberately exited 137.
+/// * A `Failed` code outside 1-255, or a signal outside 1-127, becomes
+///   `Unknown` and carries no code. `exit_code` crosses the same boundary as
+///   the reason ([`bounded_reason`]) and lands in
+///   [`crate::crd::SandboxExecutionStatus`], so an unbounded `i32` would be 32
+///   bits of a workload's choosing in etcd and every backup. A real
+///   `WEXITSTATUS` is one byte; a number outside it was never observed, and an
+///   outcome nobody observed is `Unknown` by the rule below.
 /// * Everything the runner could not establish becomes `Unknown`, never
 ///   `Failed`: `Failed` reads as "it ran and said no", which tells a caller
 ///   their retry is safe when it may not be.
@@ -185,8 +192,16 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
             _ => (ExecutionState::Unknown, None),
         },
         RunnerState::Failed => match (report.exit_code, report.signal) {
-            (Some(code), _) if code != 0 => (ExecutionState::Failed, Some(code)),
-            (_, Some(signal)) => (ExecutionState::Failed, Some(128i32.saturating_add(signal))),
+            // A wait status is eight bits, so 1-255 is every code a process on
+            // this host could have exited with; zero contradicts `Failed`. A
+            // report outside that range is not describing an exit status at
+            // all, so nothing here may forward it.
+            (Some(code), _) if (1..=255).contains(&code) => (ExecutionState::Failed, Some(code)),
+            // Linux stops at `SIGRTMAX` (64), so a real `128 + signal` stays
+            // inside those same eight bits and cannot overflow.
+            (_, Some(signal)) if (1..=127).contains(&signal) => {
+                (ExecutionState::Failed, Some(128i32.saturating_add(signal)))
+            }
             _ => (ExecutionState::Unknown, None),
         },
         RunnerState::Cancelled => (ExecutionState::Cancelled, None),
@@ -203,11 +218,13 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
 
 /// Clamp a runner-supplied reason to something that may be persisted.
 ///
-/// The reason is the ONE value that crosses from inside a tenant's container
-/// into a Kubernetes object. A runner that is old, broken, or replaced could
-/// put anything here — a path, an error message, a line of the command's own
-/// output — and object status is readable by anyone with `get` on the type,
-/// replicated to every etcd member, and included in backups. So anything
+/// The reason is one of two values that cross from inside a tenant's container
+/// into a Kubernetes object — the exit code is the other, bounded to a wait
+/// status's eight bits in [`outcome_from_report`]. A runner that is old,
+/// broken, or replaced could put anything here — a path, an error message, a
+/// line of the command's own output — and object status is readable by anyone
+/// with `get` on the type, replicated to every etcd member, and included in
+/// backups. So anything
 /// outside the closed vocabulary is replaced rather than truncated: a
 /// truncated secret is still a secret.
 ///
@@ -1138,12 +1155,83 @@ mod tests {
         }
     }
 
+    /// An exit code no wait status could produce never reaches the record.
+    ///
+    /// `exit_code` crosses the same tenant boundary as the reason: the runner's
+    /// spool is written by the workload's own UID (see [`kobe_runner::spool`]),
+    /// so a workload can forge a terminal report for its own execution. The
+    /// field is an `i32` on the wire and lands in
+    /// [`crate::crd::SandboxExecutionStatus`], so forwarding it unchanged would
+    /// hand a workload 32 bits of its choosing in etcd and every backup — the
+    /// same class of channel already closed for the reason. A real
+    /// `WEXITSTATUS` is one byte, so anything else is a number nobody observed.
+    #[test]
+    fn an_exit_code_no_wait_status_could_produce_is_never_persisted() {
+        for forged in [-1, 0, 256, 1_885_434_739, i32::MIN, i32::MAX] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: Some(forged),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(
+                outcome.state,
+                ExecutionState::Unknown,
+                "exit {forged} was never observed, so nothing may claim it as a failure"
+            );
+            assert_eq!(
+                outcome.exit_code, None,
+                "exit {forged} must not be persisted"
+            );
+        }
+
+        // The signalled path lands in the same status field and gets the same
+        // bound: `128 + signal` is only an exit code for a signal that exists.
+        for forged in [-1, 0, 128, 1_000_000, i32::MAX] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: None,
+                signal: Some(forged),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(
+                outcome.state,
+                ExecutionState::Unknown,
+                "signal {forged} does not exist, so no code may be derived from it"
+            );
+            assert_eq!(
+                outcome.exit_code, None,
+                "signal {forged} must not be persisted"
+            );
+        }
+
+        // Every code a process on this host could really have exited with still
+        // survives untouched — the bound must not cost a real diagnosis.
+        for real in [1, 2, 42, 137, 255] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: Some(real),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Failed, "exit {real}");
+            assert_eq!(outcome.exit_code, Some(real), "exit {real}");
+        }
+        for signal in [1, 9, 15, 64] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: None,
+                signal: Some(signal),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Failed, "signal {signal}");
+            assert_eq!(outcome.exit_code, Some(128 + signal), "signal {signal}");
+        }
+    }
+
     /// Nothing from inside the container reaches a Kubernetes object unbounded.
     ///
-    /// The reason is the one value that crosses that boundary. A runner that is
-    /// old, broken, or replaced could put a path, an error message, or a line
-    /// of the command's own output there — and object status is readable by
-    /// anyone with `get`, replicated to every etcd member, and in every backup.
+    /// The reason is one of the two values that cross that boundary; the exit
+    /// code is the other, pinned by
+    /// [`an_exit_code_no_wait_status_could_produce_is_never_persisted`]. A
+    /// runner that is old, broken, or replaced could put a path, an error
+    /// message, or a line of the command's own output in the reason — and
+    /// object status is readable by anyone with `get`, replicated to every etcd
+    /// member, and in every backup.
     #[test]
     fn a_runner_reason_can_never_reach_the_record_unbounded() {
         assert_eq!(bounded_reason("completed"), "completed");
