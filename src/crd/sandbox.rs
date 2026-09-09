@@ -180,20 +180,58 @@ impl SandboxPoolSpec {
                     port.name.clone(),
                 ));
             }
-            if port.port == 0 {
-                return Err(SandboxPoolValidationError::ZeroPort(port.name.clone()));
-            }
             if !container_names.contains(port.container.as_str()) {
                 return Err(SandboxPoolValidationError::UnknownPortContainer {
                     port: port.name.clone(),
                     container: port.container.clone(),
                 });
             }
-            if !target_ports.insert((port.container.as_str(), port.port)) {
-                return Err(SandboxPoolValidationError::DuplicateContainerPort {
-                    container: port.container.clone(),
-                    port: port.port,
-                });
+            // Exactly one of the two shapes, checked here as well as in CEL.
+            // CEL runs at the API server, which is the right place to refuse a
+            // bad manifest; this runs wherever a pool spec is rendered, which
+            // is the last place to catch one that arrived some other way — a
+            // CRD applied from an older chart, or a test fixture.
+            match (port.port, port.port_range) {
+                (Some(_), Some(_)) => {
+                    return Err(SandboxPoolValidationError::PortAndRange(port.name.clone()));
+                }
+                (None, None) => {
+                    return Err(SandboxPoolValidationError::NeitherPortNorRange(
+                        port.name.clone(),
+                    ));
+                }
+                (Some(single), None) => {
+                    if single == 0 {
+                        return Err(SandboxPoolValidationError::ZeroPort(port.name.clone()));
+                    }
+                    // Only published ports contend for a container port
+                    // number. A range publishes nothing, so it cannot collide
+                    // with anything, and overlapping declarations simply union.
+                    if !target_ports.insert((port.container.as_str(), single)) {
+                        return Err(SandboxPoolValidationError::DuplicateContainerPort {
+                            container: port.container.clone(),
+                            port: single,
+                        });
+                    }
+                }
+                (None, Some(range)) => {
+                    if range.start == 0 || range.end == 0 {
+                        return Err(SandboxPoolValidationError::ZeroPort(port.name.clone()));
+                    }
+                    if range.end < range.start {
+                        return Err(SandboxPoolValidationError::InvertedPortRange {
+                            name: port.name.clone(),
+                            start: range.start,
+                            end: range.end,
+                        });
+                    }
+                    if range.span() > MAX_PORT_RANGE_SPAN {
+                        return Err(SandboxPoolValidationError::PortRangeTooWide {
+                            name: port.name.clone(),
+                            span: range.span(),
+                        });
+                    }
+                }
             }
         }
 
@@ -304,12 +342,31 @@ impl JsonSchema for SandboxPlacement {
         .message("exposed port names must be unique")
 )]
 #[x_kube(
-    validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.container == p.container && other.port == p.port).size() == 1)")
+    validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.port) || self.exposedPorts.filter(other, other.container == p.container && has(other.port) && other.port == p.port).size() == 1)")
         .message("a container port may be declared only once")
 )]
 #[x_kube(
     validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, p.name.matches('.*[a-z].*') && !p.name.contains('--'))")
         .message("exposed port names must contain a letter and cannot contain consecutive hyphens")
+)]
+// The exactly-one-of invariant, at admission rather than at stream-open time.
+// A declaration with neither field authorizes nothing while looking like it
+// authorizes something, and one with both leaves the reachable set to whichever
+// branch a reader happens to check first.
+#[x_kube(
+    validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, has(p.port) != has(p.portRange))")
+        .message("each exposed port must set exactly one of port or portRange")
+)]
+#[x_kube(
+    validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.start <= p.portRange.end)")
+        .message("portRange.start must not exceed portRange.end")
+)]
+// Keeps `portRange` from being spelled as "everything". See
+// [`MAX_PORT_RANGE_SPAN`]: both ends are inclusive, so the span is the
+// difference plus one.
+#[x_kube(
+    validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.end - p.portRange.start < 8192)")
+        .message("portRange may span at most 8192 ports")
 )]
 pub struct SandboxTemplateSpec {
     /// Container selected by default for execution operations.
@@ -319,8 +376,14 @@ pub struct SandboxTemplateSpec {
     /// context, service accounts, and arbitrary Pod fields are not exposed.
     #[schemars(length(min = 1, max = 16))]
     pub containers: Vec<SandboxContainerSpec>,
-    /// Ports that later access brokers may expose. Any undeclared port remains
-    /// unauthorized.
+    /// Ports that later access brokers may expose, each declared as one port
+    /// or one contiguous range. Any undeclared port remains unauthorized.
+    ///
+    /// This list is the whole answer to "what may a caller of this pool
+    /// reach". Ranges live in it rather than in a field of their own for that
+    /// reason: an administrator auditing a pool, and the port-forward handler
+    /// enforcing it, both read exactly one place. See [`SandboxPortSpec`] for
+    /// what the two shapes mean.
     #[serde(default)]
     #[schemars(length(max = 64))]
     pub exposed_ports: Vec<SandboxPortSpec>,
@@ -354,6 +417,38 @@ pub struct SandboxTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 255), pattern(r"^/[A-Za-z0-9._/-]*$"))]
     pub runner_path: Option<String>,
+}
+
+impl SandboxTemplateSpec {
+    /// Every port this template **publishes**, as `(declaration, port)`.
+    ///
+    /// Exactly the single-port declarations. A `portRange` is authorization
+    /// for forwarding and nothing more, so it is absent here: there is no
+    /// `ContainerPort` and no Service port for a band, because a
+    /// `ContainerPort` carries one number and one name and a band supplies
+    /// neither uniquely.
+    ///
+    /// Every projection site — the Pod's `ContainerPort`s, the Service's
+    /// ports, and the certification that re-derives both — reads this instead
+    /// of `exposed_ports` directly, so "what gets published" is decided once.
+    #[allow(dead_code)]
+    pub fn published_ports(&self) -> impl Iterator<Item = (&SandboxPortSpec, u16)> {
+        self.exposed_ports
+            .iter()
+            .filter_map(|port| port.published_port().map(|number| (port, number)))
+    }
+
+    /// Whether this template's Sandbox must own a Service.
+    ///
+    /// True exactly when something is published. A range-only pool gets no
+    /// Service, and certification must expect none: port-forward reaches the
+    /// Pod's network namespace directly, so a Service would be an object with
+    /// no ports whose absence nothing would notice — except the provenance
+    /// check that demands an exact Service identity whenever one was required.
+    #[allow(dead_code)]
+    pub fn requires_service(&self) -> bool {
+        self.published_ports().next().is_some()
+    }
 }
 
 /// One administrator-controlled container in a Sandbox template.
@@ -412,16 +507,107 @@ pub struct SandboxResourceCeiling {
     pub max_memory: String,
 }
 
-/// One TCP port declared safe for later lease-scoped forwarding.
+/// Widest contiguous band one `portRange` may authorize.
+///
+/// A cap exists so `portRange` cannot be spelled to mean "everything". The
+/// point of `exposedPorts` is that the administrator decides what is
+/// reachable; a range wide enough to cover the port space would keep the
+/// syntax and discard the decision. This value is large enough to declare the
+/// entire conventional dev-server band (`3000-9999`) in one line, and small
+/// enough that no single range reaches an eighth of the 65535 ports.
+pub const MAX_PORT_RANGE_SPAN: u32 = 8192;
+
+/// One TCP port, or one contiguous band of them, declared safe for later
+/// lease-scoped forwarding.
+///
+/// Exactly one of `port` and `portRange` is set. They are not two spellings of
+/// the same thing:
+///
+/// - `port` **publishes** one port. It becomes a named `ContainerPort` on the
+///   Pod and a named port on the Sandbox's Service, and a caller may address
+///   it by that name.
+/// - `portRange` **authorizes** a band and publishes nothing. There is no
+///   `ContainerPort` and no Service port for a range — a name identifies one
+///   port, and a band spans too many for one name to pick from. Callers reach
+///   a ranged port by number; see
+///   [`SandboxTarget::resolve_port`](crate::api::sandbox_access::SandboxTarget::resolve_port).
+///
+/// The split exists because the two express different administrator
+/// intentions. An agent pool enumerates the exact ports its workload serves
+/// and wants them published; the caller is untrusted and this template is the
+/// entire security surface. A human workstation pool wants a developer to
+/// reach whatever dev server they started today without an edit to GitOps and
+/// a re-lease — but the administrator still chooses the band. Undeclared still
+/// means unauthorized either way.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxPortSpec {
+    /// Name for this declaration. Only a `port` answers to it; see the type
+    /// doc-comment.
     #[schemars(length(min = 1, max = 15), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub name: String,
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub container: String,
+    /// One published port. Mutually exclusive with `portRange`.
+    ///
+    /// Optional only so a range can take its place. A declaration that sets
+    /// neither, or both, is refused at admission rather than resolved by
+    /// preferring one: a pool whose port declaration is ambiguous is a pool
+    /// whose reachable set nobody can state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
-    pub port: u16,
+    pub port: Option<u16>,
+    /// A contiguous band authorized for forwarding. Mutually exclusive with
+    /// `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_range: Option<SandboxPortRange>,
+}
+
+/// An inclusive band of TCP ports.
+///
+/// Inclusive on both ends because that is how an administrator says it:
+/// `3000-9999` means 9999 is reachable. A half-open bound would make every
+/// declaration one port narrower than it reads, and the only place that error
+/// surfaces is a refused forward at 3am.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxPortRange {
+    /// Lowest authorized port, inclusive.
+    #[schemars(range(min = 1))]
+    pub start: u16,
+    /// Highest authorized port, inclusive. At least `start`, and the band may
+    /// not exceed [`MAX_PORT_RANGE_SPAN`] ports.
+    #[schemars(range(min = 1))]
+    pub end: u16,
+}
+
+impl SandboxPortRange {
+    /// Number of ports the band authorizes, counting both ends.
+    ///
+    /// Widened to `u32` because a full-width band counts 65536, one more than
+    /// `u16` holds: the arithmetic that checks the cap must not be the
+    /// arithmetic that overflows it. An inverted band counts zero rather than
+    /// wrapping, and [`SandboxPoolSpec::validate`] refuses it separately, so a
+    /// span check can never be the thing that lets one through.
+    pub fn span(&self) -> u32 {
+        if self.end < self.start {
+            return 0;
+        }
+        u32::from(self.end) - u32::from(self.start) + 1
+    }
+}
+
+impl SandboxPortSpec {
+    /// The single port this declaration publishes, if it declares one.
+    ///
+    /// `None` for a range, so nothing that renders `ContainerPort`s or Service
+    /// ports can see one. Every such site goes through this rather than
+    /// reading `port` directly, which keeps "is this publishable" a decision
+    /// made in one place.
+    #[allow(dead_code)]
+    pub fn published_port(&self) -> Option<u16> {
+        self.port
+    }
 }
 
 /// Isolation is a tagged enum so a hardened claim cannot omit its exact
@@ -1192,6 +1378,14 @@ pub enum SandboxPoolValidationError {
     UnknownPortContainer { port: String, container: String },
     #[error("container {container} exposes port {port} more than once")]
     DuplicateContainerPort { container: String, port: u16 },
+    #[error("exposed port {0} sets both port and portRange")]
+    PortAndRange(String),
+    #[error("exposed port {0} sets neither port nor portRange")]
+    NeitherPortNorRange(String),
+    #[error("exposed port {name} has portRange {start}-{end} with start after end")]
+    InvertedPortRange { name: String, start: u16, end: u16 },
+    #[error("exposed port {name} spans {span} ports, more than the {MAX_PORT_RANGE_SPAN} allowed")]
+    PortRangeTooWide { name: String, span: u32 },
     #[error("hardened isolation requires a non-empty runtimeClassName")]
     EmptyRuntimeClass,
     #[error("readiness canary argv must contain non-empty arguments")]
@@ -1237,7 +1431,8 @@ mod tests {
                 exposed_ports: vec![SandboxPortSpec {
                     name: "http".into(),
                     container: "agent".into(),
-                    port: 3000,
+                    port: Some(3000),
+                    port_range: None,
                 }],
                 runner_path: None,
                 attach_command: None,
@@ -1442,6 +1637,253 @@ mod tests {
                 container: "missing".into(),
             })
         );
+    }
+
+    /// A `port` declaration written before ranges existed still deserializes,
+    /// validates, and serializes identically.
+    ///
+    /// `port` became optional so a range could take its place. The reason that
+    /// is safe is written down here: an existing manifest is byte-identical on
+    /// the way in and on the way out, and still refuses everything it refused.
+    #[test]
+    fn an_existing_single_port_declaration_is_unchanged() {
+        let declared = serde_json::json!({
+            "name": "http",
+            "container": "agent",
+            "port": 8080
+        });
+        let port: SandboxPortSpec = serde_json::from_value(declared.clone()).unwrap();
+        assert_eq!(port.port, Some(8080));
+        assert_eq!(port.port_range, None);
+        assert_eq!(port.published_port(), Some(8080));
+        assert_eq!(
+            serde_json::to_value(&port).unwrap(),
+            declared,
+            "an absent portRange must not appear on the wire"
+        );
+
+        let mut spec = valid_pool_spec();
+        spec.template.exposed_ports = vec![port];
+        assert_eq!(spec.validate(), Ok(()));
+        assert!(spec.template.requires_service());
+        assert_eq!(
+            spec.template
+                .published_ports()
+                .map(|(port, number)| (port.name.as_str(), number))
+                .collect::<Vec<_>>(),
+            vec![("http", 8080)]
+        );
+
+        // Unknown fields are still refused, so a future shape cannot be
+        // smuggled through a declaration that looks familiar.
+        assert!(
+            serde_json::from_value::<SandboxPortSpec>(serde_json::json!({
+                "name": "http",
+                "container": "agent",
+                "port": 8080,
+                "hostPort": 8080
+            }))
+            .is_err()
+        );
+    }
+
+    /// A range publishes nothing.
+    ///
+    /// It authorizes forwarding, which reaches the Pod's network namespace
+    /// directly. Turning it into `ContainerPort`s or Service ports would mean
+    /// synthesising thousands of names the administrator never wrote, and
+    /// certification would then demand a Service the upstream controller had
+    /// no way to build.
+    #[test]
+    fn a_range_authorizes_without_publishing() {
+        let mut spec = valid_pool_spec();
+        spec.template.exposed_ports = vec![SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: None,
+            port_range: Some(SandboxPortRange {
+                start: 3000,
+                end: 9999,
+            }),
+        }];
+        assert_eq!(spec.validate(), Ok(()));
+        assert_eq!(spec.template.published_ports().count(), 0);
+        assert!(
+            !spec.template.requires_service(),
+            "a range-only pool must not be held to a Service it never gets"
+        );
+    }
+
+    /// Nonsense ranges are refused where the pool is admitted, not where a
+    /// stream is opened.
+    ///
+    /// A caller who discovers a bad declaration by having a forward fail has
+    /// already built on it; the administrator who wrote it has moved on. Each
+    /// case below is refused with its own reason so the message names the
+    /// mistake.
+    #[test]
+    fn pool_validation_rejects_impossible_port_declarations() {
+        let with_port = |port: Option<u16>, range: Option<SandboxPortRange>| {
+            let mut spec = valid_pool_spec();
+            spec.template.exposed_ports = vec![SandboxPortSpec {
+                name: "dev".into(),
+                container: "agent".into(),
+                port,
+                port_range: range,
+            }];
+            spec.validate()
+        };
+
+        assert_eq!(
+            with_port(None, None),
+            Err(SandboxPoolValidationError::NeitherPortNorRange(
+                "dev".into()
+            )),
+            "a declaration that authorizes nothing must not look like one that does"
+        );
+        assert_eq!(
+            with_port(
+                Some(3000),
+                Some(SandboxPortRange {
+                    start: 4000,
+                    end: 4100
+                })
+            ),
+            Err(SandboxPoolValidationError::PortAndRange("dev".into())),
+            "two shapes at once leaves the reachable set to whoever reads first"
+        );
+        assert_eq!(
+            with_port(
+                None,
+                Some(SandboxPortRange {
+                    start: 9999,
+                    end: 3000
+                })
+            ),
+            Err(SandboxPoolValidationError::InvertedPortRange {
+                name: "dev".into(),
+                start: 9999,
+                end: 3000,
+            }),
+            "an inverted band authorizes nothing and almost certainly meant the reverse"
+        );
+        assert_eq!(
+            with_port(None, Some(SandboxPortRange { start: 0, end: 100 })),
+            Err(SandboxPoolValidationError::ZeroPort("dev".into()))
+        );
+        assert_eq!(
+            with_port(Some(0), None),
+            Err(SandboxPoolValidationError::ZeroPort("dev".into()))
+        );
+
+        // The cap is what keeps `portRange` from being spelled as
+        // "everything". One port past it is refused; the cap itself is not.
+        assert_eq!(
+            with_port(
+                None,
+                Some(SandboxPortRange {
+                    start: 1,
+                    end: 65535
+                })
+            ),
+            Err(SandboxPoolValidationError::PortRangeTooWide {
+                name: "dev".into(),
+                span: 65535,
+            })
+        );
+        let widest = u16::try_from(MAX_PORT_RANGE_SPAN).unwrap();
+        assert_eq!(
+            with_port(
+                None,
+                Some(SandboxPortRange {
+                    start: 1,
+                    end: widest
+                })
+            ),
+            Ok(()),
+            "a band of exactly MAX_PORT_RANGE_SPAN ports is allowed"
+        );
+        assert_eq!(
+            with_port(
+                None,
+                Some(SandboxPortRange {
+                    start: 1,
+                    end: widest + 1
+                })
+            ),
+            Err(SandboxPoolValidationError::PortRangeTooWide {
+                name: "dev".into(),
+                span: MAX_PORT_RANGE_SPAN + 1,
+            })
+        );
+        assert_eq!(
+            SandboxPortRange {
+                start: 3000,
+                end: 9999
+            }
+            .span(),
+            7000,
+            "both ends are inclusive"
+        );
+        assert_eq!(
+            SandboxPortRange {
+                start: 9999,
+                end: 3000
+            }
+            .span(),
+            0,
+            "an inverted band must not wrap into a large span"
+        );
+
+        // A range publishes nothing, so it cannot collide with a published
+        // port that falls inside it. The two simply union.
+        let mut spec = valid_pool_spec();
+        spec.template.exposed_ports = vec![
+            SandboxPortSpec {
+                name: "http".into(),
+                container: "agent".into(),
+                port: Some(5173),
+                port_range: None,
+            },
+            SandboxPortSpec {
+                name: "dev".into(),
+                container: "agent".into(),
+                port: None,
+                port_range: Some(SandboxPortRange {
+                    start: 3000,
+                    end: 9999,
+                }),
+            },
+        ];
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    /// The CEL rules the API server enforces and the Rust checks the operator
+    /// enforces must agree on the cap.
+    ///
+    /// They are written in two languages at two layers, and a cap that drifted
+    /// between them would admit a pool the operator then refuses to render —
+    /// a pool that is valid to Kubernetes and broken to Kobe.
+    #[test]
+    fn the_published_schema_enforces_the_same_range_cap_as_the_operator() {
+        let crd = serde_json::to_value(SandboxPool::crd()).unwrap();
+        let rules = crd.to_string();
+
+        assert!(
+            rules.contains(&format!(
+                "p.portRange.end - p.portRange.start < {MAX_PORT_RANGE_SPAN}"
+            )),
+            "the CEL span rule must be written with MAX_PORT_RANGE_SPAN"
+        );
+        for rule in [
+            "has(p.port) != has(p.portRange)",
+            "p.portRange.start <= p.portRange.end",
+        ] {
+            assert!(
+                rules.contains(rule),
+                "the schema must carry the rule {rule}"
+            );
+        }
     }
 
     #[test]
@@ -1961,5 +2403,57 @@ mod tests {
             .err()
             .expect("older strict replica must reject the field");
         assert!(error.to_string().contains("placementAuthority"));
+    }
+
+    /// The `portRange` rollout skew, pinned, and its exact blast radius.
+    ///
+    /// `SandboxPortSpec` rejects unknown fields, so an operator replica older
+    /// than the release that introduced `portRange` cannot read a pool that
+    /// uses one — the same skew `placementAuthority` has, checked the same
+    /// way. That is why the docs give an order: apply the CRDs, finish the
+    /// operator rollout, then write a range.
+    ///
+    /// The second half is what bounds the risk, and is the reason the shape is
+    /// safe to ship: a pool that declares only `port` is byte-identical on the
+    /// wire and still parses under the old struct. The skew is opt-in, one
+    /// pool at a time, and never reaches a pool nobody edited.
+    #[test]
+    fn pre_range_replica_rejects_port_range_but_still_reads_single_ports() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct PreRangeSandboxPortSpec {
+            name: String,
+            container: String,
+            port: u16,
+        }
+
+        let ranged = SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: None,
+            port_range: Some(SandboxPortRange {
+                start: 3000,
+                end: 9999,
+            }),
+        };
+        let error = serde_json::from_value::<PreRangeSandboxPortSpec>(
+            serde_json::to_value(&ranged).unwrap(),
+        )
+        .err()
+        .expect("an older strict replica must reject a ranged declaration");
+        assert!(error.to_string().contains("portRange"));
+
+        let single = SandboxPortSpec {
+            name: "http".into(),
+            container: "agent".into(),
+            port: Some(8080),
+            port_range: None,
+        };
+        let read = serde_json::from_value::<PreRangeSandboxPortSpec>(
+            serde_json::to_value(&single).unwrap(),
+        )
+        .expect("an unchanged single-port declaration must still parse pre-upgrade");
+        assert_eq!(read.port, 8080);
     }
 }

@@ -234,13 +234,19 @@ pub fn build_sandbox_template(
         .containers
         .iter()
         .map(|container| {
+            // Only published ports become `ContainerPort`s. A `portRange`
+            // authorizes forwarding and publishes nothing: one band supplies
+            // neither the single number nor the single name a `ContainerPort`
+            // carries, and a Pod rendering thousands of synthesised ports
+            // would be a spec the administrator never wrote. Forwarding does
+            // not need them — it addresses the Pod's network namespace, which
+            // `ContainerPort` only documents.
             let ports: Vec<ContainerPort> = pool
                 .template
-                .exposed_ports
-                .iter()
-                .filter(|port| port.container == container.name)
-                .map(|port| ContainerPort {
-                    container_port: i32::from(port.port),
+                .published_ports()
+                .filter(|(port, _)| port.container == container.name)
+                .map(|(port, number)| ContainerPort {
+                    container_port: i32::from(number),
                     name: Some(port.name.clone()),
                     protocol: Some("TCP".to_string()),
                     ..Default::default()
@@ -307,7 +313,7 @@ pub fn build_sandbox_template(
                     },
                     "spec": pod_spec
                 },
-                "service": !pool.template.exposed_ports.is_empty(),
+                "service": pool.template.requires_service(),
                 "networkPolicyManagement": "Managed",
                 "envVarsInjectionPolicy": "Disallowed",
                 "volumeClaimTemplatesPolicy": "Disallowed"
@@ -1396,7 +1402,8 @@ mod tests {
                 exposed_ports: vec![SandboxPortSpec {
                     name: "http".into(),
                     container: "agent".into(),
-                    port: 3000,
+                    port: Some(3000),
+                    port_range: None,
                 }],
                 runner_path: None,
                 attach_command: None,

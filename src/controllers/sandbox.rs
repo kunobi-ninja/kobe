@@ -1531,7 +1531,10 @@ pub async fn reconcile_lease(
     // a name reused between placement and access would send a caller's exec
     // into somebody else's Pod. Recorded here, where the objects have just
     // been observed, rather than looked up again at access time.
-    let service_required = !pool.spec.template.exposed_ports.is_empty();
+    // A Service exists only when the pool PUBLISHES a port. A `portRange`
+    // authorizes forwarding without publishing anything, so a range-only pool
+    // correctly records no Service identity here and is not held to one.
+    let service_required = pool.spec.template.requires_service();
     if target.owned && !management_provenance_is_complete(&status, service_required) {
         let provenance = match observed_provenance(&target, &claim, &status, service_required).await
         {
@@ -3540,7 +3543,7 @@ async fn missing_service_provenance_is_allowed(
             if pool.uid().as_deref() == Some(lease.spec.pool_ref.uid.as_str())
                 && pool.metadata.generation == Some(lease.spec.pool_ref.generation) =>
         {
-            if pool.spec.template.exposed_ports.is_empty() {
+            if !pool.spec.template.requires_service() {
                 TargetFootprintCheck::Verified
             } else {
                 TargetFootprintCheck::Quarantine("required_service_provenance_missing")
@@ -10105,7 +10108,8 @@ pub(crate) mod tests {
                     exposed_ports: vec![SandboxPortSpec {
                         name: "http".into(),
                         container: "agent".into(),
-                        port: 3000,
+                        port: Some(3000),
+                        port_range: None,
                     }],
                     runner_path: None,
                     attach_command: None,

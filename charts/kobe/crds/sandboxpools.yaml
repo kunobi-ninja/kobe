@@ -250,10 +250,38 @@ spec:
                   exposedPorts:
                     default: []
                     description: |-
-                      Ports that later access brokers may expose. Any undeclared port remains
-                      unauthorized.
+                      Ports that later access brokers may expose, each declared as one port
+                      or one contiguous range. Any undeclared port remains unauthorized.
+
+                      This list is the whole answer to "what may a caller of this pool
+                      reach". Ranges live in it rather than in a field of their own for that
+                      reason: an administrator auditing a pool, and the port-forward handler
+                      enforcing it, both read exactly one place. See [`SandboxPortSpec`] for
+                      what the two shapes mean.
                     items:
-                      description: One TCP port declared safe for later lease-scoped forwarding.
+                      description: |-
+                        One TCP port, or one contiguous band of them, declared safe for later
+                        lease-scoped forwarding.
+
+                        Exactly one of `port` and `portRange` is set. They are not two spellings of
+                        the same thing:
+
+                        - `port` **publishes** one port. It becomes a named `ContainerPort` on the
+                          Pod and a named port on the Sandbox's Service, and a caller may address
+                          it by that name.
+                        - `portRange` **authorizes** a band and publishes nothing. There is no
+                          `ContainerPort` and no Service port for a range — a name identifies one
+                          port, and a band spans too many for one name to pick from. Callers reach
+                          a ranged port by number; see
+                          [`SandboxTarget::resolve_port`](crate::api::sandbox_access::SandboxTarget::resolve_port).
+
+                        The split exists because the two express different administrator
+                        intentions. An agent pool enumerates the exact ports its workload serves
+                        and wants them published; the caller is untrusted and this template is the
+                        entire security surface. A human workstation pool wants a developer to
+                        reach whatever dev server they started today without an edit to GitOps and
+                        a re-lease — but the administrator still chooses the band. Undeclared still
+                        means unauthorized either way.
                       properties:
                         container:
                           maxLength: 63
@@ -261,19 +289,53 @@ spec:
                           pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         name:
+                          description: |-
+                            Name for this declaration. Only a `port` answers to it; see the type
+                            doc-comment.
                           maxLength: 15
                           minLength: 1
                           pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         port:
+                          description: |-
+                            One published port. Mutually exclusive with `portRange`.
+
+                            Optional only so a range can take its place. A declaration that sets
+                            neither, or both, is refused at admission rather than resolved by
+                            preferring one: a pool whose port declaration is ambiguous is a pool
+                            whose reachable set nobody can state.
                           format: uint16
                           maximum: 65535.0
                           minimum: 1.0
+                          nullable: true
                           type: integer
+                        portRange:
+                          description: |-
+                            A contiguous band authorized for forwarding. Mutually exclusive with
+                            `port`.
+                          nullable: true
+                          properties:
+                            end:
+                              description: |-
+                                Highest authorized port, inclusive. At least `start`, and the band may
+                                not exceed [`MAX_PORT_RANGE_SPAN`] ports.
+                              format: uint16
+                              maximum: 65535.0
+                              minimum: 1.0
+                              type: integer
+                            start:
+                              description: Lowest authorized port, inclusive.
+                              format: uint16
+                              maximum: 65535.0
+                              minimum: 1.0
+                              type: integer
+                          required:
+                          - end
+                          - start
+                          type: object
                       required:
                       - container
                       - name
-                      - port
                       type: object
                     maxItems: 64
                     type: array
@@ -309,9 +371,15 @@ spec:
                 - message: exposed port names must be unique
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.name == p.name).size() == 1)'
                 - message: a container port may be declared only once
-                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.container == p.container && other.port == p.port).size() == 1)'
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.port) || self.exposedPorts.filter(other, other.container == p.container && has(other.port) && other.port == p.port).size() == 1)'
                 - message: exposed port names must contain a letter and cannot contain consecutive hyphens
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, p.name.matches(''.*[a-z].*'') && !p.name.contains(''--''))'
+                - message: each exposed port must set exactly one of port or portRange
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, has(p.port) != has(p.portRange))'
+                - message: portRange.start must not exceed portRange.end
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.start <= p.portRange.end)'
+                - message: portRange may span at most 8192 ports
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.end - p.portRange.start < 8192)'
               transport:
                 default: direct
                 description: |-

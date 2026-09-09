@@ -122,6 +122,92 @@ Linux capabilities, disables privilege escalation, and applies the
 user and must not require writable root-owned paths. Canary `argv` is executed
 directly, without an implicit shell.
 
+## `exposedPorts`
+
+`exposedPorts` is the complete answer to "what may a caller of this pool
+reach". Anything not in it stays unauthorized: without that list, a forward is
+a general tunnel into the sandbox's network namespace, reaching a debug
+listener or a metrics endpoint you never meant to publish.
+
+Each entry declares **either** one port **or** one contiguous range.
+
+```yaml
+    exposedPorts:
+      - name: http            # one published port
+        container: workspace
+        port: 8080
+      - name: dev             # a band, authorized for forwarding only
+        container: workspace
+        portRange:
+          start: 3000
+          end: 9999
+```
+
+The two shapes are not interchangeable.
+
+`port` **publishes** one port. It becomes a named `ContainerPort` on the Pod
+and a named port on the Sandbox's Service, and callers may address it by that
+name or by its number.
+
+`portRange` **authorizes** a band and publishes nothing — no `ContainerPort`,
+no Service port. Callers reach a ranged port **by number only**:
+
+```bash
+kobe port-forward dev 8080:5173   # 5173 is inside 3000-9999
+kobe port-forward dev 8080:dev    # refused: one name cannot pick one port
+```
+
+A range's name exists for the manifest and the audit trail, not for callers.
+Asking for it returns `400` with reason `port_name_covers_range`, because
+guessing which of 7000 ports you meant would forward you somewhere you never
+asked for.
+
+Which shape to use is a question about who the caller is. An **agent pool**
+enumerates each port its workload serves: the caller is untrusted and the
+template is the whole security surface, so declaring exactly what is needed is
+the point. A **workstation pool** for a human is different — a developer
+should be able to reach the dev server they started five minutes ago without
+editing GitOps and re-leasing. A range lets you authorize `3000-9999` once
+instead of predicting every port.
+
+It does not weaken the rule. Undeclared is still unauthorized, and you still
+decide what is declared — a range moves the decision from "which ports" to
+"which band", it does not remove it. Ranges are therefore capped at **8192
+ports**, so `portRange` cannot be spelled to mean "everything".
+
+Kobe refuses a bad declaration when the pool is admitted, not when a forward
+is attempted: an entry that sets both fields or neither, a range whose `start`
+is after its `end`, a bound outside 1-65535, or a band wider than the cap.
+Overlapping declarations simply union — a published `5173` inside a
+`3000-9999` band is fine, and the port resolves either way.
+
+A pool that declares only ranges gets no Service, because nothing is
+published. Port-forward does not need one; it addresses the Pod directly.
+
+### Rollout order
+
+`portRange` is a new field on a schema that rejects unknown ones, so an
+operator older than the release that introduced it will refuse to read a pool
+that uses it — and stop reconciling that pool, not just that field. Roll it
+out in order:
+
+1. Apply the new chart's CRD manifests. Helm does not upgrade objects from a
+   chart's `crds/` directory, so this step is explicit.
+2. Upgrade the operator, and wait until every replica is running the new
+   version. `kobe status` reports the version it is talking to.
+3. Only then write a `portRange` into a `SandboxPool`.
+
+Applying a `portRange` against the older CRD fails at `kubectl apply`: that
+schema requires `port` on every entry, and the API server prunes the field it
+does not know before it checks. That is the loud, harmless failure. The one to
+avoid is applying between steps 1 and 2 — the manifest is accepted and an old
+operator replica cannot parse the pool it now has to reconcile. Pools that
+declare only `port` are unaffected at every step.
+
+The same pruning is why a misspelled `portrange` is rejected rather than
+ignored: the unknown key is dropped, the entry is left declaring neither
+shape, and the exactly-one-of rule refuses it.
+
 ## Admission ledger namespace
 
 Sandbox quota slots, aliases, and distributed operation gates are coordination
