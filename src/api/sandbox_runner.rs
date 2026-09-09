@@ -1186,11 +1186,31 @@ mod tests {
     #[test]
     fn one_malformed_field_is_never_repaired_by_its_sibling() {
         for (code, signal, why) in [
-            (Some(256), Some(9), "an out-of-range code must not fall through to the signal"),
-            (Some(0), Some(9), "a zero code contradicts Failed and must not defer to a signal"),
-            (Some(-1), Some(15), "a negative code must not fall through to the signal"),
-            (Some(42), Some(i32::MAX), "a valid code must not mask an impossible signal"),
-            (Some(42), Some(0), "a valid code must not mask a zero signal"),
+            (
+                Some(256),
+                Some(9),
+                "an out-of-range code must not fall through to the signal",
+            ),
+            (
+                Some(0),
+                Some(9),
+                "a zero code contradicts Failed and must not defer to a signal",
+            ),
+            (
+                Some(-1),
+                Some(15),
+                "a negative code must not fall through to the signal",
+            ),
+            (
+                Some(42),
+                Some(i32::MAX),
+                "a valid code must not mask an impossible signal",
+            ),
+            (
+                Some(42),
+                Some(0),
+                "a valid code must not mask a zero signal",
+            ),
         ] {
             let outcome = outcome_from_report(&ExecutionReport {
                 exit_code: code,
