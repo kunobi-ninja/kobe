@@ -192,16 +192,26 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
             _ => (ExecutionState::Unknown, None),
         },
         RunnerState::Failed => match (report.exit_code, report.signal) {
+            // Reject an out-of-range field BEFORE reading the other one. Written
+            // as accept-guards first, these two arms fell through: a report of
+            // `(exit_code: 256, signal: 9)` failed the code guard, matched the
+            // signal arm, and persisted 137 — a number nobody observed, in a
+            // record whose whole point is that it was. Symmetrically, a valid
+            // code hid an out-of-range signal. A field outside the range it
+            // could have been observed in makes the REPORT malformed; choosing
+            // which half of a contradiction to believe is not a repair kobe is
+            // entitled to make.
+            //
             // A wait status is eight bits, so 1-255 is every code a process on
-            // this host could have exited with; zero contradicts `Failed`. A
-            // report outside that range is not describing an exit status at
-            // all, so nothing here may forward it.
-            (Some(code), _) if (1..=255).contains(&code) => (ExecutionState::Failed, Some(code)),
+            // this host could have exited with; zero contradicts `Failed`. The
+            // runner emits `(None, Some(signal))` for a signalled process, so
+            // no legitimate report is refused by rejecting a zero code here.
+            (Some(code), _) if !(1..=255).contains(&code) => (ExecutionState::Unknown, None),
             // Linux stops at `SIGRTMAX` (64), so a real `128 + signal` stays
             // inside those same eight bits and cannot overflow.
-            (_, Some(signal)) if (1..=127).contains(&signal) => {
-                (ExecutionState::Failed, Some(128i32.saturating_add(signal)))
-            }
+            (_, Some(signal)) if !(1..=127).contains(&signal) => (ExecutionState::Unknown, None),
+            (Some(code), _) => (ExecutionState::Failed, Some(code)),
+            (_, Some(signal)) => (ExecutionState::Failed, Some(128i32.saturating_add(signal))),
             _ => (ExecutionState::Unknown, None),
         },
         RunnerState::Cancelled => (ExecutionState::Cancelled, None),
@@ -1165,6 +1175,51 @@ mod tests {
     /// hand a workload 32 bits of its choosing in etcd and every backup — the
     /// same class of channel already closed for the reason. A real
     /// `WEXITSTATUS` is one byte, so anything else is a number nobody observed.
+    /// A malformed field poisons the whole report, rather than deferring to
+    /// whichever sibling field still looks plausible.
+    ///
+    /// Written as accept-guards, the `Failed` arms fell through: a forged
+    /// `(exit_code: 256, signal: 9)` failed the code guard, matched the signal
+    /// arm, and persisted 137 — a number nobody observed, in the one record
+    /// whose value is that it was. The mirror case let a valid code mask an
+    /// impossible signal. Both now settle `Unknown`.
+    #[test]
+    fn one_malformed_field_is_never_repaired_by_its_sibling() {
+        for (code, signal, why) in [
+            (Some(256), Some(9), "an out-of-range code must not fall through to the signal"),
+            (Some(0), Some(9), "a zero code contradicts Failed and must not defer to a signal"),
+            (Some(-1), Some(15), "a negative code must not fall through to the signal"),
+            (Some(42), Some(i32::MAX), "a valid code must not mask an impossible signal"),
+            (Some(42), Some(0), "a valid code must not mask a zero signal"),
+        ] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: code,
+                signal,
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Unknown, "{why}");
+            assert_eq!(outcome.exit_code, None, "{why}");
+        }
+
+        // The bound must not cost a real diagnosis: the shapes the runner
+        // actually emits still translate exactly as before.
+        let exited = outcome_from_report(&ExecutionReport {
+            exit_code: Some(137),
+            signal: None,
+            ..report(RunnerState::Failed)
+        });
+        assert_eq!(exited.state, ExecutionState::Failed);
+        assert_eq!(exited.exit_code, Some(137));
+
+        let signalled = outcome_from_report(&ExecutionReport {
+            exit_code: None,
+            signal: Some(9),
+            ..report(RunnerState::Failed)
+        });
+        assert_eq!(signalled.state, ExecutionState::Failed);
+        assert_eq!(signalled.exit_code, Some(137));
+    }
+
     #[test]
     fn an_exit_code_no_wait_status_could_produce_is_never_persisted() {
         for forged in [-1, 0, 256, 1_885_434_739, i32::MIN, i32::MAX] {
