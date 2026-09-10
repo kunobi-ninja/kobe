@@ -8,6 +8,7 @@ USER root
 # Tauri 2 Linux prerequisites plus an unprivileged software-rendered desktop.
 # Language runtimes and project tools still come from the project's mise.toml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium \
         dbus \
         file \
         fonts-dejavu-core \
@@ -17,16 +18,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev \
         novnc \
         openbox \
-        procps \
         websockify \
         wget \
         x11-utils \
+        x11-xserver-utils \
         x11vnc \
         xauth \
+        xdg-utils \
+        xterm \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chmod=0755 docker/kobe-desktop-up /usr/local/bin/kobe-desktop-up
+COPY --chmod=0755 docker/kobe-desktop docker/kobe-desktop-up /usr/local/bin/
+COPY --chown=65532:65532 docker/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
+COPY --chown=65532:65532 docker/kobe-mimeapps.list /home/agent/.config/mimeapps.list
 
 USER 65532:65532
 

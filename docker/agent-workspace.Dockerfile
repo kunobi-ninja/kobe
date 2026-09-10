@@ -42,9 +42,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         curl \
+        gh \
         git \
+        iproute2 \
+        jq \
+        less \
         libssl-dev \
+        openssh-client \
         pkg-config \
+        procps \
+        ripgrep \
         tmux \
         unzip \
         xz-utils \

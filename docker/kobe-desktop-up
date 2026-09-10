@@ -41,6 +41,12 @@ start() {
   pids+=("$!")
 }
 
+# Convenience windows must not control the desktop lifetime: users should be
+# able to close the initial terminal without taking down Xvfb or noVNC.
+start_optional() {
+  "$@" 9>&- &
+}
+
 ready() {
   local deadline=$((SECONDS + 30))
   until "$@" >/dev/null 2>&1; do
@@ -64,10 +70,14 @@ touch "$XAUTHORITY"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 start Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY"
 ready xdpyinfo -display "$DISPLAY"
+xsetroot -solid '#17324d'
 
 start dbus-daemon --session --nofork --address="$DBUS_SESSION_BUS_ADDRESS"
 ready dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames
 start openbox --sm-disable
+# A visible terminal makes an otherwise empty desktop immediately usable. The
+# Openbox right-click menu also exposes Terminal, Browser, and desktop status.
+start_optional xterm -title 'Kobe workspace' -geometry 100x28+32+32 -fa Monospace -fs 11 -e bash -lc 'printf "Kobe GUI workspace ready.\nRight-click the desktop for Terminal, Browser, and status.\n\n"; exec bash'
 start x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -forever -shared \
   -localhost -listen 127.0.0.1 -rfbport 5900 -nopw -noxdamage
 ready bash -c 'exec 3<>/dev/tcp/127.0.0.1/5900'

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Manage the lease-lived noVNC desktop through a dedicated tmux server.
+# `kobe-desktop-up` remains the foreground supervisor; this wrapper makes it
+# safe to start from a short runner execution without inheriting its 1h limit.
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}"
+socket="$runtime_dir/kobe-desktop.tmux"
+session="kobe-desktop"
+log_file="$runtime_dir/kobe-desktop.log"
+
+usage() {
+  cat <<'USAGE'
+Usage: kobe-desktop <start|status|stop|logs|terminal|browser> [arguments]
+
+  start       Start the desktop in its lease-lived tmux session (idempotent).
+  status      Report X11, D-Bus, noVNC, and browser readiness.
+  stop        Stop the tmux-managed desktop.
+  logs        Print the supervisor log (pass a line count, default 100).
+  terminal    Open an xterm window on the desktop.
+  browser     Open Chromium on the desktop (pass an optional URL).
+USAGE
+}
+
+in_tmux() {
+  tmux -S "$socket" has-session -t "$session" 2>/dev/null
+}
+
+check() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '%-15s ready\n' "$label"
+    return 0
+  fi
+  printf '%-15s unavailable\n' "$label"
+  return 1
+}
+
+ready() {
+  xdpyinfo >/dev/null 2>&1 \
+    && dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames >/dev/null 2>&1 \
+    && curl --fail --silent http://127.0.0.1:6080/vnc.html >/dev/null 2>&1
+}
+
+status() {
+  local failed=0
+  if in_tmux; then
+    printf '%-15s ready\n' 'supervisor'
+  else
+    printf '%-15s unavailable\n' 'supervisor'
+    failed=1
+  fi
+  check 'x11' xdpyinfo || failed=1
+  check 'dbus' dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames || failed=1
+  check 'novnc' curl --fail --silent http://127.0.0.1:6080/vnc.html || failed=1
+  check 'browser' chromium --version || failed=1
+  return "$failed"
+}
+
+start() {
+  if in_tmux; then
+    if ready; then
+      printf '%s\n' 'Desktop is already running.'
+      return 0
+    fi
+    printf '%s\n' 'The previous desktop supervisor is unhealthy; inspect kobe-desktop logs or run kobe-desktop stop.' >&2
+    return 1
+  fi
+
+  if ready; then
+    printf '%s\n' 'A desktop is already running outside kobe-desktop management.' >&2
+    return 1
+  fi
+
+  mkdir -p "$runtime_dir"
+  tmux -S "$socket" new-session -d -s "$session" "exec kobe-desktop-up >'$log_file' 2>&1"
+
+  local deadline=$((SECONDS + 30))
+  until ready; do
+    if ! in_tmux; then
+      printf '%s\n' 'Desktop supervisor exited during startup.' >&2
+      logs 80 >&2 || true
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      printf '%s\n' 'Desktop readiness timed out.' >&2
+      logs 80 >&2 || true
+      return 1
+    fi
+    sleep 0.2
+  done
+  printf '%s\n' 'Desktop ready. Forward port 6080 and open /vnc.html?autoconnect=1&resize=scale&path=websockify'
+}
+
+stop() {
+  if in_tmux; then
+    tmux -S "$socket" kill-session -t "$session"
+    printf '%s\n' 'Desktop stopped.'
+  else
+    printf '%s\n' 'No tmux-managed desktop is running.' >&2
+    return 1
+  fi
+}
+
+logs() {
+  local lines="${1:-100}"
+  tail -n "$lines" "$log_file"
+}
+
+terminal() {
+  xterm -title 'Kobe workspace' -fa Monospace -fs 11 -e "${SHELL:-/bin/bash}" >/dev/null 2>&1 &
+}
+
+browser() {
+  chromium "${1:-about:blank}" >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+  start) start ;;
+  status) status ;;
+  stop) stop ;;
+  logs) shift; logs "$@" ;;
+  terminal) terminal ;;
+  browser) shift; browser "$@" ;;
+  -h|--help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac
