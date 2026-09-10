@@ -856,10 +856,11 @@ spec:
                       Whether the exact pool generation that placed this lease published a
                       port, and therefore whether [`Self::service`] had to be filled.
 
-                      Recorded in the same status write as the workload identities, from the
-                      pool the reconciler has already fenced to this lease's admitted UID and
-                      generation. Release consults *this* rather than re-deriving the answer
-                      from whatever the pool says later.
+                      Recorded from the pool the reconciler has already fenced to this
+                      lease's admitted UID and generation — normally in the same status write
+                      as the workload identities, and otherwise at the Ready transition (see
+                      below). Release consults *this* rather than re-deriving the answer from
+                      whatever the pool says later.
 
                       It exists because "no Service was ever required" and "the Service
                       identity is missing" are the same absence, and telling them apart at
@@ -884,16 +885,28 @@ spec:
                       itself, in the same status write, from the pool already fenced to this
                       lease's admitted UID and generation.
 
-                      What is left in `None` is a lease made Ready by a release older than
-                      this field, or one whose Ready write landed against a SandboxLease CRD
-                      that still predates it — the API server prunes the unknown key under
-                      the default `Warn` validation and answers success, and the status
-                      writer does not re-read the stored object to notice. Both fall back to
-                      the pool-generation derivation, which is what they have always used.
+                      `None` therefore covers a wider population than "Ready before this
+                      field existed", and is deliberately not narrowed by guesswork:
 
-                      Nothing backfills a lease that is ALREADY Ready: that would mean
-                      re-observing its Pod, and a Pod that has since been replaced would then
-                      fail a merge that today never runs.
+                      * a lease made Ready by a release older than the field;
+                      * a lease made Ready by a controller that HAS the field but predates
+                        the Ready-transition write above — it knows the field and still
+                        leaves it absent on this path;
+                      * a lease whose Ready write landed against a SandboxLease CRD that
+                        still predates the field. The API server prunes the unknown key under
+                        the default `Warn` validation and answers success, and the status
+                        writer does not re-read the stored object to notice.
+
+                      All of them fall back to the pool-generation derivation, which is what
+                      they have always used, and which is fail-closed.
+
+                      Nothing backfills a MANAGEMENT lease that is already Ready. Not because
+                      deriving the answer needs the Pod — it does not; the helper above
+                      derives it from the pool alone — but because the admitted pool
+                      GENERATION is what has since moved, and that is the one input a
+                      backfill cannot recover. (A child-placed lease is different: its branch
+                      re-enters `observed_provenance` unconditionally, so an already-Ready
+                      child with matching identities can pick the flag up there.)
                     nullable: true
                     type: boolean
                 required:

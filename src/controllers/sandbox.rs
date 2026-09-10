@@ -8050,8 +8050,10 @@ fn workload_provenance_is_complete(
 /// that placed it published a port.
 ///
 /// [`observed_provenance`] is the only other writer of
-/// `target.serviceRequired`, and it runs only while provenance is incomplete —
-/// a predicate about object identities, which never mentions this flag. A
+/// `target.serviceRequired`. On the MANAGEMENT path it runs only while
+/// provenance is incomplete — a predicate about object identities, which never
+/// mentions this flag. (The child-placed branch calls it unconditionally, so a
+/// child lease is not exposed to the gap below.) A
 /// controller that checkpointed complete provenance while the lease was still
 /// `Provisioning` and stopped before the separate Ready write therefore hands
 /// the next controller a lease it carries all the way to Ready without ever
@@ -8064,9 +8066,12 @@ fn workload_provenance_is_complete(
 /// generation, into the status patch that is happening anyway, so it costs no
 /// extra round trip and — unlike a backfill — re-observes nothing.
 ///
-/// Only the transition writes it. A lease that is ALREADY Ready is left as it
-/// is: backfilling one would mean re-observing its Pod, and a Pod replaced
-/// since would fail a provenance merge that today never runs.
+/// Only the transition writes it. A management lease that is ALREADY Ready is
+/// left as it is — not because the answer needs its Pod (this function proves
+/// it does not: the pool alone decides) but because the admitted pool
+/// GENERATION has since moved, and that is the input a backfill cannot
+/// recover. Re-entering `observed_provenance` for one would also re-observe a
+/// Pod that may have been replaced, failing a merge that today never runs.
 fn record_service_requirement_at_ready(
     phase_before_ready: crate::crd::SandboxLeasePhase,
     next: &mut crate::crd::SandboxLeaseStatus,
@@ -12470,6 +12475,17 @@ pub(crate) mod tests {
         );
         advance_lease_to_latest_status(&mut lease, &server, "lease-rv-8").await;
 
+        // Resume the checkpoint an older controller could leave behind:
+        // complete workload identities, still Provisioning, and no flag. Without
+        // this the test never exercises the Ready-path insertion at all — it
+        // passed even with that production call deleted, which is no guard.
+        let resumed = lease.status.as_mut().unwrap();
+        assert_eq!(resumed.phase, crate::crd::SandboxLeasePhase::Provisioning);
+        let target = resumed.target.as_mut().unwrap();
+        assert_eq!(target.service_required, Some(true));
+        target.service_required = None;
+        assert!(management_provenance_is_complete(resumed, true));
+
         reconcile_lease(Arc::new(lease), ctx).await.unwrap();
 
         assert!(
@@ -12488,6 +12504,11 @@ pub(crate) mod tests {
             .filter_map(status_value_of)
             .find(|status| status["phase"] == "Ready")
             .expect("Ready status write");
+        assert_eq!(
+            ready_status["target"]["serviceRequired"],
+            serde_json::json!(true),
+            "the Ready patch must fill the flag even when provenance was already complete"
+        );
         assert!(
             ready_status["conditions"]
                 .as_array()
