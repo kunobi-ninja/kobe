@@ -36,6 +36,12 @@
 //! Only the execution id — a hash Kobe derived — is ever passed as an argument;
 //! the command itself is written to the runner's stdin, which nothing on the
 //! path records.
+//!
+//! The same document may carry the supervised process's own stdin, which is the
+//! only way to give a Sandbox a secret at all: without it, a command that reads
+//! a token — `gh auth login --with-token` — could be driven only by putting
+//! that token in a flag, in the argv that gets audit-logged. Those bytes are
+//! forwarded and hashed; they are never persisted, on either side.
 
 use kobe_runner::protocol::{
     Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
@@ -160,6 +166,13 @@ pub struct RunnerLogChunk {
 ///   `128 + signal` convention because [`crate::crd::SandboxExecutionStatus`]
 ///   requires a code for `Failed`, and `reason = signalled` is what keeps it
 ///   distinguishable from a command that deliberately exited 137.
+/// * A `Failed` code outside 1-255, or a signal outside 1-127, becomes
+///   `Unknown` and carries no code. `exit_code` crosses the same boundary as
+///   the reason ([`bounded_reason`]) and lands in
+///   [`crate::crd::SandboxExecutionStatus`], so an unbounded `i32` would be 32
+///   bits of a workload's choosing in etcd and every backup. A real
+///   `WEXITSTATUS` is one byte; a number outside it was never observed, and an
+///   outcome nobody observed is `Unknown` by the rule below.
 /// * Everything the runner could not establish becomes `Unknown`, never
 ///   `Failed`: `Failed` reads as "it ran and said no", which tells a caller
 ///   their retry is safe when it may not be.
@@ -179,7 +192,25 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
             _ => (ExecutionState::Unknown, None),
         },
         RunnerState::Failed => match (report.exit_code, report.signal) {
-            (Some(code), _) if code != 0 => (ExecutionState::Failed, Some(code)),
+            // Reject an out-of-range field BEFORE reading the other one. Written
+            // as accept-guards first, these two arms fell through: a report of
+            // `(exit_code: 256, signal: 9)` failed the code guard, matched the
+            // signal arm, and persisted 137 — a number nobody observed, in a
+            // record whose whole point is that it was. Symmetrically, a valid
+            // code hid an out-of-range signal. A field outside the range it
+            // could have been observed in makes the REPORT malformed; choosing
+            // which half of a contradiction to believe is not a repair kobe is
+            // entitled to make.
+            //
+            // A wait status is eight bits, so 1-255 is every code a process on
+            // this host could have exited with; zero contradicts `Failed`. The
+            // runner emits `(None, Some(signal))` for a signalled process, so
+            // no legitimate report is refused by rejecting a zero code here.
+            (Some(code), _) if !(1..=255).contains(&code) => (ExecutionState::Unknown, None),
+            // Linux stops at `SIGRTMAX` (64), so a real `128 + signal` stays
+            // inside those same eight bits and cannot overflow.
+            (_, Some(signal)) if !(1..=127).contains(&signal) => (ExecutionState::Unknown, None),
+            (Some(code), _) => (ExecutionState::Failed, Some(code)),
             (_, Some(signal)) => (ExecutionState::Failed, Some(128i32.saturating_add(signal))),
             _ => (ExecutionState::Unknown, None),
         },
@@ -197,19 +228,47 @@ pub fn outcome_from_report(report: &ExecutionReport) -> RunnerOutcome {
 
 /// Clamp a runner-supplied reason to something that may be persisted.
 ///
-/// The reason is the ONE value that crosses from inside a tenant's container
-/// into a Kubernetes object. A runner that is old, broken, or replaced could
-/// put anything here — a path, an error message, a line of the command's own
-/// output — and object status is readable by anyone with `get` on the type,
-/// replicated to every etcd member, and included in backups. So anything
+/// The reason is one of two values that cross from inside a tenant's container
+/// into a Kubernetes object — the exit code is the other, bounded to a wait
+/// status's eight bits in [`outcome_from_report`]. A runner that is old,
+/// broken, or replaced could put anything here — a path, an error message, a
+/// line of the command's own output — and object status is readable by anyone
+/// with `get` on the type, replicated to every etcd member, and included in
+/// backups. So anything
 /// outside the closed vocabulary is replaced rather than truncated: a
 /// truncated secret is still a secret.
+///
+/// The vocabulary is [`kobe_runner::protocol::reason`] itself, matched
+/// literally, because a *shape* check is not a vocabulary. "Nonempty, at most
+/// 64 bytes, lowercase ASCII and underscores" admits `password` and
+/// `ghp_never_persist_this` unchanged, which is precisely the class of string
+/// this function exists to stop. The distinction stopped being theoretical
+/// once a caller could hand the container a secret on stdin: the runner's
+/// spool is written by the workload's own UID (see
+/// [`kobe_runner::spool`]), so a workload that wants its secret in etcd only
+/// has to forge a terminal report carrying it as the reason.
+///
+/// Matching the shared constants rather than a copied list is what keeps this
+/// honest across an upgrade — a reason code renamed on the runner side stops
+/// compiling here instead of silently becoming unrecognised. A *newly added*
+/// code does degrade to `runner_reason_unrecognised` on an older Kobe, and
+/// that is the correct direction: nothing downstream branches on the string,
+/// so the cost is a less precise diagnosis rather than a wrong decision.
 pub fn bounded_reason(reason: &str) -> String {
-    let recognised = !reason.is_empty()
-        && reason.len() <= 64
-        && reason
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+    use kobe_runner::protocol::reason as code;
+
+    let recognised = matches!(
+        reason,
+        code::COMPLETED
+            | code::TIMED_OUT
+            | code::CANCELLED
+            | code::SIGNALLED
+            | code::SPAWN_FAILED
+            | code::SUPERVISOR_NOT_STARTED
+            | code::SUPERVISOR_SETUP_FAILED
+            | code::SUPERVISOR_LOST
+            | code::OUTCOME_UNOBSERVED
+    );
     if recognised {
         reason.to_string()
     } else {
@@ -218,12 +277,23 @@ pub fn bounded_reason(reason: &str) -> String {
 }
 
 /// The request Kobe writes to the runner's stdin.
+///
+/// `stdin` is the caller's bytes for the supervised process, base64-encoded
+/// here and carried inside this one document. It is emitted only when present:
+/// a request that forwards no stdin serialises byte-for-byte as it did before
+/// the field existed, so a Sandbox image older than this Kobe keeps accepting
+/// ordinary executions. One that *does* forward stdin is refused by such an
+/// image — loudly, and before anything is spawned — rather than run without the
+/// input it was meant to receive.
 pub fn start_request(
     id: &str,
     argv: &[String],
     cwd: Option<&str>,
     timeout: std::time::Duration,
+    stdin: Option<&[u8]>,
 ) -> StartRequest {
+    use base64::Engine;
+
     StartRequest {
         protocol: PROTOCOL_VERSION,
         id: id.to_string(),
@@ -233,6 +303,10 @@ pub fn start_request(
         // became one would kill a command before its own bound elapsed.
         timeout_seconds: (timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0)).max(1),
         max_output_bytes: crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES,
+        // Base64 so exact bytes survive the JSON: a credential is not required
+        // to be UTF-8, and a lossy conversion here would corrupt it in a way
+        // that surfaces as an authentication failure far from the cause.
+        stdin_base64: stdin.map(|stdin| base64::engine::general_purpose::STANDARD.encode(stdin)),
     }
 }
 
@@ -657,6 +731,7 @@ mod tests {
             &["/agent".into(), "--token".into(), "s3cret".into()],
             Some("/work"),
             std::time::Duration::from_secs(60),
+            None,
         );
         let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
         assert!(line.contains("s3cret"), "the command travels on stdin");
@@ -827,6 +902,91 @@ mod tests {
         }
     }
 
+    /// A forwarded secret travels on stdin and appears in no argument.
+    ///
+    /// This is the whole reason the field exists. If the bytes reached the
+    /// runner through argv instead, they would be in the exec URL the target
+    /// apiserver audit-logs verbatim — the exact leak `--stdin` is offered to
+    /// avoid, and one nobody could redact after the fact.
+    #[test]
+    fn forwarded_stdin_travels_on_stdin_and_never_in_an_argument() {
+        let secret = b"ghp_a-token-that-must-not-be-audit-logged";
+        let request = start_request(
+            "sbxe-abc123",
+            &["/usr/bin/gh".into(), "auth".into(), "login".into()],
+            None,
+            std::time::Duration::from_secs(60),
+            Some(secret),
+        );
+
+        // Base64 on the wire, so the exact bytes survive JSON.
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(secret.as_slice())
+        };
+        assert_eq!(request.stdin_base64.as_deref(), Some(encoded.as_str()));
+        assert_eq!(request.stdin_bytes().unwrap().unwrap(), secret);
+
+        let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
+        assert!(line.contains(&encoded), "the secret must travel on stdin");
+        assert!(line.ends_with('\n'), "the runner reads exactly one line");
+
+        // The exec argv is unchanged by the presence of stdin: two fixed words.
+        assert_eq!(start_argv("/kobe-runner", None), ["/kobe-runner", "start"]);
+        for argument in start_argv("/kobe-runner", None) {
+            assert!(!argument.contains(&encoded));
+            assert!(!argument.contains("gh"));
+        }
+    }
+
+    /// A request that forwards no stdin is byte-identical to the released one.
+    ///
+    /// A Sandbox image is built by an administrator and can be months older
+    /// than the Kobe talking to it, and the runner denies unknown fields. An
+    /// always-emitted `stdinBase64` — even null — would make every ordinary
+    /// execution fail against every already-deployed image.
+    #[test]
+    fn a_request_without_stdin_stays_wire_compatible_with_an_older_runner() {
+        let without = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        let line = String::from_utf8(start_line(&without).unwrap()).unwrap();
+        assert!(
+            !line.contains("stdin"),
+            "no stdin means no field at all: {line}"
+        );
+
+        let with = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            Some(b"token"),
+        );
+        assert!(
+            String::from_utf8(start_line(&with).unwrap())
+                .unwrap()
+                .contains("stdinBase64"),
+            "and a request that forwards stdin must say so explicitly"
+        );
+
+        // Present-but-empty is not absent: one hands the process a closed pipe,
+        // the other hands it /dev/null.
+        let empty = start_request(
+            "sbxe-abc123",
+            &["/agent".into(), "run".into()],
+            Some("/work"),
+            std::time::Duration::from_secs(60),
+            Some(b""),
+        );
+        assert_eq!(empty.stdin_base64.as_deref(), Some(""));
+        assert_ne!(empty, without);
+    }
+
     /// Kobe and the runner share the exact encoded request ceiling.
     #[test]
     fn start_request_bound_includes_the_newline() {
@@ -835,6 +995,7 @@ mod tests {
             &[String::new()],
             None,
             std::time::Duration::from_secs(1),
+            None,
         );
         let base = start_line(&request).unwrap().len();
         request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
@@ -1004,12 +1165,148 @@ mod tests {
         }
     }
 
+    /// An exit code no wait status could produce never reaches the record.
+    ///
+    /// `exit_code` crosses the same tenant boundary as the reason: the runner's
+    /// spool is written by the workload's own UID (see [`kobe_runner::spool`]),
+    /// so a workload can forge a terminal report for its own execution. The
+    /// field is an `i32` on the wire and lands in
+    /// [`crate::crd::SandboxExecutionStatus`], so forwarding it unchanged would
+    /// hand a workload 32 bits of its choosing in etcd and every backup — the
+    /// same class of channel already closed for the reason. A real
+    /// `WEXITSTATUS` is one byte, so anything else is a number nobody observed.
+    /// A malformed field poisons the whole report, rather than deferring to
+    /// whichever sibling field still looks plausible.
+    ///
+    /// Written as accept-guards, the `Failed` arms fell through: a forged
+    /// `(exit_code: 256, signal: 9)` failed the code guard, matched the signal
+    /// arm, and persisted 137 — a number nobody observed, in the one record
+    /// whose value is that it was. The mirror case let a valid code mask an
+    /// impossible signal. Both now settle `Unknown`.
+    #[test]
+    fn one_malformed_field_is_never_repaired_by_its_sibling() {
+        for (code, signal, why) in [
+            (
+                Some(256),
+                Some(9),
+                "an out-of-range code must not fall through to the signal",
+            ),
+            (
+                Some(0),
+                Some(9),
+                "a zero code contradicts Failed and must not defer to a signal",
+            ),
+            (
+                Some(-1),
+                Some(15),
+                "a negative code must not fall through to the signal",
+            ),
+            (
+                Some(42),
+                Some(i32::MAX),
+                "a valid code must not mask an impossible signal",
+            ),
+            (
+                Some(42),
+                Some(0),
+                "a valid code must not mask a zero signal",
+            ),
+        ] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: code,
+                signal,
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Unknown, "{why}");
+            assert_eq!(outcome.exit_code, None, "{why}");
+        }
+
+        // The bound must not cost a real diagnosis: the shapes the runner
+        // actually emits still translate exactly as before.
+        let exited = outcome_from_report(&ExecutionReport {
+            exit_code: Some(137),
+            signal: None,
+            ..report(RunnerState::Failed)
+        });
+        assert_eq!(exited.state, ExecutionState::Failed);
+        assert_eq!(exited.exit_code, Some(137));
+
+        let signalled = outcome_from_report(&ExecutionReport {
+            exit_code: None,
+            signal: Some(9),
+            ..report(RunnerState::Failed)
+        });
+        assert_eq!(signalled.state, ExecutionState::Failed);
+        assert_eq!(signalled.exit_code, Some(137));
+    }
+
+    #[test]
+    fn an_exit_code_no_wait_status_could_produce_is_never_persisted() {
+        for forged in [-1, 0, 256, 1_885_434_739, i32::MIN, i32::MAX] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: Some(forged),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(
+                outcome.state,
+                ExecutionState::Unknown,
+                "exit {forged} was never observed, so nothing may claim it as a failure"
+            );
+            assert_eq!(
+                outcome.exit_code, None,
+                "exit {forged} must not be persisted"
+            );
+        }
+
+        // The signalled path lands in the same status field and gets the same
+        // bound: `128 + signal` is only an exit code for a signal that exists.
+        for forged in [-1, 0, 128, 1_000_000, i32::MAX] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: None,
+                signal: Some(forged),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(
+                outcome.state,
+                ExecutionState::Unknown,
+                "signal {forged} does not exist, so no code may be derived from it"
+            );
+            assert_eq!(
+                outcome.exit_code, None,
+                "signal {forged} must not be persisted"
+            );
+        }
+
+        // Every code a process on this host could really have exited with still
+        // survives untouched — the bound must not cost a real diagnosis.
+        for real in [1, 2, 42, 137, 255] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: Some(real),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Failed, "exit {real}");
+            assert_eq!(outcome.exit_code, Some(real), "exit {real}");
+        }
+        for signal in [1, 9, 15, 64] {
+            let outcome = outcome_from_report(&ExecutionReport {
+                exit_code: None,
+                signal: Some(signal),
+                ..report(RunnerState::Failed)
+            });
+            assert_eq!(outcome.state, ExecutionState::Failed, "signal {signal}");
+            assert_eq!(outcome.exit_code, Some(128 + signal), "signal {signal}");
+        }
+    }
+
     /// Nothing from inside the container reaches a Kubernetes object unbounded.
     ///
-    /// The reason is the one value that crosses that boundary. A runner that is
-    /// old, broken, or replaced could put a path, an error message, or a line
-    /// of the command's own output there — and object status is readable by
-    /// anyone with `get`, replicated to every etcd member, and in every backup.
+    /// The reason is one of the two values that cross that boundary; the exit
+    /// code is the other, pinned by
+    /// [`an_exit_code_no_wait_status_could_produce_is_never_persisted`]. A
+    /// runner that is old, broken, or replaced could put a path, an error
+    /// message, or a line of the command's own output in the reason — and
+    /// object status is readable by anyone with `get`, replicated to every etcd
+    /// member, and in every backup.
     #[test]
     fn a_runner_reason_can_never_reach_the_record_unbounded() {
         assert_eq!(bounded_reason("completed"), "completed");
@@ -1045,6 +1342,55 @@ mod tests {
         }
     }
 
+    /// Only the runner protocol's own reason codes are ever persisted.
+    ///
+    /// The shape check the vocabulary used to be — nonempty, short, lowercase
+    /// ASCII — admits `password` and `ghp_never_persist_this` unchanged. That
+    /// is a closed vocabulary in the doc-comment only, and stdin forwarding
+    /// gives a workload a secret worth routing through it: the spool is
+    /// writable by the tenant's own UID, so a forged terminal report is the
+    /// tenant's to write.
+    #[test]
+    fn only_the_runner_protocols_own_reason_codes_are_persisted() {
+        use kobe_runner::protocol::reason as code;
+
+        // Every code the runner can actually emit survives unchanged. A fix
+        // that silently retired one of these would turn a real diagnosis into
+        // `runner_reason_unrecognised` on the next upgrade.
+        for recognised in [
+            code::COMPLETED,
+            code::TIMED_OUT,
+            code::CANCELLED,
+            code::SIGNALLED,
+            code::SPAWN_FAILED,
+            code::SUPERVISOR_NOT_STARTED,
+            code::SUPERVISOR_SETUP_FAILED,
+            code::SUPERVISOR_LOST,
+            code::OUTCOME_UNOBSERVED,
+        ] {
+            assert_eq!(
+                bounded_reason(recognised),
+                recognised,
+                "{recognised} is a protocol reason code and must reach the record"
+            );
+        }
+
+        // Each of these passes the old shape check verbatim.
+        for smuggled in [
+            "password",
+            "ghp_never_persist_this",
+            &"a".repeat(64),
+            "completed_",
+            "aws_secret_access_key",
+        ] {
+            assert_eq!(
+                bounded_reason(smuggled),
+                "runner_reason_unrecognised",
+                "reason {smuggled:?} is not a protocol code and must not be persisted"
+            );
+        }
+    }
+
     /// A command's own bound is never rounded down.
     ///
     /// A request for 1.5 seconds that became 1 would have the runner kill a
@@ -1053,7 +1399,7 @@ mod tests {
     #[test]
     fn a_timeout_is_never_rounded_down() {
         let seconds = |timeout: std::time::Duration| {
-            start_request("sbxe-1", &["/agent".into()], None, timeout).timeout_seconds
+            start_request("sbxe-1", &["/agent".into()], None, timeout, None).timeout_seconds
         };
 
         assert_eq!(seconds(std::time::Duration::from_secs(60)), 60);
@@ -1077,6 +1423,7 @@ mod tests {
             &["/agent".into()],
             None,
             std::time::Duration::from_secs(60),
+            None,
         );
         assert_eq!(
             request.max_output_bytes,

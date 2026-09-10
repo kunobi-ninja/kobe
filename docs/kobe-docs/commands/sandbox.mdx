@@ -96,6 +96,35 @@ reason about:
 kobe exec sandbox-a1b2c3d4e5f60718293a4b5c -- /bin/sh -lc 'a && b'
 ```
 
+### Passing a secret with `--stdin`
+
+`--stdin` forwards this process's standard input to the remote command and then
+closes it. **It is how you give a Sandbox a token.** The exec request Kobe makes
+against the target cluster puts the command line in a URL that the target
+apiserver's audit log records verbatim, so a token in `argv` is a token in
+somebody's log:
+
+```bash
+# Don't: the token is now in an audit log you do not control.
+kobe exec dev -- gh auth login --with-token "$GITHUB_TOKEN"
+
+# Do: the token travels on stdin, which nothing on the path records.
+printf %s "$GITHUB_TOKEN" | kobe exec dev --stdin -- gh auth login --with-token
+```
+
+The flag goes **before** `--`; anything after `--` belongs to the remote
+command. Nothing is forwarded unless you ask, so an ordinary `kobe exec` inside
+a pipeline does not start consuming the script's own input.
+
+The remote stdin is closed once the bytes are delivered, which is what lets a
+tool that reads until EOF finish instead of hanging until its timeout. Without
+`--stdin` the command reads `/dev/null`, exactly as it always has.
+
+For secrets and small inputs, not file transfer: the server refuses more than
+16 KiB rather than truncating it, and the CLI refuses to buffer a large file
+into a request that was never going to be accepted. Kobe stores none of it —
+only a digest of the request reaches the execution record.
+
 ## `kobe logs`
 
 A bounded tail of the sandbox's own output.

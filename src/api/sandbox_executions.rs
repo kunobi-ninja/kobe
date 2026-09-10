@@ -206,7 +206,29 @@ pub struct ExecutionRequest {
     pub timeout: String,
     pub idempotency_key: String,
     pub detached: bool,
+    /// Bytes to write to the process's stdin, then close.
+    ///
+    /// The only channel by which a Sandbox can receive a secret without it
+    /// appearing in argv — and argv is what the target apiserver audit-logs
+    /// verbatim. `None` and `Some(vec![])` are different requests: the first
+    /// leaves the process reading `/dev/null`, the second hands it a pipe that
+    /// is immediately closed.
+    ///
+    /// This field lives on the in-memory request and nowhere else. It is hashed
+    /// into the record's `requestDigest` and forwarded to the runner; it is
+    /// never persisted. See [`crate::crd::execution`] for why the durable
+    /// record must not hold it. Bounded by [`MAX_EXECUTION_STDIN_BYTES`], which
+    /// refuses rather than truncates.
+    pub stdin: Option<Vec<u8>>,
 }
+
+/// Most stdin one execution may carry.
+///
+/// The runner's own ceiling, re-exported rather than copied: two hand-kept
+/// copies of a limit drift, and the drift would show up as a reservation the
+/// target can only reject after the caller's idempotency key is already spent.
+/// Kobe checks it first for exactly that reason.
+pub const MAX_EXECUTION_STDIN_BYTES: usize = kobe_runner::protocol::MAX_STDIN_BYTES;
 
 /// Longest a caller-supplied idempotency key may be.
 ///
@@ -283,6 +305,18 @@ pub fn validate_request(request: &ExecutionRequest) -> Result<(), ExecutionReque
         if cwd.is_empty() || !cwd.starts_with('/') || cwd.contains('\0') {
             return Err(ExecutionRequestError::Invalid { what: "cwd" });
         }
+    }
+    if request
+        .stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_EXECUTION_STDIN_BYTES)
+    {
+        // Refused, never trimmed to fit. stdin exists on this API to carry a
+        // secret, and half a secret is still a secret — the command would
+        // receive it, fail an authentication, and report something that looks
+        // nothing like "your input was too large". Checked before the
+        // reservation so an oversized request cannot spend an idempotency key.
+        return Err(ExecutionRequestError::Invalid { what: "stdin" });
     }
     match crate::pool::parse_duration(&request.timeout) {
         Some(timeout) if timeout > chrono::Duration::zero() && timeout <= MAX_EXECUTION_TIMEOUT => {
@@ -390,6 +424,7 @@ pub async fn reserve_execution(
         &request.timeout,
         container,
         request.detached,
+        request.stdin.as_deref(),
     );
     let legacy_digest =
         legacy_request_digest(&request.argv, request.cwd.as_deref(), &request.timeout);
@@ -1943,6 +1978,7 @@ mod tests {
             timeout: "60s".into(),
             idempotency_key: "key-1".into(),
             detached: false,
+            stdin: None,
         }
     }
 
@@ -2031,6 +2067,59 @@ mod tests {
                 runner_path: "/kobe-runner".into(),
             })
         );
+    }
+
+    /// The record Kobe writes never carries the caller's stdin.
+    ///
+    /// This is the property the whole feature depends on. A caller sends stdin
+    /// precisely so a secret stays out of the argv the target apiserver
+    /// audit-logs; writing it into a `SandboxExecution` would move it into
+    /// etcd, every replica of etcd, and every backup — read by more people and
+    /// kept for longer than any audit log. Only the digest crosses.
+    #[test]
+    fn a_reserved_record_never_carries_the_callers_stdin() {
+        let secret = "ghp_never-persisted-anywhere";
+        let request = ExecutionRequest {
+            stdin: Some(secret.as_bytes().to_vec()),
+            ..request()
+        };
+        let digest = crate::crd::request_digest(
+            &request.argv,
+            request.cwd.as_deref(),
+            &request.timeout,
+            "workspace",
+            request.detached,
+            request.stdin.as_deref(),
+        );
+        let record = build_execution_record(
+            "kobe-system",
+            "execution-a",
+            &lease(),
+            &target(),
+            &request,
+            &digest,
+            recorded_target("workspace"),
+        );
+
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(
+            !encoded.contains(secret),
+            "the reserved record leaked its stdin: {encoded}"
+        );
+        assert!(
+            !encoded.to_lowercase().contains("stdin"),
+            "no persisted field may even be named for stdin: {encoded}"
+        );
+        let base64_secret = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(secret)
+        };
+        assert!(!encoded.contains(&base64_secret));
+
+        // The digest is what makes the reservation answerable at all, and it is
+        // the only thing derived from the secret that survives the request.
+        assert_eq!(record.spec.request_digest, digest);
+        assert_eq!(digest.len(), 64);
     }
 
     /// A retry may observe only the same immutable runner address. Legacy
@@ -2707,6 +2796,122 @@ mod tests {
         assert!(with(&|r| r.idempotency_key = "k".repeat(MAX_IDEMPOTENCY_KEY)).is_ok());
     }
 
+    /// Oversized stdin is refused at the documented boundary, not trimmed.
+    ///
+    /// stdin exists on this API to carry a secret. Half a secret is still a
+    /// secret: the command would receive it, fail an authentication, and report
+    /// something that looks nothing like "your input was too large". Refusing
+    /// before the reservation is what keeps the caller's idempotency key
+    /// reusable for the request they meant to make.
+    #[test]
+    fn oversized_stdin_is_refused_before_anything_is_reserved() {
+        let with_stdin = |stdin: Option<Vec<u8>>| {
+            let mut request = request();
+            request.stdin = stdin;
+            validate_request(&request)
+        };
+
+        assert!(with_stdin(None).is_ok(), "no stdin at all stays valid");
+        assert!(
+            with_stdin(Some(Vec::new())).is_ok(),
+            "an empty stdin is a request a caller may make"
+        );
+        assert!(with_stdin(Some(b"ghp_token".to_vec())).is_ok());
+        assert!(with_stdin(Some(vec![b'x'; MAX_EXECUTION_STDIN_BYTES])).is_ok());
+
+        assert_eq!(
+            with_stdin(Some(vec![b'x'; MAX_EXECUTION_STDIN_BYTES + 1])),
+            Err(ExecutionRequestError::Invalid { what: "stdin" }),
+            "one byte past the bound is refused, not trimmed"
+        );
+
+        // The caller is told to fix their request, not to send it again.
+        assert_eq!(
+            ExecutionRequestError::Invalid { what: "stdin" }.http_status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        // Kobe's ceiling is the runner's ceiling. Two hand-kept copies would
+        // drift, and the drift would surface only after the reservation was
+        // already durable.
+        assert_eq!(
+            MAX_EXECUTION_STDIN_BYTES,
+            kobe_runner::protocol::MAX_STDIN_BYTES
+        );
+    }
+
+    /// A maximal stdin still fits the one line the runner reads.
+    ///
+    /// [`MAX_EXECUTION_STDIN_BYTES`] and the runner's whole-request bound are
+    /// two different ceilings and both apply. If the first could produce a
+    /// request that violates the second, an accepted reservation would be
+    /// followed by a target-side rejection — after the idempotency key was
+    /// already spent.
+    #[test]
+    fn a_maximal_stdin_still_fits_the_encoded_start_request() {
+        let request = crate::api::sandbox_runner::start_request(
+            "sbxe-0123456789abcdef0123456789abcdef",
+            &["/usr/bin/gh".into(), "auth".into(), "login".into()],
+            Some("/workspace"),
+            std::time::Duration::from_secs(60),
+            Some(&vec![b'x'; MAX_EXECUTION_STDIN_BYTES]),
+        );
+        let line = crate::api::sandbox_runner::start_line(&request)
+            .expect("a maximal stdin must still encode inside the request bound");
+        assert!(line.len() <= kobe_runner::protocol::MAX_REQUEST_BYTES);
+    }
+
+    /// A reused key with a different secret conflicts rather than returning the
+    /// first run's result.
+    ///
+    /// Two `gh auth login` calls under one key, fed different tokens, are two
+    /// different commands. Answering the second with the first's record would
+    /// report an authentication that never happened.
+    #[test]
+    fn a_reused_key_with_different_stdin_is_a_different_request() {
+        let digest = |stdin: Option<&[u8]>| {
+            crate::crd::request_digest(
+                &["/agent".into(), "run".into()],
+                Some("/work"),
+                "60s",
+                "workspace",
+                false,
+                stdin,
+            )
+        };
+
+        let existing = SandboxExecutionSpec {
+            lease_name: None,
+            lease_uid: "lease-uid".into(),
+            pod_uid: "pod-uid".into(),
+            idempotency_key: "key-1".into(),
+            request_digest: digest(Some(b"token-a")),
+            timeout: "60s".into(),
+            detached: false,
+            runner_managed: Some(true),
+            target: None,
+        };
+
+        assert_eq!(
+            crate::crd::reuse_verdict(&existing, "lease-uid", &digest(Some(b"token-a"))),
+            ReuseVerdict::SameRequest,
+            "the same secret under the same key is a retry"
+        );
+        assert_eq!(
+            crate::crd::reuse_verdict(&existing, "lease-uid", &digest(Some(b"token-b"))),
+            ReuseVerdict::Conflict
+        );
+        assert_eq!(
+            crate::crd::reuse_verdict(&existing, "lease-uid", &digest(None)),
+            ReuseVerdict::Conflict,
+            "dropping the secret is a different command, not the same one"
+        );
+
+        // The record that decides all of this holds only the digest.
+        let encoded = serde_json::to_string(&existing).unwrap();
+        assert!(!encoded.contains("token-a"), "the record leaked: {encoded}");
+    }
+
     /// `cwd` is a path, and a nul byte is not part of one.
     ///
     /// Kobe never implements `cwd` with a shell — `cd X && ...` would make
@@ -2804,7 +3009,7 @@ mod tests {
     fn legacy_digest_reuse_is_exact_and_upgrade_bounded() {
         let argv = vec!["/agent".to_string(), "run".to_string()];
         let legacy_digest = legacy_request_digest(&argv, Some("/work"), "60s");
-        let current_digest = request_digest(&argv, Some("/work"), "60s", "workspace", false);
+        let current_digest = request_digest(&argv, Some("/work"), "60s", "workspace", false, None);
         assert_eq!(
             legacy_digest, "030c080c54aa88834e6249c7c3b544e9754b49a565a0c7696c4a06d38a8b5751",
             "the pre-upgrade digest format is a persisted compatibility vector"
@@ -2836,7 +3041,7 @@ mod tests {
             compatible_reuse_verdict(
                 &existing,
                 "lease-uid",
-                &request_digest(&argv, Some("/work"), "60s", "workspace", true),
+                &request_digest(&argv, Some("/work"), "60s", "workspace", true, None),
                 &legacy_digest,
                 true,
             ),
@@ -2848,7 +3053,14 @@ mod tests {
             compatible_reuse_verdict(
                 &existing,
                 "lease-uid",
-                &request_digest(&changed_argv, Some("/work"), "60s", "workspace", false,),
+                &request_digest(
+                    &changed_argv,
+                    Some("/work"),
+                    "60s",
+                    "workspace",
+                    false,
+                    None
+                ),
                 &legacy_request_digest(&changed_argv, Some("/work"), "60s"),
                 false,
             ),

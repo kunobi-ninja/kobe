@@ -85,6 +85,33 @@ fn start_in(
     ))
 }
 
+/// Start a command with bytes for its own stdin.
+///
+/// Kept apart from [`start`] so the ordinary path keeps sending exactly the
+/// request a released runner would accept: with nobody asking for stdin, the
+/// key must be absent rather than null.
+fn start_with_stdin(
+    scratch: &Scratch,
+    id: &str,
+    argv: &[&str],
+    stdin: &[u8],
+    timeout: u64,
+    cap: u64,
+) -> Reply {
+    use base64::Engine;
+
+    reply(start_output_with_stdin(
+        scratch,
+        &["start"],
+        id,
+        argv,
+        None,
+        timeout,
+        cap,
+        Some(base64::engine::general_purpose::STANDARD.encode(stdin)),
+    ))
+}
+
 fn start_output(
     scratch: &Scratch,
     runner_arguments: &[&str],
@@ -93,6 +120,20 @@ fn start_output(
     cwd: Option<&str>,
     timeout: u64,
     cap: u64,
+) -> std::process::Output {
+    start_output_with_stdin(scratch, runner_arguments, id, argv, cwd, timeout, cap, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_output_with_stdin(
+    scratch: &Scratch,
+    runner_arguments: &[&str],
+    id: &str,
+    argv: &[&str],
+    cwd: Option<&str>,
+    timeout: u64,
+    cap: u64,
+    stdin_base64: Option<String>,
 ) -> std::process::Output {
     use std::io::Write;
 
@@ -110,6 +151,14 @@ fn start_output(
     let mut request = request;
     if cwd.is_none() {
         request.as_object_mut().unwrap().remove("cwd");
+    }
+    // Absent when unused, for the same reason: this is the shape an older
+    // runner has to keep accepting.
+    if let Some(stdin_base64) = stdin_base64 {
+        request
+            .as_object_mut()
+            .unwrap()
+            .insert("stdinBase64".into(), stdin_base64.into());
     }
 
     let mut child = runner(scratch, runner_arguments)
@@ -899,6 +948,223 @@ fn output_is_retained_after_the_command_has_finished() {
 fn an_unknown_execution_is_not_found() {
     let scratch = Scratch::new();
     let reply = status(&scratch, "sbxe-never");
+    assert!(
+        matches!(
+            reply,
+            Reply::Error {
+                code: kobe_runner::protocol::RunnerErrorCode::NotFound
+            }
+        ),
+        "expected not found, got {reply:?}"
+    );
+}
+
+/// A secret reaches the process on stdin, and its stdin is then closed.
+///
+/// Both halves in one exercise, because `cat` proves both and neither alone is
+/// the feature. If the bytes never arrive, stdout is empty. If the descriptor
+/// is left open, `cat` never sees EOF, never exits, and the execution ends as a
+/// timeout instead of a success — which is exactly how a caller running
+/// `gh auth login --with-token` would discover a half-implemented forward.
+#[test]
+fn stdin_reaches_the_process_and_is_then_closed() {
+    let scratch = Scratch::new();
+    let secret = b"ghp_a-token-that-must-never-be-an-argument\n";
+
+    start_with_stdin(&scratch, "sbxe-stdin", &["/bin/cat"], secret, 20, 4096);
+
+    let report = settled(&scratch, "sbxe-stdin", Duration::from_secs(20));
+    assert_eq!(
+        report.state,
+        RunnerState::Succeeded,
+        "a process waiting on EOF must not hang: {report:?}"
+    );
+    assert_eq!(report.exit_code, Some(0));
+    assert_eq!(read_stream(&scratch, "sbxe-stdin", "stdout"), secret);
+}
+
+/// Exact bytes, including the ones that are not text.
+///
+/// A credential is not required to be UTF-8. A lossy conversion anywhere on
+/// this path would corrupt one in a way that surfaces as an authentication
+/// failure a long way from the cause.
+#[test]
+fn stdin_bytes_arrive_exactly_as_they_were_sent() {
+    let scratch = Scratch::new();
+    let raw: Vec<u8> = (0u8..=255).collect();
+
+    start_with_stdin(&scratch, "sbxe-stdin-bytes", &["/bin/cat"], &raw, 20, 4096);
+
+    let report = settled(&scratch, "sbxe-stdin-bytes", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Succeeded);
+    assert_eq!(read_stream(&scratch, "sbxe-stdin-bytes", "stdout"), raw);
+}
+
+/// A maximal payload survives the whole handover intact.
+///
+/// The bytes cross two pipes — `start` to the supervisor, supervisor to the
+/// command — and the first read is exact rather than "until EOF". A payload at
+/// the documented ceiling is where a short read or a partial write would
+/// actually show up, and where it would show up as a corrupted credential
+/// rather than an obvious failure.
+#[test]
+fn a_maximal_stdin_payload_arrives_whole() {
+    let scratch = Scratch::new();
+    // Non-repeating, so a duplicated or dropped block cannot pass unnoticed.
+    let payload: Vec<u8> = (0..kobe_runner::protocol::MAX_STDIN_BYTES)
+        .map(|index| (index % 251) as u8)
+        .collect();
+
+    start_with_stdin(
+        &scratch,
+        "sbxe-stdin-max",
+        &["/bin/cat"],
+        &payload,
+        30,
+        1 << 20,
+    );
+
+    let report = settled(&scratch, "sbxe-stdin-max", Duration::from_secs(30));
+    assert_eq!(report.state, RunnerState::Succeeded, "{report:?}");
+    assert!(!report.stdout_truncated);
+    assert_eq!(read_stream(&scratch, "sbxe-stdin-max", "stdout"), payload);
+}
+
+/// A command that ignores its stdin still finishes, however much was sent.
+///
+/// The bytes are written on a thread precisely so this cannot deadlock: a
+/// payload larger than a pipe buffer, handed to a process that never reads,
+/// would otherwise block the supervisor's own wait loop — and a supervisor that
+/// is not looping cannot cancel, time out, or drain output.
+#[test]
+fn stdin_nobody_reads_never_blocks_the_supervisor() {
+    let scratch = Scratch::new();
+    let bulk = vec![b'x'; kobe_runner::protocol::MAX_STDIN_BYTES];
+
+    start_with_stdin(
+        &scratch,
+        "sbxe-stdin-ignored",
+        &["/bin/sh", "-c", "echo done"],
+        &bulk,
+        20,
+        4096,
+    );
+
+    let report = settled(&scratch, "sbxe-stdin-ignored", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Succeeded, "{report:?}");
+    assert_eq!(
+        read_stream(&scratch, "sbxe-stdin-ignored", "stdout"),
+        b"done\n"
+    );
+}
+
+/// Sending no stdin still means `/dev/null`, exactly as before.
+///
+/// The forwarding path must not change what an ordinary execution gets. A
+/// command that reads stdin and was given none has to see EOF immediately, not
+/// wait for a writer that will never appear.
+#[test]
+fn an_execution_with_no_stdin_still_reads_nothing_and_exits() {
+    let scratch = Scratch::new();
+
+    start(&scratch, "sbxe-no-stdin", &["/bin/cat"], 20, 4096);
+
+    let report = settled(&scratch, "sbxe-no-stdin", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Succeeded, "{report:?}");
+    assert!(read_stream(&scratch, "sbxe-no-stdin", "stdout").is_empty());
+}
+
+/// The runner itself never puts the secret anywhere under the spool.
+///
+/// This is the property the whole design exists for. stdin carries a token so
+/// that it does not appear in an argv the apiserver audit-logs; writing it to a
+/// filesystem the tenant's workload shares — and which outlives the command —
+/// would trade one durable copy for another.
+///
+/// The command here neither reads nor echoes its stdin, and that is what makes
+/// the assertion about the *runner*. A command that does echo — `cat` — puts
+/// the bytes in `stdout.log` by doing exactly what it was asked to do, and
+/// captured output is a caller's own decision about their own secret. The
+/// boundary this pins is the one Kobe owns: nothing the runner writes of its
+/// own accord — the request file, the report, the stream files it opens —
+/// contains the bytes.
+#[test]
+fn the_runner_itself_never_writes_stdin_to_the_spool() {
+    let scratch = Scratch::new();
+    let secret = b"ghp_never-on-disk-anywhere";
+
+    start_with_stdin(
+        &scratch,
+        "sbxe-stdin-secret",
+        &["/bin/sh", "-c", "exit 0"],
+        secret,
+        20,
+        4096,
+    );
+    settled(&scratch, "sbxe-stdin-secret", Duration::from_secs(20));
+
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(secret.as_slice())
+    };
+    let mut inspected = 0usize;
+    let mut pending = vec![scratch.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            inspected += 1;
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(secret.len()).any(|window| window == secret),
+                "{} holds the raw stdin",
+                path.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(&encoded),
+                "{} holds the encoded stdin",
+                path.display()
+            );
+        }
+    }
+    assert!(inspected > 0, "the execution wrote nothing at all");
+}
+
+/// Stdin past the documented bound is refused, and reserves nothing.
+///
+/// Refused rather than trimmed: half a token is still a secret, and a command
+/// that received half of its input would fail somewhere a long way from the
+/// request that caused it. Refusing before the reservation is what keeps the
+/// caller's id reusable.
+#[test]
+fn oversized_stdin_is_refused_before_anything_is_reserved() {
+    let scratch = Scratch::new();
+    let too_much = vec![b'x'; kobe_runner::protocol::MAX_STDIN_BYTES + 1];
+
+    let reply = start_with_stdin(
+        &scratch,
+        "sbxe-stdin-too-big",
+        &["/bin/cat"],
+        &too_much,
+        20,
+        4096,
+    );
+    assert!(
+        matches!(
+            reply,
+            Reply::Error {
+                code: kobe_runner::protocol::RunnerErrorCode::InvalidRequest
+            }
+        ),
+        "expected an invalid request, got {reply:?}"
+    );
+
+    // Nothing was reserved, so the id is still free rather than occupied by a
+    // command that could never have run.
+    let reply = status(&scratch, "sbxe-stdin-too-big");
     assert!(
         matches!(
             reply,

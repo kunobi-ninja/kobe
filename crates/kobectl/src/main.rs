@@ -69,6 +69,15 @@ enum Commands {
         cwd: Option<String>,
         #[arg(long)]
         timeout: Option<String>,
+        /// Forward this process's stdin to the remote command, then close it.
+        ///
+        /// How a secret reaches a Sandbox without being typed into the command
+        /// line: the exec argv becomes a URL the target apiserver audit-logs
+        /// verbatim, so `--token s3cret` records the token where
+        /// `printf %s "$TOKEN" | kobe exec ... --stdin -- gh auth login
+        /// --with-token` does not.
+        #[arg(long)]
+        stdin: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -223,6 +232,13 @@ enum SandboxAction {
         /// Wall-clock bound for the command (e.g. `30s`, `5m`).
         #[arg(long)]
         timeout: Option<String>,
+        /// Forward this process's stdin to the remote command, then close it.
+        ///
+        /// For secrets and small inputs. The command sees EOF once the bytes
+        /// are delivered, so anything that reads until EOF — `gh auth login
+        /// --with-token` — completes rather than waiting for its timeout.
+        #[arg(long)]
+        stdin: bool,
         /// The command. Everything after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -468,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
             lease,
             cwd,
             timeout,
+            stdin,
             command,
         } => {
             let lease =
@@ -479,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
                     lease,
                     cwd,
                     timeout,
+                    stdin,
                     command,
                 },
                 target,
@@ -636,6 +654,7 @@ async fn dispatch_resource_action(
             lease,
             cwd,
             timeout,
+            stdin,
             command,
         } => {
             commands::sandbox::exec(
@@ -643,6 +662,7 @@ async fn dispatch_resource_action(
                 &command,
                 cwd.as_deref(),
                 timeout.as_deref(),
+                stdin,
                 target,
                 endpoint,
                 output,
@@ -892,6 +912,51 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["kobe", "logs", "sandbox-1", "--follow"]).is_err());
+    }
+
+    /// Forwarding stdin is opt-in, and the flag belongs to kobe rather than to
+    /// the remote command.
+    ///
+    /// Opt-in because a `kobe exec` in a pipeline must not silently start
+    /// consuming the script's own stdin. Before `--` because everything after
+    /// it is the tenant's argv — the argv this feature exists to keep secrets
+    /// out of — so `cat --stdin` has to stay a request to run `cat --stdin`.
+    #[test]
+    fn exec_forwards_stdin_only_when_asked() {
+        let cli = Cli::try_parse_from(["kobe", "exec", "sandbox-1", "--", "true"]).unwrap();
+        assert!(
+            matches!(cli.command, Commands::Exec { stdin: false, .. }),
+            "forwarding stdin must be opt-in: an ordinary exec sends none"
+        );
+
+        // Before `--`, so it cannot be confused with an argument of the remote
+        // command — which is exactly what `--stdin` exists to avoid needing.
+        let cli = Cli::try_parse_from([
+            "kobe",
+            "exec",
+            "sandbox-1",
+            "--stdin",
+            "--",
+            "gh",
+            "auth",
+            "login",
+            "--with-token",
+        ])
+        .unwrap();
+        let Commands::Exec { stdin, command, .. } = cli.command else {
+            panic!("expected exec");
+        };
+        assert!(stdin);
+        assert_eq!(command, ["gh", "auth", "login", "--with-token"]);
+
+        // A `--stdin` after `--` belongs to the remote command, not to kobe.
+        let cli =
+            Cli::try_parse_from(["kobe", "exec", "sandbox-1", "--", "cat", "--stdin"]).unwrap();
+        let Commands::Exec { stdin, command, .. } = cli.command else {
+            panic!("expected exec");
+        };
+        assert!(!stdin);
+        assert_eq!(command, ["cat", "--stdin"]);
     }
 
     #[test]

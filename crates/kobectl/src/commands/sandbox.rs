@@ -174,17 +174,73 @@ struct ExecRequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<&'a str>,
     idempotency_key: &'a str,
+    /// Base64 bytes for the remote process's stdin.
+    ///
+    /// Omitted entirely when unused, so an ordinary `kobe exec` keeps sending
+    /// exactly the body an older Kobe accepts. Serialised into the SAME buffer
+    /// the transport retry re-sends, which is what keeps a retried request the
+    /// same request rather than one that happens to share an idempotency key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdin: Option<&'a str>,
+}
+
+/// Most stdin `kobe exec --stdin` will read before refusing.
+///
+/// The server owns the real bound and returns its own message when a payload
+/// exceeds it — this CLI does not invent explanations for limits it does not
+/// enforce. What this ceiling prevents is the local mistake: an accidental
+/// `kobe exec ... --stdin < a-large-file` buffering gigabytes into memory
+/// before the server ever sees it. Generous on purpose, so the refusal a caller
+/// normally meets is the server's.
+const MAX_LOCAL_STDIN_BYTES: usize = 1024 * 1024;
+
+/// Read the bytes `--stdin` forwards, from this process's own stdin.
+///
+/// Read whole and only then sent, because the request is one JSON document:
+/// there is no streaming half of this API, and pretending otherwise would mean
+/// discovering at byte 900,000 that the request was never going to be accepted.
+/// Bytes rather than text — a token is not required to be UTF-8, and a lossy
+/// conversion would corrupt a credential in a way that surfaces as an
+/// authentication failure far from the cause.
+fn read_stdin_payload(source: &mut impl std::io::Read) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    // One byte past the ceiling, so "exactly at the limit" and "over it" are
+    // distinguishable and the refusal is explicit rather than a silent trim.
+    source
+        .take(MAX_LOCAL_STDIN_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("could not read stdin")?;
+    if bytes.len() > MAX_LOCAL_STDIN_BYTES {
+        anyhow::bail!(
+            "--stdin is for secrets and small inputs, not file transfer: \
+             refusing to send more than {MAX_LOCAL_STDIN_BYTES} bytes"
+        );
+    }
+    Ok(bytes)
 }
 
 /// Run one command in an existing Sandbox lease.
 ///
 /// Returns the exit code the process should use, so the caller decides when to
 /// exit rather than this function calling `exit` from inside a library path.
+///
+/// With `forward_stdin`, this process's own stdin is read to EOF and handed to
+/// the remote process. That is how a secret reaches a Sandbox without being
+/// typed into the argv: the exec argv becomes a URL the target apiserver
+/// audit-logs verbatim, so `--token s3cret` records the token and
+/// `--stdin` does not.
+// One argument past clippy's threshold. These are the CLI's own flags, in the
+// order `kobe exec` declares them; folding them into a struct would move the
+// same list somewhere the command definition no longer sits beside it.
+#[allow(clippy::too_many_arguments)]
 pub async fn exec(
     lease: &str,
     argv: &[String],
     cwd: Option<&str>,
     timeout: Option<&str>,
+    forward_stdin: bool,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
@@ -196,12 +252,23 @@ pub async fn exec(
         anyhow::bail!("a command is required: kobe exec <lease> -- <argv...>");
     }
 
+    // Read before the request is built, so a refusal costs no idempotency key
+    // and no round trip.
+    let stdin = if forward_stdin {
+        use base64::Engine;
+        let bytes = read_stdin_payload(&mut std::io::stdin())?;
+        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        None
+    };
+
     let result = exec_once(
         &config,
         lease,
         argv,
         cwd,
         timeout,
+        stdin.as_deref(),
         &new_idempotency_key(),
         output,
     )
@@ -211,12 +278,14 @@ pub async fn exec(
     Ok(code)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec_once(
     config: &ResolvedConfig,
     lease: &str,
     argv: &[String],
     cwd: Option<&str>,
     timeout: Option<&str>,
+    stdin: Option<&str>,
     idempotency_key: &str,
     output: OutputFormat,
 ) -> Result<ExecutionResponse> {
@@ -226,6 +295,7 @@ async fn exec_once(
         cwd,
         timeout,
         idempotency_key,
+        stdin,
     })?;
     let (status, payload) =
         retry_transport_once(|| send_exec_request(config, &path, &body, output))
@@ -1149,6 +1219,9 @@ async fn exec_once_for_run(
         cwd,
         timeout,
         idempotency_key,
+        // `kobe run` leases, runs and releases in one shot; there is no
+        // interactive stdin to forward and no flag that asks for one.
+        stdin: None,
     })
     .map_err(|error| RunExecutionError::Failure(anyhow::Error::from(error)))?;
     let (status, payload) =
@@ -2152,12 +2225,58 @@ mod tests {
             cwd: Some("/workspace"),
             timeout: Some("60s"),
             idempotency_key: "key-1",
+            stdin: None,
         })
         .unwrap();
 
         assert_eq!(body["idempotencyKey"], "key-1");
         assert!(body.get("idempotency_key").is_none());
         assert_eq!(body["cwd"], "/workspace");
+        // Absent, not null: an older Kobe denies unknown fields, and a request
+        // that forwards no stdin must stay byte-identical to what it accepted
+        // before `--stdin` existed.
+        assert!(body.get("stdin").is_none());
+
+        let body = serde_json::to_value(ExecRequestBody {
+            command: &argv,
+            cwd: None,
+            timeout: None,
+            idempotency_key: "key-1",
+            stdin: Some("czNjcmV0"),
+        })
+        .unwrap();
+        assert_eq!(body["stdin"], "czNjcmV0");
+    }
+
+    /// `--stdin` refuses a file rather than buffering one.
+    ///
+    /// The bound is local and generous — the server owns the real one and its
+    /// message is what a caller normally sees. This exists so an accidental
+    /// `--stdin < a-large-file` fails immediately instead of reading gigabytes
+    /// into memory to build a request that was never going to be accepted.
+    #[test]
+    fn forwarded_stdin_is_refused_rather_than_truncated_past_the_local_bound() {
+        let exact = vec![b'x'; MAX_LOCAL_STDIN_BYTES];
+        assert_eq!(
+            read_stdin_payload(&mut exact.as_slice()).unwrap().len(),
+            MAX_LOCAL_STDIN_BYTES
+        );
+
+        let over = vec![b'x'; MAX_LOCAL_STDIN_BYTES + 1];
+        let error = read_stdin_payload(&mut over.as_slice()).unwrap_err();
+        assert!(
+            error.to_string().contains("not file transfer"),
+            "the refusal must say why: {error}"
+        );
+
+        // Exact bytes, including the ones that are not text: a credential is
+        // not required to be UTF-8.
+        let raw: Vec<u8> = (0u8..=255).collect();
+        assert_eq!(read_stdin_payload(&mut raw.as_slice()).unwrap(), raw);
+
+        // Empty is a legitimate thing to forward, and is not the same as not
+        // passing `--stdin` at all.
+        assert!(read_stdin_payload(&mut [].as_slice()).unwrap().is_empty());
     }
 
     /// An ambiguous transport loss repeats the exact semantic request once.
