@@ -284,12 +284,19 @@ Forward a **pool-declared** port to a local one.
 ```bash
 kobe port-forward dev 8080:http    # by declared name
 kobe port-forward dev 8080:3000    # by declared number
+kobe port-forward dev 8080:5173    # by number, inside a declared range
 ```
 
-Only ports the pool published resolve. Anything else is refused — without
+Only ports the pool declared resolve. Anything else is refused — without
 that, a forward would be a general tunnel into the sandbox's network
 namespace, reaching a debug listener or a metrics endpoint the administrator
 never meant to publish.
+
+A pool declares each port either individually or as a range (see
+[`exposedPorts`](/docs/pools/sandbox-pools#exposedports)). A named port answers to
+its name or its number. A **range answers to a number only** — one name cannot
+identify one port out of thousands, so asking for the range's name is refused
+with reason `port_name_covers_range` rather than resolved to a guess.
 
 The listener binds `127.0.0.1` unless you pass `--bind`. A forward reachable
 from the network turns "a port on my machine" into "a port on the office LAN",

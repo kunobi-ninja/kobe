@@ -60,7 +60,9 @@ pub struct SandboxTarget {
     pub pod_uid: String,
     /// The single container operations may address.
     pub container: String,
-    /// Ports the pool declared. Nothing else is forwardable.
+    /// Ports the pool declared, each as one published port or one authorized
+    /// band. Nothing else is forwardable — a band widens what an
+    /// administrator can *write*, never what a caller may reach beyond it.
     pub ports: Vec<DeclaredPort>,
     /// Where `kobe-runner` lives inside the container, if the pool's image
     /// ships one. `None` means this Sandbox cannot provide the durable
@@ -86,10 +88,38 @@ pub enum TargetPlacement {
     ChildCluster,
 }
 
+/// One entry of the pool's port allowlist, as the resolver sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredPort {
+    /// The pool's name for this declaration.
     pub name: String,
-    pub port: u16,
+    /// What it authorizes.
+    pub reach: DeclaredPortReach,
+}
+
+/// What one [`DeclaredPort`] authorizes.
+///
+/// The two shapes are kept apart rather than collapsed into a `start..=end`
+/// pair because they differ in more than width: only a `Single` answers to its
+/// name, and only a `Single` was published as a `ContainerPort`. Flattening
+/// them would make a one-port range indistinguishable from a published port,
+/// which is a difference the administrator wrote down on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredPortReach {
+    /// Exactly one port, published by the pool and addressable by name.
+    Single(u16),
+    /// A contiguous inclusive band, authorized for forwarding only.
+    Range { start: u16, end: u16 },
+}
+
+impl DeclaredPortReach {
+    /// Whether this declaration authorizes `port`.
+    pub fn contains(&self, port: u16) -> bool {
+        match *self {
+            Self::Single(single) => single == port,
+            Self::Range { start, end } => start <= port && port <= end,
+        }
+    }
 }
 
 /// Why an operation cannot be resolved.
@@ -124,6 +154,11 @@ pub enum SandboxAccessDenied {
     /// The caller asked for a container or port the pool never declared.
     #[error("{what} is not part of this sandbox")]
     NotDeclared { what: &'static str },
+    /// The caller named a port declaration that is a range. The name is real;
+    /// it just does not identify one port, and guessing which of the band they
+    /// meant would forward them somewhere they did not ask for.
+    #[error("that port name covers a range; ask for a port number inside it")]
+    PortNameCoversRange,
     /// More than one live lease carries the alias.
     #[error("more than one sandbox uses this alias")]
     AmbiguousAlias,
@@ -162,6 +197,7 @@ impl SandboxAccessDenied {
             Self::ProvenanceIncomplete => "provenance_incomplete",
             Self::PoolUnresolvable => "pool_unresolvable",
             Self::NotDeclared { .. } => "not_declared",
+            Self::PortNameCoversRange => "port_name_covers_range",
             Self::AmbiguousAlias => "ambiguous_alias",
             Self::Backend => "backend_error",
         }
@@ -177,7 +213,7 @@ impl SandboxAccessDenied {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::NotReady { .. } | Self::TargetUnresolved => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
-            Self::NotDeclared { .. } => StatusCode::BAD_REQUEST,
+            Self::NotDeclared { .. } | Self::PortNameCoversRange => StatusCode::BAD_REQUEST,
             // 409 rather than 400: the request is well-formed, and the caller
             // fixes it by changing their leases rather than their command.
             Self::AmbiguousAlias => StatusCode::CONFLICT,
@@ -233,6 +269,39 @@ fn expiry_permits_access(
 /// Pure, so the fencing rules are testable without a cluster, and separated
 /// from the lookup so that no code path can construct a target from anything
 /// other than what placement recorded.
+///
+/// # Identity is pinned; policy is not
+///
+/// The two halves of this function read from deliberately different places,
+/// and the split is the point.
+///
+/// *Which objects* this lease may address comes from `lease.status.target` —
+/// the exact UIDs placement recorded. Nothing here looks an object up by name.
+///
+/// *What a caller may do to them* — the default container, the port
+/// allowlist, `runnerPath`, `attachCommand` — comes from the pool as it exists
+/// **now**, fenced only on its UID. It is deliberately NOT pinned to
+/// `spec.poolRef.generation`, and that is the opposite of what lease
+/// reconciliation does with the same reference.
+///
+/// The reason they differ is that they are answering different questions.
+/// Reconciliation is *building* a workload, and building it against a spec
+/// nobody admitted the caller to would run their code under configuration
+/// they never agreed to; so it pins the generation and refuses to move.
+/// Access is *policy*, and policy is what the administrator believes today.
+/// An administrator who removes a port from a pool is revoking it, and a
+/// revocation that only applies to leases created afterwards is not a
+/// revocation — the live leases are exactly the ones reaching the port. So an
+/// edit takes effect on the next request against every existing lease, in both
+/// directions: a number that was added becomes reachable, a number that was
+/// removed stops resolving.
+///
+/// What that widening cannot do is reach past the pool: a newly authorized
+/// number reaches only the Pod this lease already owns, over a port-forward
+/// into its network namespace, and only if something in that Pod is listening.
+/// The UID fence is what still matters — a pool deleted and recreated under
+/// the same name is a different administrator's decision and is refused
+/// outright, because then "the current pool" is no longer this pool at all.
 pub fn target_from_provenance(
     lease: &SandboxLease,
     pool: &SandboxPool,
@@ -317,9 +386,43 @@ pub fn target_from_provenance(
             .exposed_ports
             .iter()
             .filter(|port| port.container == pool.spec.template.default_container)
-            .map(|port| DeclaredPort {
-                name: port.name.clone(),
-                port: port.port,
+            // Every declaration is re-checked here, at the last place before
+            // it becomes an authorization, rather than trusted because
+            // admission should have checked it. This GET reads the pool
+            // directly and calls no validator, so a pool that reached etcd by
+            // some other route — a CRD applied without the CEL rules, a
+            // restore, a direct write — would otherwise be honoured unchecked.
+            //
+            // A declaration that sets neither field or both authorizes nothing
+            // and is dropped rather than repaired: the safe reading of an
+            // ambiguous declaration is the empty one, and it is the same
+            // reading `SandboxPortSpec::published_port` takes.
+            //
+            // A band is also held to the numbers `SandboxPoolSpec::validate`
+            // holds it to. An inverted band already matched nothing, so that
+            // part is belt-and-braces — but a band wider than
+            // `MAX_PORT_RANGE_SPAN` would have authorized more than any
+            // admissible manifest can express, which is the one case where
+            // skipping the check actually widens the reachable set.
+            .filter_map(|port| {
+                let reach = match (port.port, port.port_range) {
+                    (Some(single), None) if single != 0 => DeclaredPortReach::Single(single),
+                    (None, Some(range))
+                        if range.start != 0
+                            && range.start <= range.end
+                            && range.span() <= crate::crd::MAX_PORT_RANGE_SPAN =>
+                    {
+                        DeclaredPortReach::Range {
+                            start: range.start,
+                            end: range.end,
+                        }
+                    }
+                    _ => return None,
+                };
+                Some(DeclaredPort {
+                    name: port.name.clone(),
+                    reach,
+                })
             })
             .collect(),
         // Taken from the pool that admitted this lease, never from the caller.
@@ -336,18 +439,37 @@ pub fn target_from_provenance(
 impl SandboxTarget {
     /// Resolve a caller-named port against the pool's declaration.
     ///
-    /// Accepts a declared name or a declared number, and nothing else. Without
-    /// this, port-forward is a general tunnel into the Pod's network namespace
-    /// — reaching a debug listener, a metrics endpoint, or anything else bound
-    /// on localhost that the administrator never meant to publish.
+    /// The rule, exactly:
+    ///
+    /// 1. A **name** resolves only against a single-port declaration, to that
+    ///    port. A name that belongs to a `portRange` is refused with
+    ///    [`SandboxAccessDenied::PortNameCoversRange`] — the name is real, but
+    ///    it covers thousands of ports and picking one would forward the
+    ///    caller somewhere they never asked for.
+    /// 2. A **number** resolves when some declaration authorizes it: it equals
+    ///    a declared single port, or it falls inside a declared `portRange`.
+    ///    Overlapping declarations union; the number is the answer either way,
+    ///    so which declaration matched cannot change the result.
+    /// 3. Anything else is refused.
+    ///
+    /// So a ranged port is reached by number, and only by number.
+    ///
+    /// Widening the *shape* of a declaration does not widen the rule: what a
+    /// caller may reach is still exactly what an administrator wrote in the
+    /// pool. Without that, port-forward is a general tunnel into the Pod's
+    /// network namespace — reaching a debug listener, a metrics endpoint, or
+    /// anything else bound on localhost that nobody meant to publish.
     pub fn resolve_port(&self, requested: &str) -> Result<u16, SandboxAccessDenied> {
         if let Some(port) = self.ports.iter().find(|port| port.name == requested) {
-            return Ok(port.port);
+            return match port.reach {
+                DeclaredPortReach::Single(single) => Ok(single),
+                DeclaredPortReach::Range { .. } => Err(SandboxAccessDenied::PortNameCoversRange),
+            };
         }
         if let Ok(number) = requested.parse::<u16>()
-            && let Some(port) = self.ports.iter().find(|port| port.port == number)
+            && self.ports.iter().any(|port| port.reach.contains(number))
         {
-            return Ok(port.port);
+            return Ok(number);
         }
         Err(SandboxAccessDenied::NotDeclared { what: "port" })
     }
@@ -998,6 +1120,7 @@ mod tests {
             sandbox: Some(reference("Sandbox", "sbx", "sandbox-uid")),
             pod: Some(reference("Pod", "sbx-0", "pod-uid")),
             service: None,
+            service_required: None,
         });
         lease
     }
@@ -1220,6 +1343,279 @@ mod tests {
         assert_eq!(target.resolve_port("03000").unwrap(), 3000);
     }
 
+    /// A pool that declares only single ports behaves exactly as it did
+    /// before ranges existed.
+    ///
+    /// The `portRange` shape is additive, and this is the test that says so:
+    /// the same declaration, the same target, the same resolutions, the same
+    /// refusals. A regression here means an administrator's existing manifest
+    /// changed meaning under them.
+    #[test]
+    fn a_single_port_pool_is_unchanged_by_the_range_shape() {
+        let target = target_from_provenance(&ready_lease(), &pool(), now()).unwrap();
+
+        assert_eq!(
+            target.ports,
+            vec![DeclaredPort {
+                name: "http".into(),
+                reach: DeclaredPortReach::Single(3000),
+            }],
+            "a single-port declaration must still carry exactly one port"
+        );
+        assert_eq!(target.resolve_port("http").unwrap(), 3000);
+        assert_eq!(target.resolve_port("3000").unwrap(), 3000);
+        assert_eq!(
+            target.resolve_port("2999").unwrap_err(),
+            SandboxAccessDenied::NotDeclared { what: "port" },
+            "a neighbour of a declared single port is not a range"
+        );
+        assert_eq!(
+            target.resolve_port("3001").unwrap_err(),
+            SandboxAccessDenied::NotDeclared { what: "port" },
+            "a neighbour of a declared single port is not a range"
+        );
+    }
+
+    /// A number inside a declared range resolves to itself.
+    ///
+    /// This is the whole point of `portRange`: a workstation pool authorizes
+    /// the dev-server band once, and a developer reaches whatever they started
+    /// today without an edit to GitOps and a re-lease.
+    #[test]
+    fn a_number_inside_a_declared_range_is_forwardable() {
+        let target = ranged_target();
+
+        for inside in ["3000", "3001", "5173", "8080", "9998", "9999"] {
+            assert_eq!(
+                target.resolve_port(inside).unwrap(),
+                inside.parse::<u16>().unwrap(),
+                "port {inside} is inside the declared range"
+            );
+        }
+
+        // The single declaration alongside the range keeps working, by name
+        // and by number, and the two do not interfere.
+        assert_eq!(target.resolve_port("http").unwrap(), 80);
+        assert_eq!(target.resolve_port("80").unwrap(), 80);
+    }
+
+    /// Undeclared still means unauthorized. A range widens the shape of a
+    /// declaration, never the rule.
+    ///
+    /// This is the invariant `portRange` exists inside, not beside: the
+    /// administrator still decides. Every number here is one an operator might
+    /// plausibly have listening — an SSH daemon, a metrics endpoint, a
+    /// kubelet — and each sits outside every declaration, so each is refused.
+    /// Without this the forward is a general tunnel into the Pod's network
+    /// namespace.
+    #[test]
+    fn a_number_outside_every_declaration_is_refused() {
+        let target = ranged_target();
+
+        for outside in [
+            "22",    // ssh
+            "79",    // one below the declared single
+            "81",    // one above the declared single
+            "2379",  // etcd, below the band
+            "2999",  // one below the band
+            "10000", // one above the band
+            "10250", // kubelet
+            "65535", // the top of the space
+        ] {
+            assert_eq!(
+                target.resolve_port(outside).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "port {outside} is outside every declaration and must be refused"
+            );
+        }
+
+        // A port inside the band IS reachable, including one an operator
+        // might not have thought about — that is the administrator's decision
+        // to make when they choose a band instead of an enumeration, and the
+        // reason the cap on how wide a band may be exists at all.
+        assert_eq!(target.resolve_port("9090").unwrap(), 9090);
+
+        // Nor can a malformed number, a negative, or an overflowing one slip
+        // past the parse into the band.
+        for malformed in [
+            "", "-1", "3000 ", " 3000", "65536", "3000.0", "0x1f90", "ssh",
+        ] {
+            assert_eq!(
+                target.resolve_port(malformed).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "port {malformed:?} must be refused"
+            );
+        }
+    }
+
+    /// A range's NAME does not resolve; only a number inside it does.
+    ///
+    /// One name cannot identify one port out of thousands, and picking one for
+    /// the caller would forward them somewhere they never asked for. Refused
+    /// with its own reason rather than "not declared", because the name IS
+    /// declared and telling the caller otherwise sends them looking for a
+    /// typo that is not there.
+    #[test]
+    fn a_range_is_addressed_by_number_and_never_by_name() {
+        let target = ranged_target();
+
+        assert_eq!(
+            target.resolve_port("dev").unwrap_err(),
+            SandboxAccessDenied::PortNameCoversRange,
+        );
+        assert_eq!(
+            SandboxAccessDenied::PortNameCoversRange.http_status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "the caller fixes this by changing their command"
+        );
+        assert_eq!(
+            SandboxAccessDenied::PortNameCoversRange.reason_code(),
+            "port_name_covers_range",
+        );
+    }
+
+    /// A declaration that is neither a port nor a range authorizes nothing.
+    ///
+    /// Admission refuses that shape twice over, so this is the third fence:
+    /// were one ever to reach the resolver, it must not become a wildcard, an
+    /// implicit zero, or a port the pool never wrote down.
+    #[test]
+    fn an_ambiguous_declaration_authorizes_nothing() {
+        let mut pool = pool();
+        pool.spec.template.exposed_ports = vec![
+            crate::crd::SandboxPortSpec {
+                name: "broken".into(),
+                container: "agent".into(),
+                port: None,
+                port_range: None,
+            },
+            crate::crd::SandboxPortSpec {
+                name: "both".into(),
+                container: "agent".into(),
+                port: Some(3000),
+                port_range: Some(crate::crd::SandboxPortRange {
+                    start: 4000,
+                    end: 4100,
+                }),
+            },
+        ];
+        let target = target_from_provenance(&ready_lease(), &pool, now()).unwrap();
+
+        assert!(
+            target.ports.is_empty(),
+            "an ambiguous declaration must be dropped, not repaired"
+        );
+        for requested in ["broken", "both", "3000", "4050", "0"] {
+            assert_eq!(
+                target.resolve_port(requested).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "{requested:?} must be refused"
+            );
+        }
+    }
+
+    /// A band that no admissible manifest could express authorizes nothing.
+    ///
+    /// This resolver reads the pool with a plain GET and calls no validator,
+    /// so it is the last fence in front of a pool that reached etcd without
+    /// passing admission — a CRD applied without its CEL rules, an etcd
+    /// restore, a direct write. An inverted band already matched nothing, but
+    /// a band wider than [`crate::crd::MAX_PORT_RANGE_SPAN`], or one anchored
+    /// at the reserved zero, would have been honoured in full: the cap that
+    /// stops `portRange` from being spelled as "everything" only ever ran at
+    /// admission, and forwarding is where it would have mattered.
+    #[test]
+    fn a_band_outside_the_admissible_shape_authorizes_nothing() {
+        let band = |start: u16, end: u16| crate::crd::SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: None,
+            port_range: Some(crate::crd::SandboxPortRange { start, end }),
+        };
+        let cap = u16::try_from(crate::crd::MAX_PORT_RANGE_SPAN).unwrap();
+        let cases = [
+            // Wider than the cap by exactly one port.
+            (band(1, cap + 1), "8000", "a band one port over the cap"),
+            // The whole port space, which is the shape the cap exists for.
+            (band(1, u16::MAX), "8000", "a band covering everything"),
+            // Zero is not a port, so a band anchored at it is not a band.
+            (band(0, 100), "50", "a band starting at zero"),
+            // Already inert, pinned so it stays inert.
+            (band(9999, 3000), "5000", "an inverted band"),
+        ];
+
+        for (declaration, requested, what) in cases {
+            let mut pool = pool();
+            pool.spec.template.exposed_ports = vec![declaration];
+            let target = target_from_provenance(&ready_lease(), &pool, now()).unwrap();
+            assert!(
+                target.ports.is_empty(),
+                "{what} must be dropped, not carried"
+            );
+            assert_eq!(
+                target.resolve_port(requested).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "{what} must authorize nothing"
+            );
+        }
+
+        // The widest band an administrator can actually write still works, so
+        // the check refuses only what admission would have refused.
+        let mut pool = pool();
+        pool.spec.template.exposed_ports = vec![band(1, cap)];
+        assert_eq!(
+            pool.spec.validate(),
+            Ok(()),
+            "the fixture must be exactly the widest band admission accepts"
+        );
+        let target = target_from_provenance(&ready_lease(), &pool, now()).unwrap();
+        assert_eq!(target.resolve_port("8000").unwrap(), 8000);
+    }
+
+    /// A pool edit is a policy change, and it reaches every live lease.
+    ///
+    /// Access resolution fences the pool on UID but deliberately does NOT pin
+    /// `spec.poolRef.generation`, which is the opposite of what lease
+    /// reconciliation does with the same reference. The asymmetry is the
+    /// design: reconciliation is building a workload and must build the one
+    /// that was admitted, while this is policy, and a revocation that applied
+    /// only to future leases would leave the ports reachable on exactly the
+    /// leases already reaching them. Pinned here so the choice cannot be
+    /// quietly reversed by pinning the generation "for consistency".
+    #[test]
+    fn a_pool_edit_changes_what_an_existing_lease_may_reach() {
+        let lease = ready_lease();
+        let mut edited = pool();
+        edited.metadata.generation = Some(lease.spec.pool_ref.generation + 40);
+        edited.spec.template.exposed_ports = vec![crate::crd::SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: Some(5173),
+            port_range: None,
+        }];
+
+        let target = target_from_provenance(&lease, &edited, now()).unwrap();
+        assert_eq!(
+            target.resolve_port("5173").unwrap(),
+            5173,
+            "a newly declared port is reachable on a lease admitted before it"
+        );
+        assert_eq!(
+            target.resolve_port("3000").unwrap_err(),
+            SandboxAccessDenied::NotDeclared { what: "port" },
+            "a withdrawn port is revoked on a lease admitted while it was declared"
+        );
+
+        // The UID fence is what still holds: a pool deleted and recreated
+        // under the same name is a different administrator's decision.
+        let mut recreated = pool();
+        recreated.metadata.uid = Some("pool-uid-2".into());
+        assert_eq!(
+            target_from_provenance(&lease, &recreated, now()).unwrap_err(),
+            SandboxAccessDenied::PoolUnresolvable
+        );
+    }
+
     /// The forwardable set is exactly what the pool declared.
     ///
     /// Carried on the target so #83's port-forward cannot improvise one:
@@ -1233,9 +1629,55 @@ mod tests {
             target.ports,
             vec![DeclaredPort {
                 name: "http".into(),
-                port: 3000
+                reach: DeclaredPortReach::Single(3000),
             }]
         );
+
+        let ranged = ranged_target();
+        assert_eq!(
+            ranged.ports,
+            vec![
+                DeclaredPort {
+                    name: "http".into(),
+                    reach: DeclaredPortReach::Single(80),
+                },
+                DeclaredPort {
+                    name: "dev".into(),
+                    reach: DeclaredPortReach::Range {
+                        start: 3000,
+                        end: 9999,
+                    },
+                },
+            ],
+            "a range is carried as a band, not expanded and not dropped"
+        );
+    }
+
+    /// A workstation-shaped pool: one published port and one authorized band.
+    ///
+    /// Both on the default container, since that is the only container a
+    /// caller may address and therefore the only one whose ports reach the
+    /// target at all.
+    fn ranged_target() -> SandboxTarget {
+        let mut pool = pool();
+        pool.spec.template.exposed_ports = vec![
+            crate::crd::SandboxPortSpec {
+                name: "http".into(),
+                container: "agent".into(),
+                port: Some(80),
+                port_range: None,
+            },
+            crate::crd::SandboxPortSpec {
+                name: "dev".into(),
+                container: "agent".into(),
+                port: None,
+                port_range: Some(crate::crd::SandboxPortRange {
+                    start: 3000,
+                    end: 9999,
+                }),
+            },
+        ];
+        target_from_provenance(&ready_lease(), &pool, now()).unwrap()
     }
 
     /// A caller cannot ask the operator to buffer an unbounded log.

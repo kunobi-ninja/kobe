@@ -2659,7 +2659,9 @@ async fn sandbox_port_forward<B: ClusterBackend>(
 
     // Only what the pool declared. Without this the forward is a general
     // tunnel into the Pod's network namespace, reaching a debug listener or a
-    // metrics endpoint the administrator never meant to publish.
+    // metrics endpoint the administrator never meant to publish. A pool may
+    // declare a port or a range, but the rule is the same either way and lives
+    // in one place: see `SandboxTarget::resolve_port`.
     let port = match context.target.resolve_port(&query.port) {
         Ok(port) => port,
         Err(denied) => return access_denied(&identity, &id, "port-forward", denied),
@@ -14003,6 +14005,7 @@ mod tests {
             sandbox: Some(reference("Sandbox", "sbx")),
             pod: Some(reference("Pod", "sbx-0")),
             service: Some(reference("Service", "sbx")),
+            service_required: None,
         };
 
         let visible = caller_visible_provenance(target.clone());

@@ -756,6 +756,7 @@ pub fn child_provenance(
         sandbox: None,
         pod: None,
         service: None,
+        service_required: None,
     }
 }
 

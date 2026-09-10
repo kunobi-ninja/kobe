@@ -1531,7 +1531,16 @@ pub async fn reconcile_lease(
     // a name reused between placement and access would send a caller's exec
     // into somebody else's Pod. Recorded here, where the objects have just
     // been observed, rather than looked up again at access time.
-    let service_required = !pool.spec.template.exposed_ports.is_empty();
+    // A Service exists only when the pool PUBLISHES a port. A `portRange`
+    // authorizes forwarding without publishing anything, so a range-only pool
+    // correctly records no Service identity here and is not held to one.
+    //
+    // `pool` is fenced above to the exact UID *and* generation this lease was
+    // admitted against, which is what makes this answer safe to persist: the
+    // negative is recorded as `service_required` in the same status write, and
+    // release reads it back instead of asking a pool that may since have been
+    // edited into a different generation, or deleted.
+    let service_required = pool.spec.template.requires_service();
     if target.owned && !management_provenance_is_complete(&status, service_required) {
         let provenance = match observed_provenance(&target, &claim, &status, service_required).await
         {
@@ -1608,7 +1617,10 @@ pub async fn reconcile_lease(
     let ready_at = persisted_ready_at(&status).unwrap_or_else(chrono::Utc::now);
     let resource_version = claim.resource_version().unwrap_or_default();
 
-    let next_status = match crate::sandbox::mark_sandbox_ready(
+    // Captured BEFORE the transition: only the pass that actually moves the
+    // lease into Ready may record the Service requirement below.
+    let phase_before_ready = status.phase;
+    let mut next_status = match crate::sandbox::mark_sandbox_ready(
         &status,
         observed_generation,
         ready_at,
@@ -1631,6 +1643,8 @@ pub async fn reconcile_lease(
             return Ok(Action::requeue(std::time::Duration::from_secs(30)));
         }
     };
+
+    record_service_requirement_at_ready(phase_before_ready, &mut next_status, service_required);
 
     // Stamp the upstream absolute shutdown time as a BACKSTOP. If Kobe stops
     // reconciling — crash, upgrade, lost credentials — the upstream controller
@@ -3511,28 +3525,53 @@ fn recorded_reference_is_exact(
         && !reference.uid.is_empty()
 }
 
+/// Decide from the lease alone whether an absent Service reference is
+/// legitimate, or `None` when only the pool can answer.
+///
+/// Split out from [`missing_service_provenance_is_allowed`] so the decision
+/// that gates a release can be pinned by a test without a backend: the two
+/// answers that strand capacity forever are exactly the ones worth asserting.
+fn recorded_service_requirement(lease: &SandboxLease) -> Option<TargetFootprintCheck> {
+    let status = lease.status.as_ref();
+    // A cancelled Provisioning lease may legitimately never have reached the
+    // point where the upstream controller created a Service. Label-scoped
+    // enumeration behind the inert Claim tombstone proves that negative. Once
+    // Ready was reached, however, a published port implies a Service existed
+    // and its exact identity had to be checkpointed.
+    if status.and_then(|status| status.ready_at.as_ref()).is_none() {
+        return Some(TargetFootprintCheck::Verified);
+    }
+    let status = status?;
+    // Placement wrote this down while the pool it was fenced to was still the
+    // pool that admitted the lease. That is the only moment the answer is
+    // knowable, so it is the moment it is recorded — see
+    // [`crate::crd::SandboxTargetProvenance::service_required`].
+    match status.target.as_ref()?.service_required? {
+        false => Some(TargetFootprintCheck::Verified),
+        true => Some(TargetFootprintCheck::Quarantine(
+            "required_service_provenance_missing",
+        )),
+    }
+}
+
 /// Determine whether an absent Service reference is legitimate.
 ///
-/// New exposed-port leases checkpoint the exact Service UID before Ready. For
-/// an older lease that lacks it, the exact Pool generation is the only durable
-/// source for whether a Service was required. A missing/replaced/stale Pool
-/// cannot prove the negative and therefore fails closed.
+/// A lease that published a port checkpoints the exact Service UID before
+/// Ready, and records alongside it whether one was required at all. When that
+/// record is present it is the answer, and the pool is never consulted: the
+/// pool is mutable and the lease is not, so asking it would make release
+/// depend on whether an administrator has since edited an unrelated field.
+///
+/// Only a lease placed before that record existed falls through to the pool,
+/// where the exact admitted generation is the sole durable source for the same
+/// question. A missing, replaced, or moved-on pool cannot prove the negative
+/// and therefore fails closed — which is exactly why the record exists.
 async fn missing_service_provenance_is_allowed(
     lease: &SandboxLease,
     ctx: &SandboxContext,
 ) -> TargetFootprintCheck {
-    // A cancelled Provisioning lease may legitimately never have reached the
-    // point where the upstream controller created a Service. Label-scoped
-    // enumeration behind the inert Claim tombstone proves that negative. Once Ready was
-    // reached, however, exposed ports imply a Service existed and its exact
-    // identity had to be checkpointed.
-    if lease
-        .status
-        .as_ref()
-        .and_then(|status| status.ready_at.as_ref())
-        .is_none()
-    {
-        return TargetFootprintCheck::Verified;
+    if let Some(recorded) = recorded_service_requirement(lease) {
+        return recorded;
     }
     let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match pools.get(&lease.spec.pool_ref.name).await {
@@ -3540,7 +3579,7 @@ async fn missing_service_provenance_is_allowed(
             if pool.uid().as_deref() == Some(lease.spec.pool_ref.uid.as_str())
                 && pool.metadata.generation == Some(lease.spec.pool_ref.generation) =>
         {
-            if pool.spec.template.exposed_ports.is_empty() {
+            if !pool.spec.template.requires_service() {
                 TargetFootprintCheck::Verified
             } else {
                 TargetFootprintCheck::Quarantine("required_service_provenance_missing")
@@ -4958,6 +4997,7 @@ async fn drive_release(
                 sandbox: None,
                 pod: None,
                 service: None,
+                service_required: None,
             });
         if target.namespace != ctx.namespace {
             return quarantine_lease(lease, ctx, "claim_namespace_changed").await;
@@ -5849,6 +5889,7 @@ async fn release_child_composition(
                                 sandbox: None,
                                 pod: None,
                                 service: None,
+                                service_required: None,
                             });
                     proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
                     proposed.child_cluster_lease = Some(reference);
@@ -5905,6 +5946,7 @@ async fn release_child_composition(
                                 sandbox: None,
                                 pod: None,
                                 service: None,
+                                service_required: None,
                             });
                     if target.namespace != CHILD_SANDBOX_NAMESPACE {
                         return quarantine_lease(lease, ctx, "child_target_namespace_changed")
@@ -7982,6 +8024,7 @@ async fn observed_management_pool_provenance(
             sandbox: None,
             pod: None,
             service: None,
+            service_required: None,
         });
     proposed.sandbox_template = Some(observed.remove(0));
     proposed.sandbox_warm_pool = Some(observed.remove(0));
@@ -8001,6 +8044,49 @@ fn workload_provenance_is_complete(
             && target.pod.is_some()
             && (!service_required || target.service.is_some())
     })
+}
+
+/// Record, in the same status write that makes a lease Ready, whether the pool
+/// that placed it published a port.
+///
+/// [`observed_provenance`] is the only other writer of
+/// `target.serviceRequired`. On the MANAGEMENT path it runs only while
+/// provenance is incomplete — a predicate about object identities, which never
+/// mentions this flag. (The child-placed branch calls it unconditionally, so a
+/// child lease is not exposed to the gap below.) A
+/// controller that checkpointed complete provenance while the lease was still
+/// `Provisioning` and stopped before the separate Ready write therefore hands
+/// the next controller a lease it carries all the way to Ready without ever
+/// re-entering that writer. Left alone, such a lease would be Ready with no
+/// record and would be stranded on the legacy pool-generation fallback the
+/// moment anyone edited its pool — the exact failure this field exists to
+/// remove.
+///
+/// Written from the pool already fenced to the lease's admitted UID *and*
+/// generation, into the status patch that is happening anyway, so it costs no
+/// extra round trip and — unlike a backfill — re-observes nothing.
+///
+/// Only the transition writes it. A management lease that is ALREADY Ready is
+/// left as it is — not because the answer needs its Pod (this function proves
+/// it does not: the pool alone decides) but because the admitted pool
+/// GENERATION has since moved, and that is the input a backfill cannot
+/// recover. Re-entering `observed_provenance` for one would also re-observe a
+/// Pod that may have been replaced, failing a merge that today never runs.
+fn record_service_requirement_at_ready(
+    phase_before_ready: crate::crd::SandboxLeasePhase,
+    next: &mut crate::crd::SandboxLeaseStatus,
+    service_required: bool,
+) {
+    if phase_before_ready == crate::crd::SandboxLeasePhase::Ready {
+        return;
+    }
+    if let Some(target) = next.target.as_mut() {
+        // Never overwrites. The flag is monotonic in `merge_target_provenance`
+        // and immutable in CEL once recorded, and a second opinion about a
+        // fenced pool could only come from re-deriving against a pool this
+        // lease was never admitted against.
+        target.service_required.get_or_insert(service_required);
+    }
 }
 
 fn management_provenance_is_complete(
@@ -8099,6 +8185,13 @@ async fn observed_provenance(
             .as_deref()
             .zip(resolved.service_uid.as_deref())
             .map(|(name, uid)| reference("v1", "Service", name, uid)),
+        // The caller derived this from the pool the reconciler already fenced
+        // to this lease's admitted UID and generation, so it is the admitted
+        // answer and not the current one. Written here, in the same status
+        // patch as the identities above, because release has to be able to
+        // tell "no Service was ever required" from "the Service identity is
+        // missing" long after that pool generation is gone.
+        service_required: Some(service_required),
     }))
 }
 
@@ -8611,6 +8704,7 @@ async fn compose_child_target(
             sandbox: None,
             pod: None,
             service: None,
+            service_required: None,
         });
     proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
     proposed.child_cluster_lease = Some(crate::crd::SandboxObjectReference {
@@ -10105,7 +10199,8 @@ pub(crate) mod tests {
                     exposed_ports: vec![SandboxPortSpec {
                         name: "http".into(),
                         container: "agent".into(),
-                        port: 3000,
+                        port: Some(3000),
+                        port_range: None,
                     }],
                     runner_path: None,
                     attach_command: None,
@@ -10343,6 +10438,7 @@ pub(crate) mod tests {
                     )),
                     pod: Some(reference("v1", "Pod", "sandbox-pod", "pod-uid")),
                     service: Some(reference("v1", "Service", "sandbox-service", "service-uid")),
+                    service_required: None,
                 }),
                 ..Default::default()
             }),
@@ -12379,6 +12475,17 @@ pub(crate) mod tests {
         );
         advance_lease_to_latest_status(&mut lease, &server, "lease-rv-8").await;
 
+        // Resume the checkpoint an older controller could leave behind:
+        // complete workload identities, still Provisioning, and no flag. Without
+        // this the test never exercises the Ready-path insertion at all — it
+        // passed even with that production call deleted, which is no guard.
+        let resumed = lease.status.as_mut().unwrap();
+        assert_eq!(resumed.phase, crate::crd::SandboxLeasePhase::Provisioning);
+        let target = resumed.target.as_mut().unwrap();
+        assert_eq!(target.service_required, Some(true));
+        target.service_required = None;
+        assert!(management_provenance_is_complete(resumed, true));
+
         reconcile_lease(Arc::new(lease), ctx).await.unwrap();
 
         assert!(
@@ -12397,6 +12504,11 @@ pub(crate) mod tests {
             .filter_map(status_value_of)
             .find(|status| status["phase"] == "Ready")
             .expect("Ready status write");
+        assert_eq!(
+            ready_status["target"]["serviceRequired"],
+            serde_json::json!(true),
+            "the Ready patch must fill the flag even when provenance was already complete"
+        );
         assert!(
             ready_status["conditions"]
                 .as_array()
@@ -15482,6 +15594,7 @@ pub(crate) mod tests {
             sandbox: None,
             pod: None,
             service: None,
+            service_required: None,
         });
         status.allocation_fence = Some(crate::crd::SandboxObjectReference {
             api_version: "coordination.k8s.io/v1".into(),
@@ -18358,6 +18471,251 @@ current-context: child
             resource.api_version,
             crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_API_VERSION,
             "placement must write the version #72 validates"
+        );
+    }
+
+    /// A Ready lease that owns no Service, with the pool it was admitted
+    /// against still reachable at some generation.
+    ///
+    /// `service_required` is what placement would have written: the answer
+    /// derived from the exact fenced generation, at the only moment it was
+    /// knowable.
+    fn ready_lease_without_service(recorded_requirement: Option<bool>) -> SandboxLease {
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some("2026-08-20T01:00:00Z".into());
+        let target = status.target.as_mut().unwrap();
+        target.service = None;
+        target.service_required = recorded_requirement;
+        lease
+    }
+
+    /// A pool that authorizes a band and publishes nothing, so it owns no
+    /// Service — served at whatever generation the test needs.
+    fn range_only_pool(generation: i64) -> SandboxPool {
+        let mut pool = management_pool(POOL_UID, generation);
+        pool.spec.template.exposed_ports = vec![SandboxPortSpec {
+            name: "dev".into(),
+            container: "agent".into(),
+            port: None,
+            port_range: Some(crate::crd::SandboxPortRange {
+                start: 3000,
+                end: 9999,
+            }),
+        }];
+        assert!(
+            !pool.spec.template.requires_service(),
+            "fixture must be the shape that legitimately owns no Service"
+        );
+        pool
+    }
+
+    async fn provenance_context(pool: Option<SandboxPool>) -> (Arc<SandboxContext>, MockServer) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        if let Some(pool) = pool {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/{NS}/sandboxpools/agents"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+                .mount(&server)
+                .await;
+        }
+        let ctx = Arc::new(SandboxContext {
+            client: crate::testutil::mock_k8s_client(&server),
+            namespace: NS.into(),
+            reservation_namespace: NS.into(),
+            shutdown: CancellationToken::new(),
+            access_ledger_enabled: false,
+            placement_enabled: true,
+            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
+            managed_runtime_identity: None,
+        });
+        (ctx, server)
+    }
+
+    async fn pool_was_read(server: &MockServer) -> bool {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path().ends_with("/sandboxpools/agents"))
+    }
+
+    /// A lease that never owed a Service stays releasable after its pool is
+    /// edited.
+    ///
+    /// This is the capacity leak. Release used to prove "no Service was
+    /// required" by re-reading the pool and demanding its generation still
+    /// equal the admitted one. Every edit to a pool bumps that generation, so
+    /// one unrelated field change turned every live range-only lease into a
+    /// permanent `service_requirement_pool_identity_changed` quarantine:
+    /// finalizer, quota, and alias held forever, with no operator action —
+    /// not restoring the spec, not deleting the workload — able to undo it,
+    /// because a generation only ever moves forward.
+    ///
+    /// The record placement wrote is now the answer, and the pool is not
+    /// consulted at all. That is asserted directly: a pool served at a
+    /// different generation is *available* here, and the counterexample is
+    /// that nothing asks it.
+    #[tokio::test]
+    async fn a_lease_that_owed_no_service_releases_after_its_pool_generation_moves() {
+        let (ctx, server) = provenance_context(Some(range_only_pool(POOL_GENERATION + 1))).await;
+        let lease = ready_lease_without_service(Some(false));
+
+        assert_eq!(
+            validate_management_target_provenance(&lease, &ctx).await,
+            TargetFootprintCheck::Verified,
+            "an edited pool must not strand a lease that legitimately owns no Service"
+        );
+        assert!(
+            !pool_was_read(&server).await,
+            "the durable record decides; a mutable pool must not be able to change the answer"
+        );
+    }
+
+    /// Deleting the pool outright does not strand the lease either.
+    ///
+    /// The generation check had a companion failure: with the pool gone the
+    /// answer became `service_requirement_pool_missing`, which is the same
+    /// dead end reached from the other direction. Release is evaluated before
+    /// the pool is resolved precisely because a deleted pool is when capacity
+    /// most needs to come back.
+    #[tokio::test]
+    async fn a_lease_that_owed_no_service_releases_after_its_pool_is_deleted() {
+        let (ctx, server) = provenance_context(None).await;
+        let lease = ready_lease_without_service(Some(false));
+
+        assert_eq!(
+            validate_management_target_provenance(&lease, &ctx).await,
+            TargetFootprintCheck::Verified
+        );
+        assert!(!pool_was_read(&server).await);
+    }
+
+    /// The recorded answer does not move when the pool underneath it does.
+    ///
+    /// That is narrower than "the phase cannot flap", and deliberately so:
+    /// flapping never needed an oscillating verdict. `drive_release` moves any
+    /// non-`Releasing` phase — `Quarantined` included — to `Releasing` and
+    /// returns, and the next evidence failure writes `Quarantined` again, so a
+    /// CONSTANT quarantine verdict already cycles the phase on its own while
+    /// pool accounting counts `Quarantined` separately: a capacity number that
+    /// moved on every reconcile without any capacity ever coming back. What
+    /// ends the cycle for these leases is that the verdict is now `Verified`
+    /// and stays `Verified`, because it is read from immutable status and no
+    /// edit to the pool can reach it.
+    ///
+    /// So this pins the validator only, across repeated calls with the pool
+    /// moving underneath. It drives no phase transitions and asserts nothing
+    /// about the phase machine.
+    #[tokio::test]
+    async fn the_service_requirement_answer_does_not_change_between_release_attempts() {
+        let lease = ready_lease_without_service(Some(false));
+        for generation in [POOL_GENERATION, POOL_GENERATION + 1, POOL_GENERATION + 2] {
+            let (ctx, _server) = provenance_context(Some(range_only_pool(generation))).await;
+            assert_eq!(
+                validate_management_target_provenance(&lease, &ctx).await,
+                TargetFootprintCheck::Verified,
+                "release must not depend on what generation the pool is at now"
+            );
+        }
+    }
+
+    /// Recording the answer does not soften it. A lease that DID owe a
+    /// Service and has no identity for it still quarantines, because the
+    /// missing reference is then real evidence of a footprint nobody can
+    /// prove absent.
+    #[tokio::test]
+    async fn a_lease_that_owed_a_service_still_quarantines_without_its_identity() {
+        let (ctx, _server) =
+            provenance_context(Some(management_pool(POOL_UID, POOL_GENERATION))).await;
+        let lease = ready_lease_without_service(Some(true));
+
+        assert_eq!(
+            validate_management_target_provenance(&lease, &ctx).await,
+            TargetFootprintCheck::Quarantine("required_service_provenance_missing")
+        );
+    }
+
+    /// A lease with no record keeps the old derivation, unchanged.
+    ///
+    /// Nothing backfills `serviceRequired` onto a lease that is already Ready:
+    /// a backfill would re-observe its Pod, and a Pod replaced since would
+    /// fail a provenance merge that today never runs. So the pool-generation
+    /// path stays, and stays fail-closed, for the leases that have no record —
+    /// leases made Ready by an older release, or by a Ready write that landed
+    /// against a SandboxLease CRD which still prunes the field. Leases this
+    /// controller carries to Ready itself are not among them; see
+    /// [`record_service_requirement_at_ready`].
+    #[tokio::test]
+    async fn a_lease_without_the_record_still_falls_back_to_the_pool_generation() {
+        let (ctx, server) = provenance_context(Some(range_only_pool(POOL_GENERATION + 1))).await;
+        let lease = ready_lease_without_service(None);
+
+        assert_eq!(
+            validate_management_target_provenance(&lease, &ctx).await,
+            TargetFootprintCheck::Quarantine("service_requirement_pool_identity_changed")
+        );
+        assert!(
+            pool_was_read(&server).await,
+            "only the recordless lease may consult the pool"
+        );
+    }
+
+    /// Every lease this controller carries to Ready records its Service
+    /// requirement, including one a previous controller left mid-flight.
+    ///
+    /// The gates on the Ready path ask whether the object identities are
+    /// recorded, never whether this flag is. A controller that checkpointed
+    /// complete provenance while the lease was still `Provisioning` and
+    /// stopped before the separate Ready write therefore hands the next
+    /// controller a lease that reaches Ready without re-entering
+    /// `observed_provenance` — Ready, with no record, and stranded on the
+    /// pool-generation fallback at the first edit of its pool. A lease that is
+    /// already Ready is still left alone, because backfilling one would mean
+    /// re-observing its Pod.
+    #[test]
+    fn a_lease_made_ready_by_this_controller_always_records_its_service_requirement() {
+        let mut resumed = ready_lease_without_service(None).status.unwrap();
+        resumed.phase = crate::crd::SandboxLeasePhase::Provisioning;
+        record_service_requirement_at_ready(
+            crate::crd::SandboxLeasePhase::Provisioning,
+            &mut resumed,
+            false,
+        );
+        assert_eq!(
+            resumed.target.as_ref().unwrap().service_required,
+            Some(false),
+            "the Ready transition is the last moment the answer is still knowable"
+        );
+
+        let mut already_ready = ready_lease_without_service(None).status.unwrap();
+        record_service_requirement_at_ready(
+            crate::crd::SandboxLeasePhase::Ready,
+            &mut already_ready,
+            false,
+        );
+        assert_eq!(
+            already_ready.target.as_ref().unwrap().service_required,
+            None,
+            "backfilling an already-Ready lease is the Pod re-observation this design avoids"
+        );
+
+        let mut recorded = ready_lease_without_service(Some(true)).status.unwrap();
+        recorded.phase = crate::crd::SandboxLeasePhase::Provisioning;
+        record_service_requirement_at_ready(
+            crate::crd::SandboxLeasePhase::Provisioning,
+            &mut recorded,
+            false,
+        );
+        assert_eq!(
+            recorded.target.as_ref().unwrap().service_required,
+            Some(true),
+            "the flag is monotonic in the merge and immutable in CEL; it is never re-derived"
         );
     }
 }

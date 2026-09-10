@@ -944,18 +944,23 @@ fn policy_selects_pod(policy: &NetworkPolicy, pod: &Pod) -> bool {
     })
 }
 
+/// Service ports the upstream controller must have produced for this pool.
+///
+/// Derived from the pool's **published** ports only. A `portRange` authorizes
+/// forwarding and publishes nothing, so it contributes no Service port and
+/// must not be expected as one — otherwise certification would demand a port
+/// the upstream controller had no `ContainerPort` to build from.
 fn expected_service_ports(pool: &SandboxPool) -> Vec<(String, i32)> {
     let mut by_port = BTreeMap::<i32, String>::new();
     for container in &pool.spec.template.containers {
-        for port in pool
+        for (port, number) in pool
             .spec
             .template
-            .exposed_ports
-            .iter()
-            .filter(|port| port.container == container.name)
+            .published_ports()
+            .filter(|(port, _)| port.container == container.name)
         {
             by_port
-                .entry(i32::from(port.port))
+                .entry(i32::from(number))
                 .or_insert_with(|| port.name.clone());
         }
     }
@@ -1309,7 +1314,7 @@ async fn validate_resolved_workload(
         .map_err(|error| format!("Sandbox node lookup failed: {error}"))?;
     validate_node(&node)?;
 
-    if pool.spec.template.exposed_ports.is_empty() {
+    if !pool.spec.template.requires_service() {
         if resolved.service_name.is_some() || resolved.service_uid.is_some() {
             return Err("Sandbox unexpectedly exposes a Service".into());
         }
