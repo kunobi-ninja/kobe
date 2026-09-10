@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="Kobe workspace">
+    <item label="Terminal">
+      <action name="Execute"><execute>kobe-desktop terminal</execute></action>
+    </item>
+    <item label="Browser">
+      <action name="Execute"><execute>kobe-desktop browser</execute></action>
+    </item>
+    <item label="Desktop status">
+      <action name="Execute"><execute>xterm -title 'Kobe desktop status' -e kobe-desktop status</execute></action>
+    </item>
+    <separator />
+    <item label="Restart Openbox">
+      <action name="Restart" />
+    </item>
+  </menu>
+</openbox_menu>

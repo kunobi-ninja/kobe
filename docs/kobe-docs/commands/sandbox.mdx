@@ -120,6 +120,20 @@ The remote stdin is closed once the bytes are delivered, which is what lets a
 tool that reads until EOF finish instead of hanging until its timeout. Without
 `--stdin` the command reads `/dev/null`, exactly as it always has.
 
+Agent workspace images include `gh`. To give one an authenticated HTTPS Git
+credential, forward the host token over stdin, then configure Git without ever
+putting the token in command arguments:
+
+```bash
+gh auth token | kobe exec gui --stdin -- \
+  sh -lc 'gh auth login --hostname github.com --git-protocol https --with-token && gh auth setup-git'
+kobe exec gui -- git clone https://github.com/ORG/PRIVATE-REPOSITORY.git /home/agent/work/project
+```
+
+This stores the credential only in the active lease. Run `gh auth logout -h
+github.com` in the workspace before releasing it if the credential must be
+removed early.
+
 For secrets and small inputs, not file transfer: the server refuses more than
 16 KiB rather than truncating it, and the CLI refuses to buffer a large file
 into a request that was never going to be accepted. Kobe stores none of it —
