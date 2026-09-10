@@ -6,9 +6,9 @@ description: Define bounded, administrator-owned Agent Sandbox templates and pla
 # Sandbox pools
 
 <Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Set
-  Use `agentSandbox.mode=managed` for Kobe-owned management and child runtimes,
-  or `external` after installing Agent Sandbox v1.0.0 yourself. Kobe validates
+  `SandboxPool` and `SandboxLease` are alpha APIs. Set Use
+  `agentSandbox.mode=managed` for Kobe-owned management and child runtimes, or
+  `external` after installing Agent Sandbox v1.0.0 yourself. Kobe validates
   consumed APIs before mounting the Sandbox HTTP API; `disabled` mounts no
   Sandbox endpoints.
 </Callout>
@@ -59,9 +59,9 @@ Claim. Helm contains no operational canary hook.
 <Callout type="info">
   If a cluster still runs v0.5.x, follow the upstream v1.0.0 migration: prune
   `v1alpha1` from CRD `status.storedVersions`, install v1.0.0, then delete the
-  leftover webhook Service, cert Secret, and namespaced Role/RoleBinding.
-  Update operator-authored child bootstrap content at the same time. Managed
-  child pools must be recycled after changing the pinned runtime; Kobe rejects
+  leftover webhook Service, cert Secret, and namespaced Role/RoleBinding. Update
+  operator-authored child bootstrap content at the same time. Managed child
+  pools must be recycled after changing the pinned runtime; Kobe rejects
   mismatched children. Kobe never performs this upgrade.
 </Callout>
 
@@ -199,9 +199,9 @@ process, and reconnecting starts over instead of resuming. Declare what attach
 should run instead:
 
 ```yaml
-  template:
-    defaultContainer: agent
-    attachCommand: ["zellij", "attach", "--create", "kobe"]
+template:
+  defaultContainer: agent
+  attachCommand: ["zellij", "attach", "--create", "kobe"]
 ```
 
 Now `kobe attach dev` lands in a multiplexer session that outlives the
@@ -293,8 +293,13 @@ The desktop is opt-in. After leasing this pool, start it as a managed execution
 and keep that terminal running:
 
 ```bash
-kobe exec gui --timeout 2h -- kobe-desktop-up
+kobe exec gui --timeout 1h -- kobe-desktop-up
 ```
+
+A runner execution is limited to one hour, independently of the lease TTL.
+For a longer desktop session, run `kobe attach gui` to enter the pool's tmux
+session and start `kobe-desktop-up` there. Detach with `Ctrl-b`, then `d`; the
+desktop remains alive until you stop it in tmux or the lease ends.
 
 Here `gui` is your lease ID or alias. In another terminal, forward its declared
 port:
@@ -318,7 +323,8 @@ escalation, or container capabilities. Files and sockets live under `HOME` or
 
 `kobe-desktop-up` stays in the foreground and supervises every desktop
 component. A component exit fails the execution and stops its siblings;
-cancelling that execution or releasing the lease stops the desktop. Restart
+cancelling its runner execution or releasing the lease stops the desktop.
+When started in tmux, use `Ctrl-c` in that pane to stop it. Restart
 with a new execution if needed. Only one desktop can run in a Sandbox.
 
 Build locally with `docker buildx bake agent-workspace-gui --load` (set

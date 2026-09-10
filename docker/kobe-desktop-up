@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Own the entire desktop lifetime in one foreground runner execution. Independent
+# Own the desktop lifetime in one foreground process (runner exec or tmux).
+# Runner executions are capped at one hour; tmux follows the lease lifetime.
+# Independent
 # application executions inherit DISPLAY, XAUTHORITY and the session bus address
 # from the image. Only Kobe's declared-port tunnel should expose the browser UI.
 set -euo pipefail
