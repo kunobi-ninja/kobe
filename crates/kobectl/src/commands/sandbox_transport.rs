@@ -20,12 +20,13 @@
 //!
 //! # A local listener is a commitment too
 //!
-//! `port-forward` binds locally and forwards one connection at a time. It
+//! `port-forward` binds locally and forwards a bounded number of connections.
 //! never binds a wildcard address by default: a forward reachable from the
 //! network turns "a port on my machine" into "a port on the office LAN", and
 //! the sandbox behind it belongs to one caller.
 
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -42,6 +43,11 @@ pub const CHANNEL_STDOUT: u8 = 1;
 pub const CHANNEL_STDERR: u8 = 2;
 pub const CHANNEL_ERROR: u8 = 3;
 pub const CHANNEL_RESIZE: u8 = 4;
+
+/// Browsers need several connections at once for an application shell, its
+/// assets, and an upgraded WebSocket. Keep the local listener bounded so a
+/// single forward cannot create an unbounded number of upstream streams.
+const MAX_CONCURRENT_PORT_FORWARD_CONNECTIONS: usize = 16;
 
 /// Frame one outbound chunk.
 pub fn client_frame(channel: u8, payload: &[u8]) -> Message {
@@ -524,36 +530,62 @@ pub async fn port_forward(
     );
     let iroh = lease_uses_iroh(&config, lease, output).await;
 
-    // One connection at a time, on purpose. Concurrency here would need one
-    // upstream stream per local connection, and each of those counts against
-    // the lease's own concurrency limit — a browser opening six sockets would
-    // exhaust it and the failures would look like the sandbox misbehaving.
+    // A browser opens parallel connections for an HTML shell, JavaScript, CSS,
+    // and the upgraded WebSocket. Serving only the first connection left those
+    // later requests queued behind an HTTP keep-alive connection, which makes
+    // browser clients such as noVNC appear to load forever. Bound the fan-out
+    // so the forward remains a local, resource-limited convenience rather than
+    // an unbounded stream factory.
+    let permits = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_PORT_FORWARD_CONNECTIONS,
+    ));
     loop {
-        let (mut local, peer) = listener.accept().await.context("accept failed")?;
-        let result = if iroh {
-            match dial_iroh_session(
-                &config,
-                lease,
-                output,
-                serde_json::json!({
-                    "operation": "port-forward",
-                    "port": remote,
-                }),
-            )
+        let (local, peer) = listener.accept().await.context("accept failed")?;
+        let permit = permits
+            .clone()
+            .acquire_owned()
             .await
-            {
-                Ok(mut link) => pump_connection_iroh(&mut local, &mut link).await,
-                Err(error) => Err(error),
+            .context("port-forward connection limiter closed")?;
+        let config = config.clone();
+        let lease = lease.to_owned();
+        let remote = remote.to_owned();
+        let path = path.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut local = local;
+            let result =
+                forward_connection(&mut local, &config, &lease, &remote, &path, iroh, output).await;
+            if let Err(error) = result {
+                let _ = report_port_forward_error(output, &lease, peer, &format!("{error:#}"));
             }
-        } else {
-            match open_stream(&config, &path, output).await {
-                Ok(mut socket) => pump_connection(&mut local, &mut socket).await,
-                Err(error) => Err(error),
-            }
-        };
-        if let Err(error) = result {
-            report_port_forward_error(output, lease, peer, &format!("{error:#}"))?;
-        }
+        });
+    }
+}
+
+async fn forward_connection(
+    local: &mut tokio::net::TcpStream,
+    config: &ResolvedConfig,
+    lease: &str,
+    remote: &str,
+    path: &str,
+    iroh: bool,
+    output: OutputFormat,
+) -> Result<()> {
+    if iroh {
+        let mut link = dial_iroh_session(
+            config,
+            lease,
+            output,
+            serde_json::json!({
+                "operation": "port-forward",
+                "port": remote,
+            }),
+        )
+        .await?;
+        pump_connection_iroh(local, &mut link).await
+    } else {
+        let mut socket = open_stream(config, path, output).await?;
+        pump_connection(local, &mut socket).await
     }
 }
 
