@@ -33,7 +33,10 @@ function parseDocuments(yaml: string): Document[] {
 		.map((document) => document.trim())
 		.filter(Boolean)
 		.map((document) => Bun.YAML.parse(document) as Document)
-		.filter((document) => document && typeof document === "object" && "kind" in document);
+		.filter(
+			(document) =>
+				document && typeof document === "object" && "kind" in document,
+		);
 }
 
 async function runCommand(
@@ -76,14 +79,18 @@ async function kubectlAs(
 function policyRuleResources(policy: Document): string[] {
 	const spec = policy.spec as Record<string, unknown>;
 	const constraints = spec.matchConstraints as Record<string, unknown>;
-	return (constraints.resourceRules as Record<string, unknown>[]).flatMap((rule) =>
-		Array.isArray(rule.resources) ? rule.resources.map(String) : [],
+	return (constraints.resourceRules as Record<string, unknown>[]).flatMap(
+		(rule) => (Array.isArray(rule.resources) ? rule.resources.map(String) : []),
 	);
 }
 
 function policyExpressions(policy: Document): string[] {
-	return ((policy.spec as Record<string, unknown>).validations as Record<string, unknown>[])
-		.map((validation) => String(validation.expression));
+	return (
+		(policy.spec as Record<string, unknown>).validations as Record<
+			string,
+			unknown
+		>[]
+	).map((validation) => String(validation.expression));
 }
 
 /// The kind a validation is written for, read from its own resource guard.
@@ -91,7 +98,8 @@ function policyExpressions(policy: Document): string[] {
 /// Every expression opens by excluding the resources it does not apply to, so
 /// the guard names the one type whose fields it then reads.
 function guardedKind(expression: string): string | undefined {
-	if (expression.includes("!= 'verifiedteardownevidence'")) return "VerifiedTeardownEvidence";
+	if (expression.includes("!= 'verifiedteardownevidence'"))
+		return "VerifiedTeardownEvidence";
 	if (expression.includes("!= 'clusterleases'")) return "ClusterLease";
 	if (expression.includes("!= 'clusterinstances'")) return "ClusterInstance";
 	return undefined;
@@ -121,10 +129,14 @@ function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
 			continue;
 		}
 		// Warnings arrive as one text block per kind, each headed by the type.
-		const blocks = String(warning.warning).split(/(?=kobe\.kunobi\.ninja\/v1alpha1, Kind=)/);
+		const blocks = String(warning.warning).split(
+			/(?=kobe\.kunobi\.ninja\/v1alpha1, Kind=)/,
+		);
 		const targeted = blocks.find((block) => block.includes(`Kind=${kind}:`));
 		if (targeted && /ERROR:/.test(targeted)) {
-			fatal.push(`${warning.fieldRef} does not type-check against ${kind}: ${targeted}`);
+			fatal.push(
+				`${warning.fieldRef} does not type-check against ${kind}: ${targeted}`,
+			);
 		}
 	}
 	return fatal;
@@ -257,7 +269,9 @@ async function waitForTypeCheckedPolicy(name: string): Promise<void> {
 				const warnings = policy.status.typeChecking.expressionWarnings;
 				const fatal = offTargetWarnings(warnings, policyExpressions(policy));
 				if (fatal.length > 0) {
-					throw new Error(`${name} type-check warnings: ${JSON.stringify(fatal)}`);
+					throw new Error(
+						`${name} type-check warnings: ${JSON.stringify(fatal)}`,
+					);
 				}
 				return;
 			}
@@ -275,6 +289,7 @@ async function patchLeaseStatus(
 	username: string,
 	status: Record<string, unknown>,
 	allowFailure = false,
+	dryRun = false,
 ): Promise<CommandResult> {
 	return kubectlAs(
 		username,
@@ -286,6 +301,7 @@ async function patchLeaseStatus(
 			namespace,
 			"--subresource=status",
 			"--type=merge",
+			...(dryRun ? ["--dry-run=server"] : []),
 			"-p",
 			JSON.stringify({ status }),
 		],
@@ -313,12 +329,18 @@ const documents = parseDocuments(rendered.stdout);
 const policies = documents.filter(
 	(document) => document.kind === "ValidatingAdmissionPolicy",
 );
-assert(policies.length === 2, `rendered ${policies.length} authority policies, expected 2`);
+assert(
+	policies.length === 2,
+	`rendered ${policies.length} authority policies, expected 2`,
+);
 const authorityPolicy = policies.find((policy) =>
 	policyRuleResources(policy).includes("verifiedteardownevidence"),
 );
 const firewallPolicy = policies.find((policy) => policy !== authorityPolicy);
-assert(authorityPolicy && firewallPolicy, "could not identify the rendered policy pair");
+assert(
+	authorityPolicy && firewallPolicy,
+	"could not identify the rendered policy pair",
+);
 const authorityPolicyName = String(metadata(authorityPolicy).name);
 const firewallPolicyName = String(metadata(firewallPolicy).name);
 const authorityUsername = policyExpressions(authorityPolicy)
@@ -327,8 +349,14 @@ const authorityUsername = policyExpressions(authorityPolicy)
 const controlPlaneUsername = policyExpressions(firewallPolicy)
 	.join(" ")
 	.match(/system:serviceaccount:[a-z0-9-]+:[a-z0-9-]+/)?.[0];
-assert(authorityUsername, "rendered policy does not contain the authority identity");
-assert(controlPlaneUsername, "rendered firewall does not contain the control-plane identity");
+assert(
+	authorityUsername,
+	"rendered policy does not contain the authority identity",
+);
+assert(
+	controlPlaneUsername,
+	"rendered firewall does not contain the control-plane identity",
+);
 const authorityNamespace = authorityUsername.split(":")[2];
 
 await kubectl(["create", "namespace", namespace]);
@@ -362,13 +390,17 @@ try {
 	await patchLeaseStatus(controlPlaneUsername, { phase: "Pending" });
 
 	// Type-checked is not enforcing. Prove the binding is live on the admission
-	// path before reading a successful write as a forged proof.
+	// path before reading a successful write as a forged proof. Use server-side
+	// dry-run: an admitted probe must not persist its value. Otherwise every
+	// retry is an unchanged-field write, which the policy correctly permits
+	// even after enforcement starts, and readiness can never be observed.
 	await waitForEnforcingPolicy(
 		controlPlaneUsername,
 		() =>
 			patchLeaseStatus(
 				controlPlaneUsername,
 				{ phase: "Pending", teardownAttemptId: "enforcement-probe" },
+				true,
 				true,
 			),
 		"only the teardown authority may change status.teardownAttemptId",
@@ -381,11 +413,13 @@ try {
 	);
 	assert(
 		forged.exitCode !== 0 &&
-			forged.stderr.includes("only the teardown authority may change status.teardownAttemptId"),
+			forged.stderr.includes(
+				"only the teardown authority may change status.teardownAttemptId",
+			),
 		forged.exitCode === 0
 			? "control plane FORGED a teardown proof: the patch was admitted"
 			: "control plane patch was rejected for the wrong reason: " +
-				(forged.stderr.trim() || "<no stderr>"),
+					(forged.stderr.trim() || "<no stderr>"),
 	);
 
 	await patchLeaseStatus(authorityUsername, {
@@ -399,7 +433,9 @@ try {
 	);
 	assert(
 		lifecycle.exitCode !== 0 &&
-			lifecycle.stderr.includes("teardown authority may not change lifecycle phase"),
+			lifecycle.stderr.includes(
+				"teardown authority may not change lifecycle phase",
+			),
 		`authority changed lifecycle state or failed unexpectedly: ${lifecycle.stderr}`,
 	);
 
@@ -408,7 +444,10 @@ try {
 		{ phase: "Pending", teardownAttemptId: null },
 		true,
 	);
-	assert(erased.exitCode !== 0, "control plane erased authority-owned evidence");
+	assert(
+		erased.exitCode !== 0,
+		"control plane erased authority-owned evidence",
+	);
 	const live = JSON.parse(
 		(
 			await kubectl([
@@ -428,6 +467,27 @@ try {
 		"a rejected cross-boundary write changed live status",
 	);
 
+	// The namespace firewall has its own binding; authority enforcement does
+	// not prove this independent policy has propagated. Dry-run leaves no
+	// ConfigMap behind if the first probe reaches the server too early.
+	await waitForEnforcingPolicy(
+		controlPlaneUsername,
+		() =>
+			kubectlAs(
+				controlPlaneUsername,
+				[
+					"create",
+					"configmap",
+					"firewall-probe",
+					"-n",
+					authorityNamespace,
+					"--dry-run=server",
+				],
+				true,
+			),
+		"control plane may not mutate the teardown-authority namespace",
+	);
+
 	const namespaceMutation = await kubectlAs(
 		controlPlaneUsername,
 		["create", "configmap", "forged-authority", "-n", authorityNamespace],
@@ -442,7 +502,13 @@ try {
 	);
 	const rbacMutation = await kubectlAs(
 		controlPlaneUsername,
-		["create", "clusterrole", "forged-authority", "--verb=get", "--resource=pods"],
+		[
+			"create",
+			"clusterrole",
+			"forged-authority",
+			"--verb=get",
+			"--resource=pods",
+		],
 		true,
 	);
 	assert(
@@ -461,7 +527,14 @@ try {
 	});
 	for (const target of [authorityNamespace, namespace]) {
 		await kubectl(
-			["delete", "namespace", target, "--ignore-not-found", "--wait=true", "--timeout=60s"],
+			[
+				"delete",
+				"namespace",
+				target,
+				"--ignore-not-found",
+				"--wait=true",
+				"--timeout=60s",
+			],
 			{ allowFailure: true },
 		);
 	}
