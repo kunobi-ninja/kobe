@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Own the entire desktop lifetime in one foreground runner execution. Independent
+# application executions inherit DISPLAY, XAUTHORITY and the session bus address
+# from the image. Only Kobe's declared-port tunnel should expose the browser UI.
+set -euo pipefail
+
+umask 077
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+exec 9>"$XDG_RUNTIME_DIR/desktop.lock"
+flock -n 9 || {
+  echo "A desktop is already running." >&2
+  exit 1
+}
+
+pids=()
+# Invoked by the EXIT trap, including signal and startup failures.
+# shellcheck disable=SC2329
+cleanup() {
+  trap - EXIT TERM INT
+  if ((${#pids[@]})); then
+    kill "${pids[@]}" 2>/dev/null || true
+    # Bound cleanup even if a component stops responding to TERM.
+    for _ in {1..20}; do
+      [[ -z $(jobs -pr) ]] && break
+      sleep 0.1
+    done
+    kill -KILL "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  rm -f "$XAUTHORITY" "$XDG_RUNTIME_DIR/bus"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+start() {
+  "$@" 9>&- &
+  pids+=("$!")
+}
+
+ready() {
+  local deadline=$((SECONDS + 30))
+  until "$@" >/dev/null 2>&1; do
+    for pid in "${pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null || {
+        echo "Desktop component exited during startup." >&2
+        exit 1
+      }
+    done
+    ((SECONDS < deadline)) || {
+      echo "Desktop readiness timed out: $1" >&2
+      exit 1
+    }
+    sleep 0.1
+  done
+}
+
+# Unix-domain X11 only, with a fresh cookie readable only by this workload UID.
+rm -f "$XAUTHORITY" "$XDG_RUNTIME_DIR/bus"
+touch "$XAUTHORITY"
+xauth -f "$XAUTHORITY" add "$DISPLAY" . "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+start Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY"
+ready xdpyinfo -display "$DISPLAY"
+
+start dbus-daemon --session --nofork --address="$DBUS_SESSION_BUS_ADDRESS"
+ready dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames
+start openbox --sm-disable
+start x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -forever -shared \
+  -localhost -listen 127.0.0.1 -rfbport 5900 -nopw -noxdamage
+ready bash -c 'exec 3<>/dev/tcp/127.0.0.1/5900'
+# No VNC password: both listeners are loopback-only within the leased Sandbox.
+start websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900
+ready curl --fail --silent http://127.0.0.1:6080/vnc.html
+printf '%s\n' 'Desktop ready on DISPLAY=:99. Forward port 6080 and open /vnc.html?autoconnect=1&resize=scale&path=websockify'
+
+# Any component exit (even zero) ends the desktop and fails the execution.
+status=0
+wait -n "${pids[@]}" || status=$?
+echo "Desktop component exited (status $status); stopping desktop." >&2
+exit 1

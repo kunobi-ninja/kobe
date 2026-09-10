@@ -258,3 +258,69 @@ contract. Lease callers cannot override either placement or isolation.
 See the [API reference](/docs/api/reference#sandbox-leases) for lease operations
 and [authentication and authorization](/docs/auth/overview) for Sandbox policy
 verbs and limits.
+
+## Agent workspace images
+
+`zondax/kobe-agent-workspace` includes `kobe-runner`, `mise`, `tmux`, Git,
+OpenSSL headers, and a C toolchain. The workload runs as `65532:65532`, with
+`HOME=/home/agent` and a writable `/home/agent/work`. Clone projects there and
+run `mise install`; the image trusts mise configurations under that workspace
+and puts tool shims on `PATH` for direct `kobe exec` commands.
+
+`zondax/kobe-agent-workspace-gui` adds the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
+software rendering, Xvfb, Openbox, and noVNC. Node, Rust, package managers, and
+other project tools still come from the project's `mise.toml`. Both images use
+the same release tags and runner. Pin a release tag or digest in your pool.
+
+For a GUI pool, set these fields in its template (alongside your resource
+requests and limits):
+
+```yaml
+template:
+  defaultContainer: workspace
+  runnerPath: /kobe-runner
+  attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
+  containers:
+    - name: workspace
+      image: zondax/kobe-agent-workspace-gui:v0.44.0
+  exposedPorts:
+    - name: desktop
+      container: workspace
+      port: 6080
+```
+
+The desktop is opt-in. After leasing this pool, start it as a managed execution
+and keep that terminal running:
+
+```bash
+kobe exec gui --timeout 2h -- kobe-desktop-up
+```
+
+Here `gui` is your lease ID or alias. In another terminal, forward its declared
+port:
+
+```bash
+kobe port-forward gui 6080:6080
+```
+
+Open `http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&path=websockify`.
+Run your project's normal Linux desktop development command in another
+execution, using `--cwd /home/agent/work/your-project`. Each execution already
+inherits `DISPLAY=:99`, the X11 authority file, and the session D-Bus address.
+
+Both noVNC (6080) and its VNC backend (5900) listen only on the Sandbox's
+loopback interface; X11 uses a Unix socket with a per-session cookie. Access
+comes through Kobe's authorized port forward, without a separate desktop
+password. Authorize port 6080 with an explicit port declaration or a permitted
+development port range. This does not require host networking, privilege
+escalation, or container capabilities. Files and sockets live under `HOME` or
+`/tmp`.
+
+`kobe-desktop-up` stays in the foreground and supervises every desktop
+component. A component exit fails the execution and stops its siblings;
+cancelling that execution or releasing the lease stops the desktop. Restart
+with a new execution if needed. Only one desktop can run in a Sandbox.
+
+Build locally with `docker buildx bake agent-workspace-gui --load` (set
+`PLATFORM=linux/arm64` on an ARM host). The `default` and `push` Bake groups
+include both workspace variants.
