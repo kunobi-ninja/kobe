@@ -39,15 +39,31 @@ FROM debian:bookworm-slim
 # joins the container's own idle process and a dropped connection loses the
 # session — the exact failure an 8h agent lease must not have.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        autocutsel \
         build-essential \
         ca-certificates \
         curl \
+        dbus \
+        file \
+        firefox-esr \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation2 \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-noto-core \
         gh \
         git \
         iproute2 \
         jq \
         less \
+        libayatana-appindicator3-dev \
+        libgl1-mesa-dri \
+        librsvg2-dev \
         libssl-dev \
+        libwebkit2gtk-4.1-dev \
+        novnc \
+        openbox \
         openssh-client \
         openssh-server \
         pkg-config \
@@ -55,6 +71,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
         tmux \
         unzip \
+        websockify \
+        wget \
+        x11-utils \
+        x11-xserver-utils \
+        x11vnc \
+        xauth \
+        xdg-utils \
+        xterm \
+        xvfb \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -129,6 +154,9 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/mise/installs/node/24.18.1/bin:$PATH' \
 
 COPY --from=runner /kobe-runner /kobe-runner
 COPY --chmod=0755 docker/kobe-workspace-ssh /usr/local/bin/kobe-workspace-ssh
+COPY --chmod=0755 docker/kobe-desktop docker/kobe-desktop-up /usr/local/bin/
+COPY --chown=65532:65532 docker/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
+COPY --chown=65532:65532 docker/kobe-mimeapps.list /home/agent/.config/mimeapps.list
 
 RUN test -x /kobe-runner \
     && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0700 /var/run/kobe/executions
@@ -138,7 +166,13 @@ USER 65532:65532
 ENV HOME=/home/agent \
     # The image pins a tested Claude Code version. Updating a shared executable
     # from an ephemeral lease would make its behavior non-reproducible.
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    DISPLAY=:99 \
+    XDG_RUNTIME_DIR=/home/agent/.cache/kobe-desktop \
+    XAUTHORITY=/home/agent/.cache/kobe-desktop/Xauthority \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/home/agent/.cache/kobe-desktop/bus \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    WEBKIT_DISABLE_DMABUF_RENDERER=1
 
 # `mise activate` is a SHELL hook, and Kobe's runner executes argv directly with
 # no implicit shell — so a shell-activated PATH would never apply to
@@ -196,7 +230,7 @@ LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.title="kobe-agent-workspace"
-LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, and kobe-runner"
+LABEL org.opencontainers.image.description="Kobe Sandbox workspace with development tools and an opt-in loopback-only desktop"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
 # Idle until the lease drives it. TERM is trapped so a released lease tears the

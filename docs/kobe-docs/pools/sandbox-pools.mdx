@@ -386,21 +386,19 @@ verbs and limits.
 
 ## Agent workspace images
 
-`zondax/kobe-agent-workspace` includes `kobe-runner`, `mise`, `tmux`, Git,
-GitHub CLI (`gh`), OpenSSH, Node, Codex, Claude Code, JSON/search/network
-diagnostics, OpenSSL headers, and a C toolchain. Codex and Claude Code are
-version-pinned image tools with no credentials or tokens. Each user signs in
-inside their own lease. The workload runs as `65532:65532`, with
-`HOME=/home/agent` and a writable `/home/agent/work`. Clone projects there and
-run `mise install`; the image trusts mise configurations under that workspace
-and puts project tool shims on `PATH` for direct `kobe exec` commands.
-
-`zondax/kobe-agent-workspace-gui` adds the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
+`zondax/kobe-agent-workspace` is the single development workspace image. It
+includes `kobe-runner`, `mise`, `tmux`, Git, GitHub CLI (`gh`), OpenSSH, Node,
+Codex, Claude Code, JSON/search/network diagnostics, OpenSSL headers, a C
+toolchain, the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
 software rendering, Xvfb, Openbox, noVNC, Firefox, broader Noto/Liberation/emoji
 font coverage, and a visible terminal. Firefox is registered for HTTP and HTTPS
 links, so OAuth flows opened by desktop applications stay inside the noVNC
-desktop. Both images use the same release tags and runner. Pin a release tag or
-digest in your pool.
+desktop. Codex and Claude Code are version-pinned image tools with no credentials
+or tokens. Each user signs in inside their own lease. The workload runs as
+`65532:65532`, with
+`HOME=/home/agent` and a writable `/home/agent/work`. Clone projects there and
+run `mise install`; the image trusts mise configurations under that workspace
+and puts project tool shims on `PATH` for direct `kobe exec` commands.
 
 For a GUI pool, set these fields in its template (alongside your resource
 requests and limits):
@@ -412,7 +410,7 @@ template:
   attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
   containers:
     - name: workspace
-      image: zondax/kobe-agent-workspace-gui:v0.44.0
+      image: zondax/kobe-agent-workspace:v0.44.0
   exposedPorts:
     - name: desktop
       container: workspace
@@ -495,6 +493,6 @@ client's SSH agent, password authentication is disabled, and it cannot bind
 outside the Sandbox loopback interface. Run `kobe-workspace-ssh stop` to remove
 its credentials before release when an earlier teardown is useful.
 
-Build locally with `docker buildx bake agent-workspace-gui --load` (set
+Build locally with `docker buildx bake agent-workspace --load` (set
 `PLATFORM=linux/arm64` on an ARM host). The `default` and `push` Bake groups
-include both workspace variants.
+include this workspace image.
