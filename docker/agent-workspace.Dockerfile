@@ -83,6 +83,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# KasmVNC is an opt-in experimental HTML5 desktop transport. The upstream
+# project publishes Bookworm packages for both Kobe architectures, so fetch the
+# exact package and verify the architecture-specific digest before installing.
+# It is not started by the image; `kobe-kasmvnc` creates lease-local state and
+# credentials only when a user explicitly requests it.
+ARG KASMVNC_VERSION=1.5.0
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) kasmvnc_sha256=770fd3df51510beecc89666879d82faf411276e68c6e11df612f736b891b5f71 ;; \
+        arm64) kasmvnc_sha256=aa83a1a6c9069d1a02239988b07a3a2a082a433042b4d4ee2b9e9f6b2df9643c ;; \
+        *) echo "unsupported KasmVNC architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && kasmvnc_deb="kasmvncserver_bookworm_${KASMVNC_VERSION}_${TARGETARCH}.deb" \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        "https://github.com/kasmtech/KasmVNC/releases/download/v${KASMVNC_VERSION}/${kasmvnc_deb}" \
+        -o "/tmp/${kasmvnc_deb}" \
+    && echo "${kasmvnc_sha256}  /tmp/${kasmvnc_deb}" | sha256sum --check \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "/tmp/${kasmvnc_deb}" \
+    && rm -rf /var/lib/apt/lists/* "/tmp/${kasmvnc_deb}"
+
 # --- Workload identity ------------------------------------------------------
 #
 # A real passwd entry for the UID Kobe runs as. Without one, git refuses some
@@ -155,6 +176,7 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/mise/installs/node/24.18.1/bin:$PATH' \
 COPY --from=runner /kobe-runner /kobe-runner
 COPY --chmod=0755 docker/kobe-workspace-ssh /usr/local/bin/kobe-workspace-ssh
 COPY --chmod=0755 docker/kobe-desktop docker/kobe-desktop-up /usr/local/bin/
+COPY --chmod=0755 docker/kobe-kasmvnc /usr/local/bin/kobe-kasmvnc
 COPY --chown=65532:65532 docker/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
 COPY --chown=65532:65532 docker/kobe-mimeapps.list /home/agent/.config/mimeapps.list
 
@@ -220,7 +242,9 @@ RUN mise use --global jq@1.7.1 \
 # credential or starts a listener during image construction.
 RUN codex --version \
     && claude --version \
-    && kobe-workspace-ssh --help >/dev/null
+    && kobe-workspace-ssh --help >/dev/null \
+    && kobe-kasmvnc --help >/dev/null \
+    && Xkasmvnc -version
 
 ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown

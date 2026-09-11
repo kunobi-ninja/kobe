@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Start an opt-in KasmVNC desktop for a Kobe workspace lease.
+set -Eeuo pipefail
+
+readonly SESSION="kobe-kasmvnc"
+readonly DISPLAY_NUMBER=98
+readonly DISPLAY=":${DISPLAY_NUMBER}"
+readonly PORT=6901
+readonly STATE_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache/kobe-desktop}/kasmvnc"
+readonly AUTHORITY="${STATE_DIR}/Xauthority"
+readonly PASSWORD_FILE="${STATE_DIR}/passwd"
+readonly CREDENTIALS_FILE="${STATE_DIR}/credentials"
+readonly LOG_FILE="${STATE_DIR}/server.log"
+
+die() {
+  printf 'kobe-kasmvnc: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: kobe-kasmvnc <command>
+
+Commands:
+  start       create lease-local credentials and start the KasmVNC desktop
+  status      show whether the desktop is ready
+  password    print the lease-local browser password
+  url         print the local URL after `kobe port-forward <lease> 6901:6901`
+  logs        show the KasmVNC server log
+  stop        stop the desktop and remove its credentials
+
+KasmVNC is experimental. It serves browser traffic on loopback TCP port 6901,
+and refuses to start if its upstream UDP transport opens a listener. Continue
+using it in a trusted, isolated workspace pool while it is under acceptance
+testing.
+EOF
+}
+
+ensure_tools() {
+  command -v Xkasmvnc >/dev/null || die 'KasmVNC is not installed in this image'
+  command -v kasmvncpasswd >/dev/null || die 'KasmVNC password tool is unavailable'
+  command -v tmux >/dev/null || die 'tmux is unavailable'
+}
+
+server_ready() {
+  ss -ltn "sport = :${PORT}" 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:${PORT}|\\[::1\\]:${PORT}"
+}
+
+udp_listener_present() {
+  ss -lun "sport = :${PORT}" 2>/dev/null | awk 'NR > 1 { found = 1 } END { exit !found }'
+}
+
+create_credentials() {
+  install -d -m 0700 "${STATE_DIR}"
+  local password
+  password="$(openssl rand -hex 24)"
+  printf '%s\n' "${password}" "${password}" \
+    | kasmvncpasswd -u kobe -w -o "${PASSWORD_FILE}" >/dev/null
+  printf 'username=kobe\npassword=%s\n' "${password}" > "${CREDENTIALS_FILE}"
+  chmod 0600 "${CREDENTIALS_FILE}" "${PASSWORD_FILE}"
+}
+
+up() {
+  ensure_tools
+  install -d -m 0700 "${STATE_DIR}"
+  test -f "${PASSWORD_FILE}" || create_credentials
+  rm -f "${LOG_FILE}"
+  touch "${AUTHORITY}"
+  xauth -f "${AUTHORITY}" add "${DISPLAY}" . "$(mcookie)"
+
+  Xkasmvnc "${DISPLAY}" \
+    -geometry 1440x900 \
+    -depth 24 \
+    -auth "${AUTHORITY}" \
+    -interface 127.0.0.1 \
+    -websocketPort "${PORT}" \
+    -udpPort "${PORT}" \
+    -PublicIP 127.0.0.1 \
+    -StunServer none \
+    -sslOnly 0 \
+    -SecurityTypes None \
+    -KasmPasswordFile "${PASSWORD_FILE}" \
+    -httpd /usr/share/kasmvnc/www \
+    >"${LOG_FILE}" 2>&1 &
+  local server_pid=$!
+
+  for _ in $(seq 1 50); do
+    if server_ready; then
+      if udp_listener_present; then
+        kill "${server_pid}" 2>/dev/null || true
+        die 'KasmVNC opened a UDP listener; refusing to run an unsafe transport'
+      fi
+      DISPLAY="${DISPLAY}" XAUTHORITY="${AUTHORITY}" openbox >/dev/null 2>&1 &
+      DISPLAY="${DISPLAY}" XAUTHORITY="${AUTHORITY}" xterm -geometry 110x30+40+40 &
+      wait "${server_pid}"
+      return
+    fi
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+      cat "${LOG_FILE}" >&2 || true
+      die 'KasmVNC exited before its loopback TCP listener was ready'
+    fi
+    sleep 0.1
+  done
+
+  kill "${server_pid}" 2>/dev/null || true
+  die 'KasmVNC did not become ready within five seconds'
+}
+
+start() {
+  ensure_tools
+  if server_ready; then
+    printf 'KasmVNC is already ready on loopback port %s.\n' "${PORT}"
+    return
+  fi
+  if tmux has-session -t "${SESSION}" 2>/dev/null; then
+    tmux kill-session -t "${SESSION}"
+  fi
+  create_credentials
+  tmux new-session -d -s "${SESSION}" "exec $(printf '%q' "$0") up"
+  for _ in $(seq 1 50); do
+    if server_ready; then
+      printf 'KasmVNC ready. Forward port %s and run kobe-kasmvnc url.\n' "${PORT}"
+      return
+    fi
+    if ! tmux has-session -t "${SESSION}" 2>/dev/null; then
+      logs || true
+      die 'KasmVNC failed to start'
+    fi
+    sleep 0.1
+  done
+  logs || true
+  die 'KasmVNC did not become ready within five seconds'
+}
+
+status() {
+  if server_ready; then
+    printf 'KasmVNC is ready on 127.0.0.1:%s.\n' "${PORT}"
+  else
+    die 'KasmVNC is not running'
+  fi
+}
+
+password() {
+  test -f "${CREDENTIALS_FILE}" || die 'no KasmVNC credentials exist; run start first'
+  awk -F= '$1 == "password" { print $2 }' "${CREDENTIALS_FILE}"
+}
+
+url() {
+  test -f "${CREDENTIALS_FILE}" || die 'no KasmVNC credentials exist; run start first'
+  printf 'http://kobe:%s@127.0.0.1:%s/\n' "$(password)" "${PORT}"
+}
+
+logs() {
+  test -f "${LOG_FILE}" || die 'no KasmVNC log exists'
+  cat "${LOG_FILE}"
+}
+
+stop() {
+  tmux kill-session -t "${SESSION}" 2>/dev/null || true
+  rm -rf "${STATE_DIR}"
+  printf 'KasmVNC stopped and its credentials were removed.\n'
+}
+
+case "${1:-}" in
+  start) start ;;
+  up) up ;;
+  status) status ;;
+  password) password ;;
+  url) url ;;
+  logs) logs ;;
+  stop) stop ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

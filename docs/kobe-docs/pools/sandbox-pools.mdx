@@ -415,6 +415,9 @@ template:
     - name: desktop
       container: workspace
       port: 6080
+    - name: kasmvnc
+      container: workspace
+      port: 6901
     - name: ssh
       container: workspace
       port: 2222
@@ -468,6 +471,27 @@ component. A component exit fails the execution and stops its siblings;
 cancelling its runner execution or releasing the lease stops the desktop.
 When started in tmux, use `Ctrl-c` in that pane to stop it. Restart
 with a new execution if needed. Only one desktop can run in a Sandbox.
+
+### Experimental KasmVNC transport
+
+The image also includes KasmVNC as an opt-in acceptance-test transport. It has
+its own browser client, sharper text-oriented encoding controls, and a
+lease-local HTTP Basic credential generated at startup. Do not start it beside
+the noVNC desktop: it owns a separate X display.
+
+```bash
+kobe exec workspace -- kobe-kasmvnc start
+kobe port-forward workspace 6901:6901
+kobe exec workspace -- kobe-kasmvnc url
+```
+
+The printed URL includes the generated local credential; do not share it.
+`kobe-kasmvnc stop` removes that credential and all KasmVNC state. Its browser
+listener binds `127.0.0.1`; startup sets the public address to loopback,
+disables STUN, and refuses to continue if KasmVNC creates a UDP listener. Use
+it only in a trusted isolated pool while we compare clipboard, keyboard, OAuth,
+latency, and text sharpness with noVNC. noVNC remains the supported default
+transport.
 
 ### SSH and cmux
 
