@@ -18,7 +18,7 @@ Usage: kobe-desktop <start|status|stop|logs|terminal|browser> [arguments]
   stop        Stop the tmux-managed desktop.
   logs        Print the supervisor log (pass a line count, default 100).
   terminal    Open an xterm window on the desktop.
-  browser     Open Chromium on the desktop (pass an optional URL).
+  browser     Open Firefox on the desktop (pass an optional URL).
 USAGE
 }
 
@@ -54,7 +54,7 @@ status() {
   check 'x11' xdpyinfo || failed=1
   check 'dbus' dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames || failed=1
   check 'novnc' curl --fail --silent http://127.0.0.1:6080/vnc.html || failed=1
-  check 'browser' chromium --version || failed=1
+  check 'browser' firefox-esr --version || failed=1
   return "$failed"
 }
 
@@ -113,7 +113,7 @@ terminal() {
 }
 
 browser() {
-  chromium "${1:-about:blank}" >/dev/null 2>&1 &
+  firefox-esr "${1:-about:blank}" >/dev/null 2>&1 &
 }
 
 case "${1:-}" in

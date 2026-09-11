@@ -1,4 +1,4 @@
 [Default Applications]
-x-scheme-handler/http=chromium.desktop
-x-scheme-handler/https=chromium.desktop
-text/html=chromium.desktop
+x-scheme-handler/http=firefox-esr.desktop
+x-scheme-handler/https=firefox-esr.desktop
+text/html=firefox-esr.desktop
