@@ -350,6 +350,31 @@ spec:
                       type: object
                     maxItems: 64
                     type: array
+                  imagePullSecrets:
+                    description: |-
+                      Administrator-owned image-pull credentials in the SandboxPool's own
+                      namespace. This is deliberately limited to `LocalObjectReference`s:
+                      callers cannot select a secret, a namespace, a service account, or any
+                      other Pod identity field.
+                    items:
+                      description: |-
+                        A same-namespace Kubernetes Secret used only for pulling an image.
+
+                        `SandboxPool` is an administrator-authored resource, and the controller
+                        projects this exact reference into `PodSpec.imagePullSecrets`. Keeping the
+                        namespace implicit prevents a pool from selecting credentials outside the
+                        namespace in which its controller-owned workload runs.
+                      properties:
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
                   runnerPath:
                     description: |-
                       Absolute path to `kobe-runner` inside `defaultContainer`, when the
@@ -377,6 +402,8 @@ spec:
                   rule: self.containers.exists(c, c.name == self.defaultContainer)
                 - message: container names must be unique
                   rule: self.containers.all(c, self.containers.filter(other, other.name == c.name).size() == 1)
+                - message: image pull secret names must be unique
+                  rule: '!has(self.imagePullSecrets) || self.imagePullSecrets.all(s, self.imagePullSecrets.filter(other, other.name == s.name).size() == 1)'
                 - message: every exposed port must name one declared container
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.containers.exists(c, c.name == p.container))'
                 - message: exposed port names must be unique

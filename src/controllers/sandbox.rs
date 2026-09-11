@@ -10196,6 +10196,7 @@ pub(crate) mod tests {
                             limits: quantity("1", "1Gi", "2Gi"),
                         },
                     }],
+                    image_pull_secrets: vec![],
                     exposed_ports: vec![SandboxPortSpec {
                         name: "http".into(),
                         container: "agent".into(),

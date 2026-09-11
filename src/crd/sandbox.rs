@@ -122,6 +122,18 @@ impl SandboxPoolSpec {
             return Err(SandboxPoolValidationError::NoContainers);
         }
 
+        let mut image_pull_secret_names = BTreeSet::new();
+        for secret in &self.template.image_pull_secrets {
+            if secret.name.trim().is_empty() {
+                return Err(SandboxPoolValidationError::EmptyImagePullSecret);
+            }
+            if !image_pull_secret_names.insert(secret.name.as_str()) {
+                return Err(SandboxPoolValidationError::DuplicateImagePullSecret(
+                    secret.name.clone(),
+                ));
+            }
+        }
+
         let mut container_names = BTreeSet::new();
         for container in &self.template.containers {
             if container.name.trim().is_empty() {
@@ -334,6 +346,10 @@ impl JsonSchema for SandboxPlacement {
         .message("container names must be unique")
 )]
 #[x_kube(
+    validation = Rule::new("!has(self.imagePullSecrets) || self.imagePullSecrets.all(s, self.imagePullSecrets.filter(other, other.name == s.name).size() == 1)")
+        .message("image pull secret names must be unique")
+)]
+#[x_kube(
     validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, self.containers.exists(c, c.name == p.container))")
         .message("every exposed port must name one declared container")
 )]
@@ -376,6 +392,13 @@ pub struct SandboxTemplateSpec {
     /// context, service accounts, and arbitrary Pod fields are not exposed.
     #[schemars(length(min = 1, max = 16))]
     pub containers: Vec<SandboxContainerSpec>,
+    /// Administrator-owned image-pull credentials in the SandboxPool's own
+    /// namespace. This is deliberately limited to `LocalObjectReference`s:
+    /// callers cannot select a secret, a namespace, a service account, or any
+    /// other Pod identity field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub image_pull_secrets: Vec<SandboxImagePullSecret>,
     /// Ports that later access brokers may expose, each declared as one port
     /// or one contiguous range. Any undeclared port remains unauthorized.
     ///
@@ -417,6 +440,22 @@ pub struct SandboxTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 255), pattern(r"^/[A-Za-z0-9._/-]*$"))]
     pub runner_path: Option<String>,
+}
+
+/// A same-namespace Kubernetes Secret used only for pulling an image.
+///
+/// `SandboxPool` is an administrator-authored resource, and the controller
+/// projects this exact reference into `PodSpec.imagePullSecrets`. Keeping the
+/// namespace implicit prevents a pool from selecting credentials outside the
+/// namespace in which its controller-owned workload runs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxImagePullSecret {
+    #[schemars(
+        length(min = 1, max = 253),
+        pattern("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+    )]
+    pub name: String,
 }
 
 impl SandboxTemplateSpec {
@@ -1452,6 +1491,10 @@ pub enum SandboxPoolValidationError {
     EmptyClusterPoolRef,
     #[error("template must contain at least one container")]
     NoContainers,
+    #[error("image pull secret name must not be empty")]
+    EmptyImagePullSecret,
+    #[error("duplicate image pull secret {0}")]
+    DuplicateImagePullSecret(String),
     #[error("container name must not be empty")]
     EmptyContainerName,
     #[error("duplicate container name {0}")]
@@ -1525,6 +1568,7 @@ mod tests {
                         },
                     },
                 }],
+                image_pull_secrets: vec![],
                 exposed_ports: vec![SandboxPortSpec {
                     name: "http".into(),
                     container: "agent".into(),
@@ -1722,6 +1766,22 @@ mod tests {
             spec.validate(),
             Err(SandboxPoolValidationError::UnknownDefaultContainer(
                 "missing".into()
+            ))
+        );
+
+        let mut spec = valid_pool_spec();
+        spec.template.image_pull_secrets = vec![
+            SandboxImagePullSecret {
+                name: "registry".into(),
+            },
+            SandboxImagePullSecret {
+                name: "registry".into(),
+            },
+        ];
+        assert_eq!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::DuplicateImagePullSecret(
+                "registry".into()
             ))
         );
 

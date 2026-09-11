@@ -88,6 +88,8 @@ spec:
     type: management
   template:
     defaultContainer: workspace
+    imagePullSecrets:
+      - name: private-workspace-registry
     containers:
       - name: workspace
         image: ghcr.io/example/agent-sandbox:v1
@@ -121,6 +123,28 @@ Linux capabilities, disables privilege escalation, and applies the
 `RuntimeDefault` seccomp profile. Images must therefore work as that non-root
 user and must not require writable root-owned paths. Canary `argv` is executed
 directly, without an implicit shell.
+
+## Private images
+
+For a private container registry, an administrator creates a Kubernetes image
+pull Secret in the same namespace as the `SandboxPool`, then references that
+Secret from `template.imagePullSecrets`. Kobe projects only these
+administrator-authored, same-namespace names into the resulting Pod's
+`imagePullSecrets`; callers cannot choose credentials or alter the Pod identity.
+
+```yaml
+template:
+  defaultContainer: workspace
+  imagePullSecrets:
+    - name: zondax-workspace-registry
+  containers:
+    - name: workspace
+      image: docker.io/zondax/kobe-workspace:sha-0123456
+```
+
+Create and rotate the registry Secret through the cluster's normal secret
+management path. Do not put registry tokens in the pool manifest, the image,
+or a caller command. Existing public-image pools may omit the field.
 
 ## `exposedPorts`
 

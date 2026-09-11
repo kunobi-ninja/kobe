@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, PodSecurityContext, PodSpec, ResourceRequirements,
-    SeccompProfile, SecurityContext,
+    Capabilities, Container, ContainerPort, LocalObjectReference, PodSecurityContext, PodSpec,
+    ResourceRequirements, SeccompProfile, SecurityContext,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -279,6 +279,15 @@ pub fn build_sandbox_template(
         automount_service_account_token: Some(false),
         containers,
         enable_service_links: Some(false),
+        image_pull_secrets: (!pool.template.image_pull_secrets.is_empty()).then(|| {
+            pool.template
+                .image_pull_secrets
+                .iter()
+                .map(|secret| LocalObjectReference {
+                    name: secret.name.clone(),
+                })
+                .collect()
+        }),
         restart_policy: Some("Never".to_string()),
         runtime_class_name: pool.isolation.runtime_class_name().map(ToString::to_string),
         security_context: Some(PodSecurityContext {
@@ -1427,6 +1436,7 @@ mod tests {
                         limits: quantity("1", "1Gi", "2Gi"),
                     },
                 }],
+                image_pull_secrets: vec![],
                 exposed_ports: vec![SandboxPortSpec {
                     name: "http".into(),
                     container: "agent".into(),
@@ -1771,6 +1781,22 @@ mod tests {
             value["spec"]["podTemplate"]["spec"]
                 .get("volumes")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn template_projection_maps_only_administrator_selected_image_pull_secrets() {
+        let mut pool = pool();
+        pool.template.image_pull_secrets = vec![crate::crd::SandboxImagePullSecret {
+            name: "zondax-workspace-registry".into(),
+        }];
+
+        let object = build_sandbox_template("agents", "targets", &pool, Some(&owner())).unwrap();
+        let value = serde_json::to_value(object).unwrap();
+
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["imagePullSecrets"],
+            serde_json::json!([{ "name": "zondax-workspace-registry" }])
         );
     }
 
