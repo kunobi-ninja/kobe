@@ -8,9 +8,9 @@ USER root
 # Tauri 2 Linux prerequisites plus an unprivileged software-rendered desktop.
 # Language runtimes and project tools still come from the project's mise.toml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium \
         dbus \
         file \
+        firefox-esr \
         fonts-dejavu-core \
         libayatana-appindicator3-dev \
         libgl1-mesa-dri \
