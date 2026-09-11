@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         libssl-dev \
         openssh-client \
+        openssh-server \
         pkg-config \
         procps \
         ripgrep \
@@ -100,14 +101,44 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
     && rm -f /tmp/mise-install.sh \
     && /usr/local/bin/mise --version | grep -q "${MISE_VERSION#v}"
 
+# AI coding CLIs are part of the workspace baseline: a project cannot install
+# them before an agent starts. Their credentials are deliberately *not* baked
+# in; each lease authenticates its own user at runtime. Node is installed with
+# the same pinned tool manager used by the workspace, then exposed at a stable
+# root-owned path for direct `kobe exec` calls.
+ARG NODE_VERSION=24.18.1
+ARG CODEX_VERSION=0.154.0
+ARG CLAUDE_CODE_VERSION=2.1.268
+# npm locates its bundled JavaScript relative to its executable. Keeping the
+# whole Node distribution together avoids a broken /usr/local symlink.
+RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
+    && node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
+    && PATH="$node_dir/bin:$PATH" \
+    && export PATH \
+    && npm install --global --prefix "$node_dir" --no-audit --no-fund \
+        "@openai/codex@${CODEX_VERSION}" \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && codex --version \
+    && claude --version
+
+# Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
+# the pinned tools visible there as well as to Kobe's direct-exec environment.
+RUN printf '%s\n' 'export PATH=/opt/kobe/mise/installs/node/24.18.1/bin:$PATH' \
+      > /etc/profile.d/kobe-node-tools.sh \
+    && chmod 0644 /etc/profile.d/kobe-node-tools.sh
+
 COPY --from=runner /kobe-runner /kobe-runner
+COPY --chmod=0755 docker/kobe-workspace-ssh /usr/local/bin/kobe-workspace-ssh
 
 RUN test -x /kobe-runner \
     && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0700 /var/run/kobe/executions
 
 USER 65532:65532
 
-ENV HOME=/home/agent
+ENV HOME=/home/agent \
+    # The image pins a tested Claude Code version. Updating a shared executable
+    # from an ephemeral lease would make its behavior non-reproducible.
+    DISABLE_AUTOUPDATER=1
 
 # `mise activate` is a SHELL hook, and Kobe's runner executes argv directly with
 # no implicit shell — so a shell-activated PATH would never apply to
@@ -115,7 +146,7 @@ ENV HOME=/home/agent
 # shell: they are real executables on PATH that dispatch to the version the
 # project's `mise.toml` pins. Putting them first is what makes a bare `cargo`
 # resolve at all in this image.
-ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:$PATH
+ENV PATH=/opt/kobe/mise/installs/node/24.18.1/bin:/home/agent/.local/share/mise/shims:/home/agent/.local/bin:$PATH
 
 # mise refuses to read a config file it has not been told to trust, which in a
 # freshly cloned repo means `mise install` stops and waits for a human that a
@@ -149,6 +180,13 @@ RUN mise use --global jq@1.7.1 \
     && jq --version \
     && mise unuse --global jq \
     && rm -rf /home/agent/.cache/mise
+
+# Fail the image build if either the coding baseline or the lease-local SSH
+# helper is missing. This proves installation only; neither command writes a
+# credential or starts a listener during image construction.
+RUN codex --version \
+    && claude --version \
+    && kobe-workspace-ssh --help >/dev/null
 
 ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown

@@ -8,10 +8,16 @@ USER root
 # Tauri 2 Linux prerequisites plus an unprivileged software-rendered desktop.
 # Language runtimes and project tools still come from the project's mise.toml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        autocutsel \
         dbus \
         file \
         firefox-esr \
+        fontconfig \
         fonts-dejavu-core \
+        fonts-liberation2 \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-noto-core \
         libayatana-appindicator3-dev \
         libgl1-mesa-dri \
         librsvg2-dev \

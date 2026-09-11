@@ -90,7 +90,7 @@ start() {
     fi
     sleep 0.2
   done
-  printf '%s\n' 'Desktop ready. Forward port 6080 and open /vnc.html?autoconnect=1&resize=scale&path=websockify'
+  printf '%s\n' 'Desktop ready. Forward port 6080 and open /vnc.html?autoconnect=1&resize=remote&quality=9&compression=0&path=websockify'
 }
 
 stop() {

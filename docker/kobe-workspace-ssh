@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Start a lease-local SSH server for terminal clients such as cmux.
+#
+# The server listens only on 127.0.0.1:2222. A caller can reach it only through
+# Kobe's authenticated, pool-declared port-forward. Both its host key and the
+# authorized_keys file live under the lease's writable runtime directory, so
+# neither survives release or becomes an image-wide credential.
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:-${HOME:?HOME is required}/.cache/kobe-ssh}"
+port="${KOBE_WORKSPACE_SSH_PORT:-2222}"
+server_user="$(id -un)"
+host_key="$runtime_dir/ssh_host_ed25519_key"
+authorized_keys="$runtime_dir/authorized_keys"
+config="$runtime_dir/sshd_config"
+pid_file="$runtime_dir/sshd.pid"
+log_file="$runtime_dir/sshd.log"
+
+usage() {
+  cat <<'USAGE'
+Usage: kobe-workspace-ssh <authorize|start|status|stop|fingerprint>
+
+  authorize    Read OpenSSH public key(s) from stdin for this lease only.
+  start        Start a loopback-only SSH server on port 2222.
+  status       Report the server and key state.
+  stop         Stop the lease-local SSH server and remove its credentials.
+  fingerprint  Print the lease-local SSH host-key fingerprint.
+
+Start only after authorizing a local public key, for example:
+  ssh-add -L | kobe exec <lease> --stdin -- kobe-workspace-ssh authorize
+  kobe exec <lease> -- kobe-workspace-ssh start
+  kobe port-forward <lease> 2222:2222
+  cmux ssh nonroot@127.0.0.1 -p 2222
+USAGE
+}
+
+prepare_runtime() {
+  mkdir -p "$runtime_dir"
+  chmod 700 "$runtime_dir"
+}
+
+write_config() {
+  cat >"$config" <<EOF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $host_key
+AuthorizedKeysFile $authorized_keys
+PidFile $pid_file
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+PermitRootLogin no
+PermitUserEnvironment no
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding yes
+GatewayPorts no
+PermitTunnel no
+AllowUsers $server_user
+Subsystem sftp /usr/lib/openssh/sftp-server
+LogLevel VERBOSE
+EOF
+  chmod 600 "$config"
+}
+
+ensure_host_key() {
+  if [[ ! -s "$host_key" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$host_key"
+  fi
+  chmod 600 "$host_key"
+}
+
+running() {
+  [[ -s "$pid_file" ]] && kill -0 "$(<"$pid_file")" 2>/dev/null
+}
+
+authorize() {
+  prepare_runtime
+  local candidate="$runtime_dir/authorized_keys.candidate"
+  cat >"$candidate"
+  [[ -s "$candidate" ]] || {
+    printf '%s\n' 'No public key was provided on stdin.' >&2
+    return 2
+  }
+
+  while IFS= read -r key; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    ssh-keygen -lf <(printf '%s\n' "$key") >/dev/null
+  done <"$candidate"
+  sort -u "$candidate" >"$authorized_keys"
+  rm -f "$candidate"
+  chmod 600 "$authorized_keys"
+  printf '%s\n' 'Lease-local SSH public key(s) authorized.'
+}
+
+start() {
+  prepare_runtime
+  [[ -s "$authorized_keys" ]] || {
+    printf '%s\n' 'Authorize a public key before starting SSH.' >&2
+    return 2
+  }
+  if running; then
+    printf '%s\n' 'Lease-local SSH is already running.'
+    return 0
+  fi
+  rm -f "$pid_file"
+  ensure_host_key
+  write_config
+  /usr/sbin/sshd -f "$config" -E "$log_file"
+  for _ in {1..50}; do
+    running && {
+      printf '%s\n' "Lease-local SSH ready on 127.0.0.1:$port."
+      return 0
+    }
+    sleep 0.1
+  done
+  cat "$log_file" >&2 || true
+  printf '%s\n' 'Lease-local SSH did not start.' >&2
+  return 1
+}
+
+status() {
+  if running; then
+    printf '%-16s ready\n' 'server'
+  else
+    printf '%-16s unavailable\n' 'server'
+  fi
+  [[ -s "$authorized_keys" ]] \
+    && printf '%-16s ready\n' 'authorized keys' \
+    || printf '%-16s unavailable\n' 'authorized keys'
+  [[ -s "$host_key" ]] \
+    && printf '%-16s ready\n' 'ephemeral host key' \
+    || printf '%-16s unavailable\n' 'ephemeral host key'
+  running
+}
+
+stop() {
+  if running; then
+    kill "$(<"$pid_file")"
+    for _ in {1..20}; do
+      running || break
+      sleep 0.1
+    done
+  fi
+  rm -f "$pid_file" "$config" "$host_key" "$host_key.pub" "$authorized_keys" "$log_file"
+  printf '%s\n' 'Lease-local SSH stopped and credentials removed.'
+}
+
+fingerprint() {
+  [[ -s "$host_key" ]] || {
+    printf '%s\n' 'SSH has not been started for this lease.' >&2
+    return 1
+  }
+  ssh-keygen -lf "$host_key.pub"
+}
+
+case "${1:-}" in
+  authorize) authorize ;;
+  start) start ;;
+  status) status ;;
+  stop) stop ;;
+  fingerprint) fingerprint ;;
+  -h|--help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac
