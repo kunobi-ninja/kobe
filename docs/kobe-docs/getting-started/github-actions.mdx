@@ -1,0 +1,103 @@
+---
+title: GitHub Actions
+description: Lease a cluster for a CI job with kobe-action and release it when the job ends.
+---
+
+# GitHub Actions
+
+[`kunobi-ninja/kobe-action`](https://github.com/kunobi-ninja/kobe-action)
+leases a cluster from a pool, writes its kubeconfig, and releases the lease
+when the job ends. It authenticates with the job's GitHub OIDC token, so the
+repository stores no kobe secret.
+
+## Allow the repository to lease
+
+Create an `AccessPolicy` that trusts GitHub's OIDC issuer. The action
+requests tokens for the audience `kobe-system` unless you set `audience`, so
+the policy must accept the same value:
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: github-ci
+  namespace: kobe
+spec:
+  auth:
+    oidc:
+      issuer: https://token.actions.githubusercontent.com
+      audience: ["kobe-system"]
+  identity: "{repository}"
+  rules:
+    - match:
+        claim: repository
+        value: my-org/api-service
+      pools: ["ci-small"]
+      maxTtl: 30m
+      maxConcurrentLeases: 5
+      maxExtensions: 0
+```
+
+Each rule limits which pools the repository may use, for how long, and how
+many leases it may hold at once. See [OIDC](/docs/auth/oidc) for other claims
+you can match on.
+
+## Lease a cluster in a workflow
+
+```yaml
+name: e2e
+
+on: [pull_request]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write    # lets the job request an OIDC token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: kunobi-ninja/kobe-action@v2
+        id: cluster
+        with:
+          endpoint: https://kobe.example.com
+          pool: ci-small
+          ttl: 30m
+          wait-for-ready: true
+
+      - name: Run tests against the leased cluster
+        env:
+          KUBECONFIG: ${{ steps.cluster.outputs.kubeconfig-path }}
+        run: |
+          kubectl get nodes
+          make e2e
+```
+
+The job needs no release step. The action's post step releases the lease
+whether the job succeeds, fails, or is cancelled. If the job dies without
+running it, the lease still ends at its TTL.
+
+## Wait for nodes, not only the API
+
+A lease is `Bound` once the cluster's API server answers. Nodes can take
+longer to register, so tests that list nodes right away may find none. Set
+`wait-for-ready: true` to wait until nodes report Ready. For pools with
+separate workers, also set `min-ready-nodes: 1`.
+
+## Inputs and outputs
+
+| Input | Default | Purpose |
+|---|---|---|
+| `endpoint` | | kobe API URL (required) |
+| `pool` | | Pool to lease from (required) |
+| `ttl` | `1h` | Lease duration, capped by the policy's `maxTtl` |
+| `audience` | `kobe-system` | OIDC audience; must match the policy |
+| `timeout` | `5m` | How long to wait for the lease to become `Bound` |
+| `wait-for-ready` | `false` | Also wait for nodes to be Ready |
+| `min-ready-nodes` | `0` | Workers required when waiting for readiness |
+| `ready-timeout` | `2m` | How long to wait for readiness after `Bound` |
+
+Outputs: `kubeconfig-path`, `lease-id`, `cluster-name`, and
+`cluster-backend`. The [action's README](https://github.com/kunobi-ninja/kobe-action#readme)
+has the full reference.

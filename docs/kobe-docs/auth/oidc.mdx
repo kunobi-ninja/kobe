@@ -40,7 +40,10 @@ spec:
       maxExtensions: 0
 ```
 
-In your GitHub Actions workflow, request the token and pass it to kobe:
+In your workflow, lease with [`kunobi-ninja/kobe-action`](https://github.com/kunobi-ninja/kobe-action).
+It requests the token and releases the lease when the job ends. Set its
+`audience` to a value the policy accepts; the action's default is
+`kobe-system`:
 
 ```yaml
 jobs:
@@ -48,16 +51,18 @@ jobs:
     permissions:
       id-token: write    # required to request the OIDC token
     steps:
-      - name: Claim cluster
-        run: |
-          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://kobe.example.com" | jq -r .value)
-          LEASE=$(curl -s -X POST https://kobe.example.com/v1/leases \
-            -H "Authorization: Bearer $TOKEN" \
-            -d '{"pool": "ci-small", "ttl": "20m"}')
-          echo "LEASE_ID=$(echo $LEASE | jq -r .id)" >> $GITHUB_ENV
-          echo "$LEASE" | jq -r .kubeconfig > /tmp/kube.yaml
+      - uses: kunobi-ninja/kobe-action@v2
+        id: cluster
+        with:
+          endpoint: https://kobe.example.com
+          pool: ci-small
+          ttl: 20m
+          audience: https://kobe.example.com
+      - run: kubectl --kubeconfig ${{ steps.cluster.outputs.kubeconfig-path }} get nodes
 ```
+
+See [GitHub Actions](/docs/getting-started/github-actions) for a complete
+workflow.
 
 ## Clerk
 

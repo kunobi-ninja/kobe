@@ -42,6 +42,29 @@ curl -X DELETE https://pool.kunobi.ninja/v1/leases/lease-a1b2c3d4e5f6 \
 
 > Prefer the CLI? `kobe login` → `kobe lease ci-small` → `kobe release <lease-id>`. See the [quick start](docs/kobe-docs/getting-started/quick-start.mdx).
 
+### In GitHub Actions
+
+[`kunobi-ninja/kobe-action`](https://github.com/kunobi-ninja/kobe-action) leases a cluster with the job's OIDC token and releases it when the job ends, including on failure or cancellation:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: kunobi-ninja/kobe-action@v2
+        id: cluster
+        with:
+          endpoint: https://kobe.example.com
+          pool: ci-small
+          wait-for-ready: true
+
+      - run: kubectl --kubeconfig ${{ steps.cluster.outputs.kubeconfig-path }} get nodes
+```
+
+The endpoint needs an `AccessPolicy` that trusts GitHub's OIDC issuer. See [GitHub Actions](docs/kobe-docs/getting-started/github-actions.mdx).
+
 ## How It Works
 
 Kobe runs as an operator in a host Kubernetes cluster. It maintains warm **pools** of clusters, each defined by a `ClusterPool` (a backend + cluster template with specific configuration, addons, and resource limits).
