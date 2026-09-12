@@ -8,29 +8,10 @@ on:
     # exactly backwards, since the point of holding work off main is to prove
     # it carries no regressions first.
     branches: [main, "epic/**"]
-    paths:
-      - "src/**"
-      - "crates/**"
-      # The conformance suite lives here. Without it a PR that only touches
-      # `tests/` triggers no run at all, so its required check never reports
-      # and the PR is blocked forever — and a change that broke the suite
-      # would reach main unexamined.
-      - "tests/**"
-      - "charts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "justfile"
-      - "docker/**"
-      - "docker-bake.hcl"
-      - "hack/**"
-      - "scripts/**"
-      - "apt_config/**"
-      - "nix/**"
-      - "flake.nix"
-      - "flake.lock"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/package-publish.yml"
-      - ".github/workflows/publish-crates.yaml"
+    # No `paths:` filter. A filtered-out PR starts no run, so the required
+    # `Rust Checks` never reports and the PR stays blocked forever (this hit
+    # every docs-only PR). The `changes` job decides instead; a job skipped by
+    # its `if:` reports success, so docs-only PRs pass without building.
   # Releases are cut by pushing a `v*` tag — NOT by publishing a GitHub Release
   # by hand. `_release-rust.yml` creates the Release itself as a DRAFT, attaches
   # every signed asset, and only then flips it to published. That ordering is
@@ -77,8 +58,48 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  # Does this PR touch anything the Rust gate covers? Pushes, tags, schedules
+  # and dispatches always answer yes. Jobs below run unless this job succeeded
+  # AND said no, so if it fails the gate runs in full instead of being skipped.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" != "pull_request" ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r file; do
+            case "$file" in
+              # `tests/` holds the conformance suite: a change that broke it
+              # must not reach main unexamined.
+              src/*|crates/*|tests/*|charts/*|docker/*|hack/*|scripts/*|apt_config/*|nix/*) code=true ;;
+              Cargo.toml|Cargo.lock|justfile|docker-bake.hcl|flake.nix|flake.lock) code=true ;;
+              .github/workflows/ci.yml|.github/workflows/package-publish.yml|.github/workflows/publish-crates.yaml) code=true ;;
+            esac
+          done < <(gh pr diff "$PR" --repo "$REPO" --name-only)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Code changes: $code"
+
   checks:
     name: Rust Checks
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: kunobi-runners
     container:
       # Toolchain floor is driven by `kunobi-ha` (≥ 1.94 since kunobi-ha
@@ -235,6 +256,8 @@ jobs:
 
   lifecycle-state-machine:
     name: Lifecycle State Machine (Kani + mutations)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: kunobi-runners
     # Bare ARC runners intentionally carry no compiler/linker. Use the same
     # build environment as the main Rust gate so installing Kani has `cc`.
@@ -285,6 +308,8 @@ jobs:
   # image, Helm release, or external Agent Sandbox runtime is involved.
   sandbox-apiserver-contract:
     name: Sandbox API-server Contract
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: kunobi-runners
     timeout-minutes: 15
     env:
@@ -349,6 +374,8 @@ jobs:
   # refuses to reuse one.
   sandbox-runtime-contract:
     name: Agent Sandbox Runtime Contract
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: kunobi-runners
     timeout-minutes: 20
     env:
