@@ -105,46 +105,6 @@ pub(crate) async fn fetch_leases_path(
     Ok(response.json().await?)
 }
 
-async fn fetch_sandbox_leases_with_output(
-    config: &ResolvedConfig,
-    output: OutputFormat,
-) -> Result<Vec<LeaseSummary>> {
-    let path = "/v1/sandbox-leases";
-    let endpoint = config.endpoint.as_str();
-    let token = get_auth_header_for_output(config, "GET", path, b"", output).await?;
-    let response = with_auth(
-        super::authed_client().get(format!("{endpoint}{path}")),
-        &token,
-    )
-    .send()
-    .await
-    .reaching(config)?;
-    let status = response.status();
-    if matches!(status.as_u16(), 403 | 404 | 501) {
-        return Ok(Vec::new());
-    }
-    if !status.is_success() {
-        anyhow::bail!("Failed to list Sandbox leases (HTTP {status})");
-    }
-    let mut leases: Vec<LeaseSummary> = response.json().await?;
-    for lease in &mut leases {
-        lease.resource_kind = "Sandbox".to_string();
-        lease.capabilities = vec![
-            "exec".to_string(),
-            "cancel".to_string(),
-            "logs".to_string(),
-            "attach".to_string(),
-            "port-forward".to_string(),
-            "extend".to_string(),
-            "release".to_string(),
-        ];
-    }
-    Ok(leases)
-}
-
-/// Return every lease kind through one client-side inventory. The server keeps
-/// kind-specific storage and authorization routes; callers should not need to
-/// know that to select, inspect, extend, or release a lease.
 pub(crate) async fn fetch_all_leases(config: &ResolvedConfig) -> Result<Vec<LeaseSummary>> {
     fetch_all_leases_with_output(config, OutputFormat::Text).await
 }
@@ -168,31 +128,33 @@ pub(crate) async fn fetch_all_leases_with_output(
         }
         response.json().await?
     };
-    let unified = leases
-        .iter()
-        .any(|lease| lease.resource_kind.eq_ignore_ascii_case("sandbox"));
+    // Older operators omit `resourceKind` and `capabilities`. A `sandbox-` id
+    // is never a cluster, and each kind's verbs are fixed, so both can be
+    // filled in here rather than fetched from the kind-specific alias route.
     for lease in &mut leases {
-        if lease.resource_kind.is_empty() {
-            lease.resource_kind = if lease.id.starts_with("sandbox-") {
-                "Sandbox".to_string()
+        if lease.id.starts_with("sandbox-") {
+            lease.resource_kind = "Sandbox".to_string();
+        } else if lease.resource_kind.is_empty() {
+            lease.resource_kind = "Cluster".to_string();
+        }
+        if lease.capabilities.is_empty() {
+            lease.capabilities = if lease.is_sandbox() {
+                [
+                    "exec",
+                    "cancel",
+                    "logs",
+                    "attach",
+                    "port-forward",
+                    "extend",
+                    "release",
+                ]
+                .map(str::to_string)
+                .to_vec()
             } else {
-                "Cluster".to_string()
+                ["kubeconfig", "extend", "release"]
+                    .map(str::to_string)
+                    .to_vec()
             };
-        }
-        if lease.capabilities.is_empty() && !lease.is_sandbox() {
-            lease.capabilities = vec![
-                "kubeconfig".to_string(),
-                "extend".to_string(),
-                "release".to_string(),
-            ];
-        }
-    }
-    if !unified {
-        let extra = fetch_sandbox_leases_with_output(config, output).await?;
-        for lease in extra {
-            if !leases.iter().any(|existing| existing.id == lease.id) {
-                leases.push(lease);
-            }
         }
     }
     leases.sort_by(|left, right| left.id.cmp(&right.id));

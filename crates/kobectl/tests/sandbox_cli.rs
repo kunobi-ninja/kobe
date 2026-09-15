@@ -192,6 +192,17 @@ fn pool_body(name: &str, resource_kind: &str, capabilities: &[&str]) -> String {
     .to_string()
 }
 
+/// A cluster lease and the sandbox inventory in one `/v1/leases` listing,
+/// as a unified operator serves them.
+fn mixed_inventory(profile: &str) -> String {
+    let mut leases: Vec<Value> = serde_json::from_str(&sandbox_inventory()).unwrap();
+    leases.insert(
+        0,
+        json!({ "id": "lease-cluster", "phase": "Bound", "profile": profile }),
+    );
+    serde_json::to_string(&leases).unwrap()
+}
+
 fn sandbox_inventory() -> String {
     json!([{
         "id": "sandbox-test",
@@ -319,8 +330,7 @@ fn run_server(
 fn flat_exec_routes_an_executable_lease_without_a_kind_namespace() {
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(
+            ("GET", "/v1/leases") => reply(
                 stream,
                 200,
                 &[],
@@ -369,7 +379,6 @@ fn flat_exec_rejects_a_cluster_lease_by_capability() {
                 }])
                 .to_string(),
             ),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 403, &[], ""),
             _ => panic!("unsupported capability must not reach execution: {request:?}"),
         }
     });
@@ -387,8 +396,7 @@ fn flat_exec_rejects_a_cluster_lease_by_capability() {
 fn flat_release_resolves_a_sandbox_alias_before_dispatch() {
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(
+            ("GET", "/v1/leases") => reply(
                 stream,
                 200,
                 &[],
@@ -420,8 +428,7 @@ fn flat_release_resolves_a_sandbox_alias_before_dispatch() {
 fn flat_capability_commands_resolve_aliases_without_a_kind_namespace() {
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
             ("GET", "/v1/sandbox-leases/sandbox-test/logs?tail=5") => {
                 reply(stream, 200, &[], "sandbox log\n")
             }
@@ -536,8 +543,7 @@ fn flat_lease_dispatches_from_the_pool_resource_kind() {
 fn flat_extend_and_purge_route_both_resource_kinds() {
     let extend_server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
             ("PATCH", "/v1/sandbox-leases/sandbox-test") => reply(
                 stream,
                 200,
@@ -566,18 +572,7 @@ fn flat_extend_and_purge_route_both_resource_kinds() {
     let observed = Arc::clone(&deleted);
     let purge_server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(
-                stream,
-                200,
-                &[],
-                &json!([{
-                    "id": "lease-cluster",
-                    "phase": "Bound",
-                    "profile": "ci"
-                }])
-                .to_string(),
-            ),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &mixed_inventory("ci")),
             ("DELETE", "/v1/leases/lease-cluster")
             | ("DELETE", "/v1/sandbox-leases/sandbox-test") => {
                 observed.lock().unwrap().push(request.path);
@@ -626,18 +621,7 @@ fn flat_status_reports_one_mixed_pool_and_lease_inventory() {
                 ])
                 .to_string(),
             ),
-            ("GET", "/v1/leases") => reply(
-                stream,
-                200,
-                &[],
-                &json!([{
-                    "id": "lease-cluster",
-                    "phase": "Bound",
-                    "profile": "ci"
-                }])
-                .to_string(),
-            ),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &mixed_inventory("ci")),
             ("GET", "/v1/leases/lease-cluster") => reply(
                 stream,
                 200,
@@ -983,8 +967,7 @@ fn json_attach_is_refused_and_port_forward_errors_are_machine_events() {
     let observed = Arc::clone(&calls);
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
             ("GET", "/v1/sandbox-leases/sandbox-test") => reply(
                 stream,
                 200,
@@ -1889,8 +1872,7 @@ fn ssh_proxy_authorizes_the_key_then_attaches_to_the_named_sandbox() {
     let seen = Arc::clone(&executions);
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(
+            ("GET", "/v1/leases") => reply(
                 stream,
                 200,
                 &[],
@@ -1964,8 +1946,7 @@ fn ssh_proxy_authorizes_the_key_then_attaches_to_the_named_sandbox() {
 fn ssh_proxy_names_the_missing_sshd_instead_of_closing_silently() {
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(
+            ("GET", "/v1/leases") => reply(
                 stream,
                 200,
                 &[],
@@ -2015,7 +1996,6 @@ fn ssh_proxy_creates_the_sandbox_when_the_name_is_new() {
                 ),
             ),
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             ("POST", "/v1/sandbox-leases") => {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 let (_, id) = keyed_lease(&request.body);
@@ -2071,7 +2051,6 @@ fn ssh_proxy_without_a_pool_explains_how_to_name_one() {
                 &format!("[{}]", pool_body("small", "Sandbox", &["exec", "attach"])),
             ),
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             _ => panic!("nothing may be created without a pool: {request:?}"),
         }
     });
@@ -2092,7 +2071,6 @@ fn ssh_proxy_no_create_refuses_a_missing_sandbox() {
     let server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             _ => panic!("--no-create must not create: {request:?}"),
         }
     });
@@ -2135,7 +2113,6 @@ fn ssh_proxy_refuses_a_cluster_lease() {
                 }])
                 .to_string(),
             ),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             _ => panic!("a cluster lease must be refused before any other call: {request:?}"),
         }
     });
@@ -2218,7 +2195,6 @@ fn init_then_doctor_round_trip_without_prompts() {
             ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
             ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             _ => panic!("unexpected request: {request:?}"),
         }
     });
@@ -2336,7 +2312,6 @@ fn doctor_reports_what_init_would_fix() {
             ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
             ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
             ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
             _ => panic!("unexpected request: {request:?}"),
         }
     });
@@ -2434,8 +2409,7 @@ fn start_attach_server(stdout_reply: &'static [u8]) -> (String, thread::JoinHand
                 let request = String::from_utf8_lossy(&buffer[..count]).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
                 let body = match path.as_str() {
-                    "/v1/leases" => "[]".to_string(),
-                    "/v1/sandbox-leases" => sandbox_inventory(),
+                    "/v1/leases" => sandbox_inventory(),
                     "/v1/sandbox-leases/sandbox-test" => json!({
                         "id": "sandbox-test",
                         "phase": "Ready",
