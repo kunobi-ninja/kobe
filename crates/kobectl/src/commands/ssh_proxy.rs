@@ -301,7 +301,7 @@ async fn authorize_key(config: &ResolvedConfig, lease_id: &str, public_key: &str
 /// [`DEFAULT_PUBLIC_KEYS`] under `~/.ssh`. A key that is present but not a
 /// public key (someone pointed at the private half) is refused rather than
 /// sent anywhere.
-fn resolve_public_key(flag: Option<&str>, configured: Option<&str>) -> Result<String> {
+pub(crate) fn resolve_public_key(flag: Option<&str>, configured: Option<&str>) -> Result<String> {
     let path = match flag.or(configured) {
         Some(explicit) => expand_home(explicit),
         None => {

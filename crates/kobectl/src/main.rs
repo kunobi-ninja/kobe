@@ -141,6 +141,37 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         public_key: Option<String>,
     },
+    /// Set this machine up for `ssh kobe-<pool>-<name>`.
+    ///
+    /// Writes a target with --endpoint (or uses the current one), completes
+    /// login or the one-time trust answer, picks a default pool, finds your
+    /// public key, installs the ssh_config block, and proves `ssh -G`
+    /// resolves it. Every step is skipped when already done.
+    Init {
+        /// Create or replace a target at this endpoint and make it current.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// Name for the target written by --endpoint (default: `default`).
+        #[arg(long, value_name = "NAME", requires = "endpoint")]
+        name: Option<String>,
+        /// Auth mode for --endpoint (none, token, oidc, ssh). Discovered when omitted.
+        #[arg(long, requires = "endpoint")]
+        auth: Option<String>,
+        /// Bearer token for --auth token.
+        #[arg(long, requires = "endpoint")]
+        token: Option<String>,
+        /// Pool `kobe ssh-proxy` uses when the host name does not name one.
+        #[arg(long = "default-pool", value_name = "POOL")]
+        default_pool: Option<String>,
+        /// Public key file to authorize inside sandboxes; remembered in the config.
+        #[arg(long, value_name = "PATH")]
+        public_key: Option<String>,
+        /// Never prompt; take every default.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Check everything `ssh kobe-<pool>-<name>` depends on, without changing anything.
+    Doctor,
     /// Print the ssh_config block that routes `kobe-*` hosts through `kobe ssh-proxy`.
     ///
     /// Append it to `~/.ssh/config` (or a file it includes). Uses the absolute
@@ -638,6 +669,34 @@ async fn main() -> anyhow::Result<()> {
                 Err(error) => exit_resource_error(error, OutputFormat::Text),
             }
         }
+        Commands::Init {
+            endpoint: new_endpoint,
+            name,
+            auth,
+            token: new_token,
+            default_pool,
+            public_key,
+            yes,
+        } => {
+            commands::init(commands::InitCommand {
+                endpoint: new_endpoint.as_deref(),
+                name: name.as_deref(),
+                auth: auth.as_deref(),
+                token: new_token.as_deref(),
+                default_pool: default_pool.as_deref(),
+                public_key: public_key.as_deref(),
+                yes,
+                target_override: target,
+                endpoint_override: endpoint,
+                output,
+            })
+            .await
+        }
+        Commands::Doctor => match commands::doctor(target, endpoint, output).await {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(error) => Err(error),
+        },
         Commands::SshConfig => commands::ssh_config(target),
         Commands::Sandbox { action } => {
             dispatch_resource_action(action, target, endpoint, output).await

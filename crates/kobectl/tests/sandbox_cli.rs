@@ -2158,3 +2158,185 @@ fn base64_decode(value: &str) -> String {
     )
     .unwrap()
 }
+
+// --- init / doctor -----------------------------------------------------------
+
+fn status_body(methods: &[&str]) -> String {
+    json!({ "version": "0.99.0", "auth": { "methods": methods } }).to_string()
+}
+
+fn ssh_capable_pools() -> String {
+    format!(
+        "[{},{}]",
+        pool_body("small", "Sandbox", &["exec", "logs", "attach"]),
+        pool_body("ci-small", "Cluster", &["kubeconfig"])
+    )
+}
+
+#[test]
+fn init_then_doctor_round_trip_without_prompts() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
+            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            _ => panic!("unexpected request: {request:?}"),
+        }
+    });
+    let endpoint = server.endpoint();
+    let directory = tempfile::tempdir().unwrap();
+    write_public_key(&directory);
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kobe"));
+        command
+            .current_dir(directory.path())
+            .env("HOME", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        wait_output(command.spawn().unwrap())
+    };
+
+    let output = run(&[
+        "init",
+        "--endpoint",
+        &endpoint,
+        "--auth",
+        "none",
+        "--default-pool",
+        "small",
+        "--yes",
+        "--output",
+        "json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let init: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(init["target"], "default");
+    assert_eq!(init["defaultPool"], "small");
+    assert_eq!(init["tryHost"], "kobe-small-1");
+    let kobe_config = std::path::PathBuf::from(init["sshConfig"].as_str().unwrap());
+    let user_config = std::path::PathBuf::from(init["include"].as_str().unwrap());
+    assert!(kobe_config.starts_with(directory.path()), "{kobe_config:?}");
+    assert!(user_config.starts_with(directory.path()), "{user_config:?}");
+    let block = std::fs::read_to_string(&kobe_config).unwrap();
+    assert!(block.contains("Host kobe-*\n"), "{block}");
+    assert!(
+        block.contains(&format!(
+            "ProxyCommand {} ssh-proxy %n\n",
+            env!("CARGO_BIN_EXE_kobe")
+        )),
+        "{block}"
+    );
+    let user = std::fs::read_to_string(&user_config).unwrap();
+    assert!(
+        user.starts_with(&format!("Include \"{}\"\n", kobe_config.display())),
+        "{user}"
+    );
+
+    // A second run changes nothing and still succeeds.
+    let output = run(&["init", "--yes", "--output", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&user_config).unwrap(),
+        user,
+        "include added twice"
+    );
+
+    let output = run(&["doctor", "--output", "json"]);
+    let doctor: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        serde_json::to_string_pretty(&doctor).unwrap()
+    );
+    assert_eq!(doctor["healthy"], true);
+    let by_name: HashMap<&str, &Value> = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| (check["name"].as_str().unwrap(), check))
+        .collect();
+    for name in [
+        "binary",
+        "target",
+        "endpoint",
+        "session",
+        "pools",
+        "leases",
+        "public key",
+        "ssh config",
+        "ssh resolve",
+    ] {
+        assert_eq!(by_name[name]["status"], "ok", "{name}: {}", by_name[name]);
+    }
+    assert!(
+        by_name["pools"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("default small")
+    );
+}
+
+#[test]
+fn doctor_reports_what_init_would_fix() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
+            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            _ => panic!("unexpected request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(&server.endpoint(), &["doctor", "--output", "json"]);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(1));
+    let doctor: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doctor["healthy"], false);
+    let by_name: HashMap<&str, &Value> = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| (check["name"].as_str().unwrap(), check))
+        .collect();
+    assert_eq!(by_name["endpoint"]["status"], "ok");
+    assert_eq!(by_name["session"]["status"], "ok");
+    assert_eq!(by_name["pools"]["status"], "warn", "{}", by_name["pools"]);
+    assert_eq!(by_name["public key"]["status"], "fail");
+    assert_eq!(by_name["ssh config"]["status"], "fail");
+    assert_eq!(by_name["ssh config"]["fix"], "kobe init");
+}
+
+#[test]
+fn init_refuses_a_pool_that_cannot_serve_ssh() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+            _ => panic!("unexpected request: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(
+        &server.endpoint(),
+        &["init", "--default-pool", "ci-small", "--yes"],
+    );
+    write_public_key(&directory);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ci-small cannot serve SSH"), "{stderr}");
+    assert!(stderr.contains("small"), "{stderr}");
+}

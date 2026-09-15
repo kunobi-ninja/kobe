@@ -17,6 +17,8 @@ description: All kobe CLI commands with flags and examples.
 | `kobe cancel` | Cancel a running execution |
 | `kobe attach` | Open an interactive session through an `attach` capability |
 | `kobe port-forward` | Forward a declared port through a `port-forward` capability |
+| `kobe init` | Set this machine up for `ssh kobe-<pool>-<name>`: target, login, default pool, public key, `ssh_config` ([details](/commands/ssh)) |
+| `kobe doctor` | Check everything `ssh kobe-…` depends on, without changing anything |
 | `kobe ssh-proxy` | Serve an SSH connection to a sandbox on stdin/stdout, as an ssh `ProxyCommand` ([details](/commands/ssh)) |
 | `kobe ssh-config` | Print the `ssh_config` block that routes `kobe-*` hosts through `kobe ssh-proxy` |
 | `kobe login` | Authenticate with the kobe service |

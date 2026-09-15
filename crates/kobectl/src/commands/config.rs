@@ -605,7 +605,7 @@ pub async fn config_set_target(command: SetTargetCommand<'_>) -> Result<()> {
 
 /// Insert/update a target in the local `./.kobe.toml`, creating the
 /// file if it doesn't exist. Returns the absolute path written.
-fn write_target_to_local(name: &str, target: KobeTarget) -> Result<PathBuf> {
+pub(crate) fn write_target_to_local(name: &str, target: KobeTarget) -> Result<PathBuf> {
     let path = local_config_path()?
         .ok_or_else(|| anyhow::anyhow!("Cannot determine current directory for .kobe.toml"))?;
 

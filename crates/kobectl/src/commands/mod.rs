@@ -1,6 +1,8 @@
 mod config;
 mod config_tui;
+mod doctor;
 mod extend;
+mod init;
 mod keepalive;
 mod lease_create;
 mod leases;
@@ -14,6 +16,7 @@ pub(crate) mod sandbox_transport;
 mod select;
 pub(crate) mod session;
 mod ssh_proxy;
+mod ssh_setup;
 mod state;
 mod status;
 mod version;
@@ -27,7 +30,9 @@ pub use config::{
     config_set_target, config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
+pub use doctor::doctor;
 pub use extend::extend;
+pub use init::{InitCommand, init};
 pub use lease_create::{LeaseCreateCommand, lease_create};
 pub use login::{login, logout};
 pub use purge::purge;
@@ -411,7 +416,7 @@ pub(crate) enum Unreachable {
 }
 
 impl Unreachable {
-    fn summary(self) -> &'static str {
+    pub(crate) fn summary(self) -> &'static str {
         match self {
             Self::Dns => "the host name does not resolve",
             Self::Refused => "nothing is listening there",
@@ -421,7 +426,7 @@ impl Unreachable {
         }
     }
 
-    fn hint(self) -> &'static str {
+    pub(crate) fn hint(self) -> &'static str {
         match self {
             Self::Dns => {
                 "A private cluster resolves only from its network: connect the VPN, or check the endpoint for a typo."
