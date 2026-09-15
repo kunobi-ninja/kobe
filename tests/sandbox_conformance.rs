@@ -98,11 +98,17 @@ impl Placement {
     }
 }
 
-/// Run one scenario against both placements.
+/// Run one scenario against both placements, at the same time.
 ///
-/// A failure names the placement, because "the exec scenario failed" is not
-/// actionable when the whole point is that one placement behaves differently
-/// from the other.
+/// The two placements are independent pools, so a scenario that leases one
+/// sandbox in each can hold both at once; running them in series only added
+/// the second placement's provisioning and teardown to every scenario's wall
+/// clock. Both halves always run to completion, and a failure names its
+/// placement, because "the exec scenario failed" is not actionable when the
+/// whole point is that one placement behaves differently from the other.
+///
+/// Scenarios that restart the operator or inject a failure into it must not
+/// overlap with themselves: use [`both_placements_serial!`] for those.
 ///
 /// Leading attributes are forwarded, so a scenario can carry the doc comment
 /// that says what breaks when it does not hold. Without the passthrough that
@@ -116,16 +122,67 @@ macro_rules! both_placements {
         async fn $name() {
             require_e2e();
             let scenario: fn(Placement) -> _ = $body;
-            scenario(Placement::Management)
-                .await
-                .unwrap_or_else(|error| panic!("[{}] {error:#}", Placement::Management.label()));
-            scenario(Placement::ChildCluster)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("[{}] {error:#}", Placement::ChildCluster.label())
-                });
+            let started = Instant::now();
+            let (management, child) = tokio::join!(
+                scenario(Placement::Management),
+                scenario(Placement::ChildCluster)
+            );
+            eprintln!(
+                "[timing] {} both placements done in {:.0?}",
+                stringify!($name),
+                started.elapsed()
+            );
+            report_placements(&[
+                (Placement::Management, management),
+                (Placement::ChildCluster, child),
+            ]);
         }
     };
+}
+
+/// Run one scenario against both placements, one after the other.
+///
+/// For scenarios whose body restarts the operator or injects a failure into
+/// it: those act on the whole operator, so two copies running side by side
+/// would restart or break each other's run.
+macro_rules! both_placements_serial {
+    ($(#[$attribute:meta])* $name:ident, $body:expr) => {
+        $(#[$attribute])*
+        #[tokio::test]
+        #[ignore = "requires a live Kobe endpoint; see the module docs"]
+        async fn $name() {
+            require_e2e();
+            let scenario: fn(Placement) -> _ = $body;
+            let started = Instant::now();
+            let management = scenario(Placement::Management).await;
+            let child = scenario(Placement::ChildCluster).await;
+            eprintln!(
+                "[timing] {} both placements done in {:.0?} (serial)",
+                stringify!($name),
+                started.elapsed()
+            );
+            report_placements(&[
+                (Placement::Management, management),
+                (Placement::ChildCluster, child),
+            ]);
+        }
+    };
+}
+
+/// Panic with every placement that failed, not only the first.
+fn report_placements(outcomes: &[(Placement, anyhow::Result<()>)]) {
+    let failures: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(placement, outcome)| {
+            outcome
+                .as_ref()
+                .err()
+                .map(|error| format!("[{}] {error:#}", placement.label()))
+        })
+        .collect();
+    if !failures.is_empty() {
+        panic!("{}", failures.join("\n"));
+    }
 }
 
 fn require_e2e() {
@@ -356,6 +413,9 @@ struct LeasedSandbox {
     api: Api,
     id: String,
     released: bool,
+    placement: Placement,
+    /// When the create request was sent: the zero of every `[timing]` line.
+    created: Instant,
 }
 
 impl LeasedSandbox {
@@ -366,7 +426,8 @@ impl LeasedSandbox {
         // concurrency ceiling while earlier releases finish tearing down.
         // Queue on the clean 429 rather than failing — a teardown that never
         // frees its reservation still fails here, loudly, at the deadline.
-        let deadline = Instant::now() + Duration::from_secs(240);
+        let created = Instant::now();
+        let deadline = created + Duration::from_secs(240);
         let (status, body) = loop {
             let (status, body) = api
                 .json(
@@ -403,11 +464,28 @@ impl LeasedSandbox {
                 "admission_pending must be a durable non-retry handle: {body}"
             );
         }
+        eprintln!(
+            "[timing] {} {id}: accepted after {:.1?}",
+            placement.label(),
+            created.elapsed()
+        );
         Ok(Self {
             api,
             id,
             released: false,
+            placement,
+            created,
         })
+    }
+
+    /// One `[timing]` line: what happened, how long after the create request.
+    fn timing(&self, event: &str) {
+        eprintln!(
+            "[timing] {} {}: {event} at +{:.1?}",
+            self.placement.label(),
+            self.id,
+            self.created.elapsed()
+        );
     }
 
     /// The lease as its own holder sees it, right now.
@@ -437,7 +515,10 @@ impl LeasedSandbox {
                 "sandbox admission was cancelled before Ready: {body}"
             );
             match body["phase"].as_str() {
-                Some("Ready") => return Ok(body),
+                Some("Ready") => {
+                    self.timing("ready");
+                    return Ok(body);
+                }
                 Some(terminal @ ("Released" | "Expired" | "Quarantined")) => {
                     anyhow::bail!("sandbox reached {terminal} before Ready: {body}");
                 }
@@ -488,6 +569,7 @@ impl LeasedSandbox {
                             "{expected_phase} was exposed without {required}=True: {body}"
                         );
                     }
+                    self.timing(&format!("{expected_phase} verified ({expected_cause})"));
                     return Ok(body);
                 }
                 Some(terminal @ ("Released" | "Expired" | "Quarantined")) => {
@@ -670,6 +752,7 @@ impl LeasedSandbox {
             "could not release: HTTP {status} {body}"
         );
         self.released = true;
+        self.timing("release requested");
         // Deliberately NOT awaited to terminal cleanup: the revocation
         // scenarios observe the mid-teardown window this call opens (the 409
         // on a Releasing lease, the revoked attach stream), and quota freed
@@ -1479,7 +1562,7 @@ both_placements!(
 // been asked to reboot.
 // ---------------------------------------------------------------------------
 
-both_placements!(
+both_placements_serial!(
     /// A restart before readiness resumes the same composition rather than
     /// starting a second one.
     ///
@@ -1551,7 +1634,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// A restart between a retry and its original still runs the command once.
     ///
     /// The reservation that makes two concurrent retries race for one object
@@ -1612,7 +1695,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// Kobe may die after its durable Running checkpoint but before the target
     /// runner sees `start`. The workload can also remove the runner spool, so
     /// `NotFound` cannot restore spawn authority. The exact retry must settle
@@ -1662,7 +1745,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// A runner crash after its target-side reservation but before supervisor
     /// spawn returns one stable Unknown and never manufactures the command.
     crash_before_spawn_is_unknown_and_never_retried,
@@ -1714,7 +1797,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// The runner may spawn and then disappear before acknowledging Kobe. The
     /// caller gets one stable Unknown, while the target-side reservation keeps
     /// an exact retry from spawning the side effect twice.
@@ -1767,7 +1850,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// Once Kobe has parsed the runner acknowledgement, a process crash before
     /// terminal status persistence is recovered by polling that same runner
     /// reservation. Exact output, exit status and side effects stay stable.
@@ -1815,7 +1898,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// A restart during teardown still settles the lease exactly once.
     ///
     /// Teardown is where a restart is most expensive to get wrong: a resumed
@@ -1879,7 +1962,7 @@ both_placements!(
     }
 );
 
-both_placements!(
+both_placements_serial!(
     /// An unverifiable teardown withholds capacity instead of releasing it.
     ///
     /// The safe direction is the counter-intuitive one. An under-counted pool
@@ -2222,12 +2305,17 @@ mod suite_shape {
     /// appear literally in this file. A hand-rolled scan rather than a regex
     /// dependency, for one pattern.
     fn declared_scenarios(source: &str) -> Vec<String> {
-        source
-            .match_indices("both_placements!(")
-            .filter_map(|(start, _)| {
+        ["both_placements!(", "both_placements_serial!("]
+            .into_iter()
+            .flat_map(|opener| {
+                source
+                    .match_indices(opener)
+                    .map(move |(start, _)| start + opener.len())
+            })
+            .filter_map(|after_opener| {
                 // The macro forwards doc comments, so they sit between the
                 // paren and the name; skip whitespace and `///` lines.
-                let mut rest = source[start + "both_placements!(".len()..].trim_start();
+                let mut rest = source[after_opener..].trim_start();
                 while rest.starts_with("///") {
                     rest = match rest.split_once('\n') {
                         Some((_, tail)) => tail.trim_start(),

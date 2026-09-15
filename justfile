@@ -178,7 +178,7 @@ test-sandbox-conformance-pr:
       natural_expiry_rejects_further_access; do
       parallel+=("$scenario")
     done
-    cargo test --test sandbox_conformance -- --ignored --exact --test-threads=2 "${parallel[@]}" 2>&1 | tee "$summary"
+    cargo test --test sandbox_conformance -- --ignored --exact --nocapture --test-threads=2 "${parallel[@]}" 2>&1 | tee "$summary"
     grep -qE "^test result: ok\. +${#parallel[@]} passed;" "$summary" || {
       echo "parallel group did not report exactly ${#parallel[@]} passing tests — a scenario renamed or deleted?" >&2
       exit 1
@@ -195,7 +195,7 @@ test-sandbox-conformance-pr:
       crash_before_spawn_is_unknown_and_never_retried \
       crash_after_spawn_before_ack_is_unknown_and_runs_once \
       crash_after_ack_before_status_recovers_the_original_outcome; do
-      cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1 2>&1 | tee "$summary"
+      cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$summary"
       grep -qE '^test result: ok\. +1 passed;' "$summary" || {
         echo "scenario '$scenario' did not report exactly one passing test — renamed or deleted?" >&2
         exit 1
