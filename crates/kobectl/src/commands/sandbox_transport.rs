@@ -315,11 +315,78 @@ fn apply_server_frame(message: &Message) -> Option<String> {
 }
 
 async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
-    #[cfg(unix)]
-    if tty {
-        return pump_raw(socket).await;
+    if !tty {
+        return pump_pipe(socket).await;
     }
-    pump_key_events(socket, tty).await
+    #[cfg(unix)]
+    {
+        pump_raw(socket).await
+    }
+    #[cfg(not(unix))]
+    {
+        pump_key_events(socket).await
+    }
+}
+
+/// Forward stdin and stdout as opaque bytes, with no terminal in the loop.
+///
+/// This is `--no-tty`: the caller is a pipe, not a person. An `ssh` running
+/// `kobe ssh-proxy` as its ProxyCommand speaks the SSH protocol over these two
+/// descriptors, and any interpretation of the bytes — decoding keystrokes,
+/// raw mode, a resize watcher that opens the controlling terminal — either
+/// corrupts the stream or, with no terminal at all, aborts the process.
+/// crossterm's event reader is the latter case: it panics when it cannot open
+/// one, which is exactly the situation here.
+async fn pump_pipe(socket: &mut Socket) -> Result<String> {
+    let mut receiver = spawn_stdin_reader();
+    loop {
+        tokio::select! {
+            inbound = socket.next() => {
+                let Some(message) = inbound else {
+                    return Ok("closed".to_string());
+                };
+                let message = message.context("stream failed")?;
+                if let Some(reason) = apply_server_frame(&message) {
+                    return Ok(reason);
+                }
+            }
+            outbound = receiver.recv() => {
+                // stdin at EOF is not the end of the session: the workload may
+                // still be writing. Stop forwarding and keep rendering.
+                let Some(bytes) = outbound else { continue };
+                socket.send(client_frame(CHANNEL_STDIN, &bytes)).await?;
+            }
+        }
+    }
+}
+
+/// Read this process's stdin on its own thread and hand the bytes to a channel.
+///
+/// A dedicated thread rather than `tokio::io::stdin()`: a read cancelled by
+/// `select!` can lose whatever it had already taken from the fd, and the
+/// bytes it would lose are the user's keystrokes. Handing them to a channel
+/// makes the branch cancel-safe, because a receive that loses the race
+/// leaves the message queued. The channel closes at EOF.
+fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.blocking_send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    receiver
 }
 
 /// Forward stdin byte for byte, interpreting nothing.
@@ -339,30 +406,7 @@ async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
 async fn pump_raw(socket: &mut Socket) -> Result<String> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    // A dedicated thread rather than `tokio::io::stdin()`: a read cancelled by
-    // `select!` can lose whatever it had already taken from the fd, and the
-    // bytes it would lose are the user's keystrokes. Handing them to a channel
-    // makes the branch cancel-safe, because a receive that loses the race
-    // leaves the message queued.
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if sender.blocking_send(buffer[..read].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-
+    let mut receiver = spawn_stdin_reader();
     let mut resized =
         signal(SignalKind::window_change()).context("could not watch for terminal resizes")?;
 
@@ -396,9 +440,11 @@ async fn pump_raw(socket: &mut Socket) -> Result<String> {
 /// Decode key events and re-encode them as bytes.
 ///
 /// The fallback where no `SIGWINCH` exists. Lossy by construction — see
-/// [`key_to_bytes`] — so it is only reached off Unix, or when there is no tty
-/// to put in raw mode.
-async fn pump_key_events(socket: &mut Socket, tty: bool) -> Result<String> {
+/// [`key_to_bytes`] — so it is only reached off Unix, and only with a terminal:
+/// a pipe goes through [`pump_pipe`], because the event reader needs a
+/// terminal to open and aborts the process without one.
+#[cfg(not(unix))]
+async fn pump_key_events(socket: &mut Socket) -> Result<String> {
     use crossterm::event::{Event, EventStream};
 
     let mut events = EventStream::new();
@@ -413,7 +459,7 @@ async fn pump_key_events(socket: &mut Socket, tty: bool) -> Result<String> {
                     return Ok(reason);
                 }
             }
-            event = events.next(), if tty => {
+            event = events.next() => {
                 let Some(event) = event else { continue };
                 match event.context("terminal input failed")? {
                     Event::Key(key) => {
