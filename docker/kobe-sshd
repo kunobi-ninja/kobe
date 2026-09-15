@@ -1,0 +1,37 @@
+#!/bin/sh
+# Serve one SSH session over stdin/stdout for `kobe ssh-proxy`.
+#
+# The proxy runs this through `kobe attach --no-tty`, so stdin and stdout are
+# the SSH transport and must carry nothing else. Diagnostics go to stderr.
+#
+# The host key is generated on first use under $HOME, so every sandbox gets
+# its own and the image ships none. Two sessions starting at once may both
+# reach the generation step: each writes a private candidate and links it
+# into place, and the first link wins. The loser's candidate is discarded.
+#
+# `--check` validates the configuration and key material without serving
+# a session; the image build uses it as a proof that sshd can run as the
+# workload user.
+set -eu
+
+config=/etc/kobe/sshd_config
+dir="${HOME}/.ssh"
+key="${dir}/kobe_host_ed25519_key"
+
+umask 077
+mkdir -p "${dir}"
+[ -e "${dir}/authorized_keys" ] || : > "${dir}/authorized_keys"
+
+if [ ! -f "${key}" ]; then
+    candidate="${key}.$$"
+    ssh-keygen -q -t ed25519 -N '' -C 'kobe-sandbox' -f "${candidate}" >/dev/null 2>&1
+    ln "${candidate}" "${key}" 2>/dev/null || true
+    ln "${candidate}.pub" "${key}.pub" 2>/dev/null || true
+    rm -f "${candidate}" "${candidate}.pub"
+fi
+
+if [ "${1:-}" = "--check" ]; then
+    exec /usr/sbin/sshd -t -f "${config}" -o "HostKey=${key}"
+fi
+
+exec /usr/sbin/sshd -i -e -f "${config}" -o "HostKey=${key}"
