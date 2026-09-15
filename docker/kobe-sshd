@@ -12,7 +12,37 @@
 # `--check` validates the configuration and key material without serving
 # a session; the image build uses it as a proof that sshd can run as the
 # workload user.
+#
+# `--session NAME` (from `ssh kobe-<name>.NAME`) makes interactive logins land
+# in the `kobe-runner` session NAME, whose shell outlives the connection. sshd
+# runs this script again as its ForceCommand with `--login NAME`; anything the
+# client asked for other than a login shell (a command, scp, sftp, an editor's
+# remote server) runs exactly as it would without a session.
 set -eu
+
+if [ "${1:-}" = "--login" ]; then
+    # sshd replaced the client's command with this one; SSH_ORIGINAL_COMMAND
+    # holds what was asked for, including a subsystem's command for sftp.
+    if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+        exec "${SHELL:-/bin/sh}" -c "${SSH_ORIGINAL_COMMAND}"
+    fi
+    exec /kobe-runner session attach --name "${2:?session name}"
+fi
+
+session=
+if [ "${1:-}" = "--session" ]; then
+    session="${2:-}"
+    case "${session}" in
+        '' | *[!a-z0-9-]*)
+            echo "kobe-sshd: session name must be lowercase letters, digits and '-'" >&2
+            exit 2
+            ;;
+    esac
+    if [ "${#session}" -gt 64 ]; then
+        echo "kobe-sshd: session name is longer than 64 characters" >&2
+        exit 2
+    fi
+fi
 
 config=/etc/kobe/sshd_config
 dir="${HOME}/.ssh"
@@ -32,6 +62,11 @@ fi
 
 if [ "${1:-}" = "--check" ]; then
     exec /usr/sbin/sshd -t -f "${config}" -o "HostKey=${key}"
+fi
+
+if [ -n "${session}" ]; then
+    exec /usr/sbin/sshd -i -e -f "${config}" -o "HostKey=${key}" \
+        -o "ForceCommand=/usr/local/bin/kobe-sshd --login ${session}"
 fi
 
 exec /usr/sbin/sshd -i -e -f "${config}" -o "HostKey=${key}"

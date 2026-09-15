@@ -253,6 +253,307 @@ pub async fn attach(
     Ok(0)
 }
 
+/// Where `kobe attach --session` finds `kobe-runner` when not told otherwise:
+/// the path the Kobe workspace images ship it at, and set as `runnerPath`.
+pub const DEFAULT_RUNNER_PATH: &str = "/kobe-runner";
+
+/// End reason for a stream the caller left with `~.`. Hyphenated so it cannot
+/// collide with a server reason, which are snake_case.
+const LOCAL_DETACH: &str = "local-detach";
+
+/// A connection that lasted this long was a success, and resets the backoff.
+const SESSION_STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Consecutive failed reconnects before giving up: about five minutes.
+const MAX_SESSION_RECONNECTS: u32 = 30;
+
+const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `name` can name a runner session: the runner's own id rule,
+/// lowercase letters, digits and `-`, at most 64 bytes.
+pub fn is_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Split `dev.main` into the lease selector `dev` and the session `main`.
+///
+/// On the last dot, so a selector that itself contains dots (a pool name may)
+/// keeps them. The caller tries the whole selector first; this is only the
+/// reading it falls back to.
+pub fn split_session_selector(selector: &str) -> Option<(&str, &str)> {
+    let (lease, session) = selector.rsplit_once('.')?;
+    (!lease.is_empty() && is_session_name(session)).then_some((lease, session))
+}
+
+/// Argv that attaches to runner session `name`, creating it with `command`.
+pub fn session_command(runner_path: &str, name: &str, command: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        runner_path.to_string(),
+        "session".to_string(),
+        "attach".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    if !command.is_empty() {
+        argv.push("--".to_string());
+        argv.extend(command.iter().cloned());
+    }
+    argv
+}
+
+/// Whether a stream that ended for `reason` leaves a session to reconnect to.
+///
+/// The shell lives in the runner, not in the stream, so a limit that ends the
+/// stream ends only this connection. `completed` means the runner itself
+/// exited: the shell did, or another attach took the session over. A revoked
+/// lease refuses the next attach too, and a protocol violation would repeat.
+fn session_reconnects_after(reason: &str) -> bool {
+    !matches!(
+        reason,
+        "completed" | "revoked" | "protocol_violation" | LOCAL_DETACH
+    )
+}
+
+fn reconnect_delay(failures: u32) -> std::time::Duration {
+    let exponent = failures.saturating_sub(1).min(4);
+    std::time::Duration::from_secs(1 << exponent).min(MAX_RECONNECT_DELAY)
+}
+
+/// A stream Kobe refused to open, as opposed to one it could not be reached
+/// for. Retrying a refusal only repeats it.
+fn is_refusal(error: &anyhow::Error) -> bool {
+    let status = error.chain().find_map(|cause| {
+        if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) = cause.downcast_ref() {
+            return Some(response.status().as_u16());
+        }
+        cause
+            .downcast_ref::<IrohSessionRefused>()
+            .map(|refused| refused.0)
+    });
+    matches!(status, Some(code) if (400..500).contains(&code) && code != 408 && code != 429)
+}
+
+/// ssh's escape sequence: `~.` typed at the start of a line detaches.
+///
+/// Only at the start of a line, so a `~` in a path or a word is sent at once.
+/// `~~` sends one `~`, and a held `~` followed by anything else sends both.
+#[derive(Debug, Default)]
+pub struct EscapeFilter {
+    mid_line: bool,
+    holding: bool,
+}
+
+impl EscapeFilter {
+    /// The bytes to forward, and whether the caller asked to detach. Bytes
+    /// after the escape are dropped: they were typed to a session that is
+    /// being left.
+    pub fn filter(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut forward = Vec::with_capacity(input.len() + 1);
+        for &byte in input {
+            if self.holding {
+                self.holding = false;
+                match byte {
+                    b'.' => return (forward, true),
+                    b'~' => {
+                        forward.push(b'~');
+                        self.mid_line = true;
+                        continue;
+                    }
+                    _ => forward.push(b'~'),
+                }
+            } else if !self.mid_line && byte == b'~' {
+                self.holding = true;
+                continue;
+            }
+            forward.push(byte);
+            self.mid_line = !matches!(byte, b'\r' | b'\n');
+        }
+        (forward, false)
+    }
+}
+
+/// `kobe attach --session`: a terminal that survives its connection.
+///
+/// The shell runs under `kobe-runner session` in the sandbox, detached from
+/// the exec, so this side only has to reconnect. Any end the runner did not
+/// choose (a dropped network, an operator restart, the stream's idle or
+/// duration bound) is followed by a reconnect, and the runner redraws the
+/// screen. `~.` at the start of a line detaches and leaves the shell running.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub async fn attach_session(
+    lease: &str,
+    name: &str,
+    runner_path: &str,
+    command: &[String],
+    container: Option<&str>,
+    target_override: Option<&str>,
+    endpoint_override: Option<&str>,
+    output: OutputFormat,
+) -> Result<i32> {
+    use super::sandbox::CLI_FAILURE_EXIT;
+
+    if output == OutputFormat::Json {
+        anyhow::bail!("sandbox attach is interactive and does not support --output json");
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--session needs an interactive terminal");
+    }
+    let config = CliConfig::load()?;
+    let config = config.resolve(target_override, endpoint_override)?;
+    let argv = session_command(runner_path, name, command);
+    let iroh = lease_uses_iroh(&config, lease, output).await;
+
+    let _raw = RawModeGuard::enter()?;
+    let mut input = spawn_stdin_reader();
+    let mut escape = EscapeFilter::default();
+    let detached = || {
+        eprint!("\r\n[kobe: detached; `kobe attach {lease} --session {name}` resumes]\r\n");
+        Ok(0)
+    };
+    let mut failures = 0u32;
+    loop {
+        let started = tokio::time::Instant::now();
+        let outcome = session_once(
+            &config,
+            lease,
+            &argv,
+            container,
+            iroh,
+            &mut input,
+            &mut escape,
+        )
+        .await;
+        if started.elapsed() >= SESSION_STABLE_AFTER {
+            failures = 0;
+        }
+        let why = match outcome {
+            Ok(reason) if reason == LOCAL_DETACH => return detached(),
+            Ok(reason) if reason == "completed" => return Ok(0),
+            Ok(reason) if !session_reconnects_after(&reason) => {
+                eprint!("\r\nkobe: session ended: {reason}\r\n");
+                return Ok(CLI_FAILURE_EXIT);
+            }
+            Ok(reason) => reason,
+            Err(error) if is_refusal(&error) => {
+                eprint!("\r\nkobe: {error:#}\r\n");
+                return Ok(CLI_FAILURE_EXIT);
+            }
+            Err(error) => format!("{error:#}"),
+        };
+
+        failures += 1;
+        if failures > MAX_SESSION_RECONNECTS {
+            eprint!("\r\nkobe: giving up after {MAX_SESSION_RECONNECTS} reconnects: {why}\r\n");
+            return Ok(CLI_FAILURE_EXIT);
+        }
+        let delay = reconnect_delay(failures);
+        eprint!(
+            "\r\n[kobe: connection lost ({why}); reconnecting in {}s, ~. to stop]\r\n",
+            delay.as_secs()
+        );
+        if wait_or_detach(delay, &mut input, &mut escape).await {
+            return detached();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+pub async fn attach_session(
+    _lease: &str,
+    _name: &str,
+    _runner_path: &str,
+    _command: &[String],
+    _container: Option<&str>,
+    _target_override: Option<&str>,
+    _endpoint_override: Option<&str>,
+    _output: OutputFormat,
+) -> Result<i32> {
+    anyhow::bail!("--session is supported only on unix terminals")
+}
+
+/// One connection to the session, until it ends for any reason.
+#[cfg(unix)]
+async fn session_once(
+    config: &ResolvedConfig,
+    lease: &str,
+    argv: &[String],
+    container: Option<&str>,
+    iroh: bool,
+    input: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    escape: &mut EscapeFilter,
+) -> Result<String> {
+    // The initial size on every connection: the runner resizes the shell to
+    // whichever terminal attached last.
+    let size = crossterm::terminal::size()
+        .ok()
+        .and_then(|(width, height)| resize_frame(width, height));
+    if iroh {
+        let mut body = serde_json::json!({
+            "operation": "attach",
+            "tty": true,
+            "command": argv,
+        });
+        if let Some(container) = container {
+            body["container"] = serde_json::json!(container);
+        }
+        let mut link = dial_iroh_session(config, lease, OutputFormat::Text, body).await?;
+        if let Some(Message::Binary(frame)) = size {
+            write_blob(&mut link.send, &frame).await.ok();
+        }
+        pump_raw_iroh(&mut link, input, Some(escape)).await
+    } else {
+        let mut path = format!("/v1/sandbox-leases/{lease}/attach?tty=true");
+        if let Some(container) = container {
+            path.push_str(&format!("&container={container}"));
+        }
+        for argument in argv {
+            path.push_str(&format!("&command={}", urlencoding_minimal(argument)));
+        }
+        let mut socket = open_stream(config, &path, OutputFormat::Text).await?;
+        if let Some(frame) = size {
+            socket.send(frame).await.ok();
+        }
+        pump_raw(&mut socket, input, Some(escape)).await
+    }
+}
+
+/// Sleep out a reconnect delay, unless the caller detaches first.
+///
+/// Keystrokes typed while disconnected are dropped rather than queued: the
+/// caller cannot see what they would land on, and a queued `rm` reaching a
+/// shell after an unseen screen change is worse than retyping.
+#[cfg(unix)]
+async fn wait_or_detach(
+    delay: std::time::Duration,
+    input: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    escape: &mut EscapeFilter,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            bytes = input.recv() => {
+                let Some(bytes) = bytes else {
+                    (&mut sleep).await;
+                    return false;
+                };
+                // Ctrl-C has no shell to reach while disconnected, so it
+                // stops the reconnecting instead.
+                if escape.filter(&bytes).1 || bytes.contains(&0x03) {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -320,7 +621,7 @@ async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
     }
     #[cfg(unix)]
     {
-        pump_raw(socket).await
+        pump_raw(socket, &mut spawn_stdin_reader(), None).await
     }
     #[cfg(not(unix))]
     {
@@ -367,6 +668,10 @@ async fn pump_pipe(socket: &mut Socket) -> Result<String> {
 /// bytes it would lose are the user's keystrokes. Handing them to a channel
 /// makes the branch cancel-safe, because a receive that loses the race
 /// leaves the message queued. The channel closes at EOF.
+///
+/// One per stdin, not one per stream. The thread holds the stdin lock while
+/// it blocks in `read`, so a second reader started on reconnect would wait for
+/// the first to wake up, and the keystroke that woke it would be lost.
 fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
@@ -402,13 +707,20 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 ///
 /// The cost is that resizes no longer arrive as decoded events, because
 /// nothing is decoding. `SIGWINCH` carries them instead.
+///
+/// With an `escape` filter, `~.` at the start of a line ends the pump with
+/// [`LOCAL_DETACH`] instead of reaching the workload.
 #[cfg(unix)]
-async fn pump_raw(socket: &mut Socket) -> Result<String> {
+async fn pump_raw(
+    socket: &mut Socket,
+    input: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut escape: Option<&mut EscapeFilter>,
+) -> Result<String> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut receiver = spawn_stdin_reader();
     let mut resized =
         signal(SignalKind::window_change()).context("could not watch for terminal resizes")?;
+    let mut input_open = true;
 
     loop {
         tokio::select! {
@@ -421,11 +733,23 @@ async fn pump_raw(socket: &mut Socket) -> Result<String> {
                     return Ok(reason);
                 }
             }
-            outbound = receiver.recv() => {
+            outbound = input.recv(), if input_open => {
                 // stdin at EOF is not the end of the session: the workload may
                 // still be writing. Stop forwarding and keep rendering.
-                let Some(bytes) = outbound else { continue };
-                socket.send(client_frame(CHANNEL_STDIN, &bytes)).await?;
+                let Some(bytes) = outbound else {
+                    input_open = false;
+                    continue;
+                };
+                let (bytes, detach) = match escape.as_deref_mut() {
+                    Some(filter) => filter.filter(&bytes),
+                    None => (bytes, false),
+                };
+                if !bytes.is_empty() {
+                    socket.send(client_frame(CHANNEL_STDIN, &bytes)).await?;
+                }
+                if detach {
+                    return Ok(LOCAL_DETACH.to_string());
+                }
             }
             _ = resized.recv() => {
                 if let Ok((width, height)) = crossterm::terminal::size()
@@ -769,10 +1093,22 @@ async fn request_iroh_session(
     .await
     .reaching(config)?;
     if !response.status().is_success() {
-        anyhow::bail!("iroh session was refused (HTTP {})", response.status());
+        return Err(IrohSessionRefused(response.status().as_u16()).into());
     }
     response.json().await.context("iroh session offer")
 }
+
+/// The operator answered the iroh session request with a non-success status.
+#[derive(Debug)]
+struct IrohSessionRefused(u16);
+
+impl std::fmt::Display for IrohSessionRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "iroh session was refused (HTTP {})", self.0)
+    }
+}
+
+impl std::error::Error for IrohSessionRefused {}
 
 async fn write_blob<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -952,36 +1288,23 @@ fn apply_server_blob(payload: &[u8]) -> Option<String> {
 async fn pump_terminal_iroh(link: &mut IrohLink, tty: bool) -> Result<String> {
     #[cfg(unix)]
     if tty {
-        return pump_raw_iroh(link).await;
+        return pump_raw_iroh(link, &mut spawn_stdin_reader(), None).await;
     }
     pump_key_events_iroh(link).await
 }
 
+/// [`pump_raw`] over an iroh stream.
 #[cfg(unix)]
-async fn pump_raw_iroh(link: &mut IrohLink) -> Result<String> {
+async fn pump_raw_iroh(
+    link: &mut IrohLink,
+    input: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut escape: Option<&mut EscapeFilter>,
+) -> Result<String> {
     use tokio::signal::unix::{SignalKind, signal};
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if sender.blocking_send(buffer[..read].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
 
     let mut resized =
         signal(SignalKind::window_change()).context("could not watch for terminal resizes")?;
+    let mut input_open = true;
 
     loop {
         tokio::select! {
@@ -993,12 +1316,24 @@ async fn pump_raw_iroh(link: &mut IrohLink) -> Result<String> {
                     return Ok(reason);
                 }
             }
-            outbound = receiver.recv() => {
-                let Some(bytes) = outbound else { continue };
-                let mut frame = Vec::with_capacity(bytes.len() + 1);
-                frame.push(CHANNEL_STDIN);
-                frame.extend_from_slice(&bytes);
-                write_blob(&mut link.send, &frame).await?;
+            outbound = input.recv(), if input_open => {
+                let Some(bytes) = outbound else {
+                    input_open = false;
+                    continue;
+                };
+                let (bytes, detach) = match escape.as_deref_mut() {
+                    Some(filter) => filter.filter(&bytes),
+                    None => (bytes, false),
+                };
+                if !bytes.is_empty() {
+                    let mut frame = Vec::with_capacity(bytes.len() + 1);
+                    frame.push(CHANNEL_STDIN);
+                    frame.extend_from_slice(&bytes);
+                    write_blob(&mut link.send, &frame).await?;
+                }
+                if detach {
+                    return Ok(LOCAL_DETACH.to_string());
+                }
             }
             _ = resized.recv() => {
                 if let Ok((width, height)) = crossterm::terminal::size()
@@ -1316,6 +1651,117 @@ mod tests {
             key_to_bytes(&KeyEvent::new(KeyCode::F(13), KeyModifiers::NONE)),
             None
         );
+    }
+
+    /// `~.` detaches only where ssh's escape would: at the start of a line.
+    #[test]
+    fn the_escape_detaches_only_at_the_start_of_a_line() {
+        let run = |chunks: &[&[u8]]| {
+            let mut filter = EscapeFilter::default();
+            let mut forwarded = Vec::new();
+            for chunk in chunks {
+                let (bytes, detach) = filter.filter(chunk);
+                forwarded.extend(bytes);
+                if detach {
+                    return (forwarded, true);
+                }
+            }
+            (forwarded, false)
+        };
+
+        // At the very start, after Enter, and split across reads.
+        assert_eq!(run(&[b"~."]), (vec![], true));
+        assert_eq!(run(&[b"ls\r~."]), (b"ls\r".to_vec(), true));
+        assert_eq!(run(&[b"ls\r~", b"."]), (b"ls\r".to_vec(), true));
+        // Anything after the escape was typed to a session being left.
+        assert_eq!(run(&[b"~.rm -rf\r"]), (vec![], true));
+
+        // Mid-line, a tilde is just a tilde.
+        assert_eq!(run(&[b"cd ~/src\r"]), (b"cd ~/src\r".to_vec(), false));
+        assert_eq!(run(&[b"a~."]), (b"a~.".to_vec(), false));
+        // `~~` sends one, and a held tilde followed by anything else sends both.
+        assert_eq!(run(&[b"~~."]), (b"~.".to_vec(), false));
+        assert_eq!(run(&[b"~/x"]), (b"~/x".to_vec(), false));
+        assert_eq!(run(&[b"~", b"\r"]), (b"~\r".to_vec(), false));
+    }
+
+    /// `dev.main` reads as a lease and a session; anything else stays whole.
+    #[test]
+    fn a_selector_splits_on_its_last_dot_into_a_session() {
+        assert_eq!(split_session_selector("dev.main"), Some(("dev", "main")));
+        assert_eq!(
+            split_session_selector("kobe-dev.build-2"),
+            Some(("kobe-dev", "build-2"))
+        );
+        // A dotted selector keeps its dots; only the last segment can be a
+        // session.
+        assert_eq!(
+            split_session_selector("ci.gpu.main"),
+            Some(("ci.gpu", "main"))
+        );
+
+        for whole in ["dev", "dev.", ".main", "dev.Main", "dev.a_b", "dev.a/b"] {
+            assert_eq!(split_session_selector(whole), None, "{whole}");
+        }
+        assert!(is_session_name(&"a".repeat(64)));
+        assert!(!is_session_name(&"a".repeat(65)));
+    }
+
+    /// The session command reaches the runner, and a program only when given.
+    #[test]
+    fn the_session_command_names_the_runner_and_the_session() {
+        assert_eq!(
+            session_command("/kobe-runner", "main", &[]),
+            ["/kobe-runner", "session", "attach", "--name", "main"]
+        );
+        assert_eq!(
+            session_command("/opt/r", "work", &["zsh".to_string()]),
+            ["/opt/r", "session", "attach", "--name", "work", "--", "zsh"]
+        );
+    }
+
+    /// Limits end the connection, not the session; only a final end stops.
+    #[test]
+    fn only_a_final_end_stops_the_reconnect_loop() {
+        for again in [
+            "closed",
+            "idle_timeout",
+            "duration_exceeded",
+            "byte_limit_exceeded",
+            "target_error",
+            "something_new",
+        ] {
+            assert!(session_reconnects_after(again), "{again}");
+        }
+        for fin in ["completed", "revoked", "protocol_violation", LOCAL_DETACH] {
+            assert!(!session_reconnects_after(fin), "{fin}");
+        }
+    }
+
+    #[test]
+    fn the_reconnect_delay_backs_off_to_a_ceiling() {
+        let delays: Vec<u64> = (1..=7).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 10, 10, 10]);
+    }
+
+    /// A refusal is final; a network failure or an overloaded server is not.
+    #[test]
+    fn a_refused_stream_is_not_retried() {
+        use tokio_tungstenite::tungstenite::{Error, http::Response};
+
+        let http = |status: u16| {
+            anyhow::Error::new(Error::Http(Box::new(
+                Response::builder().status(status).body(None).unwrap(),
+            )))
+            .context("could not open the stream")
+        };
+        assert!(is_refusal(&http(403)));
+        assert!(is_refusal(&http(404)));
+        assert!(is_refusal(&anyhow::Error::new(IrohSessionRefused(409))));
+
+        assert!(!is_refusal(&http(429)));
+        assert!(!is_refusal(&http(503)));
+        assert!(!is_refusal(&anyhow::anyhow!("connection reset")));
     }
 
     /// A forward spec keeps its remote half as a string.

@@ -18,7 +18,7 @@
 # Administrators consume it either way round:
 #
 #     COPY --from=zondax/kobe-runner:latest /kobe-runner /kobe-runner
-#     RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+#     RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions /var/run/kobe/sessions
 #     USER 65532:65532
 #
 # using the workload's real UID/GID, then set
@@ -63,7 +63,7 @@ FROM alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8
 
 COPY --from=build /kobe-runner /kobe-runner
 
-RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions /var/run/kobe/sessions
 
 USER 65532:65532
 

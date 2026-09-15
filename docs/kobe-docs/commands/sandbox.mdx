@@ -277,6 +277,32 @@ kobe attach dev -- zellij attach --create kobe
 Running the multiplexer inside the sandbox also means your session survives a
 disconnect: reattaching resumes it rather than starting over.
 
+### Sessions that survive a disconnect
+
+`--session` keeps a shell alive in the sandbox without a multiplexer in the
+image. `kobe-runner` holds the shell and its screen, `kobe` reconnects when the
+connection drops, and the screen is redrawn as you left it.
+
+```bash
+kobe attach dev --session main               # create or resume "main"
+kobe attach dev.main                         # the same, shorter
+kobe attach dev --session build -- /bin/zsh  # a new session runs this program
+```
+
+`ssh kobe-dev.main` reaches the same session over SSH.
+
+- A dropped connection, an operator restart, or the stream's idle or duration
+  limit reconnects on its own, waiting up to 10 seconds between tries.
+- Type `~.` at the start of a line to detach. The shell keeps running, and the
+  same command resumes it. Ctrl-C while reconnecting also detaches.
+- The session ends when its shell exits. Attaching to the same name from a
+  second terminal takes the session over, and the first one exits.
+- Keystrokes typed while disconnected are dropped, not queued.
+
+The image must ship `kobe-runner` at `/kobe-runner` (or pass `--runner-path`)
+and give the workload user a writable `/var/run/kobe/sessions`. The Kobe
+workspace images do both.
+
 <Callout type="info">
 Byte transparency needs a Unix client and a terminal. Elsewhere `kobe` falls back to decoding keystrokes and re-encoding them, which carries ordinary typing, arrows and control keys but not mouse or paste.
 </Callout>
