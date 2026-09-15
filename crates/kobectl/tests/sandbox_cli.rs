@@ -2340,3 +2340,129 @@ fn init_refuses_a_pool_that_cannot_serve_ssh() {
     assert!(stderr.contains("ci-small cannot serve SSH"), "{stderr}");
     assert!(stderr.contains("small"), "{stderr}");
 }
+
+// --- attach over a pipe -----------------------------------------------------
+//
+// `kobe attach --no-tty` is what `kobe ssh-proxy` runs: stdin and stdout are a
+// pipe carrying somebody else's protocol, and no terminal exists. This server
+// answers the REST lookups over plain HTTP and the attach path as a real
+// WebSocket, so the whole client path runs against the actual framing.
+
+fn start_attach_server(stdout_reply: &'static [u8]) -> (String, thread::JoinHandle<Vec<u8>>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        runtime.block_on(async move {
+            let mut received_stdin = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = [0u8; 512];
+                let peeked = stream.peek(&mut head).await.unwrap();
+                let request_line = String::from_utf8_lossy(&head[..peeked]).to_string();
+                if request_line.contains("/attach?") {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    // Echo what the client forwards from its stdin, then end.
+                    while let Some(Ok(message)) = socket.next().await {
+                        if let tokio_tungstenite::tungstenite::Message::Binary(frame) = message
+                            && frame.first() == Some(&0)
+                        {
+                            received_stdin.extend_from_slice(&frame[1..]);
+                            if received_stdin.ends_with(b"\n") {
+                                break;
+                            }
+                        }
+                    }
+                    let mut reply = vec![1u8];
+                    reply.extend_from_slice(stdout_reply);
+                    reply.extend_from_slice(&received_stdin);
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(reply.into()))
+                        .await
+                        .unwrap();
+                    socket.close(None).await.ok();
+                    return received_stdin;
+                }
+                // Plain HTTP: consume the request, answer the lease lookups.
+                let mut buffer = vec![0u8; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = match path.as_str() {
+                    "/v1/leases" => "[]".to_string(),
+                    "/v1/sandbox-leases" => sandbox_inventory(),
+                    "/v1/sandbox-leases/sandbox-test" => json!({
+                        "id": "sandbox-test",
+                        "phase": "Ready",
+                        "pool": "agents",
+                        "alias": "dev"
+                    })
+                    .to_string(),
+                    other => panic!("unexpected request: {other}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.ok();
+            }
+        })
+    });
+    (endpoint, handle)
+}
+
+#[test]
+fn attach_without_a_tty_copies_bytes_both_ways_and_never_touches_a_terminal() {
+    let (endpoint, server) = start_attach_server(b"pong:");
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".kobe.toml"),
+        format!("endpoint = {endpoint:?}\nauth = \"none\"\n"),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kobe"))
+        .current_dir(directory.path())
+        .env("HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .args(["attach", "dev", "--no-tty", "--", "/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Bytes that no key decoder would pass through unchanged: an escape
+    // sequence and a NUL, the kind of thing an SSH handshake is made of.
+    let payload = b"SSH-2.0-proof\x1b[?1h\x00tail\n";
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    // stdin stays open on the child's side (we dropped our end, so it sees EOF)
+    // and the session ends when the server closes, not when input ends.
+    let output = wait_output(child);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected = b"pong:".to_vec();
+    expected.extend_from_slice(payload);
+    assert_eq!(
+        output.stdout, expected,
+        "stdout must be the server's bytes, untouched"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(
+        server.join().unwrap(),
+        payload.to_vec(),
+        "stdin must reach the server byte for byte"
+    );
+}
