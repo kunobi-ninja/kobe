@@ -792,21 +792,24 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
-    let mut winsize = libc::winsize {
+    let winsize = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
     // SAFETY: openpty writes two descriptors through the first two pointers
-    // and reads the winsize; the name and termios pointers may be null.
+    // and only reads the winsize; the name and termios pointers may be null.
+    // The winsize goes as a raw pointer because its mutability differs by
+    // platform (`*const` on Linux, `*mut` on macOS), and a `*mut` coerces to
+    // either.
     let result = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut winsize,
+            std::ptr::addr_of!(winsize).cast_mut(),
         )
     };
     if result != 0 {
