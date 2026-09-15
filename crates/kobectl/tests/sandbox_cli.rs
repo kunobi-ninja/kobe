@@ -1961,6 +1961,44 @@ fn ssh_proxy_authorizes_the_key_then_attaches_to_the_named_sandbox() {
 }
 
 #[test]
+fn ssh_proxy_names_the_missing_sshd_instead_of_closing_silently() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(
+                stream,
+                200,
+                &[],
+                &format!(
+                    "[{}]",
+                    ready_sandbox("sandbox-old", "kobe-small-1", "small")
+                ),
+            ),
+            ("POST", "/v1/sandbox-leases/sandbox-old/executions") => {
+                // The image predates kobe-sshd: the preflight exits 3.
+                reply(stream, 200, &[], &execution_body("Succeeded", Some(3)))
+            }
+            _ => panic!("no attach may be attempted without kobe-sshd: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(
+        &server.endpoint(),
+        &["ssh-proxy", "kobe-small-1", "--pool", "small"],
+    );
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("without /usr/local/bin/kobe-sshd"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("v0.45.0 or newer"), "{stderr}");
+}
+
+#[test]
 fn ssh_proxy_creates_the_sandbox_when_the_name_is_new() {
     let created = Arc::new(Mutex::new(Vec::<Value>::new()));
     let seen = Arc::clone(&created);

@@ -69,10 +69,18 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// names one. Ed25519 first because `kobe login` prefers it too.
 const DEFAULT_PUBLIC_KEYS: &[&str] = &["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"];
 
-/// Appends the caller's key to `authorized_keys` once. Run with `sh -c`, the
-/// key arriving on stdin so it never appears in an argv that the target
-/// cluster's audit log records.
-const AUTHORIZE_KEY_SCRIPT: &str = r#"umask 077
+/// Exit status of [`AUTHORIZE_KEY_SCRIPT`] when the image has no `kobe-sshd`.
+///
+/// Checked before the attach because the attach cannot report it: a command
+/// that does not exist ends the stream, and `ssh` only sees a connection
+/// closed before the banner.
+const EXIT_NO_SSHD: i32 = 3;
+
+/// Appends the caller's key to `authorized_keys` once, after checking that
+/// the image can serve SSH at all. Run with `sh -c`, the key arriving on stdin
+/// so it never appears in an argv that the target cluster's audit log records.
+const AUTHORIZE_KEY_SCRIPT: &str = r#"[ -x /usr/local/bin/kobe-sshd ] || exit 3
+umask 077
 mkdir -p "$HOME/.ssh"
 file="$HOME/.ssh/authorized_keys"
 key="$(cat)"
@@ -311,6 +319,13 @@ async fn authorize_key(config: &ResolvedConfig, lease_id: &str, public_key: &str
              so `kobe exec` is available"
         )
     })?;
+    if result.exit_code == Some(EXIT_NO_SSHD) {
+        anyhow::bail!(
+            "{lease_id} runs an image without {REMOTE_SSHD}; the pool needs \
+             zondax/kobe-agent-workspace v0.45.0 or newer (release this sandbox with \
+             `kobe release {lease_id}` once the pool image is updated)"
+        );
+    }
     if result.exit_code != Some(0) {
         anyhow::bail!(
             "authorizing the public key in {lease_id} failed ({}): {}",
