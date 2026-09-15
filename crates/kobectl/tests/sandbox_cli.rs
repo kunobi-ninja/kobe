@@ -1852,3 +1852,309 @@ fn logs_follow_flushes_each_ndjson_record_before_the_next_poll_finishes() {
     reader.join().unwrap();
     assert_eq!(output.status.code(), Some(0));
 }
+
+// --- ssh-proxy --------------------------------------------------------------
+//
+// `kobe ssh-proxy` is an ssh ProxyCommand: stdout is the SSH transport. These
+// tests drive it up to the attach request, which the mock answers with a plain
+// HTTP failure instead of a WebSocket upgrade. That proves everything before
+// the transport (name resolution, creation, key authorization) and that the
+// failure reaches the caller as an exit code on stderr with stdout untouched.
+
+fn write_public_key(directory: &tempfile::TempDir) {
+    let ssh = directory.path().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("id_ed25519.pub"),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPROOF proof@test\n",
+    )
+    .unwrap();
+}
+
+fn ready_sandbox(id: &str, alias: &str, pool: &str) -> String {
+    json!({
+        "id": id,
+        "phase": "Ready",
+        "pool": pool,
+        "alias": alias,
+        "resourceKind": "Sandbox",
+        "capabilities": ["exec", "logs", "attach"]
+    })
+    .to_string()
+}
+
+#[test]
+fn ssh_proxy_authorizes_the_key_then_attaches_to_the_named_sandbox() {
+    let executions = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&executions);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(
+                stream,
+                200,
+                &[],
+                &format!(
+                    "[{}]",
+                    ready_sandbox("sandbox-small", "kobe-small-1", "small")
+                ),
+            ),
+            ("POST", "/v1/sandbox-leases/sandbox-small/executions") => {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&request.body).unwrap());
+                reply(stream, 200, &[], &execution_body("Succeeded", Some(0)))
+            }
+            ("GET", "/v1/sandbox-leases/sandbox-small") => reply(
+                stream,
+                200,
+                &[],
+                &ready_sandbox("sandbox-small", "kobe-small-1", "small"),
+            ),
+            (_, path) if path.starts_with("/v1/sandbox-leases/sandbox-small/attach") => {
+                reply(stream, 503, &[], "attach unavailable in this test")
+            }
+            _ => panic!("unexpected ssh-proxy request: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(
+        &server.endpoint(),
+        &["ssh-proxy", "kobe-small-1", "--pool", "small"],
+    );
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout is the SSH transport and must stay empty: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("creating"), "{stderr}");
+
+    let executions = executions.lock().unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "one authorization exec, got {executions:?}"
+    );
+    let exec = &executions[0];
+    assert_eq!(exec["command"][0], "/bin/sh");
+    assert_eq!(exec["command"][1], "-c");
+    assert!(
+        exec["command"][2]
+            .as_str()
+            .unwrap()
+            .contains("authorized_keys")
+    );
+    let stdin = exec["stdin"].as_str().unwrap();
+    let decoded = base64_decode(stdin);
+    assert_eq!(
+        decoded, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPROOF proof@test\n",
+        "the key travels on stdin, not in argv"
+    );
+    assert!(
+        !exec["command"].to_string().contains("AAAAC3Nza"),
+        "the key must not appear in argv"
+    );
+}
+
+#[test]
+fn ssh_proxy_creates_the_sandbox_when_the_name_is_new() {
+    let created = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&created);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools") => reply(
+                stream,
+                200,
+                &[],
+                &format!(
+                    "[{},{}]",
+                    pool_body("small", "Sandbox", &["exec", "attach"]),
+                    pool_body("ci-small", "Cluster", &["kubeconfig"])
+                ),
+            ),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            ("POST", "/v1/sandbox-leases") => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let (_, id) = keyed_lease(&request.body);
+                seen.lock().unwrap().push(body);
+                reply(stream, 202, &[], &lease_body(&id, "Pending"))
+            }
+            ("POST", path) if path.ends_with("/executions") => {
+                reply(stream, 200, &[], &execution_body("Succeeded", Some(0)))
+            }
+            ("GET", path) if path.starts_with("/v1/sandbox-leases/sandbox-") => {
+                if path.contains("/attach") {
+                    reply(stream, 503, &[], "attach unavailable in this test")
+                } else {
+                    let id = path.trim_start_matches("/v1/sandbox-leases/");
+                    reply(
+                        stream,
+                        200,
+                        &[],
+                        &ready_sandbox(id, "kobe-small-1", "small"),
+                    )
+                }
+            }
+            _ => panic!("unexpected ssh-proxy request: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(&server.endpoint(), &["ssh-proxy", "kobe-small-1"]);
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("creating kobe-small-1 in pool small"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("is ready"), "{stderr}");
+
+    let created = created.lock().unwrap();
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(created[0]["pool"], "small");
+    assert_eq!(created[0]["alias"], "kobe-small-1");
+}
+
+#[test]
+fn ssh_proxy_without_a_pool_explains_how_to_name_one() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools") => reply(
+                stream,
+                200,
+                &[],
+                &format!("[{}]", pool_body("small", "Sandbox", &["exec", "attach"])),
+            ),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            _ => panic!("nothing may be created without a pool: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(&server.endpoint(), &["ssh-proxy", "kobe-dev"]);
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("names no pool"), "{stderr}");
+    assert!(stderr.contains("pools: small"), "{stderr}");
+    assert!(stderr.contains("--default-pool"), "{stderr}");
+}
+
+#[test]
+fn ssh_proxy_no_create_refuses_a_missing_sandbox() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            _ => panic!("--no-create must not create: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(
+        &server.endpoint(),
+        &[
+            "ssh-proxy",
+            "kobe-small-1",
+            "--pool",
+            "small",
+            "--no-create",
+        ],
+    );
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no active sandbox named kobe-small-1"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn ssh_proxy_refuses_a_cluster_lease() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "lease-cluster",
+                    "phase": "Bound",
+                    "profile": "ci-small",
+                    "alias": "kobe-ci-small-1",
+                    "resourceKind": "Cluster"
+                }])
+                .to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], "[]"),
+            _ => panic!("a cluster lease must be refused before any other call: {request:?}"),
+        }
+    });
+    let (directory, child) = spawn_child(
+        &server.endpoint(),
+        &["ssh-proxy", "kobe-ci-small-1", "--pool", "ci-small"],
+    );
+    write_public_key(&directory);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot serve SSH"), "{stderr}");
+}
+
+#[test]
+fn ssh_proxy_without_a_public_key_says_where_it_looked() {
+    let server = Server::start(move |request, _| {
+        panic!("no request may be made before the key is resolved: {request:?}")
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["ssh-proxy", "kobe-small-1", "--pool", "small"],
+    );
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no public key found under"), "{stderr}");
+    assert!(stderr.contains("--public-key"), "{stderr}");
+}
+
+#[test]
+fn ssh_config_prints_a_block_for_the_prefix() {
+    let server = Server::start(move |request, _| panic!("ssh-config is offline: {request:?}"));
+    let (_directory, child) = spawn_child(&server.endpoint(), &["ssh-config"]);
+    let output = wait_output(child);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Host kobe-*\n"), "{stdout}");
+    assert!(stdout.contains("User nonroot\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "ProxyCommand {} ssh-proxy %n\n",
+            env!("CARGO_BIN_EXE_kobe")
+        )),
+        "{stdout}"
+    );
+}
+
+fn base64_decode(value: &str) -> String {
+    use base64::Engine;
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .unwrap(),
+    )
+    .unwrap()
+}

@@ -2,6 +2,7 @@
   "title": "Commands",
   "pages": [
     "reference",
-    "sandbox"
+    "sandbox",
+    "ssh"
   ]
 }

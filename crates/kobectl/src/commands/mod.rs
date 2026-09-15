@@ -13,6 +13,7 @@ pub(crate) mod sandbox;
 pub(crate) mod sandbox_transport;
 mod select;
 pub(crate) mod session;
+mod ssh_proxy;
 mod state;
 mod status;
 mod version;
@@ -22,8 +23,8 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 pub use config::{
-    config_current_target, config_export, config_import, config_list_targets, config_set_target,
-    config_show, config_use_target,
+    SetTargetCommand, config_current_target, config_export, config_import, config_list_targets,
+    config_set_target, config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
 pub use extend::extend;
@@ -31,6 +32,7 @@ pub use lease_create::{LeaseCreateCommand, lease_create};
 pub use login::{login, logout};
 pub use purge::purge;
 pub use release::release;
+pub use ssh_proxy::{SshProxyCommand, ssh_config, ssh_proxy};
 pub use status::status;
 pub use version::version;
 pub use with_lease::{WithLeaseCommand, with_lease};
