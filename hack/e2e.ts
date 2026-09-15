@@ -1064,8 +1064,12 @@ async function installChart(args: Args): Promise<void> {
 
 
 export function sandboxConformanceManifest(namespace: string, fixture: SandboxFixture): string {
-  const poolSpec = (placement: string) => `spec:
-  warmCapacity: 1
+  // Management sandboxes are cheap pods, so three stay warm and the PR gate's
+  // parallel scenarios bind instantly. Child placement keeps one: each warm
+  // child sandbox holds a nested k3s cluster, and the child ClusterPool caps
+  // those at two.
+  const poolSpec = (placement: string, warmCapacity: number) => `spec:
+  warmCapacity: ${warmCapacity}
   defaultTtl: "10m"
   maxTtl: "20m"
   provisioningTimeout: "5m"
@@ -1137,14 +1141,14 @@ kind: SandboxPool
 metadata:
   name: ${DEMO_SANDBOX_POOL_MANAGEMENT}
   namespace: ${namespace}
-${poolSpec("    type: management")}
+${poolSpec("    type: management", 3)}
 ---
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: SandboxPool
 metadata:
   name: ${DEMO_SANDBOX_POOL_CHILD}
   namespace: ${namespace}
-${poolSpec(`    type: childCluster\n    clusterPoolRef: ${DEMO_K3S_POOL}`)}
+${poolSpec(`    type: childCluster\n    clusterPoolRef: ${DEMO_K3S_POOL}`, 1)}
 `;
 }
 
