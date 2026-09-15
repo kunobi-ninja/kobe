@@ -627,7 +627,20 @@ mod tests {
         assert!(spool.spawn_was_intended("sbxe-1"));
 
         drop(guard);
-        assert!(!spool.starter_active("sbxe-1"));
+        // flock follows the open file description, and a test elsewhere in
+        // this binary may be between fork and exec of a supervisor at this
+        // instant: its child holds a copy of every descriptor, including the
+        // one the guard just closed, until exec replaces its table. The lock
+        // is released the moment that window ends, so observe it with a
+        // bounded poll rather than a single read.
+        let dropped = std::time::Instant::now();
+        while spool.starter_active("sbxe-1") {
+            assert!(
+                dropped.elapsed() < std::time::Duration::from_secs(5),
+                "start lock still held 5s after its guard dropped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// A status process may decide from a stale Running read after the
