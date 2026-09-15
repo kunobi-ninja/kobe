@@ -17,6 +17,8 @@ description: All kobe CLI commands with flags and examples.
 | `kobe cancel` | Cancel a running execution |
 | `kobe attach` | Open an interactive session through an `attach` capability |
 | `kobe port-forward` | Forward a declared port through a `port-forward` capability |
+| `kobe ssh-proxy` | Serve an SSH connection to a sandbox on stdin/stdout, as an ssh `ProxyCommand` ([details](/commands/ssh)) |
+| `kobe ssh-config` | Print the `ssh_config` block that routes `kobe-*` hosts through `kobe ssh-proxy` |
 | `kobe login` | Authenticate with the kobe service |
 | `kobe logout` | Remove stored credentials |
 | `kobe lease <pool>` | Lease the resource provided by a pool |
@@ -175,7 +177,7 @@ The CLI stores named targets in `~/.config/kobe/config.json`. Most users set up 
 | `kobe config list` | List named targets |
 | `kobe config current` | Show the current target |
 | `kobe config use <name>` | Switch the active target |
-| `kobe config set <name> ...` | Create or replace a named target |
+| `kobe config set <name> ...` | Create or replace a named target (`--default-pool` sets the pool `kobe ssh-proxy` falls back to) |
 
 ```sh
 kobe config set work --endpoint https://kobe.example.com --auth ssh

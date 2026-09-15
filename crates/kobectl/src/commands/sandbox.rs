@@ -279,7 +279,7 @@ pub async fn exec(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn exec_once(
+pub(crate) async fn exec_once(
     config: &ResolvedConfig,
     lease: &str,
     argv: &[String],
@@ -462,9 +462,9 @@ struct CreateLeaseBody<'a> {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SandboxLeaseResponse {
-    id: String,
-    phase: String,
+pub(crate) struct SandboxLeaseResponse {
+    pub(crate) id: String,
+    pub(crate) phase: String,
     #[serde(default)]
     pool: String,
     #[serde(default)]
@@ -818,6 +818,66 @@ pub(crate) struct LeaseCommand<'a> {
     pub wait_timeout: Option<&'a str>,
     pub keepalive: bool,
     pub output: OutputFormat,
+}
+
+/// Create a Sandbox lease and wait until it is `Ready`, printing nothing.
+///
+/// The interactive `kobe lease` path prints progress and the lease summary;
+/// callers whose stdout is a transport (`kobe ssh-proxy`) cannot afford a
+/// byte of it. Authorization runs non-interactively for the same reason: a
+/// trust prompt would read its answer from a stream that belongs to `ssh`.
+pub(crate) async fn create_ready_lease(
+    config: &ResolvedConfig,
+    pool: &str,
+    ttl: Option<&str>,
+    alias: Option<&str>,
+    ready_timeout: std::time::Duration,
+) -> Result<SandboxLeaseResponse> {
+    let key = new_idempotency_key();
+    let expected_lease = lease_id_for_create_key(&key);
+    let post_started = std::cell::Cell::new(false);
+    let lease_id = match create_sandbox_lease(
+        config,
+        CreateLeaseBody {
+            pool,
+            ttl,
+            alias,
+            idempotency_key: &key,
+        },
+        &expected_lease,
+        OutputFormat::Json,
+        &post_started,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(failure) if failure.may_have_committed => {
+            anyhow::bail!(
+                "Sandbox lease {expected_lease} may have been created: {:#}",
+                failure.error
+            )
+        }
+        Err(failure) => return Err(failure.error),
+    };
+    wait_ready_quiet(config, &lease_id, ready_timeout).await
+}
+
+/// Poll an existing Sandbox lease until it is `Ready`, printing nothing.
+pub(crate) async fn wait_ready_quiet(
+    config: &ResolvedConfig,
+    lease_id: &str,
+    ready_timeout: std::time::Duration,
+) -> Result<SandboxLeaseResponse> {
+    wait_until_ready(config, lease_id, OutputFormat::Json, ready_timeout)
+        .await
+        .map_err(|error| {
+            let message = error.message();
+            if matches!(error, RunExecutionError::ReadyTimeout(_)) {
+                anyhow::anyhow!("{message}. Release with: kobe release {lease_id}")
+            } else {
+                anyhow::anyhow!(message)
+            }
+        })
 }
 
 pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) -> Result<()> {
@@ -2393,6 +2453,7 @@ mod tests {
             auth: crate::commands::config::AuthMode::None,
             token: None,
             ssh_fingerprint: None,
+            default_pool: None,
         };
         let started = tokio::time::Instant::now();
         let result = wait_until_ready(

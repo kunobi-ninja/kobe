@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::config::ResolvedConfig;
 use super::leases::LeaseSummary;
-use super::{OutputFormat, authed_client, get_auth_header, get_auth_header_for_output, with_auth};
+use super::{OutputFormat, authed_client, get_auth_header_for_output, with_auth};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,8 +81,16 @@ impl PoolSummary {
 }
 
 pub(crate) async fn fetch_pools_for_config(config: &ResolvedConfig) -> Result<Vec<PoolSummary>> {
+    fetch_pools_for_config_with_output(config, OutputFormat::Text).await
+}
+
+/// List pools, authorizing according to `output`: JSON never prompts.
+pub(crate) async fn fetch_pools_for_config_with_output(
+    config: &ResolvedConfig,
+    output: OutputFormat,
+) -> Result<Vec<PoolSummary>> {
     let endpoint = config.endpoint.as_str();
-    let token = get_auth_header(config, "GET", "/v1/pools", b"").await?;
+    let token = get_auth_header_for_output(config, "GET", "/v1/pools", b"", output).await?;
 
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/pools")), &token)

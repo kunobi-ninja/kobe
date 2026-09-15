@@ -116,6 +116,36 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
     },
+    /// Serve an SSH connection to a sandbox on stdin/stdout (an ssh ProxyCommand).
+    ///
+    /// `ssh kobe-<pool>-<name>` resolves the host name to one of your
+    /// sandboxes, creating it on first use, authorizes your public key in it,
+    /// and runs the sandbox's sshd over `kobe attach`. Install the ssh_config
+    /// block with `kobe ssh-config`. Not meant to be run by hand.
+    SshProxy {
+        /// Host name as ssh passes it (`%n`): kobe-<pool>-<name> or kobe-<name>.
+        host: String,
+        /// Pool for a new sandbox. Overrides the host name and the target's default pool.
+        #[arg(long)]
+        pool: Option<String>,
+        /// TTL for a new sandbox (pool default when omitted).
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Maximum time to wait for a new sandbox to become ready (e.g. 30s, 5m).
+        #[arg(long, value_name = "DURATION")]
+        wait_timeout: Option<String>,
+        /// Connect to an existing sandbox only; never create one.
+        #[arg(long)]
+        no_create: bool,
+        /// Public key file to authorize inside the sandbox.
+        #[arg(long, value_name = "PATH")]
+        public_key: Option<String>,
+    },
+    /// Print the ssh_config block that routes `kobe-*` hosts through `kobe ssh-proxy`.
+    ///
+    /// Append it to `~/.ssh/config` (or a file it includes). Uses the absolute
+    /// path of this executable, and carries `--target` when one is given.
+    SshConfig,
     /// Deprecated compatibility namespace for the original Sandbox CLI.
     #[command(hide = true)]
     Sandbox {
@@ -357,6 +387,9 @@ enum ConfigAction {
         /// SSH key fingerprint for auth=ssh
         #[arg(long = "ssh-fingerprint")]
         ssh_fingerprint: Option<String>,
+        /// Pool `kobe ssh-proxy` uses when the host name does not name one
+        #[arg(long = "default-pool", value_name = "POOL")]
+        default_pool: Option<String>,
         /// Write to the global config file (`~/.config/kobe/config.json`)
         /// instead of the local `./.kobe.toml`. Use for endpoints you
         /// reuse across many projects.
@@ -578,6 +611,34 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Commands::SshProxy {
+            host,
+            pool,
+            ttl,
+            wait_timeout,
+            no_create,
+            public_key,
+        } => {
+            // stdout is the SSH transport, so the outcome is an exit code and
+            // stderr text, never a JSON envelope on stdout.
+            match commands::ssh_proxy(commands::SshProxyCommand {
+                host: &host,
+                pool: pool.as_deref(),
+                ttl: ttl.as_deref(),
+                wait_timeout: wait_timeout.as_deref(),
+                no_create,
+                public_key: public_key.as_deref(),
+                target_override: target,
+                endpoint_override: endpoint,
+            })
+            .await
+            {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(error) => exit_resource_error(error, OutputFormat::Text),
+            }
+        }
+        Commands::SshConfig => commands::ssh_config(target),
         Commands::Sandbox { action } => {
             dispatch_resource_action(action, target, endpoint, output).await
         }
@@ -612,17 +673,19 @@ async fn main() -> anyhow::Result<()> {
                 auth,
                 token,
                 ssh_fingerprint,
+                default_pool,
                 global,
             }) => {
-                commands::config_set_target(
-                    &name,
-                    &endpoint,
-                    auth.as_deref(),
-                    token.as_deref(),
-                    ssh_fingerprint.as_deref(),
+                commands::config_set_target(commands::SetTargetCommand {
+                    name: &name,
+                    endpoint: &endpoint,
+                    auth: auth.as_deref(),
+                    token: token.as_deref(),
+                    ssh_fingerprint: ssh_fingerprint.as_deref(),
+                    default_pool: default_pool.as_deref(),
                     global,
                     output,
-                )
+                })
                 .await
             }
             None => print_config_help(),

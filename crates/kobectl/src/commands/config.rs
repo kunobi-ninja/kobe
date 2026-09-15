@@ -75,6 +75,10 @@ pub struct KobeTarget {
     /// SSH key fingerprint (when auth = ssh). If None, first Ed25519 key is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_fingerprint: Option<String>,
+
+    /// Pool used by `kobe ssh-proxy` when the host name does not name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_pool: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +88,8 @@ pub struct ResolvedConfig {
     pub auth: AuthMode,
     pub token: Option<String>,
     pub ssh_fingerprint: Option<String>,
+    /// Pool used by `kobe ssh-proxy` when the host name does not name one.
+    pub default_pool: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +112,8 @@ struct ConfigTargetOutput {
     token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_pool: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +214,13 @@ pub struct CliConfig {
     /// SSH key fingerprint (when auth = ssh). If None, first Ed25519 key is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_fingerprint: Option<String>,
+
+    /// Public key `kobe ssh-proxy` authorizes inside a sandbox. Machine-wide,
+    /// because it identifies this machine's SSH client, not a Kobe target.
+    /// Unset means the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`,
+    /// `id_rsa.pub` that exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_public_key: Option<String>,
 }
 
 fn is_default_auth(auth: &AuthMode) -> bool {
@@ -324,6 +339,7 @@ impl CliConfig {
                 auth: self.auth.clone(),
                 token: self.token.clone(),
                 ssh_fingerprint: self.ssh_fingerprint.clone(),
+                default_pool: None,
             },
         );
         self.current_target = Some("default".to_string());
@@ -375,6 +391,7 @@ impl CliConfig {
                     auth: target.auth.clone(),
                     token: target.token.clone(),
                     ssh_fingerprint: target.ssh_fingerprint.clone(),
+                    default_pool: target.default_pool.clone(),
                 });
             }
 
@@ -384,6 +401,7 @@ impl CliConfig {
                 auth: self.auth.clone(),
                 token: self.token.clone(),
                 ssh_fingerprint: self.ssh_fingerprint.clone(),
+                default_pool: None,
             });
         }
 
@@ -404,6 +422,7 @@ impl CliConfig {
                 auth: target.auth.clone(),
                 token: target.token.clone(),
                 ssh_fingerprint: target.ssh_fingerprint.clone(),
+                default_pool: target.default_pool.clone(),
             });
         }
 
@@ -414,6 +433,7 @@ impl CliConfig {
                 auth: self.auth.clone(),
                 token: self.token.clone(),
                 ssh_fingerprint: self.ssh_fingerprint.clone(),
+                default_pool: None,
             });
         }
 
@@ -518,15 +538,29 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
 /// Does NOT touch the active-target session file. Defining a target
 /// and switching to it are separate operations; run `kobe config use
 /// <name>` afterwards to make it active for this shell.
-pub async fn config_set_target(
-    name: &str,
-    endpoint: &str,
-    auth: Option<&str>,
-    token: Option<&str>,
-    ssh_fingerprint: Option<&str>,
-    global: bool,
-    output: OutputFormat,
-) -> Result<()> {
+/// Arguments of `kobe config set`.
+pub struct SetTargetCommand<'a> {
+    pub name: &'a str,
+    pub endpoint: &'a str,
+    pub auth: Option<&'a str>,
+    pub token: Option<&'a str>,
+    pub ssh_fingerprint: Option<&'a str>,
+    pub default_pool: Option<&'a str>,
+    pub global: bool,
+    pub output: OutputFormat,
+}
+
+pub async fn config_set_target(command: SetTargetCommand<'_>) -> Result<()> {
+    let SetTargetCommand {
+        name,
+        endpoint,
+        auth,
+        token,
+        ssh_fingerprint,
+        default_pool,
+        global,
+        output,
+    } = command;
     let auth = match auth {
         Some(auth) => parse_auth_mode(auth)?,
         None if token.is_some() => AuthMode::Token,
@@ -543,6 +577,7 @@ pub async fn config_set_target(
         auth,
         token: token.map(str::to_string),
         ssh_fingerprint: ssh_fingerprint.map(str::to_string),
+        default_pool: default_pool.map(str::to_string),
     };
 
     let written_path = if global {
@@ -818,6 +853,7 @@ fn config_view_output(config: &CliConfig, target_override: Option<&str>) -> Conf
                         auth: target.auth.clone(),
                         token: target.token.clone(),
                         ssh_fingerprint: target.ssh_fingerprint.clone(),
+                        default_pool: target.default_pool.clone(),
                     },
                 )
             })
@@ -962,6 +998,7 @@ mod tests {
             auth: AuthMode::Oidc,
             token: None,
             ssh_fingerprint: None,
+            default_pool: None,
         }
     }
 
@@ -1211,6 +1248,7 @@ mod tests {
                 auth: AuthMode::Oidc,
                 token: None,
                 ssh_fingerprint: None,
+                default_pool: None,
             },
         );
         config.endpoint = Some("https://legacy.example.test".to_string());
@@ -1375,6 +1413,7 @@ mod tests {
                 auth: AuthMode::Token,
                 token: Some("prod-token".to_string()),
                 ssh_fingerprint: None,
+                default_pool: None,
             },
         );
         config.current_target = Some("prod".to_string());
@@ -1492,6 +1531,7 @@ mod tests {
                 auth: AuthMode::Ssh,
                 token: None,
                 ssh_fingerprint: Some("SHA256:abc".to_string()),
+                default_pool: None,
             },
         );
 
@@ -1524,6 +1564,7 @@ mod tests {
                 auth: AuthMode::Token,
                 token: Some("ci-token".to_string()),
                 ssh_fingerprint: None,
+                default_pool: None,
             },
         );
 
@@ -1679,6 +1720,7 @@ mod tests {
                 auth: AuthMode::Ssh,
                 token: None,
                 ssh_fingerprint: Some("SHA256:abc".to_string()),
+                default_pool: None,
             },
         );
         config.current_target = Some("prod".to_string());

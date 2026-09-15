@@ -575,6 +575,7 @@ mod tests {
             auth,
             token: None,
             ssh_fingerprint: None,
+            default_pool: None,
         }
     }
 

@@ -388,7 +388,9 @@ verbs and limits.
 
 `zondax/kobe-agent-workspace` includes `kobe-runner`, `mise`, `tmux`, Git,
 GitHub CLI (`gh`), OpenSSH, JSON/search/network diagnostics, OpenSSL headers,
-and a C toolchain. The workload runs as `65532:65532`, with `HOME=/home/agent`
+and a C toolchain. It also ships `kobe-sshd`, so an SSH client can reach the
+sandbox through [`kobe ssh-proxy`](/commands/ssh) without any port being
+declared. The workload runs as `65532:65532`, with `HOME=/home/agent`
 and a writable `/home/agent/work`. Clone projects there and run `mise install`;
 the image trusts mise configurations under that workspace and puts tool shims
 on `PATH` for direct `kobe exec` commands.
