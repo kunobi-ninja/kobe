@@ -303,11 +303,11 @@ async fn choose_default_pool(
     report: &Reporter,
 ) -> Result<Option<String>> {
     let pools = pools::fetch_pools_for_config_with_output(config, OutputFormat::Json).await?;
-    let capable: Vec<String> = pools
+    let capable_pools: Vec<&pools::PoolSummary> = pools
         .iter()
         .filter(|pool| pool.is_sandbox() && pool.supports("attach") && pool.supports("exec"))
-        .map(|pool| pool.name.clone())
         .collect();
+    let capable: Vec<String> = capable_pools.iter().map(|pool| pool.name.clone()).collect();
     if capable.is_empty() {
         anyhow::bail!(
             "no pool can serve SSH ({} visible); a SandboxPool with runnerPath and an image that ships kobe-sshd is needed",
@@ -331,12 +331,9 @@ async fn choose_default_pool(
     } else if capable.len() == 1 {
         Some(capable[0].clone())
     } else if interactive {
-        let items: Vec<super::picker::PickerItem> = capable
+        let items: Vec<super::picker::PickerItem> = capable_pools
             .iter()
-            .map(|name| super::picker::PickerItem {
-                primary: name.clone(),
-                secondary: "Sandbox".to_string(),
-            })
+            .map(|pool| pool_picker_item(pool))
             .collect();
         let index = super::picker::run_picker(
             "Default pool for ssh kobe-<name>",
@@ -361,6 +358,28 @@ async fn choose_default_pool(
         ),
     }
     Ok(chosen)
+}
+
+/// One picker row per ssh-capable pool: what is available now, what a lease
+/// costs, and what it can do. The same counts and policy line `kobe status`
+/// prints, so the picker and the status table never disagree.
+fn pool_picker_item(pool: &pools::PoolSummary) -> super::picker::PickerItem {
+    let phase = pool
+        .phase
+        .as_deref()
+        .filter(|phase| !phase.is_empty())
+        .unwrap_or("Ready");
+    let mut secondary = vec![format!("{phase}  {}", pools::format_pool_counts(pool))];
+    if let Some(policy) = pools::format_policy(pool) {
+        secondary.push(policy);
+    }
+    if !pool.capabilities.is_empty() {
+        secondary.push(pool.capabilities.join(", "));
+    }
+    super::picker::PickerItem {
+        primary: pool.name.clone(),
+        secondary: secondary.join("   "),
+    }
 }
 
 /// Persist the default pool on whichever file defines the target.
@@ -444,5 +463,42 @@ fn ensure_public_key(
         Err(error) => {
             Err(error).context("pass --public-key <path>, or run `ssh-keygen -t ed25519`")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_picker_row_shows_availability_policy_and_capabilities() {
+        let pool: pools::PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "agent-workspace",
+            "resourceKind": "Sandbox",
+            "capabilities": ["exec", "logs", "attach", "port-forward"],
+            "phase": "Ready",
+            "ready": 2,
+            "leased": 1,
+            "creating": 0,
+            "policy": { "mode": "fixed", "ttl": "30m", "warmTarget": 2 }
+        }))
+        .unwrap();
+        let item = pool_picker_item(&pool);
+        assert_eq!(item.primary, "agent-workspace");
+        assert_eq!(
+            item.secondary,
+            "Ready  ready 2  leased 1   ttl 30m  warm 2 fixed   exec, logs, attach, port-forward"
+        );
+    }
+
+    #[test]
+    fn pool_picker_row_without_policy_or_phase_still_reads() {
+        let pool: pools::PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "small",
+            "resourceKind": "Sandbox",
+            "ready": 0
+        }))
+        .unwrap();
+        assert_eq!(pool_picker_item(&pool).secondary, "Ready  ready 0");
     }
 }
