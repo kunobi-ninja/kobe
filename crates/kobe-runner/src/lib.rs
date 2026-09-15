@@ -13,6 +13,8 @@
 //! here runs inside the Sandbox container.
 
 pub mod protocol;
+#[cfg(unix)]
+pub mod session;
 pub mod spool;
 #[cfg(unix)]
 pub mod supervisor;

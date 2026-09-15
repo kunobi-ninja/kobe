@@ -123,7 +123,8 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
 COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner \
-    && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0700 /var/run/kobe/executions
+    && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0700 \
+        /var/run/kobe/executions /var/run/kobe/sessions
 
 USER 65532:65532
 
@@ -166,7 +167,8 @@ RUN printf '%s\n' '{"protocol":1,"id":"agentws-image-smoke","argv":["/bin/true"]
 # generates the host key and validates the configuration, then a real `ssh`
 # logs in through `kobe-sshd` as its ProxyCommand, exactly as `kobe ssh-proxy`
 # will drive it. Every key this produces is removed afterwards so no sandbox
-# inherits one.
+# inherits one. The `--session` path is proven the same way: a command and
+# sftp pass through unchanged, and an interactive login runs in a session.
 RUN kobe-sshd --check \
     && ssh-keygen -q -t ed25519 -N '' -f /tmp/proof-client \
     && cat /tmp/proof-client.pub >> "$HOME/.ssh/authorized_keys" \
@@ -178,7 +180,17 @@ RUN kobe-sshd --check \
         -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes \
         nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server' \
-    && rm -rf "$HOME/.ssh" /tmp/proof-client /tmp/proof-client.pub
+    && session_ssh='-o IdentityFile=/tmp/proof-client -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes' \
+    && session_proxy='ProxyCommand=/usr/local/bin/kobe-sshd --session proof' \
+    && ssh -q ${session_ssh} -o "${session_proxy}" nonroot@kobe-proof 'echo passed-through' \
+        | grep -qx passed-through \
+    && printf 'ls /\n' > /tmp/proof-batch \
+    && sftp -q ${session_ssh} -o "${session_proxy}" -b /tmp/proof-batch nonroot@kobe-proof >/dev/null \
+    && printf 'echo in-session-$((6 * 7))\nexit\n' \
+        | ssh -q -tt ${session_ssh} -o "${session_proxy}" nonroot@kobe-proof \
+        | grep -q in-session-42 \
+    && rm -rf "$HOME/.ssh" /tmp/proof-client /tmp/proof-client.pub /tmp/proof-batch \
+        /var/run/kobe/sessions/proof.*
 
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.

@@ -106,6 +106,69 @@ enum Commands {
         #[arg(long)]
         id: String,
     },
+    /// Persistent terminal sessions that survive a dropped connection.
+    Session {
+        /// Where session sockets live.
+        #[arg(long, default_value = DEFAULT_SESSIONS_DIR)]
+        dir: std::path::PathBuf,
+
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Attach this terminal to a session, starting it when it does not exist.
+    Attach {
+        #[arg(long, default_value = "main")]
+        name: String,
+        /// Program for a new session. The login shell when empty. Ignored
+        /// when the session already exists.
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Own one session's shell. Started by `attach`, never by hand.
+    #[command(hide = true)]
+    Serve {
+        #[arg(long)]
+        name: String,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Print the live sessions as JSON.
+    List,
+}
+
+#[cfg(unix)]
+const DEFAULT_SESSIONS_DIR: &str = kobe_runner::session::DEFAULT_SESSIONS_DIR;
+#[cfg(not(unix))]
+const DEFAULT_SESSIONS_DIR: &str = "";
+
+/// `session` is interactive, not request/response: its replies are a terminal.
+#[cfg(unix)]
+fn session(dir: &std::path::Path, action: &SessionAction) -> i32 {
+    use kobe_runner::session;
+    match action {
+        SessionAction::Attach { name, argv } => session::attach(dir, name, argv),
+        SessionAction::Serve { name, argv } => match session::serve(dir, name, argv) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("kobe-runner: session {name}: {error}");
+                1
+            }
+        },
+        SessionAction::List => {
+            println!("{}", serde_json::json!({ "sessions": session::list(dir) }));
+            0
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn session(_dir: &std::path::Path, _action: &SessionAction) -> i32 {
+    eprintln!("kobe-runner: sessions are supported only on unix");
+    1
 }
 
 fn main() {
@@ -118,6 +181,9 @@ fn main() {
         #[cfg(unix)]
         supervisor::supervise(&spool, id, *stdin_bytes, std::io::stdin());
         return;
+    }
+    if let Commands::Session { dir, action } = &cli.command {
+        std::process::exit(session(dir, action));
     }
 
     let reply = match &cli.command {
@@ -138,7 +204,7 @@ fn main() {
             max_bytes,
         } => logs(&spool, id, stream, *offset, *max_bytes),
         Commands::Cancel { id } => cancel(&spool, id),
-        Commands::Supervise { .. } => unreachable!("handled above"),
+        Commands::Supervise { .. } | Commands::Session { .. } => unreachable!("handled above"),
     };
 
     // Exactly one document, on stdout, and nothing else — diagnostics go to

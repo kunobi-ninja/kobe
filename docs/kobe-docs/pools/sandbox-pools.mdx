@@ -333,6 +333,19 @@ Now `kobe attach dev` lands in a multiplexer session that outlives the
 connection, so a dropped laptop costs nothing. The caller's own `-- argv` still
 wins, and a pool that declares nothing keeps the existing behaviour.
 
+An image that ships `kobe-runner` gets the same without a multiplexer:
+
+```yaml
+template:
+  defaultContainer: agent
+  runnerPath: /kobe-runner
+  attachCommand: ["/kobe-runner", "session", "attach", "--name", "main"]
+```
+
+A bare `kobe attach dev` then resumes one shell session and redraws its
+screen. Callers who also want automatic reconnects use
+`kobe attach dev --session main`.
+
 The command comes from the pool, never the caller, for the same reason
 `runnerPath` does: it becomes an exec under Kobe's credential. Declaring it
 also changes which subresource attach calls, from `pods/attach` to `pods/exec`,

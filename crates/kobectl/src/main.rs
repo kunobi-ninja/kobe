@@ -106,6 +106,13 @@ enum Commands {
         container: Option<String>,
         #[arg(long)]
         no_tty: bool,
+        /// Attach to a persistent session, creating it on first use.
+        /// `LEASE.NAME` is the same as `LEASE --session NAME`.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_tty")]
+        session: Option<String>,
+        /// Where `kobe-runner` lives in the sandbox, for `--session`.
+        #[arg(long, requires = "session")]
+        runner_path: Option<String>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -123,7 +130,8 @@ enum Commands {
     /// and runs the sandbox's sshd over `kobe attach`. Install the ssh_config
     /// block with `kobe ssh-config`. Not meant to be run by hand.
     SshProxy {
-        /// Host name as ssh passes it (`%n`): kobe-<pool>-<name> or kobe-<name>.
+        /// Host name as ssh passes it (`%n`): kobe-<pool>-<name> or kobe-<name>,
+        /// optionally followed by `.<session>`.
         host: String,
         /// Pool for a new sandbox. Overrides the host name and the target's default pool.
         #[arg(long)]
@@ -352,6 +360,18 @@ enum SandboxAction {
         /// Run without allocating a terminal.
         #[arg(long)]
         no_tty: bool,
+        /// Attach to a persistent session in the sandbox's `kobe-runner`,
+        /// creating it on first use. The shell outlives the connection:
+        /// dropped connections and stream limits reconnect on their own, and
+        /// `~.` at the start of a line detaches. The command after `--`
+        /// starts a new session; the login shell when there is none.
+        /// `LEASE.NAME` is the same as `LEASE --session NAME`.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_tty")]
+        session: Option<String>,
+        /// Where `kobe-runner` lives in the sandbox, for `--session`.
+        /// Defaults to `/kobe-runner`.
+        #[arg(long, requires = "session")]
+        runner_path: Option<String>,
         /// Command to run instead of attaching. Everything after `--`.
         #[arg(last = true)]
         command: Vec<String>,
@@ -609,6 +629,8 @@ async fn main() -> anyhow::Result<()> {
             lease,
             container,
             no_tty,
+            session,
+            runner_path,
             command,
         } => {
             dispatch_resource_action(
@@ -616,6 +638,8 @@ async fn main() -> anyhow::Result<()> {
                     lease,
                     container,
                     no_tty,
+                    session,
+                    runner_path,
                     command,
                 },
                 target,
@@ -835,31 +859,71 @@ async fn dispatch_resource_action(
             lease,
             container,
             no_tty,
+            session,
+            runner_path,
             command,
         } => {
             // One resolution point for both spellings: a named lease must
             // advertise `attach`, and an unnamed one opens the picker over
             // the leases that do.
-            let lease = match lease {
-                Some(lease) => {
-                    commands::require_lease_capability(&lease, "attach", target, endpoint, output)
-                        .await
+            let (lease, session) = match lease {
+                Some(selector) => {
+                    // `dev.main` is `dev --session main`. The whole selector is
+                    // tried first: a pool name may contain dots, and a selector
+                    // that already names a lease keeps meaning that lease.
+                    let whole = commands::require_lease_capability(
+                        &selector, "attach", target, endpoint, output,
+                    )
+                    .await;
+                    match (
+                        whole,
+                        commands::sandbox_transport::split_session_selector(&selector),
+                    ) {
+                        (Ok(lease), _) => Ok((lease, session)),
+                        (Err(_), Some((lease, name))) if session.is_none() => {
+                            commands::require_lease_capability(
+                                lease, "attach", target, endpoint, output,
+                            )
+                            .await
+                            .map(|lease| (lease, Some(name.to_string())))
+                        }
+                        (Err(error), _) => Err(error),
+                    }
                 }
-                None => {
-                    commands::pick_lease_with_capability("attach", target, endpoint, output).await
-                }
+                None => commands::pick_lease_with_capability("attach", target, endpoint, output)
+                    .await
+                    .map(|lease| (lease, session)),
             }
             .unwrap_or_else(|error| exit_resource_error(error, output));
-            commands::sandbox_transport::attach(
-                &lease,
-                &command,
-                container.as_deref(),
-                !no_tty,
-                target,
-                endpoint,
-                output,
-            )
-            .await
+            match session {
+                Some(name) => {
+                    commands::sandbox_transport::attach_session(
+                        &lease,
+                        &name,
+                        runner_path
+                            .as_deref()
+                            .unwrap_or(commands::sandbox_transport::DEFAULT_RUNNER_PATH),
+                        &command,
+                        container.as_deref(),
+                        target,
+                        endpoint,
+                        output,
+                    )
+                    .await
+                }
+                None => {
+                    commands::sandbox_transport::attach(
+                        &lease,
+                        &command,
+                        container.as_deref(),
+                        !no_tty,
+                        target,
+                        endpoint,
+                        output,
+                    )
+                    .await
+                }
+            }
         }
         SandboxAction::PortForward { lease, spec, bind } => {
             match commands::sandbox_transport::split_forward_spec(&spec) {
