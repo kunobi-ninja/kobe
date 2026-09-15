@@ -2182,13 +2182,20 @@ mod suite_shape {
     #[test]
     fn every_pr_gate_scenario_exists_in_the_suite() {
         let justfile = include_str!("../justfile");
-        let list = justfile
+        // Every `for scenario in \` list in the recipe: the parallel group and
+        // the serial crash group are two lists of one gate.
+        let lists: Vec<&str> = justfile
             .split("for scenario in \\")
-            .nth(1)
-            .and_then(|rest| rest.split("; do").next())
-            .expect("the PR gate's scenario list is marked in the justfile");
-        let names: Vec<&str> = list
-            .lines()
+            .skip(1)
+            .filter_map(|rest| rest.split("; do").next())
+            .collect();
+        assert!(
+            !lists.is_empty(),
+            "the PR gate's scenario lists are marked in the justfile"
+        );
+        let names: Vec<&str> = lists
+            .iter()
+            .flat_map(|list| list.lines())
             .map(|line| line.trim().trim_end_matches('\\').trim())
             .filter(|line| !line.is_empty())
             .collect();
