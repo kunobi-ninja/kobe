@@ -144,12 +144,19 @@ test-sandbox-conformance:
 # Keeping the selection here (instead of adding a second implementation)
 # prevents the fast and exhaustive contracts from drifting.
 #
+# Two groups. The first shares one `cargo test` with two threads: every
+# scenario leases its own sandbox, and two is the child ClusterPool's
+# `maxClusters` in the e2e harness, so a third concurrent child placement would
+# only queue. The `crash_*` scenarios restart the operator, which would abort
+# any scenario running beside them, so they stay one per process, in series.
+#
 # libtest exits 0 when an exact filter matches nothing, so a scenario renamed
 # or deleted would be silently skipped while the gate stayed green. Two guards
-# close that: this loop requires each invocation to report exactly "1 passed",
-# and tests/sandbox_conformance.rs's suite_shape parses this same list and
-# asserts every name is a declared scenario. Editing one side without the
-# other fails.
+# close that: each group requires exactly its own count of passing tests (and
+# the parallel group additionally an `ok` line per name), and
+# tests/sandbox_conformance.rs's `every_pr_gate_scenario_exists_in_the_suite`
+# parses these same lists and asserts every name is a declared scenario.
+# Editing one side without the other fails.
 [group('test')]
 test-sandbox-conformance-pr:
     #!/usr/bin/env bash
@@ -158,6 +165,8 @@ test-sandbox-conformance-pr:
     export KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}"
     summary="$(mktemp)"
     trap 'rm -f "$summary"' EXIT
+
+    parallel=()
     for scenario in \
       an_execution_returns_the_exact_remote_exit_code \
       detached_logs_resume_and_cancel_stops_the_process \
@@ -165,12 +174,27 @@ test-sandbox-conformance-pr:
       an_undeclared_port_is_refused \
       a_declared_port_forwards_exact_bytes_over_loopback \
       a_real_terminal_resize_reaches_the_remote_pty \
+      release_rejects_further_access \
+      natural_expiry_rejects_further_access; do
+      parallel+=("$scenario")
+    done
+    cargo test --test sandbox_conformance -- --ignored --exact --test-threads=2 "${parallel[@]}" 2>&1 | tee "$summary"
+    grep -qE "^test result: ok\. +${#parallel[@]} passed;" "$summary" || {
+      echo "parallel group did not report exactly ${#parallel[@]} passing tests — a scenario renamed or deleted?" >&2
+      exit 1
+    }
+    for scenario in "${parallel[@]}"; do
+      grep -qE "^test ${scenario} \.\.\. ok$" "$summary" || {
+        echo "scenario '$scenario' did not pass in the parallel group" >&2
+        exit 1
+      }
+    done
+
+    for scenario in \
       crash_after_running_before_target_reservation_is_unknown_and_never_started \
       crash_before_spawn_is_unknown_and_never_retried \
       crash_after_spawn_before_ack_is_unknown_and_runs_once \
-      crash_after_ack_before_status_recovers_the_original_outcome \
-      release_rejects_further_access \
-      natural_expiry_rejects_further_access; do
+      crash_after_ack_before_status_recovers_the_original_outcome; do
       cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1 2>&1 | tee "$summary"
       grep -qE '^test result: ok\. +1 passed;' "$summary" || {
         echo "scenario '$scenario' did not report exactly one passing test — renamed or deleted?" >&2
