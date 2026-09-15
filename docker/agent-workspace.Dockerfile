@@ -38,6 +38,10 @@ FROM debian:bookworm-slim
 # `tmux` backs the pool's `attachCommand`. Without a multiplexer, `kobe attach`
 # joins the container's own idle process and a dropped connection loses the
 # session — the exact failure an 8h agent lease must not have.
+#
+# `openssh-server` is for `kobe ssh-proxy`: an SSH client on the caller's
+# machine reaches this sandbox through `kobe attach`, which runs `kobe-sshd`
+# (below) as the workload user in inetd mode. No port is opened.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -49,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         libssl-dev \
         openssh-client \
+        openssh-server \
         pkg-config \
         procps \
         ripgrep \
@@ -67,7 +72,22 @@ ARG WORKLOAD_GID=65532
 RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
     && useradd --uid "${WORKLOAD_UID}" --gid "${WORKLOAD_GID}" \
         --create-home --home-dir /home/agent --shell /bin/bash nonroot \
-    && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0755 /home/agent/work
+    && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0755 /home/agent/work \
+    && usermod -p '*' nonroot
+
+# --- SSH over the attach stream ---------------------------------------------
+#
+# `useradd` leaves the password field as `!`, which sshd reads as a locked
+# account and refuses even for public-key logins when PAM is not in use. `*`
+# above means "no password", which is what an image with only key auth wants.
+#
+# `kobe-sshd` serves one session on stdin/stdout; `kobe ssh-proxy` on the
+# caller's side hands that stream to the local `ssh`. The configuration is
+# root-owned so the workload cannot loosen it; the host key is generated per
+# sandbox under $HOME on first use, so the image ships no key material.
+COPY docker/kobe-sshd_config /etc/kobe/sshd_config
+COPY docker/kobe-sshd /usr/local/bin/kobe-sshd
+RUN chmod 0644 /etc/kobe/sshd_config && chmod 0755 /usr/local/bin/kobe-sshd
 
 # --- mise -------------------------------------------------------------------
 #
@@ -141,6 +161,24 @@ RUN printf '%s\n' '{"protocol":1,"id":"agentws-image-smoke","argv":["/bin/true"]
          sleep 0.05; \
        done \
     && rm -rf /var/run/kobe/executions/agentws-image-smoke
+
+# The SSH path is proven end to end as the workload user: `kobe-sshd --check`
+# generates the host key and validates the configuration, then a real `ssh`
+# logs in through `kobe-sshd` as its ProxyCommand, exactly as `kobe ssh-proxy`
+# will drive it. Every key this produces is removed afterwards so no sandbox
+# inherits one.
+RUN kobe-sshd --check \
+    && ssh-keygen -q -t ed25519 -N '' -f /tmp/proof-client \
+    && cat /tmp/proof-client.pub >> "$HOME/.ssh/authorized_keys" \
+    && ssh -q \
+        -o ProxyCommand=/usr/local/bin/kobe-sshd \
+        -o IdentityFile=/tmp/proof-client \
+        -o IdentitiesOnly=yes \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes \
+        nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server' \
+    && rm -rf "$HOME/.ssh" /tmp/proof-client /tmp/proof-client.pub
 
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.

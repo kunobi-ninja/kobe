@@ -1,0 +1,23 @@
+# sshd configuration for `kobe ssh-proxy`.
+#
+# `kobe-sshd` runs this as the workload user in inetd mode (`sshd -i`): one
+# session per process, served over the attach stream's stdin and stdout.
+# Nothing listens on a port, so `exposedPorts` is not involved and the pool
+# needs no Service. The host key path is supplied by `kobe-sshd` because it
+# lives under $HOME, which the image does not fix at build time.
+#
+# Only the workload user can log in: sshd running without root cannot switch
+# identity, and `AllowUsers` makes the intent explicit rather than implied.
+AllowUsers nonroot
+AuthorizedKeysFile %h/.ssh/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+UsePAM no
+StrictModes yes
+PermitUserEnvironment no
+AcceptEnv LANG LC_* COLORTERM
+PidFile none
+LogLevel ERROR
+Subsystem sftp /usr/lib/openssh/sftp-server
