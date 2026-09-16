@@ -66,16 +66,55 @@ pub const CHILD_KUBECONFIG_PROVENANCE_ANNOTATION: &str =
     "kobe.kunobi.ninja/child-kubeconfig-provenance";
 pub const CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1: &str = "secret-uid-sha256-v1";
 
-/// Retain the handle at least as long as the outer audit record, plus the
-/// bounded create window and scheduling margin used by the release fence.
-pub fn child_handle_retention_deadline(
+/// Retention labels, annotations and finalizers that fence a child handle to
+/// one outer Sandbox lease, independent of owner references.
+///
+/// Unknown labels, annotations, and finalizers are preserved. The known
+/// identity fields are overwritten, so callers validate any pre-existing
+/// values first. A retention deadline that is still live is kept.
+pub fn child_handle_retention_metadata(
+    handle: &ClusterLease,
+    outer_name: &str,
+    outer_uid: &str,
+    stale_rejected: bool,
     now: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
-    now + crate::api::sandbox::sandbox_lease_retention(configured.as_deref())
-        + chrono::Duration::from_std(crate::controllers::sandbox::SANDBOX_CLAIM_CREATE_TIMEOUT)
-            .expect("fixed create timeout fits chrono")
-        + chrono::Duration::minutes(5)
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let mut labels = handle.metadata.labels.clone().unwrap_or_default();
+    labels.insert(
+        crate::sandbox::SANDBOX_LEASE_UID_LABEL.into(),
+        outer_uid.into(),
+    );
+    labels.insert(CHILD_HANDLE_TOMBSTONE_LABEL.into(), "true".into());
+    let mut annotations = handle.metadata.annotations.clone().unwrap_or_default();
+    annotations.insert(CHILD_HANDLE_OUTER_NAME_ANNOTATION.into(), outer_name.into());
+    if stale_rejected {
+        annotations.insert(
+            CHILD_HANDLE_STALE_REJECTED_ANNOTATION.into(),
+            outer_uid.into(),
+        );
+    }
+    let deadline_is_live = annotations
+        .get(CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
+    if !deadline_is_live {
+        annotations.insert(
+            CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.into(),
+            crate::controllers::sandbox::sandbox_retention_deadline(now).to_rfc3339(),
+        );
+    }
+    let mut finalizers = handle.metadata.finalizers.clone().unwrap_or_default();
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer == CHILD_HANDLE_RETENTION_FINALIZER)
+    {
+        finalizers.push(CHILD_HANDLE_RETENTION_FINALIZER.into());
+    }
+    (labels, annotations, finalizers)
 }
 
 /// Why a child composition cannot proceed.
@@ -514,7 +553,8 @@ pub fn build_internal_cluster_lease(
                     ),
                     (
                         CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.to_string(),
-                        child_handle_retention_deadline(chrono::Utc::now()).to_rfc3339(),
+                        crate::controllers::sandbox::sandbox_retention_deadline(chrono::Utc::now())
+                            .to_rfc3339(),
                     ),
                     (
                         CHILD_KUBECONFIG_PROVENANCE_ANNOTATION.to_string(),

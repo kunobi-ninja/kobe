@@ -2053,11 +2053,7 @@ fn new_claim_tombstone_deadline(
     lease: &SandboxLease,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
-    let retention = crate::api::sandbox::sandbox_lease_retention(configured.as_deref());
-    let create_window = chrono::Duration::from_std(SANDBOX_CLAIM_CREATE_TIMEOUT)
-        .expect("the fixed Claim create timeout fits chrono");
-    let retention_bound = now + retention + create_window + SANDBOX_CLAIM_TOMBSTONE_MARGIN;
+    let retention_bound = sandbox_retention_deadline(now);
     let provisioning_bound = lease
         .status
         .as_ref()
@@ -2473,40 +2469,17 @@ async fn ensure_internal_lease_fenced(
     let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
         return Ok(InternalHandleFence::Foreign);
     };
-    let mut labels = current.metadata.labels.clone().unwrap_or_default();
     let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
         return Ok(InternalHandleFence::Foreign);
     };
-    labels.insert(
-        crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
-        lease_uid,
-    );
-    labels.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.to_string(),
-        "true".into(),
-    );
-    let mut annotations = current.metadata.annotations.clone().unwrap_or_default();
-    annotations.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.to_string(),
-        lease.name_any(),
-    );
-    let deadline_is_live = annotations
-        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
-    if !deadline_is_live {
-        annotations.insert(
-            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.to_string(),
-            allocation_fence_deadline(now).to_rfc3339(),
+    let (labels, annotations, finalizers) =
+        crate::controllers::sandbox_child::child_handle_retention_metadata(
+            current,
+            &lease.name_any(),
+            &lease_uid,
+            false,
+            now,
         );
-    }
-    let mut finalizers = current.metadata.finalizers.clone().unwrap_or_default();
-    if !finalizers.iter().any(|finalizer| {
-        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
-    }) {
-        finalizers
-            .push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.to_string());
-    }
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
@@ -2531,7 +2504,12 @@ async fn ensure_internal_lease_fenced(
     }
 }
 
-fn allocation_fence_deadline(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+/// How long anything that fences a Sandbox lease must outlive it: the outer
+/// lease's audit retention, plus the bounded create window and a scheduling
+/// margin. Claim tombstones, allocation fences and child handles all use it.
+pub(crate) fn sandbox_retention_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
     let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
     now + crate::api::sandbox::sandbox_lease_retention(configured.as_deref())
         + chrono::Duration::from_std(SANDBOX_CLAIM_CREATE_TIMEOUT)
@@ -2634,7 +2612,7 @@ async fn ensure_allocation_fence(
                         [
                             (
                                 SANDBOX_ALLOCATION_FENCE_RETAIN_UNTIL_ANNOTATION.to_string(),
-                                allocation_fence_deadline(now).to_rfc3339(),
+                                sandbox_retention_deadline(now).to_rfc3339(),
                             ),
                             (
                                 SANDBOX_ALLOCATION_FENCE_LEASE_NAME_ANNOTATION.to_string(),
@@ -7360,10 +7338,11 @@ fn live_child_pool_matches_recorded(
     recorded: &crate::crd::SandboxObjectReference,
     check: ChildPoolCheck,
 ) -> bool {
-    pool.name_any() == recorded.name
-        && pool.uid().as_deref() == Some(recorded.uid.as_str())
+    recorded
+        .namespace
+        .as_deref()
+        .is_some_and(|namespace| pool.is_recorded_pool(namespace, &recorded.name, &recorded.uid))
         && (check == ChildPoolCheck::Teardown || pool.metadata.generation == recorded.generation)
-        && pool.metadata.deletion_timestamp.is_none()
 }
 
 /// Validate the complete reciprocal tuple against the immutable outer status.

@@ -351,6 +351,22 @@ pub struct KubeletSharedMountConfig {
     pub host_path_root: String,
 }
 
+impl ClusterPool {
+    /// Whether this live pool is still the recorded pool `name`/`uid` in
+    /// `namespace` and is not being deleted.
+    ///
+    /// This is identity only. Callers building against admitted configuration
+    /// also pin `metadata.generation`; teardown must not, because generations
+    /// only move forward and any edit would strand bound capacity (#222).
+    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
+    pub fn is_recorded_pool(&self, namespace: &str, name: &str, uid: &str) -> bool {
+        self.metadata.namespace.as_deref() == Some(namespace)
+            && self.metadata.name.as_deref() == Some(name)
+            && self.metadata.uid.as_deref() == Some(uid)
+            && self.metadata.deletion_timestamp.is_none()
+    }
+}
+
 impl Default for KubeletSharedMountConfig {
     fn default() -> Self {
         Self {
