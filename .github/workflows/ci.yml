@@ -57,14 +57,29 @@ concurrency:
   # two days, and each time the vcluster and vkobe-etcd legs died before
   # reporting, so a conformance fix landed with no end-to-end proof at all.
   #
-  # Give the slow runs a group of their own and never cancel them. Push and PR
-  # runs keep superseding each other, which is right — a newer commit makes an
-  # older run irrelevant — but nothing they do can now interrupt the matrix.
+  # Give the slow runs a group of their own and never cancel them, so nothing
+  # a push or PR does can interrupt the matrix.
+  #
+  # Only PULL REQUEST runs supersede each other. A newer commit on a branch
+  # makes the older one irrelevant, so cancelling is right there.
+  #
+  # A newer commit on main does NOT make the older one irrelevant: each is a
+  # distinct state, and each has to be proven on its own. While conformance
+  # also ran on every PR that was survivable — the proof had already happened
+  # once. Now that the k3s gate is opt-in on PRs, main is the only place it
+  # runs by default, and cancelling meant a burst of merges landed with no
+  # end-to-end proof for any commit but the last. Four merges in ten minutes
+  # produced exactly that: three cancelled runs and one commit's conformance
+  # never completing.
+  #
+  # Main runs therefore queue instead of cancelling. Serialized is the right
+  # trade against a storm of large runners; a merge's proof can lag by roughly
+  # one conformance run per queued commit, and it arrives.
   group: >-
     ${{ github.workflow }}-${{ github.ref }}-${{
     (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     && 'full' || 'fast' }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Does this PR touch anything the Rust gate covers? Pushes, tags, schedules
