@@ -361,6 +361,15 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Print a shell completion script
+    ///
+    /// Load it in your shell's startup file, for example
+    /// `source <(kobe completions zsh)` in `~/.zshrc` or
+    /// `kobe completions fish | source` in `~/.config/fish/config.fish`.
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
     /// List, switch, and define named targets
     ///
     /// With no subcommand, lists them.
@@ -874,6 +883,10 @@ async fn main() -> anyhow::Result<()> {
             }
             None => exit_with_config_help(),
         },
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "kobe", &mut std::io::stdout());
+            Ok(())
+        }
         Commands::Target { action } => {
             run_target_action(action.unwrap_or(TargetAction::List), output).await
         }
