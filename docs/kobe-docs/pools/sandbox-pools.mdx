@@ -408,16 +408,17 @@ and a writable `/home/agent/work`. Clone projects there and run `mise install`;
 the image trusts mise configurations under that workspace and puts tool shims
 on `PATH` for direct `kobe exec` commands.
 
-`zondax/kobe-agent-workspace-gui` adds the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
-software rendering, Xvfb, Openbox, noVNC, Firefox, and a
-visible terminal. Firefox is registered for HTTP and HTTPS links, so OAuth
-flows opened by desktop applications stay inside the noVNC desktop. Node, Rust,
-package managers, and other project tools still come from the project's
-`mise.toml`. Both images use
-the same release tags and runner. Pin a release tag or digest in your pool.
+The same image also carries the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
+software rendering, Xvfb, Openbox, noVNC, Firefox, and a visible terminal.
+Firefox is registered for HTTP and HTTPS links, so OAuth flows opened by
+desktop applications stay inside the noVNC desktop. There is no separate GUI
+image: the desktop is installed but never started, so a headless lease pays
+only the image size and nothing at runtime. Node, Rust, package managers, and
+other project tools still come from the project's `mise.toml`. Pin a release
+tag or digest in your pool.
 
-For a GUI pool, set these fields in its template (alongside your resource
-requests and limits):
+To use the desktop from a pool, declare its port in the template (alongside
+your resource requests and limits):
 
 ```yaml
 template:
@@ -426,7 +427,7 @@ template:
   attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
   containers:
     - name: workspace
-      image: zondax/kobe-agent-workspace-gui:v0.44.0
+      image: zondax/kobe-agent-workspace:v0.47.0
   exposedPorts:
     - name: desktop
       container: workspace
@@ -477,6 +478,5 @@ cancelling its runner execution or releasing the lease stops the desktop.
 When started in tmux, use `Ctrl-c` in that pane to stop it. Restart
 with a new execution if needed. Only one desktop can run in a Sandbox.
 
-Build locally with `docker buildx bake agent-workspace-gui --load` (set
-`PLATFORM=linux/arm64` on an ARM host). The `default` and `push` Bake groups
-include both workspace variants.
+Build locally with `docker buildx bake agent-workspace --load` (set
+`PLATFORM=linux/arm64` on an ARM host).

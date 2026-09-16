@@ -82,11 +82,11 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator", "kobe-sync", "runner", "agent-workspace", "agent-workspace-gui"]
+  targets = ["operator", "kobe-sync", "runner", "agent-workspace"]
 }
 
 group "push" {
-  targets = ["operator-push", "kobe-sync-push", "runner-push", "agent-workspace-push", "agent-workspace-gui-push"]
+  targets = ["operator-push", "kobe-sync-push", "runner-push", "agent-workspace-push"]
 }
 
 # =============================================================================
@@ -264,22 +264,4 @@ target "agent-workspace-push" {
 # GUI adds system libraries and a desktop to the exact headless image. Keep the
 # push dependency on the push variant, so neither the base nor its runner is
 # exported twice to the same local cache during one bake invocation.
-target "agent-workspace-gui" {
-  dockerfile = "docker/agent-workspace-gui.Dockerfile"
-  context    = "."
-  contexts = {
-    workspace = "target:agent-workspace"
-  }
-  platforms  = [PLATFORM]
-  tags       = tags("kobe-agent-workspace-gui")
-  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/agent-workspace-gui"]
-  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/agent-workspace-gui,mode=max"]
-}
 
-target "agent-workspace-gui-push" {
-  inherits = ["agent-workspace-gui"]
-  contexts = {
-    workspace = "target:agent-workspace-push"
-  }
-  output = ["type=registry"]
-}
