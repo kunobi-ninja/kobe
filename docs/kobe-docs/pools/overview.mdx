@@ -14,7 +14,7 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
   name: ci-small
-  namespace: kobe
+  namespace: kobe-system
 spec:
   size: 3
   ttl: 1h
@@ -44,7 +44,7 @@ spec:
   # Backend selection and backend-specific config.
   # Defaults to k3s if omitted.
   backend:
-    type: k3s                 # k3s | k0s | capi | vkobe
+    type: k3s                 # k3s | k0s | vcluster | capi | vkobe
 
   # Addons to install after the cluster is ready.
   addons:
@@ -84,10 +84,12 @@ spec:
     storage: s3://my-diagnostics-bucket/kobe/diag
     retentionDays: 7
 
-  # Velero golden image snapshot.
+  # Velero golden image snapshot. See /docs/operate/golden-images.
   snapshot:
     enabled: true
-    schedule: "0 2 * * *"
+    veleroNamespace: velero
+    storageLocation: default
+    refreshOn: ProfileChange
 ```
 
 ## Addons
@@ -129,3 +131,5 @@ diagnostics:
 ```
 
 The operator uses the standard AWS credential chain (environment variables, IAM role, instance profile) to authenticate with S3.
+
+Rolling recycle during operator or spec upgrades is `spec.upgradePolicy`. See [Upgrades](/docs/operate/upgrades). Golden-image restores are [Velero snapshots](/docs/operate/golden-images).

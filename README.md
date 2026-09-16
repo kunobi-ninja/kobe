@@ -7,16 +7,18 @@
 
 **Premium cattle, managed by ninjas.**
 
-Kobe is a Kubernetes operator that manages fleets of ephemeral clusters. It pre-warms pools across multiple backends (k3s, k0s, [vcluster](https://www.vcluster.com/), CAPI) so your CI pipelines and developers get fully functional, isolated Kubernetes clusters instantly — leased via a simple HTTP API.
+Kobe is a Kubernetes operator that manages fleets of ephemeral environments. It pre-warms **cluster** pools (k3s, k0s, [vcluster](https://www.vcluster.com/), CAPI) so CI and developers get a kubeconfig in seconds, and **sandbox** pools so agents and humans get `exec`, SSH (`ssh kobe-agents-dev`), and an optional Linux desktop, without ever seeing the cluster underneath.
 
 ## Why
 
 | Without Kobe | With Kobe |
 |---------------|-----------|
 | Spin up Kind/vcluster on demand (~30-360s) | Claim a pre-warmed cluster (<5s) |
-| Distribute kubeconfigs or K8s API access | Simple `curl` with a JWT |
+| Distribute kubeconfigs or K8s API access | `curl` or `kobe lease` with OIDC / SSH / a token |
 | DinD hacks in CI, fragile networking | No Docker needed, just an HTTP call |
-| Static secrets to rotate | OIDC, SSH keys, or tokens — zero static secrets |
+| SSH to a cloud VM you then forget to delete | `ssh kobe-agents-dev` — first connection creates it, TTL cleans it up |
+| Agent needs a pod spec and cluster creds | `kobe run` / `kobe exec`; the pool template is the whole surface |
+| Desktop Linux in CI/dev | GUI sandbox: noVNC + Firefox, OAuth stays in the box |
 
 ## Quick Start
 
@@ -192,7 +194,15 @@ status:
 
 ## Documentation
 
-See [kunobi.ninja/docs/kobe](https://kunobi.ninja/docs/kobe) for the user-facing documentation site.
+The site is [kunobi.com/docs/kobe](https://kunobi.com/docs/kobe) (source: [`docs/kobe-docs/`](docs/kobe-docs/)).
+
+| Start here | |
+|---|---|
+| [Install the CLI](docs/kobe-docs/getting-started/installation.mdx) | mise, Homebrew, apt, winget |
+| [Deploy the operator](docs/kobe-docs/getting-started/deploy.mdx) | `helm install oci://registry-1.docker.io/zondax/kobe` |
+| [Lease a cluster](docs/kobe-docs/getting-started/quick-start.mdx) | `kobe login` → `kobe lease` |
+| [Lease a sandbox](docs/kobe-docs/getting-started/sandbox.mdx) | `kobe run` / `ssh kobe-…` |
+| [GUI desktop](docs/kobe-docs/getting-started/desktop.mdx) | noVNC in a sandbox |
 
 ## License
 

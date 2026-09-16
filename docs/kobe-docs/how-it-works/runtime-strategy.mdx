@@ -1,63 +1,51 @@
 ---
 title: Runtime strategy
-description: Which virtual-cluster runtime kobe stands on today, where it is heading, and what is retired.
+description: Which cluster runtime to pick for a new pool.
 ---
 
 # Runtime strategy
 
-This page is the authoritative statement of kobe's runtime direction. If any
-other document disagrees with it, this page wins.
+kobe's value is the fleet layer — pools, leases, admission, GitOps, golden
+images, observability — kept uniform across runtimes. The runtimes themselves
+are pluggable. Pick from what ships today.
 
-kobe's value is the **fleet layer** — pools, leases, multi-backend admission,
-GitOps, golden images, observability — kept uniform across runtimes. The
-runtimes themselves are deliberately pluggable, and the strategy is two-pronged:
-
-## Density: vcluster
-
-For high-density, low-overhead virtual clusters (CI, ephemeral environments),
-kobe stands on **[vcluster](https://www.vcluster.com/)** (loft-sh, Apache 2.0)
-as the `vcluster` backend. The operator deploys one vcluster instance per
-`ClusterInstance` via the upstream Helm chart into a dedicated per-instance
-namespace.
-
-Because this backend inherits vcluster's syncer semantics, it also inherits
-its fidelity boundaries (cloud identity such as IRSA, syncer coverage, version
-skew). Route tenants who need full-fidelity cluster semantics to an
-isolation-tier backend instead.
-
-## Isolation: pkobe (native)
-
-For workloads that need real isolation and full API fidelity — dedicated
-control planes, real worker nodes, native RBAC/CSI/cloud-identity — kobe builds
-its own runtime: **pkobe** (dedicated control plane + real nodes, KubeVirt as
-the primary node provider). This is the backend kobe develops natively, and
-the roadmap's isolation tier. See the roadmap epic
-([#24](https://github.com/kunobi-ninja/kobe/issues/24)) and the pkobe issue
-([#23](https://github.com/kunobi-ninja/kobe/issues/23)).
-
-Until pkobe lands, full isolation is served by the **k3s / k0s** backends
-(nested real clusters) — today's production path — and **CAPI** for
-provider-managed real infrastructure.
-
-## On hold: kobe-sync / vkobe
-
-Development of the in-house proxy-based syncer runtime — the `kobe-sync`
-sidecar and the `vkobe` backend built on it — is **on hold**. Maintaining
-translation fidelity for the full Kubernetes resource surface is a whole
-product in itself, and current effort goes to the fleet layer, the vcluster
-backend, and pkobe instead.
-
-The code remains in the tree and existing vkobe pools keep working, but no
-new functionality is being added while it is on hold — prefer `vcluster` for
-new density pools. Contributor guidance that presents kobe-sync as the
-actively developed runtime is stale — this page supersedes it.
-
-## Summary
+## What to use
 
 | Need | Backend | Status |
 |---|---|---|
-| Nested real clusters (CI today) | `k3s` / `k0s` | Production |
-| High density, low overhead | `vcluster` | Adopted |
-| Full isolation, native fidelity | `pkobe` | In design (#23) |
-| Provider-managed real infra | `capi` | Available |
-| Proxy-based virtual clusters | `vkobe` (kobe-sync) | **On hold** |
+| Nested real clusters | `k3s` / `k0s` | Production default |
+| High density, low overhead | `vcluster` | Production |
+| Provider-managed real infra | `capi` | Available (no CI provider in-tree) |
+| Full isolation, native fidelity | `pkobe` | Not available yet |
+| Proxy-based virtual clusters | `vkobe` (kobe-sync) | On hold |
+
+Configuration for each backend: [Backends](/docs/pools/backends).
+
+## Density: vcluster
+
+For high-density ephemeral clusters (CI), use **[vcluster](https://www.vcluster.com/)**
+as `spec.backend.type: vcluster`. The operator deploys one instance per
+`ClusterInstance` via the upstream Helm chart into a dedicated per-instance
+namespace.
+
+This backend inherits vcluster's syncer semantics and fidelity boundaries
+(cloud identity such as IRSA, syncer coverage, version skew). Tenants who need
+full cluster semantics should use k3s, k0s, or CAPI instead.
+
+## Isolation: k3s / k0s / CAPI
+
+Nested k3s and k0s are today's production path for real control planes and
+nodes. CAPI delegates to an infrastructure provider you already run.
+
+A native isolation runtime (pkobe) is tracked as
+[#23](https://github.com/kunobi-ninja/kobe/issues/23) / [#24](https://github.com/kunobi-ninja/kobe/issues/24).
+It is not a backend you can set on a pool.
+
+## On hold: kobe-sync / vkobe
+
+Development of the in-house proxy-based syncer — `kobe-sync` and the `vkobe`
+backend — is paused. Maintaining translation fidelity for the Kubernetes
+resource surface is a product of its own.
+
+The code remains in the tree and existing vkobe pools keep working. Prefer
+`vcluster` for new density pools. Do not start a new vkobe pool.

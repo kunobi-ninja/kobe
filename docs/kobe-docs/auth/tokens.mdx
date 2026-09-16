@@ -1,0 +1,64 @@
+---
+title: Tokens
+description: Authenticate with a static bearer token stored in a Kubernetes Secret.
+---
+
+# Tokens
+
+A token `AccessPolicy` accepts `Authorization: Bearer …` using a value stored in a Secret in the operator watch namespace. Use this for scripts, in-cluster jobs, and local e2e, not for interactive developers (prefer [SSH](/docs/auth/ssh-keys) or [OIDC](/docs/auth/oidc)).
+
+## Secret
+
+The Secret must have a `token` key:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kobe-ci-token
+  namespace: kobe-system
+type: Opaque
+stringData:
+  token: "replace-me-with-a-long-random-value"
+```
+
+## AccessPolicy
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: ci-token
+  namespace: kobe-system
+spec:
+  auth:
+    token:
+      secretRef: kobe-ci-token
+  rules:
+    - pools: ["ci-*"]
+      maxTtl: 1h
+      maxConcurrentLeases: 4
+      maxExtensions: 0
+```
+
+`secretRef` is the Secret name. Identity for concurrency tracking is the policy name (`ci-token`), not a value inside the token.
+
+If the Secret is missing, empty, or has no `token` key, the operator logs an error and skips this provider until the next policy reload.
+
+## CLI
+
+```sh
+kobe target set ci --endpoint https://kobe.example.com --auth token --token "$KOBE_TOKEN" --global
+kobe target use ci
+kobe lease ci-small
+```
+
+Or without storing the token in config:
+
+```sh
+KOBE_ENDPOINT=https://kobe.example.com \
+KOBE_TOKEN=$KOBE_TOKEN \
+  kobe lease ci-small --ttl 30m
+```
+
+Rotate by writing a new Secret value. In-flight leases keep working until TTL; new requests need the new token once the operator reloads the Secret.

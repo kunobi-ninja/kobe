@@ -1,27 +1,29 @@
 ---
 title: Quick start
-description: Configure the kobe CLI, lease your first cluster, and release it when done.
+description: Configure the kobe CLI, lease a cluster, and release it when done.
 ---
 
 # Quick start
 
-## Configure the CLI
+This path leases a Kubernetes cluster. For sandboxes, see [Sandbox](/docs/getting-started/sandbox). You need the [CLI](/docs/getting-started/installation) and an endpoint. If you are standing the operator up yourself, [deploy](/docs/getting-started/deploy) it first.
 
 <Steps>
   <Step>
-    **Point the CLI at your kobe endpoint**
+    **Point the CLI at the endpoint**
+
+    `kobe target set` writes to `./.kobe.toml` in the current directory unless you pass `--global`. Use `--global` for an endpoint you want from any directory:
 
     ```sh
-    kobe config set endpoint https://kobe.example.com
+    kobe target set work --endpoint https://kobe.example.com --auth ssh --global
+    kobe target use work
     ```
 
-    Or open the interactive config editor:
+    Or open the interactive editor:
 
     ```sh
     kobe config
     ```
   </Step>
-
   <Step>
     **Authenticate**
 
@@ -29,25 +31,20 @@ description: Configure the kobe CLI, lease your first cluster, and release it wh
     kobe login
     ```
 
-    kobe supports SSH key auth (Ed25519 via your SSH agent), OIDC tokens, and static bearer tokens. The login flow detects which methods your endpoint accepts and guides you through the appropriate one.
+    kobe supports SSH key auth (Ed25519 via your SSH agent), OIDC, and static bearer tokens. Login detects which methods the endpoint accepts.
 
-    To check which auth methods are available on your endpoint:
+    Over SSH or on a headless host, use device login instead of a local browser:
+
+    ```sh
+    kobe login --device
+    ```
+
+    Check what the endpoint offers:
 
     ```sh
     kobe status
     ```
   </Step>
-
-  <Step>
-    **List available pools**
-
-    ```sh
-    kobe status
-    ```
-
-    This shows the endpoint version, available auth methods, pool summary, and your active leases.
-  </Step>
-
   <Step>
     **Lease a cluster**
 
@@ -55,50 +52,87 @@ description: Configure the kobe CLI, lease your first cluster, and release it wh
     kobe lease ci-small
     ```
 
-    kobe writes the kubeconfig to `~/.kube/kobe-<lease-id>` by default and prints the lease ID and expiry. The cluster is ready to use immediately.
+    The CLI waits until the lease is `Bound`, writes a kubeconfig to
+    `~/.kube/kobe-<pool>-<short-id>.yaml`, and prints the path, lease id, and expiry.
 
-    To write to a specific path:
+    Request a longer TTL (capped by the policy's `maxTtl`). The CLI default is `1h` if you omit `--ttl`:
+
+    ```sh
+    kobe lease ci-small --ttl 2h
+    ```
+
+    Write the kubeconfig somewhere else:
 
     ```sh
     kobe lease ci-small --kubeconfig /tmp/kube.yaml
     ```
 
-    To request a longer TTL (within your policy's `maxTtl`):
+    Name the lease so you can reuse it in CI:
 
     ```sh
-    kobe lease ci-small --ttl 2h
+    kobe lease ci-small --name pr-3835 --ensure
     ```
-  </Step>
 
+    `--ensure` extends the existing active lease of that name instead of failing on the duplicate.
+  </Step>
   <Step>
     **Use the cluster**
 
     ```sh
-    KUBECONFIG=~/.kube/kobe-<lease-id> kubectl get nodes
+    export KUBECONFIG=~/.kube/kobe-ci-small-<short-id>.yaml
+    kubectl get nodes
     ```
 
-    The cluster is a fully isolated Kubernetes environment. It won't affect other callers, and all resources you create are destroyed with it when the lease expires or is released.
+    The cluster is isolated. Resources you create die with the lease.
   </Step>
-
   <Step>
-    **Release the cluster**
+    **Release**
 
     ```sh
     kobe release <lease-id>
     ```
 
-    This immediately destroys the cluster and returns it to the pool for recycling. Releasing early is good practice in CI — it lets the pool refill faster for the next run.
+    This destroys the instance and starts a replacement in the pool. Releasing early in CI lets the pool refill for the next job. If you do nothing, the server expires the lease at TTL and the kubeconfig stops working (the client cert uses the same TTL).
   </Step>
 </Steps>
 
-## Manage active leases
+## One command around a job
+
+`kobe with-lease` creates a cluster lease, sets `KUBECONFIG` for one command, heartbeat-extends the lease while the command runs, and releases on exit (success, failure, or signal):
+
+```sh
+kobe with-lease ci-small --ttl 1h -- kubectl get nodes
+kobe with-lease ci-small -- make e2e
+```
+
+The pool must expose the `kubeconfig` capability. For sandboxes, use `kobe run` instead.
+
+## Heartbeat without wrapping a command
+
+```sh
+kobe lease ci-small --keepalive
+```
+
+Re-extends by `--ttl` at half-TTL intervals until Ctrl-C or the policy ceiling.
+
+## See what you hold
 
 ```sh
 kobe status
 ```
 
-Shows your live leases together with pool availability. Released and expired records are omitted from text; pass `--all` or use `-o json` / `GET /v1/leases` for the full inventory.
+Text output hides released and expired leases. Pass `--all` or `-o json` for the full inventory.
 
-## What happens when a lease expires
+Extend an active lease:
 
-kobe enforces TTLs server-side. When a lease expires, the operator sets its phase to `Expired` and begins recycling the cluster. The kubeconfig you received stops working at expiry — Kubernetes API calls will fail with certificate errors, since the client cert is issued with the same TTL.
+```sh
+kobe extend --ttl 30m
+kobe extend pr-3835 --ttl 30m
+```
+
+Release everything this identity still holds, and drop local kubeconfigs kobe wrote:
+
+```sh
+kobe purge
+kobe purge --orphans-only   # files whose leases are already gone
+```

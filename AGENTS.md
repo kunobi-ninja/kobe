@@ -13,8 +13,8 @@ Written material for this project lives in two homes. Keep them separate.
 
 Current structure:
 
-- `docs/kobe-docs/` — the site source (MDX + `meta.json`).
-- `docs/guides/` — operator how-to guides, referenced by the site.
+- `docs/kobe-docs/` — the site source (MDX + `meta.json`). Operator runbooks that should appear on kunobi.com also live here under `operate/`.
+- `docs/guides/` — operator how-to guides in the repo (CRD comments and code point here). Keep them as full documents, not stubs. If a guide is also on the site, update both.
 
 ### Internal notes — outside the repo
 
@@ -39,7 +39,7 @@ The code is the source of truth for behavior. Doc-comments on what the code does
 | Function contract, invariants, edge cases | `///` on the function |
 | CRD field meaning / valid values | `#[schemars(description = "...")]` on the field |
 | Why-this-shape decisions | inline `//` comment at the decision site |
-| User-facing config / runbook / how-to | `docs/guides/*.md` |
+| User-facing config / runbook / how-to | `docs/kobe-docs/` (site) and `docs/guides/*.md` (in-repo operator guides) |
 | Plans, roadmap, ADRs, research | Obsidian vault (not in git) |
 
 ### Rules
@@ -51,4 +51,4 @@ The code is the source of truth for behavior. Doc-comments on what the code does
 
 ### When `docs/` is right
 
-`docs/` is for content an external kobe adopter needs to read. Operator runbooks (`docs/guides/`) and the site (`docs/kobe-docs/`) qualify. Algorithm internals, code-level decision rationale, and one-off design notes do not — they belong inline with the code or in the Obsidian vault.
+`docs/` is for content an external kobe adopter needs to read. The site (`docs/kobe-docs/`) and operator runbooks (`docs/guides/`) qualify. Algorithm internals, code-level decision rationale, and one-off design notes do not — they belong inline with the code or in the Obsidian vault.

@@ -1,51 +1,57 @@
 ---
 title: Configuration
-description: CLI config file, environment variables, and per-command overrides.
+description: CLI config file, named targets, environment variables, and per-command overrides.
 ---
 
 # Configuration
 
-The kobe CLI stores its config at `~/.config/kobe/config.json`. It supports named targets, so one machine can talk to multiple kobe deployments.
+The CLI stores named targets. One machine can talk to several kobe deployments.
 
-## Config file
+## Where config lives
 
-```json title="~/.config/kobe/config.json"
-{
-  "current_target": "work",
-  "targets": {
-    "work": {
-      "endpoint": "https://kobe.example.com",
-      "auth": "ssh",
-      "ssh_fingerprint": "SHA256:..."
-    }
-  }
-}
+| File | Role |
+|---|---|
+| `~/.config/kobe/config.json` | Global targets and the current target |
+| `./.kobe.toml` | Project-local targets (gitignored if you choose) |
+
+`kobe target set <name> --endpoint …` writes `./.kobe.toml` in the current directory. Pass `--global` to write `~/.config/kobe/config.json` instead, for an endpoint you want from any directory.
+
+```sh
+kobe target set work --endpoint https://kobe.example.com --auth ssh --global
+kobe target use work
 ```
 
-To inspect the current config:
+`kobe target use` switches the target for the current shell only, so two terminals can point at different deployments. `--target NAME` overrides it for one command.
+
+A local target of the same name overlays the global one. `kobe target list` marks those as `both`.
+
+To inspect:
 
 ```sh
 kobe config view
+kobe target list
+kobe target current
 ```
 
-To create or replace a target:
+To edit interactively, run `kobe config` in a terminal. It opens the editor for the current target; `kobe config edit NAME` opens another one.
 
 ```sh
-kobe config set work --endpoint https://kobe.example.com --auth ssh
-kobe config use work
+kobe config
+kobe config edit work
 ```
 
-To edit interactively:
+Export and import JSON:
 
 ```sh
-kobe config edit
+kobe config export > kobe-config.json
+kobe config import kobe-config.json
 ```
 
-### Project file (`.kobe.toml`)
+Use `-` for stdout/stdin.
 
-A gitignored `./.kobe.toml` in the current directory can register extra
-targets (for example a local `e2e` operator). It does not replace a global
-`current_target` unless you opt in:
+### Project file
+
+A `./.kobe.toml` can register extra targets (for example a local e2e operator). It does not replace a global `current_target` unless you opt in:
 
 ```toml
 # Optional: make this checkout default to e2e.
@@ -67,7 +73,9 @@ the `default` target.
 `current_target = ""` is not a fallback to global; it is an unknown target
 name. Omit the key instead.
 
-Use `kobe --target e2e` or `kobe config use e2e` without opting in.
+Use `kobe --target e2e` or `kobe target use e2e` without opting in.
+
+`--default-pool` on `kobe target set` is the pool `kobe ssh-proxy` uses when the SSH host does not name one.
 
 ## Environment variables
 
@@ -76,13 +84,15 @@ Use `kobe --target e2e` or `kobe config use e2e` without opting in.
 | `KOBE_ENDPOINT` | One-off endpoint override |
 | `KOBE_TOKEN` | Bearer token when using `token` auth |
 
-Environment variables are most useful in CI, where you typically inject a token directly:
+Environment variables are useful in CI when you inject a token directly:
 
 ```sh
 KOBE_ENDPOINT=https://kobe.example.com \
 KOBE_TOKEN=$CI_KOBE_TOKEN \
   kobe lease ci-small --ttl 30m
 ```
+
+`--endpoint` and `--target` are global flags on every command.
 
 ## SSH key auth
 
@@ -93,4 +103,4 @@ ssh-add ~/.ssh/id_ed25519
 kobe login
 ```
 
-kobe uses TOFU (Trust On First Use) for server fingerprint verification. On first login to an endpoint, it stores the fingerprint in the config file and warns if it changes in the future.
+kobe uses TOFU (Trust On First Use) for server fingerprint verification. On first login to an endpoint, it stores the fingerprint and warns if it changes later. JSON output (`-o json`) never prompts; establish trust in text mode first.

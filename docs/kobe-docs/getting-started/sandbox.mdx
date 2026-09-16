@@ -1,0 +1,72 @@
+---
+title: Sandbox
+description: Lease a sandbox, run a command, or SSH into it.
+---
+
+# Sandbox
+
+A sandbox is a bounded container leased from a `SandboxPool`. You get `exec`, logs, port-forward, and optional SSH. You never receive credentials for the Kubernetes cluster underneath.
+
+The operator serves sandbox APIs only when `agentSandbox.mode` is `managed` or `external`. The chart default is `disabled`. Ask your operator, or see [Sandbox pools](/docs/pools/sandbox-pools) if you run the chart.
+
+You need the [CLI](/docs/getting-started/installation) and a working [target](/docs/getting-started/quick-start).
+
+## Run one command
+
+```sh
+kobe run agents --ttl 30m -- /bin/echo hello
+```
+
+`run` creates a lease, waits for readiness, executes the command as-is (no shell), then releases. The process exit code is the remote command's exit code, so `set -e` works.
+
+Cleanup is reported separately. If the command succeeded but release could not be confirmed, JSON mode still returns exit `0` and sets `cleanup.released` to false. Headless callers should check both. Details: [executable commands](/docs/commands/sandbox).
+
+## Hold a sandbox and exec
+
+```sh
+kobe lease agents --ttl 1h
+kobe exec agents -- /bin/uname -a
+kobe logs <lease-id> --tail 200
+kobe release <lease-id>
+```
+
+`kobe exec`, `logs`, `attach`, and `port-forward` accept a lease id, an alias, or a pool name when you hold exactly one matching lease.
+
+Pass a secret on stdin, not in argv. The target apiserver audit-logs the exec URL:
+
+```sh
+printf %s "$GITHUB_TOKEN" | kobe exec agents --stdin -- gh auth login --with-token
+```
+
+## SSH into a sandbox
+
+```sh
+kobe init --endpoint https://kobe.example.com
+ssh kobe-agents-dev
+```
+
+`init` writes a target, completes login, picks a default SSH-capable pool, installs an `ssh_config` block, and proves `ssh -G` routes `kobe-*` through `kobe ssh-proxy`. Later:
+
+```sh
+ssh kobe-agents-dev
+kobe release kobe-agents-dev
+```
+
+First connection creates the sandbox; later connections reuse the alias. Disconnecting does not release it.
+
+A login shell dies with the SSH connection. Add a session name and it survives:
+
+```sh
+ssh kobe-agents-dev.main
+kobe attach kobe-agents-dev --session main
+```
+
+Reconnect and the screen is as you left it. `scp` and an editor's remote server still talk to `kobe-agents-dev` without the session suffix. Full host-name rules and `kobe doctor`: [SSH](/docs/commands/ssh).
+
+## Linux desktop
+
+Pools that use `zondax/kobe-agent-workspace` and publish port 6080 can start a noVNC desktop (Firefox, Openbox, Tauri prerequisites). Walkthrough: [Desktop](/docs/getting-started/desktop).
+
+## What the pool controls
+
+Callers pick pool, TTL, and an optional alias. They cannot set the image, command, ports, mounts, or credentials. The administrator authors those on the `SandboxPool`. See [Sandbox pools](/docs/pools/sandbox-pools), [ports](/docs/pools/ports), and [images and runner](/docs/pools/images-and-runner).

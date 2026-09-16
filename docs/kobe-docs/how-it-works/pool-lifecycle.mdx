@@ -19,7 +19,7 @@ Creating -> Ready -> Leased -> Recycling -> [destroyed]
 
 ### Creating
 
-The operator has issued the backend command to create the instance (for example a k3s StatefulSet, a CAPI cluster, or a vkobe pod). The instance is not yet available for leases. It stays in this phase until:
+The operator has issued the backend command to create the instance (for example a k3s StatefulSet, a vcluster Helm release, or a CAPI cluster). The instance is not yet available for leases. It stays in this phase until:
 
 - The Kubernetes control plane is reachable
 - All addons have been installed
@@ -35,7 +35,7 @@ The instance is warm and waiting in the pool. It passes health checks and can be
 
 A `ClusterLease` is bound to this instance. The lease includes a TTL, and the operator enforces expiry server-side regardless of client activity.
 
-Callers can extend a lease up to `maxExtensions` times (default: 2) using `PATCH /v1/leases/:id`.
+Callers can extend a lease up to `maxExtensions` times (default: 2) using `kobe extend` or `PATCH /v1/leases/:id`.
 
 ### Recycling
 
@@ -91,7 +91,7 @@ spec:
 
 ## Autoscaling
 
-When `scaling` is set on a pool, the operator adjusts the number of warm instances based on demand instead of holding a fixed `size`. The pool grows when leases arrive faster than clusters can be created, and shrinks back down during quiet periods.
+When `scaling` is set on a pool, the operator adjusts the number of warm instances based on demand instead of holding a fixed `size`. The pool grows when leases arrive faster than clusters can be created, and shrinks back down during quiet periods. Spec-hash drift (operator bump, pool edit, bootstrap change) is recycled under [upgrade policy](/docs/operate/upgrades).
 
 ```yaml
 spec:
@@ -105,4 +105,4 @@ spec:
 
 ## Velero snapshots
 
-When `snapshot` is configured, the operator maintains a Velero backup of a golden cluster and restores new pool members from it. This skips the addon installation phase, reducing `Creating` time from minutes to seconds for complex addon stacks. See [Velero guide](/docs/guides/velero-golden-images) for setup details.
+When `snapshot` is configured, the operator maintains a Velero backup of a golden cluster and restores new pool members from it. This skips the addon installation phase, reducing `Creating` time from minutes to seconds for complex addon stacks. See [Golden images](/docs/operate/golden-images) for setup details.

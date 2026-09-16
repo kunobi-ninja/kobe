@@ -1,0 +1,71 @@
+---
+title: Golden images
+description: Pre-build a cluster with Velero and restore pool members from the backup.
+---
+
+# Golden images
+
+When `spec.snapshot` is enabled on a `ClusterPool`, the operator builds a temporary cluster from that pool's spec, waits for addons and readiness gates, takes a Velero backup, then tears the temporary cluster down. New pool members restore from the backup instead of installing addons from scratch.
+
+This is the slow-addon path. Provision time drops because addon install is skipped, not because Kubernetes itself gets faster. Exact numbers depend on cluster size, addon complexity, and the storage backend.
+
+Velero CRDs must be present in the host cluster. If they are missing, the operator logs that snapshot support is disabled and ignores `spec.snapshot`.
+
+## Prerequisites
+
+- Velero installed (the `velero` namespace by default).
+- An S3-compatible `BackupStorageLocation` (MinIO, AWS S3, GCS, Azure Blob).
+- CSI snapshots if the pool uses dynamic persistence: Velero CSI plugin plus a VolumeSnapshotClass for the StorageClass.
+- RBAC for the kobe operator ServiceAccount to create `Backup` and `Restore` in the Velero namespace.
+
+Minimal Velero install (adjust provider and bucket):
+
+```bash
+velero install \
+  --provider aws \
+  --bucket my-kobe-backups \
+  --secret-file ./credentials-velero \
+  --plugins velero/velero-plugin-for-aws:v1.10.0 \
+  --use-volume-snapshots=true \
+  --features=EnableCSI
+```
+
+## ClusterPool spec
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ci-small
+  namespace: kobe-system
+spec:
+  size: 3
+  ttl: 1h
+  backend:
+    type: k3s
+  cluster:
+    version: v1.31.3+k3s1
+    servers: 1
+  snapshot:
+    enabled: true
+    veleroNamespace: velero
+    storageLocation: default
+    goldenPrefix: golden
+    ttl: 720h
+    refreshOn: ProfileChange
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn golden images on |
+| `veleroNamespace` | `velero` | Where Velero runs |
+| `storageLocation` | `default` | Velero `BackupStorageLocation` name |
+| `goldenPrefix` | `golden` | Backup name is `<prefix>-<pool>-<generation>` |
+| `ttl` | `720h` | Velero backup retention |
+| `refreshOn` | `ProfileChange` | When to rebuild |
+
+`ProfileChange` rebuilds when the pool's `.metadata.generation` increments (any spec change). `Manual` does not auto-rebuild; the operator only creates a golden backup on `ProfileChange`. A backup already in progress for that generation is not spawned again.
+
+The restore maps the golden namespace onto the new member namespace and sets `restorePVs: true`. Backends that cannot snapshot volumes will not get a useful restore; k3s with CSI persistence is the path this feature was built for.
+
+Watch `kobe_golden_backup_total` and `kobe_provision_method_total{method="restore"}` to see whether members are coming from the snapshot. See [Observability](/docs/operate/observability).

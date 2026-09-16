@@ -1,5 +1,7 @@
 # Rolling Upgrade Policy
 
+This page is also on the docs site: [Operate → Upgrades](../kobe-docs/operate/upgrades.mdx).
+
 When you bump the kobe operator (or anything that flows into a
 ClusterPool's spec hash), existing pool members on the old hash
 need to rotate out. Without policy, they all rotate at once and the
@@ -190,11 +192,11 @@ through the pool the next time a claim warms it up.
 
 ### Metrics
 
-`kobe_instance_recycles_total{reason="SpecDrift"}` increments per
+`kobe_instance_recycles_total{reason="spec_drift"}` increments per
 drift Delete. Tap into your Prometheus to track upgrade velocity:
 
 ```promql
-rate(kobe_instance_recycles_total{reason="SpecDrift"}[5m])
+rate(kobe_instance_recycles_total{reason="spec_drift"}[5m])
 ```
 
 ### Pool phase

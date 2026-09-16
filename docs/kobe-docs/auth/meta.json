@@ -1,4 +1,4 @@
 {
   "title": "Authentication",
-  "pages": ["overview", "oidc", "ssh-keys"]
+  "pages": ["overview", "oidc", "ssh-keys", "tokens", "service-accounts"]
 }

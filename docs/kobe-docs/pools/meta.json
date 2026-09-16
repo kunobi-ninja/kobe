@@ -1,4 +1,10 @@
 {
   "title": "Pools",
-  "pages": ["overview", "backends", "sandbox-pools"]
+  "pages": [
+    "overview",
+    "backends",
+    "sandbox-pools",
+    "ports",
+    "images-and-runner"
+  ]
 }

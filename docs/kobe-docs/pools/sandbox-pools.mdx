@@ -1,12 +1,12 @@
 ---
 title: Sandbox pools
-description: Define bounded, administrator-owned Agent Sandbox templates and placement.
+description: Administrator-owned Agent Sandbox templates, placement, and isolation.
 ---
 
 # Sandbox pools
 
 <Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Set Use
+  `SandboxPool` and `SandboxLease` are alpha APIs. Set
   `agentSandbox.mode=managed` for Kobe-owned management and child runtimes, or
   `external` after installing Agent Sandbox v1.0.0 yourself. Kobe validates
   consumed APIs before mounting the Sandbox HTTP API; `disabled` mounts no
@@ -17,6 +17,8 @@ Administrators author `SandboxPool` objects. API callers only choose an allowed
 pool, TTL, and optional alias; they cannot provide a Pod spec, namespace,
 RuntimeClass, environment values, mounts, PVCs, or target credentials.
 
+Callers: [first sandbox](/docs/getting-started/sandbox). Ports: [Ports](/docs/pools/ports). Images, `kobe-runner`, and attach: [Images and runner](/docs/pools/images-and-runner). Chart mode and the admission ledger: [Helm](/docs/operate/helm).
+
 ## Runtime ownership
 
 `agentSandbox.mode` has three values:
@@ -24,7 +26,7 @@ RuntimeClass, environment values, mounts, PVCs, or target credentials.
 - `disabled` is the default. Kobe renders no upstream Agent Sandbox resources
   and serves no new Sandbox API work. Lifecycle controllers continue cleanup
   for leases admitted before the mode changed.
-- `external` installs, upgrades, and uninstalls nothing. The operator owns the
+- `external` installs, upgrades, and uninstalls nothing. You own the
   Agent Sandbox v1.0.0 core, extensions, CRDs, and controller.
 - `managed` installs the chart-pinned v1.0.0 runtime by controller image digest,
   retains its CRDs, RBAC, and controller on Helm uninstall, and publishes a
@@ -34,14 +36,11 @@ Kobe checks that all four consumed CRDs are established, serve `v1beta1` only
 (no leftover `v1alpha1` or conversion webhook), and expose the WarmPool
 generation field. Validation is GET-only: it does not inspect one particular
 Deployment topology and does not create a temporary `SandboxClaim`.
-Consequently, API compatibility does not prove that the external controller is
-healthy. The actual Claim for a requested lease still fails closed during
-provisioning, and its administrator-declared readiness command must pass before
-that lease becomes Ready.
+API compatibility does not prove that the external controller is healthy.
 
 Child placement requires `managed` mode. Reference the BootstrapConfig
-published by the Helm release explicitly from the child `ClusterPool`. For a
-release named `kobe`, the default reference is:
+published by the Helm release from the child `ClusterPool`. For a
+release named `kobe`:
 
 ```yaml
 spec:
@@ -50,26 +49,24 @@ spec:
 ```
 
 Kobe checks the exact BootstrapConfig owner and pinned-manifest digest before
-allocating a child. After the generic ClusterInstance bootstrap completes, Kobe
+allocating a child. After generic ClusterInstance bootstrap, Kobe
 authenticates the installed CRDs and controller image, then runs a restart-safe
-create/delete canary inside that exact child. The canary checkpoints the Claim,
-Sandbox, and Pod UIDs and proves their absence before Kobe creates the caller's
-Claim. Helm contains no operational canary hook.
+create/delete canary inside that child. Helm contains no operational canary hook.
 
 <Callout type="info">
-  If a cluster still runs v0.5.x, follow the upstream v1.0.0 migration: prune
-  `v1alpha1` from CRD `status.storedVersions`, install v1.0.0, then delete the
-  leftover webhook Service, cert Secret, and namespaced Role/RoleBinding. Update
-  operator-authored child bootstrap content at the same time. Managed child
-  pools must be recycled after changing the pinned runtime; Kobe rejects
-  mismatched children. Kobe never performs this upgrade.
+  If a cluster still runs Agent Sandbox v0.5.x, follow the upstream v1.0.0
+  migration: prune `v1alpha1` from CRD `status.storedVersions`, install v1.0.0,
+  then delete the leftover webhook Service, cert Secret, and namespaced
+  Role/RoleBinding. Update operator-authored child bootstrap content at the
+  same time. Managed child pools must be recycled after changing the pinned
+  runtime; Kobe rejects mismatched children. Kobe never performs this upgrade.
 </Callout>
 
 Agent Sandbox does not install gVisor, Kata, node runtimes, or RuntimeClasses.
 This release certifies only `trusted-runc`, for trusted workloads. The `gvisor`
-and `kata` schema values are reserved for a future isolation qualification
-under issue #14; selecting either keeps the pool `Ready=False` even when the
-named RuntimeClass exists. Kobe never downgrades either tier silently to runc.
+and `kata` schema values are reserved; selecting either keeps the pool
+`Ready=False` even when the named RuntimeClass exists. Kobe never downgrades
+either tier to runc.
 
 ## Example
 
@@ -78,12 +75,14 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: SandboxPool
 metadata:
   name: agent-small
-  namespace: kobe
+  namespace: kobe-system
 spec:
   warmCapacity: 2
   defaultTtl: 30m
   maxTtl: 2h
+  maxIdle: 30m            # optional; see Idle reclaim below
   provisioningTimeout: 10m
+  transport: direct       # or iroh
   placement:
     type: management
   template:
@@ -118,263 +117,23 @@ Every container must declare CPU, memory, and ephemeral-storage requests and
 limits. `defaultContainer` and each exposed port must refer to a declared
 container. Kobe runs every Sandbox container as UID/GID `65532`, drops all
 Linux capabilities, disables privilege escalation, and applies the
-`RuntimeDefault` seccomp profile. Images must therefore work as that non-root
-user and must not require writable root-owned paths. Canary `argv` is executed
+`RuntimeDefault` seccomp profile. Images must work as that non-root user and
+must not require writable root-owned paths. Canary `argv` is executed
 directly, without an implicit shell.
 
-## `exposedPorts`
+## Idle reclaim
 
-`exposedPorts` is the complete answer to "what may a caller of this pool
-reach". Anything not in it stays unauthorized: without that list, a forward is
-a general tunnel into the sandbox's network namespace, reaching a debug
-listener or a metrics endpoint you never meant to publish.
+Without `maxIdle`, a sandbox has a fixed lifetime from readiness: extensions cannot move expiry past `readyAt + maxTtl`. A box used every day and one forgotten yesterday look the same.
 
-Each entry declares **either** one port **or** one contiguous range.
+With `maxIdle`, each extension is bounded by `now + maxIdle` (and still by the caller's grant). A caller that keeps extending keeps the box; one that stops loses it within `maxIdle` of the last extension. `maxExtensions` does not apply while `maxIdle` is set, because a count cap would restore a fixed lifetime.
 
-```yaml
-    exposedPorts:
-      - name: http            # one published port
-        container: workspace
-        port: 8080
-      - name: dev             # a band, authorized for forwarding only
-        container: workspace
-        portRange:
-          start: 3000
-          end: 9999
-```
+The AccessPolicy sandbox grant can set its own `maxIdle`. The effective window is the lower of the pool and the grant.
 
-The two shapes are not interchangeable.
+## Transport
 
-`port` **publishes** one port. It becomes a named `ContainerPort` on the Pod
-and a named port on the Sandbox's Service, and callers may address it by that
-name or by its number.
+`transport: direct` (default) is the WebSocket path terminated at the API server. `transport: iroh` opts the pool into P2P QUIC for attach, exec, and port-forward. Session bytes are end-to-end encrypted; a relay sees addresses and timing, not content.
 
-`portRange` **authorizes** a band and publishes nothing — no `ContainerPort`,
-no Service port. Callers reach a ranged port **by number only**:
-
-```bash
-kobe port-forward dev 8080:5173   # 5173 is inside 3000-9999
-kobe port-forward dev 8080:dev    # refused: one name cannot pick one port
-```
-
-A range's name exists for the manifest and the audit trail, not for callers.
-Asking for it returns `400` with reason `port_name_covers_range`, because
-guessing which of 7000 ports you meant would forward you somewhere you never
-asked for.
-
-Which shape to use is a question about who the caller is. An **agent pool**
-enumerates each port its workload serves: the caller is untrusted and the
-template is the whole security surface, so declaring exactly what is needed is
-the point. A **workstation pool** for a human is different — a developer
-should be able to reach the dev server they started five minutes ago without
-editing GitOps and re-leasing. A range lets you authorize `3000-9999` once
-instead of predicting every port.
-
-It does not weaken the rule. Undeclared is still unauthorized, and you still
-decide what is declared — a range moves the decision from "which ports" to
-"which band", it does not remove it.
-
-A single `portRange` is capped at **8192 ports**. Read that as a limit on how
-much one line can do by accident, not as a ceiling on the pool: `exposedPorts`
-takes up to 64 entries, so eight adjacent bands still spell the whole port
-space. The cap refuses a `1-65535` written because it was easier than thinking
-about the range; it does not stop an administrator who means it and writes it
-out. Kobe insists the decision be visible, not that it be small.
-
-Kobe refuses a bad declaration when the pool is admitted, not when a forward
-is attempted: an entry that sets both fields or neither, a range whose `start`
-is after its `end`, a bound outside 1-65535, or a band wider than the cap.
-Overlapping declarations simply union — a published `5173` inside a
-`3000-9999` band is fine, and the port resolves either way.
-
-A pool that declares only ranges gets no Service, because nothing is
-published. Port-forward does not need one; it addresses the Pod directly.
-
-### Rollout order
-
-`portRange` is a new field on a schema that rejects unknown ones, so an
-operator older than the release that introduced it will refuse to read a pool
-that uses it. Roll it out in order:
-
-1. Apply the new chart's CRD manifests. Helm does not upgrade objects from a
-   chart's `crds/` directory, so this step is explicit.
-2. Upgrade the operator, and wait until every replica is running the new
-   version. `kobe status` reports the version it is talking to.
-3. Only then write a `portRange` into a `SandboxPool`.
-
-**Do not write a range between steps 1 and 2.** An old operator that cannot
-decode one pool does not simply skip it: it lists `SandboxPool` objects as a
-typed collection, and one undecodable item fails the whole list. So during
-that window a single ranged pool can make the operator's pool watch fail on
-startup or relist, and can turn `kobe pools` into a `500` for every pool in
-the namespace — not just the edited one. Pools that declare only `port` are
-unaffected by the field itself, but they share that list. Finish step 2 first
-and the window never opens.
-
-Applying a range **before** step 1 is the harmless failure: the older schema
-requires `port` on every entry, the unknown `portRange` is dropped, and the
-write is rejected for the missing `port`.
-
-### Apply pool manifests with strict field validation
-
-`kubectl apply` sends `fieldValidation=Strict` by default, and you should keep
-it that way for `SandboxPool`. Under the API server's default (`Warn`), an
-unknown field is **pruned and the write succeeds** — which means a manifest
-can be accepted as something other than what it says.
-
-The case that matters is a `portRange` written alongside a `port` against the
-older CRD:
-
-```yaml
-exposedPorts:
-  - name: dev
-    container: workspace
-    port: 8080
-    portRange: { start: 3000, end: 4000 }   # dropped by an older CRD
-```
-
-The new CRD rejects that entry outright — exactly one of the two fields, and
-this sets both. The old CRD does not know `portRange`, so a non-strict apply
-prunes it and stores a perfectly ordinary `port: 8080` declaration. Nothing is
-over-authorized: `8080` is a port you wrote. But `3000-4000` is silently not
-there, the ambiguity is gone before any operator can see it, and your manifest
-and the cluster now disagree. Strict validation turns that into an error at
-apply time, which is where you can still read the file that caused it.
-
-The same pruning is why a misspelled `portrange` needs strict validation to be
-caught. Without it the unknown key is dropped: if the entry declared nothing
-else, the exactly-one-of rule still refuses it — but if it also set `port`, it
-is accepted as a plain single-port declaration and the band you meant to write
-is gone.
-
-## Admission ledger namespace
-
-Sandbox quota slots, aliases, and distributed operation gates are coordination
-`Lease` objects. When Sandbox mode is enabled, the chart creates a dedicated
-namespace named from the immutable Helm release identity
-(`<release>-sandbox-ledger-<hash>`) with:
-
-- a `ValidatingAdmissionPolicy` that permits Lease mutations only from the
-  exact Kobe operator ServiceAccount;
-- a namespace-wide Lease object quota, configured by
-  `agentSandbox.reservationObjectLimit` (default `4096`, minimum `4`); and
-- namespace-scoped operator RBAC. The chart grants tenants no access there,
-  and the admission policy denies every non-operator Lease create, update, or
-  delete even if another administrator grants broader RBAC.
-
-The namespace, policy, binding, and quota are retained on Helm uninstall.
-Before admission, Kobe creates one exact access gate per Sandbox; admission
-then adds one quota token and, when requested, one alias token. Each principal
-with active operations adds one shared principal ledger. This is why values
-below the documented minimum cannot represent one fully usable aliased lease.
-Deleting any of them while a `SandboxLease` is live can free its admission slot
-or erase the proof that all API replicas drained before teardown. Remove
-retained ledger resources only after every Sandbox lease, reservation, and
-operation gate has been verified absent. The admission policy
-requires Kubernetes 1.30 or newer with the `ValidatingAdmissionPolicy` and
-`ResourceQuota` admission plugins enabled. Before serving Sandbox routes, Kobe
-confirms its authenticated ServiceAccount identity and proves both plugins with
-server-side dry-run requests that must be denied; startup fails if either
-control is inactive.
-
-The namespace is intentionally not configurable. Moving it would both reset
-admission capacity and leave retained old reservations outside the active
-policy. The namespace contains no resources other than this ledger.
-
-## Durable execution
-
-Kobe uses the same supervisor for wait-mode and detached commands. A raw
-Kubernetes exec cannot apply a working directory without a shell, cannot always
-recover the exact exit code, and dies with its connection. A pool therefore
-offers the durable execution API only if its image ships `kobe-runner` and the
-template says where:
-
-```yaml
-template:
-  defaultContainer: workspace
-  runnerPath: /kobe-runner
-```
-
-Copy the binary into your own agent image:
-
-```dockerfile
-COPY --from=zondax/kobe-runner:latest /kobe-runner /kobe-runner
-RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
-USER 65532:65532
-```
-
-Replace `65532:65532` with the UID and GID your workload uses. The directory must
-exist and be writable by that identity; ordinary non-root users cannot create
-new directories directly under `/var/run`. The runner is a static binary with
-no dependencies on the base image, and at runtime it needs no privileges beyond
-starting a process and writing the execution spool.
-
-That spool is not an isolation boundary. The runner and workload use the same
-container identity, so the workload can remove or replace its files. Kobe never
-restores spawn authority from a missing spool and never uses a runner report as
-proof that target capacity is safe to reuse. An execution that crossed
-`startedAt` therefore holds one active slot until that exact Sandbox target is
-destroyed.
-
-## `attachCommand`
-
-A bare `kobe attach` joins the container's own process. For an image whose job
-is to host sessions that is the wrong landing place: the caller gets the idle
-process, and reconnecting starts over instead of resuming. Declare what attach
-should run instead:
-
-```yaml
-template:
-  defaultContainer: agent
-  attachCommand: ["zellij", "attach", "--create", "kobe"]
-```
-
-Now `kobe attach dev` lands in a multiplexer session that outlives the
-connection, so a dropped laptop costs nothing. The caller's own `-- argv` still
-wins, and a pool that declares nothing keeps the existing behaviour.
-
-An image that ships `kobe-runner` gets the same without a multiplexer:
-
-```yaml
-template:
-  defaultContainer: agent
-  runnerPath: /kobe-runner
-  attachCommand: ["/kobe-runner", "session", "attach", "--name", "main"]
-```
-
-A bare `kobe attach dev` then resumes one shell session and redraws its
-screen. Callers who also want automatic reconnects use
-`kobe attach dev --session main`.
-
-The command comes from the pool, never the caller, for the same reason
-`runnerPath` does: it becomes an exec under Kobe's credential. Declaring it
-also changes which subresource attach calls, from `pods/attach` to `pods/exec`,
-so the grant it needs is the `exec` verb either way.
-
-Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` returns
-`501 Not Implemented` in both modes. That is deliberate: selecting wait mode
-must not silently remove working-directory, exact-exit-code, process-group
-cancellation, or reconnectability guarantees.
-
-Output from every durable execution is retained inside the container until the
-Sandbox is torn down and can be read back through
-`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Kobe retains at most
-1 MiB of stdout and 1 MiB of stderr per execution, and accepts at most 256
-idempotency keys — durable executions — over one Sandbox lifetime. An execution
-that crossed `startedAt` holds its slot until that exact Sandbox target is
-destroyed, because same-UID runner state cannot safely prove capacity is
-reusable; the per-lifetime count is therefore the only execution budget, sized
-for long-running agent sessions rather than a small per-target batch.
-Requests beyond the limit return `409 Conflict` with reason
-`execution_limit_exhausted`: retrying cannot succeed, a new lease must be
-requested.
-
-Cancelling an execution asks the runner to terminate its whole process group,
-not only the process Kobe started. Lease release first closes new access, then
-asks every recorded runner to cancel. Runner state remains tenant-controlled,
-so Kobe retains each started execution record and slot, destroys the exact
-Sandbox target, and retires them only after target absence is proven. Execution
-records are deleted with that Sandbox rather than kept as history after it ends.
+Admission rejects `iroh` if the operator set `agentSandbox.irohRelay=disabled`. It never silently falls back to `direct`. Relays: [Helm](/docs/operate/helm).
 
 ## Placement and isolation
 
@@ -390,93 +149,8 @@ placement:
 
 Isolation tier `trusted-runc` must omit `runtimeClassName`. Reserved tiers
 `gvisor` and `kata` require the exact administrator-selected RuntimeClass name,
-but remain ineligible until issue #14 qualifies their complete runtime and node
-contract. Lease callers cannot override either placement or isolation.
+but remain ineligible until their runtime and node contract is qualified.
+Lease callers cannot override either placement or isolation.
 
 See the [API reference](/docs/api/reference#sandbox-leases) for lease operations
-and [authentication and authorization](/docs/auth/overview) for Sandbox policy
-verbs and limits.
-
-## Agent workspace images
-
-`zondax/kobe-agent-workspace` includes `kobe-runner`, `mise`, `tmux`, Git,
-GitHub CLI (`gh`), OpenSSH, JSON/search/network diagnostics, OpenSSL headers,
-and a C toolchain. It also ships `kobe-sshd`, so an SSH client can reach the
-sandbox through [`kobe ssh-proxy`](/commands/ssh) without any port being
-declared. The workload runs as `65532:65532`, with `HOME=/home/agent`
-and a writable `/home/agent/work`. Clone projects there and run `mise install`;
-the image trusts mise configurations under that workspace and puts tool shims
-on `PATH` for direct `kobe exec` commands.
-
-The same image also carries the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
-software rendering, Xvfb, Openbox, noVNC, Firefox, and a visible terminal.
-Firefox is registered for HTTP and HTTPS links, so OAuth flows opened by
-desktop applications stay inside the noVNC desktop. There is no separate GUI
-image: the desktop is installed but never started, so a headless lease pays
-only the image size and nothing at runtime. Node, Rust, package managers, and
-other project tools still come from the project's `mise.toml`. Pin a release
-tag or digest in your pool.
-
-To use the desktop from a pool, declare its port in the template (alongside
-your resource requests and limits):
-
-```yaml
-template:
-  defaultContainer: workspace
-  runnerPath: /kobe-runner
-  attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
-  containers:
-    - name: workspace
-      image: zondax/kobe-agent-workspace:v0.47.0
-  exposedPorts:
-    - name: desktop
-      container: workspace
-      port: 6080
-```
-
-The desktop is opt-in. Start it with the lease-lived manager:
-
-```bash
-kobe exec gui -- kobe-desktop start
-kobe exec gui -- kobe-desktop status
-```
-
-`kobe-desktop start` is idempotent and runs the desktop supervisor in a dedicated
-tmux server, so it outlives the one-hour runner-execution limit. Use
-`kobe-desktop logs`, `kobe-desktop terminal`, or `kobe-desktop browser` to
-inspect the session. `kobe-desktop stop` stops only that managed desktop.
-
-Here `gui` is your lease ID or alias. In another terminal, forward its declared
-port:
-
-```bash
-kobe port-forward gui 6080:6080
-```
-
-Open `http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&path=websockify`.
-This is the whole virtual 1440×900 desktop. It starts with a terminal and a
-blue background; right-click the desktop for Terminal, Browser, and Desktop
-status. Run your project's normal Linux desktop development command in another
-execution, using `--cwd /home/agent/work/your-project`. Each execution already
-inherits `DISPLAY=:99`, the X11 authority file, and the session D-Bus address.
-
-`kobe-desktop-up` remains the foreground low-level supervisor for diagnostics.
-Starting it directly through `kobe exec` is limited to that execution's
-one-hour timeout; prefer `kobe-desktop start` for an interactive workspace.
-
-Both noVNC (6080) and its VNC backend (5900) listen only on the Sandbox's
-loopback interface; X11 uses a Unix socket with a per-session cookie. Access
-comes through Kobe's authorized port forward, without a separate desktop
-password. Authorize port 6080 with an explicit port declaration or a permitted
-development port range. This does not require host networking, privilege
-escalation, or container capabilities. Files and sockets live under `HOME` or
-`/tmp`.
-
-`kobe-desktop-up` stays in the foreground and supervises every desktop
-component. A component exit fails the execution and stops its siblings;
-cancelling its runner execution or releasing the lease stops the desktop.
-When started in tmux, use `Ctrl-c` in that pane to stop it. Restart
-with a new execution if needed. Only one desktop can run in a Sandbox.
-
-Build locally with `docker buildx bake agent-workspace --load` (set
-`PLATFORM=linux/arm64` on an ARM host).
+and [authentication](/docs/auth/overview) for Sandbox policy verbs and limits.

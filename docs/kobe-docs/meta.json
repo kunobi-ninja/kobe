@@ -6,7 +6,8 @@
     "how-it-works",
     "pools",
     "auth",
-    "api",
-    "commands"
+    "operate",
+    "commands",
+    "api"
   ]
 }

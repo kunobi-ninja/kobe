@@ -1,0 +1,10 @@
+{
+  "title": "Operate",
+  "pages": [
+    "helm",
+    "upgrades",
+    "golden-images",
+    "observability",
+    "troubleshooting"
+  ]
+}

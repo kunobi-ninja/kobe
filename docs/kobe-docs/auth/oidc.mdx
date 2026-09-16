@@ -16,12 +16,12 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: AccessPolicy
 metadata:
   name: github-ci
-  namespace: kobe
+  namespace: kobe-system
 spec:
   auth:
     oidc:
       issuer: https://token.actions.githubusercontent.com
-      audience: ["https://kobe.example.com"]
+      audience: ["kobe-system"]
   identity: "{repository}"
   rules:
     - match:
@@ -41,9 +41,9 @@ spec:
 ```
 
 In your workflow, lease with [`kunobi-ninja/kobe-action`](https://github.com/kunobi-ninja/kobe-action).
-It requests the token and releases the lease when the job ends. Set its
-`audience` to a value the policy accepts; the action's default is
-`kobe-system`:
+It requests the token and releases the lease when the job ends. The action
+default audience is `kobe-system`; the policy above matches that. If you set
+`audience` on the action, change the policy to the same value.
 
 ```yaml
 jobs:
@@ -57,7 +57,6 @@ jobs:
           endpoint: https://kobe.example.com
           pool: ci-small
           ttl: 20m
-          audience: https://kobe.example.com
       - run: kubectl --kubeconfig ${{ steps.cluster.outputs.kubeconfig-path }} get nodes
 ```
 

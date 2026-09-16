@@ -5,18 +5,19 @@ description: How AccessPolicy configures authentication and authorization for le
 
 # Authentication
 
-kobe uses `AccessPolicy` CRDs to configure both authentication (who can call the API) and authorization (which pools they can access, at what TTL, and how many concurrent leases they can hold).
+kobe uses `AccessPolicy` CRDs for both authentication (who can call the API) and authorization (which pools, at what TTL, how many concurrent leases).
 
-Each `AccessPolicy` configures one authentication method. You can have multiple policies in the same namespace for different teams or identity providers.
+Each `AccessPolicy` configures one authentication method. You can have several policies in the same watch namespace for different teams or identity providers.
 
 ## Auth methods
 
 | Method | Use case |
 |---|---|
 | `oidc` | GitHub Actions, Clerk, Auth0, or any OIDC provider |
-| `ssh` | Developer workstations using an SSH agent |
-| `token` | Simple bearer token from a Kubernetes Secret |
-| `serviceAccount` | In-cluster workloads using a Kubernetes ServiceAccount token |
+| `ssh` | Developer workstations using an SSH agent (Ed25519) |
+| `token` | Bearer token stored in a Kubernetes Secret |
+
+The CRD also has an `auth.serviceAccount` field. The operator does not authenticate Kubernetes ServiceAccount tokens today. In-cluster callers use a [static token](/docs/auth/tokens) or OIDC.
 
 ## AccessPolicy structure
 
@@ -25,16 +26,16 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: AccessPolicy
 metadata:
   name: github-ci
-  namespace: kobe
+  namespace: kobe-system
 spec:
   # Authentication method — exactly one should be set.
   auth:
     oidc:
       issuer: https://token.actions.githubusercontent.com
-      audience: ["https://kobe.example.com"]
+      audience: ["kobe-system"]
 
   # Identity template — interpolated from JWT claims.
-  # Defaults to "{sub}". Ignored for token and serviceAccount auth.
+  # Defaults to "{sub}". Ignored for token auth.
   identity: "{repository}:{ref}"
 
   # Authorization rules — first matching rule wins.
@@ -60,41 +61,31 @@ spec:
           maxMemory: 8Gi
 ```
 
-## Authorization rules
+Place the object in the operator watch namespace (`operatorNamespace` on the chart).
 
-Rules control what an authenticated caller can do. Fields:
+## Authorization rules
 
 | Field | Description |
 |---|---|
-| `pools` | Pool name patterns. Supports `*` suffix wildcard (e.g., `ci-*`) and literal `*` for all pools. |
-| `maxTtl` | Maximum TTL the caller can request. Requests for longer TTLs are capped to this value. |
-| `maxConcurrentLeases` | How many active leases this identity can hold simultaneously. |
-| `maxExtensions` | How many times a lease can be extended via `PATCH /v1/leases/:id`. |
+| `pools` | Pool name patterns. `*` suffix wildcard (for example `ci-*`) and literal `*` for all pools. |
+| `maxTtl` | Maximum TTL the caller can request. Longer requests are capped. |
+| `maxConcurrentLeases` | How many active cluster leases this identity can hold at once. |
+| `maxExtensions` | How many times a cluster lease can be extended via `PATCH /v1/leases/:id`. |
 | `sandbox` | Optional, independent Sandbox grant. Missing means Sandbox access is denied. |
 
-The `sandbox` block scopes `SandboxPool` names and verbs separately from cluster
-pools. `lease` permits create plus read/list of the caller's own Sandbox leases;
-`release` is independently revocable. `exec`, `logs`, and `port-forward` are
-consumed by the restricted Sandbox execution API.
+The `sandbox` block scopes `SandboxPool` names and verbs separately from cluster pools. `lease` permits create plus read/list of the caller's own Sandbox leases; `release` is independently revocable. `exec`, `logs`, and `port-forward` are consumed by the restricted Sandbox execution API.
 
-The Sandbox block carries its own `maxExtensions`, defaulting to `2`, governing
-`PATCH /v1/sandbox-leases/:id`. An extension can never move expiry past
-`maxTtl` measured from readiness — the ceiling the caller could have asked for
-at creation — so it changes how incrementally that ceiling is reached, not how
-much runtime exists. Set `0` to forbid extension and require callers to commit
-to a TTL up front.
+The Sandbox block carries its own `maxExtensions`, defaulting to `2`, governing `PATCH /v1/sandbox-leases/:id`. An extension can never move expiry past `maxTtl` measured from readiness. Set `0` to forbid extension.
 
-`resourceCeiling.maxCpu` and `maxMemory` are Kubernetes quantities compared
-against the sum of all container limits in the selected `SandboxPool`. Invalid
-quantities fail closed. Sandbox concurrency is also counted separately from
-`ClusterLease` concurrency, and a quarantined Sandbox continues consuming its
-quota until cleanup is proven.
+`sandbox.maxIdle` changes that ceiling. Absent, lifetime is age from readiness. Present, each extension is bounded by `now + maxIdle`, so a box that is still being used lives and an abandoned one is reclaimed. `maxExtensions` does not apply while `maxIdle` is set. The effective window is the lower of this grant and the pool's `maxIdle`.
 
-For OIDC policies, a `match` clause lets you apply different rules to different roles or repositories within the same provider. The first rule whose `match` clause passes is used. Rules without a `match` clause always apply.
+`resourceCeiling.maxCpu` and `maxMemory` are Kubernetes quantities compared against the sum of all container limits in the selected `SandboxPool`. Invalid quantities fail closed. Sandbox concurrency is counted separately from `ClusterLease` concurrency. A quarantined Sandbox keeps consuming its quota until cleanup is proven.
+
+For OIDC policies, a `match` clause applies different rules to different roles or repositories. The first rule whose `match` clause passes is used. Rules without `match` always apply.
 
 ## Identity template
 
-The `identity` field controls how kobe derives a stable identity string from the authenticated caller. This identity is stored on the `ClusterLease` and used for concurrency tracking.
+The `identity` field controls how kobe derives a stable identity string from the authenticated caller. That string is stored on the lease and used for concurrency tracking.
 
 ```yaml
 # GitHub Actions: include the repo and ref
@@ -107,9 +98,10 @@ identity: "{sub}"
 identity: "{private_metadata.team}:{sub}"
 ```
 
-For `token` and `serviceAccount` auth, the identity is set to the ServiceAccount name or the token's subject — the `identity` field is ignored.
+For `token` auth, identity is the AccessPolicy name. The `identity` field is ignored.
 
 <Cards>
   <Card title="OIDC" href="/docs/auth/oidc" description="GitHub Actions, Clerk, and custom OIDC providers" />
   <Card title="SSH keys" href="/docs/auth/ssh-keys" description="Ed25519 key auth via SSH agent" />
+  <Card title="Tokens" href="/docs/auth/tokens" description="Static bearer token from a Secret" />
 </Cards>

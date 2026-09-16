@@ -1,4 +1,12 @@
 {
   "title": "Getting Started",
-  "pages": ["installation", "quick-start", "github-actions", "configuration"]
+  "pages": [
+    "installation",
+    "deploy",
+    "quick-start",
+    "sandbox",
+    "desktop",
+    "github-actions",
+    "configuration"
+  ]
 }

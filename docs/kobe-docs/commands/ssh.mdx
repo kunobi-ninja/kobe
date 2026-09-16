@@ -95,7 +95,7 @@ The host name selects the pool and names the sandbox:
 
 The pool is the longest pool name the host starts with, so `ci` and `ci-gpu`
 are both addressable. A name that matches no pool uses the target's default
-pool, set with `kobe config set <target> --default-pool <pool>`. With neither,
+pool, set with `kobe target set <target> --default-pool <pool>`. With neither,
 the connection fails and lists the pools you can use.
 
 The whole host name is the lease alias. `kobe-small-1` and `kobe-small-2` are

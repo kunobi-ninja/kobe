@@ -191,7 +191,7 @@ echo "$result" | jq -e '.cleanup == null or .cleanup.released == true' >/dev/nul
 ```
 
 Check `.cleanup` even when `$code` is `0`: command and release outcomes are
-independent by design.
+independent.
 
 `stdout` and `stderr` are always separate fields. A consumer that cannot tell
 a tool's diagnostics from its output cannot reliably parse either.
@@ -333,7 +333,7 @@ namespace, reaching a debug listener or a metrics endpoint the administrator
 never meant to publish.
 
 A pool declares each port either individually or as a range (see
-[`exposedPorts`](/docs/pools/sandbox-pools#exposedports)). A named port answers to
+[`exposedPorts`](/docs/pools/ports)). A named port answers to
 its name or its number. A **range answers to a number only** — one name cannot
 identify one port out of thousands, so asking for the range's name is refused
 with reason `port_name_covers_range` rather than resolved to a guess.

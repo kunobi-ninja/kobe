@@ -2,7 +2,7 @@
   "title": "How it works",
   "pages": [
     "architecture",
-    "runtime-strategy",
-    "pool-lifecycle"
+    "pool-lifecycle",
+    "runtime-strategy"
   ]
 }

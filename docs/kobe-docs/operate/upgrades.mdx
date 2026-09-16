@@ -1,0 +1,102 @@
+---
+title: Upgrades
+description: Rolling recycle when a ClusterPool spec hash changes, and how to tune the knobs.
+---
+
+# Upgrades
+
+When you bump the operator, or anything that flows into a ClusterPool's spec hash, existing members on the old hash need to rotate out. Without policy they all rotate at once and the pool drops to zero until refill catches up. `spec.upgradePolicy` makes the rotation rolling.
+
+## When an upgrade fires
+
+Any change that flips the pool's spec hash marks existing members drifted and eligible for recycle:
+
+1. User-visible spec edits on the `ClusterPool` — cluster config, addons, bootstrap names.
+2. Operator-level config bumps — `KOBE_SYNC_IMAGE`, which only affects vkobe-backend pools.
+3. `BootstrapConfig` content edits — the install manifest or script inside referenced bootstrap CRs, even if the reference name did not change.
+4. The rendered workload itself — a digest of the server StatefulSet and agent Deployment the backend would build. An operator release that changes how pods are rendered flips the hash even though the `ClusterPool` CR is untouched.
+
+Source 4 is implemented for the **k3s** backend. Other backends report no fingerprint: an operator upgrade that only changes rendering is invisible to drift detection on those pools.
+
+To diff hashes:
+
+```sh
+kubectl get clusterinstance -n kobe-system \
+  -l 'app.kubernetes.io/managed-by=kobe-operator' \
+  -o custom-columns=NAME:.metadata.name,HASH:.status.specHash,PHASE:.status.phase
+```
+
+Mismatched hashes in the same pool mean an in-flight or stalled upgrade.
+
+## The three knobs
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ci-small
+  namespace: kobe-system
+spec:
+  size: 4
+  upgradePolicy:
+    maxRecycling: 1
+    maxSurge: 1
+    minReadyDuringUpgrade: 3
+```
+
+When `upgradePolicy` is omitted, the operator uses `maxRecycling=1`, `maxSurge=1`, and a floor of `minReady` (or `spec.size` for fixed pools).
+
+### `maxRecycling` (default 1)
+
+Maximum drifted instances to recycle in one reconcile. Higher is faster and spikes create traffic. **Set to `0` to pause** Deletes without redeploying the operator. Drift detection still runs.
+
+### `maxSurge` (default 1)
+
+Extra clusters allowed above `minReady` (or `spec.size`) while at least one drifted Ready remains. The scale-up loop overshoots so a replacement lands before the next drifted member is deleted. Surge disappears once drift is cleared.
+
+### `minReadyDuringUpgrade` (default `minReady` / `size`)
+
+Floor on total Ready (clean or drifted) during the upgrade. Drifted Ready still serves claims. Set to `0` to recycle as fast as `maxRecycling` allows.
+
+## Choosing knobs
+
+**Size 1.** Pair `maxSurge: 1` with `minReadyDuringUpgrade: 0`. Sequence: surge create (pool grows to 2), then delete the drifted original once the replacement is Ready.
+
+**Fixed `size=4`.** `maxRecycling: 1`, `maxSurge: 1`, `minReadyDuringUpgrade: 3`. About 25% capacity overhead; CI keeps landing on the three healthy members.
+
+**Larger fleets (`size >= 8`).** `maxRecycling: 2`, `maxSurge: 2`, `minReadyDuringUpgrade: 6` if the host can take the extra create traffic.
+
+**Scaling pools.** Default floor is `scaling.minReady`, not `spec.size`.
+
+**Scale-to-zero (`minReady: 0`).** Drift is detected only when at least one instance is Ready. The next claim that warms the pool starts the rotation.
+
+Do not set `maxSurge: 0` together with `minReadyDuringUpgrade >= size`: the recycle can never progress. `maxSurge` above `maxClusters - size` is a no-op; the ceiling binds first.
+
+## Watching
+
+`kobe_instance_recycles_total{reason="spec_drift"}` increments per drift Delete:
+
+```promql
+rate(kobe_instance_recycles_total{reason="spec_drift"}[5m])
+```
+
+`status.phase` stays `Healthy` through a normal upgrade. `ScalingDown` or `Failing` means something else is wrong.
+
+Leased members are not recycled until released. A member stuck in `Recycling` has had its Delete shipped; the backing resources are slow to go away.
+
+## Pause and roll back
+
+```sh
+kubectl patch clusterpool ci-small -n kobe-system --type=merge \
+  -p '{"spec":{"upgradePolicy":{"maxRecycling":0}}}'
+```
+
+Resume by setting `maxRecycling` back. In-flight surge replacements finish creating.
+
+If the new spec is the problem, rolling it back flips the hash. In-flight Creating instances with the bad hash are deleted on the next reconcile without waiting for the recycle cap.
+
+## Forensics
+
+1. `status.consecutiveFailures` and `status.nextAttemptAt` — non-zero means failure backoff. Drift recycle and scale-up are suppressed; only Unhealthy and stuck-Creating timeouts still ship.
+2. Operator logs: `Drifted Ready: rolling recycle`, `Holding drift recycle: floor would be violated`, `Drifted Creating: recycling without waiting for timeout`.
+3. `kubectl describe clusterinstance <name>` for provision failures, OOM, bootstrap timeouts.
