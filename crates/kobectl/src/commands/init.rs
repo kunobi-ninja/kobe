@@ -61,14 +61,71 @@ struct InitOutput {
     try_host: String,
 }
 
+/// Rewrite `$HOME/x` as `~/x`. `init` reports four paths and three of them
+/// live under the home directory, where the prefix is the longest and least
+/// informative part of the line.
+///
+/// Takes the home directory rather than reading the environment so the
+/// rewrite can be tested without one.
+fn shorten_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_string();
+    };
+    let home = home.strip_suffix('/').unwrap_or(home);
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+fn home_path(path: &std::path::Path) -> String {
+    shorten_home(
+        &path.display().to_string(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
 struct Reporter {
     output: OutputFormat,
+    /// Escapes are for a person watching, so they are off whenever stdout is
+    /// redirected or `NO_COLOR` is set. Decided once: a report whose lines are
+    /// styled inconsistently is worse than one with no styling at all.
+    color: bool,
 }
 
 impl Reporter {
+    fn new(output: OutputFormat) -> Self {
+        let color = output == OutputFormat::Text
+            && std::io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none();
+        Self { output, color }
+    }
+
+    /// Explanatory prose under the report. Dimmed, because it is there for
+    /// the first run and should not compete with the result on later ones.
+    fn note(&self, body: impl AsRef<str>) {
+        if self.output != OutputFormat::Text {
+            return;
+        }
+        for line in body.as_ref().lines() {
+            if self.color {
+                println!("  \x1b[2m{line}\x1b[0m");
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+
     fn step(&self, name: &str, detail: impl AsRef<str>) {
-        if self.output == OutputFormat::Text {
-            println!("{name:<12} {}", detail.as_ref());
+        if self.output != OutputFormat::Text {
+            return;
+        }
+        let detail = detail.as_ref();
+        if self.color {
+            println!("  \x1b[32m✓\x1b[0m \x1b[2m{name:<12}\x1b[0m {detail}");
+        } else {
+            println!("  ✓ {name:<12} {detail}");
         }
     }
 }
@@ -78,9 +135,7 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
         && command.output == OutputFormat::Text
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
-    let report = Reporter {
-        output: command.output,
-    };
+    let report = Reporter::new(command.output);
 
     // 1. target
     let target_name = match command.endpoint {
@@ -159,15 +214,15 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
     let user_config = ssh_setup::user_ssh_config_path()?;
     let block = ssh_proxy::render_ssh_config(&executable, command.target_override);
     let change = ssh_setup::install(&kobe_config, &block)?;
-    report.step("ssh config", format!("wrote {}", kobe_config.display()));
+    report.step("ssh config", format!("wrote {}", home_path(&kobe_config)));
     report.step(
         "include",
         match change {
             ssh_setup::IncludeChange::AlreadyPresent => {
-                format!("{} already includes it", user_config.display())
+                format!("{} already includes it", home_path(&user_config))
             }
             ssh_setup::IncludeChange::Added => {
-                format!("added to the top of {}", user_config.display())
+                format!("added to the top of {}", home_path(&user_config))
             }
             ssh_setup::IncludeChange::AddedAboveScoped { scoped_line } => format!(
                 "added to the top of {}; the Include on line {scoped_line} is inside a Host block and can be removed",
@@ -180,7 +235,13 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
     let probe = format!("{}init-probe", ssh_proxy::HOST_PREFIX);
     match ssh_setup::resolved_proxy_command(&user_config, &probe)? {
         Some(proxy) if proxy.contains("ssh-proxy") => {
-            report.step("ssh resolve", format!("ssh -G {probe} → {proxy}"));
+            report.step(
+                "ssh resolve",
+                format!(
+                    "ssh -G {probe} → {}",
+                    shorten_home(&proxy, std::env::var("HOME").ok().as_deref())
+                ),
+            );
         }
         Some(proxy) => anyhow::bail!(
             "ssh -G {probe} resolves to `{proxy}`, not kobe ssh-proxy: another Host block in {} matches kobe-* first",
@@ -204,7 +265,21 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
     match command.output {
         OutputFormat::Text => {
             println!();
-            println!("Ready. Try:  ssh {try_host}");
+            if report.color {
+                println!("  Ready.  \x1b[1mssh {try_host}\x1b[0m");
+            } else {
+                println!("  Ready.  ssh {try_host}");
+            }
+            // The trailing `1` reads like an index into machines that already
+            // exist. It is a name the caller invents, and inventing another
+            // one leases a second sandbox instead of reconnecting. One line,
+            // because that is the whole of what a first run needs; the dot
+            // suffix for persistent sessions belongs in the docs, not here.
+            report.note("        kobe-<pool>-<name>: a different name is a different sandbox.");
+            // Say that clusters are a different road by naming the road, not
+            // by denying this one. A reader who wanted a cluster gets the
+            // command; everyone else reads four words and moves on.
+            report.note("        For a cluster instead: kobe lease <pool>");
         }
         OutputFormat::Json => print_json(&InitOutput {
             target: target_name.unwrap_or_default(),
@@ -468,6 +543,43 @@ fn ensure_public_key(
 
 #[cfg(test)]
 mod tests {
+
+    /// `init` prints four paths and three sit under the home directory, so the
+    /// prefix is the longest and least useful part of each line.
+    #[test]
+    fn home_is_shortened_to_a_tilde_only_at_a_path_boundary() {
+        assert_eq!(
+            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij")),
+            "~/.ssh/config"
+        );
+        assert_eq!(shorten_home("/Users/lenij", Some("/Users/lenij")), "~");
+        // A trailing slash on HOME must not produce "~//.ssh/config".
+        assert_eq!(
+            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij/")),
+            "~/.ssh/config"
+        );
+    }
+
+    /// A different account whose name merely starts with ours keeps its path:
+    /// rewriting `/Users/lenija` to `~a` would be worse than not rewriting.
+    #[test]
+    fn a_sibling_directory_sharing_the_prefix_is_left_alone() {
+        assert_eq!(
+            shorten_home("/Users/lenija/.ssh/config", Some("/Users/lenij")),
+            "/Users/lenija/.ssh/config"
+        );
+        assert_eq!(
+            shorten_home("/etc/ssh/config", Some("/Users/lenij")),
+            "/etc/ssh/config"
+        );
+    }
+
+    /// No HOME, no rewrite. The report still has to be printable.
+    #[test]
+    fn without_a_home_the_path_is_printed_as_it_is() {
+        assert_eq!(shorten_home("/Users/lenij/x", None), "/Users/lenij/x");
+        assert_eq!(shorten_home("/Users/lenij/x", Some("")), "/Users/lenij/x");
+    }
     use super::*;
 
     #[test]
