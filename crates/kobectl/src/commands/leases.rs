@@ -17,11 +17,18 @@ pub(crate) struct LeaseSummary {
     pub capabilities: Vec<String>,
     #[serde(alias = "pool")]
     pub profile: String,
-    #[serde(default)]
+    // `GET /v1/leases` renames only `resourceKind`; its other multi-word
+    // fields stay snake_case. This struct's camelCase rule therefore missed
+    // them and `default` turned each into a silent `None`, while `LeaseDetail`
+    // — which carries no rename rule — read them correctly. That is why a
+    // per-lease detail fetch looked like the thing that supplied an expiry.
+    // Both structs now accept either spelling, so one client works against
+    // whichever an operator serves.
+    #[serde(default, alias = "cluster_name")]
     pub cluster_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "expires_at")]
     pub expires_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "queue_position")]
     pub queue_position: u32,
     #[serde(default)]
     pub requester: Option<String>,
@@ -59,11 +66,14 @@ pub(crate) struct LeaseDetail {
     pub capabilities: Vec<String>,
     #[serde(alias = "pool")]
     pub profile: String,
-    #[serde(default)]
+    // No `rename_all` here, so these read the snake_case an operator serves
+    // today. The camelCase aliases mirror [`LeaseSummary`] so both structs
+    // accept both spellings.
+    #[serde(default, alias = "clusterName")]
     pub cluster_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "expiresAt")]
     pub expires_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "queuePosition")]
     pub queue_position: u32,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
@@ -413,5 +423,70 @@ mod tests {
     fn glance_label_pending_queue() {
         let pending = lease("sandbox-x", "Pending", None, 3);
         assert_eq!(lease_glance_label(&pending), "pending  queue #3");
+    }
+
+    /// A listing row keeps its expiry, cluster and queue position.
+    ///
+    /// `GET /v1/leases` spells these snake_case while renaming only
+    /// `resourceKind`. Reading the listing through a plain camelCase rule
+    /// dropped all three into `None` without erroring, and `kobe status` hid
+    /// the loss behind a per-lease detail fetch. Parsing the shape the server
+    /// actually serves is what lets that fetch go away.
+    #[test]
+    fn a_listing_row_keeps_the_fields_the_operator_spells_snake_case() {
+        let row: LeaseSummary = serde_json::from_str(
+            r#"{
+                "id": "lease-abc",
+                "phase": "Bound",
+                "resourceKind": "Cluster",
+                "profile": "ci-small",
+                "cluster_name": "kobe-ci-7",
+                "expires_at": "2026-09-16T10:51:51Z",
+                "queue_position": 4
+            }"#,
+        )
+        .expect("a listing row parses");
+
+        assert_eq!(row.expires_at.as_deref(), Some("2026-09-16T10:51:51Z"));
+        assert_eq!(row.cluster_name.as_deref(), Some("kobe-ci-7"));
+        assert_eq!(row.queue_position, 4);
+    }
+
+    /// The same row in camelCase parses identically, so the client does not
+    /// depend on which spelling an operator settles on.
+    #[test]
+    fn a_listing_row_parses_the_camel_case_spelling_too() {
+        let row: LeaseSummary = serde_json::from_str(
+            r#"{
+                "id": "lease-abc",
+                "phase": "Bound",
+                "resourceKind": "Cluster",
+                "profile": "ci-small",
+                "clusterName": "kobe-ci-7",
+                "expiresAt": "2026-09-16T10:51:51Z",
+                "queuePosition": 4
+            }"#,
+        )
+        .expect("a listing row parses");
+
+        assert_eq!(row.expires_at.as_deref(), Some("2026-09-16T10:51:51Z"));
+        assert_eq!(row.cluster_name.as_deref(), Some("kobe-ci-7"));
+        assert_eq!(row.queue_position, 4);
+    }
+
+    /// `LeaseDetail` accepts both spellings as well, so the two structs cannot
+    /// drift back into disagreeing about the same response.
+    #[test]
+    fn a_detail_body_parses_either_spelling() {
+        for body in [
+            r#"{"id":"lease-abc","phase":"Bound","profile":"ci-small",
+                 "expires_at":"2026-09-16T10:51:51Z","queue_position":4}"#,
+            r#"{"id":"lease-abc","phase":"Bound","profile":"ci-small",
+                 "expiresAt":"2026-09-16T10:51:51Z","queuePosition":4}"#,
+        ] {
+            let detail: LeaseDetail = serde_json::from_str(body).expect("a detail body parses");
+            assert_eq!(detail.expires_at.as_deref(), Some("2026-09-16T10:51:51Z"));
+            assert_eq!(detail.queue_position, 4);
+        }
     }
 }
