@@ -5598,61 +5598,119 @@ async fn cleanup_child_executions_after_proof(
 /// that reference and returns `None` without it, which reads as a mismatch on
 /// a receipt already proven authoritative — and no retry can change it.
 ///
-/// The identity is resolved from the reciprocal binding, never from the
-/// receipt, so a receipt still cannot certify its own scope.
+/// The identity comes from the handle's own binding, never from the receipt,
+/// so a receipt still cannot certify its own scope. It is not read from the
+/// live `ClusterInstance` either: the receipt exists because that instance was
+/// proven gone, so a live lookup 404s on exactly the path this recovers (#236).
+/// The binding is immutable once a `VerifiedDestroy` handle reserves an
+/// instance, and the identity is recorded only if the receipt proves teardown
+/// of that exact instance.
 async fn recover_child_instance_identity(
     lease: &SandboxLease,
     ctx: &SandboxContext,
     status: &crate::crd::SandboxLeaseStatus,
+    current: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
     recorded: &crate::crd::SandboxObjectReference,
+    recorded_pool: &crate::crd::SandboxObjectReference,
 ) -> Result<Action, SandboxPlacementError> {
     let name = lease.name_any();
-    let resolution = {
-        let client = ctx.client.clone();
-        let namespace = ctx.namespace.clone();
-        let lease_name = recorded.name.clone();
-        let lease_uid = recorded.uid.clone();
-        tokio::spawn(async move {
-            crate::lease_binding::resolve_lease_binding(
-                &client,
-                &namespace,
-                &lease_name,
-                &lease_uid,
-                crate::lease_binding::BindingResolveMode::Lifecycle,
-            )
-            .await
-        })
-        .await
-    };
-    let resolved = match resolution {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(error)) => {
-            warn!(lease = %name, reason = error.reason_code(), "recorded child binding is not reciprocally valid");
-            return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable").await;
-        }
-        Err(error) => {
-            warn!(lease = %name, error = %error, "child binding resolver task did not complete");
-            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-        }
+    let Some(instance) = receipt_proven_child_instance(current, receipt, recorded, recorded_pool)
+    else {
+        warn!(lease = %name, "child receipt does not prove teardown of the handle's bound instance");
+        return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
     };
     let mut next = status.clone();
     let Some(target) = next.target.as_mut() else {
         return quarantine_lease(lease, ctx, "child_composition_provenance_invalid").await;
     };
-    target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
-        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-        kind: "ClusterInstance".into(),
-        namespace: Some(ctx.namespace.clone()),
-        name: resolved.binding.instance.name.clone(),
-        uid: resolved.binding.instance.uid.clone(),
-        generation: Some(resolved.binding.instance.observed_generation),
-    });
+    target.child_cluster_instance = Some(instance);
     if patch_lease_status_fenced(ctx, lease, &next).await? {
         info!(lease = %name, "recovered the child instance identity before teardown");
     } else {
         debug!(lease = %name, "child instance recovery checkpoint lost a status race");
     }
     Ok(Action::await_change())
+}
+
+enum TornDownChildIdentity {
+    /// The pool and instance references, boxed to keep the enum small.
+    Recovered(
+        Box<(
+            crate::crd::SandboxObjectReference,
+            crate::crd::SandboxObjectReference,
+        )>,
+    ),
+    Retry,
+    Quarantine(&'static str),
+}
+
+/// Recover the pool and instance of an unrecorded child handle whose instance
+/// verified teardown already removed.
+///
+/// The reciprocal lookup needs the live `ClusterInstance`, and a receipt is
+/// written only once that instance is gone, so the lookup 404s on exactly this
+/// path (#236). The identities come from the handle's write-once binding
+/// instead, the pool is confirmed live by name and UID, and the receipt must
+/// prove teardown of exactly that binding. The recorded path authenticates the
+/// receipt against its evidence object before anything is released.
+async fn recover_torn_down_child_identity(
+    ctx: &SandboxContext,
+    handle: &crate::crd::ClusterLease,
+    reference: &crate::crd::SandboxObjectReference,
+) -> TornDownChildIdentity {
+    let Some(status) = handle.status.as_ref() else {
+        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+    };
+    let (Some(binding), Some(receipt)) =
+        (status.binding.as_ref(), status.teardown_receipt.as_ref())
+    else {
+        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+    };
+    if binding.lease.name != reference.name
+        || binding.lease.uid.as_deref() != Some(reference.uid.as_str())
+    {
+        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+    }
+    if validated_binding_receipt_token(handle, receipt, &ctx.namespace).is_none() {
+        return TornDownChildIdentity::Quarantine("child_receipt_does_not_match_precheckpoint");
+    }
+    let pools: Api<crate::crd::ClusterPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let live_pool = match pools.get(&binding.pool.name).await {
+        Ok(pool) => pool,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return TornDownChildIdentity::Quarantine("child_pool_provenance_unavailable");
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return TornDownChildIdentity::Quarantine("child_pool_provenance_unverifiable");
+        }
+        Err(error) => {
+            warn!(pool = %binding.pool.name, error = %error, "could not read the torn-down child's pool");
+            return TornDownChildIdentity::Retry;
+        }
+    };
+    let pool = crate::crd::SandboxObjectReference {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "ClusterPool".into(),
+        namespace: Some(ctx.namespace.clone()),
+        name: binding.pool.name.clone(),
+        uid: binding.pool.uid.clone().unwrap_or_default(),
+        generation: live_pool.metadata.generation,
+    };
+    if !live_child_pool_matches_recorded(&live_pool, &pool, ChildPoolCheck::Teardown) {
+        return TornDownChildIdentity::Quarantine("child_pool_identity_changed");
+    }
+    TornDownChildIdentity::Recovered(Box::new((
+        pool,
+        crate::crd::SandboxObjectReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some(ctx.namespace.clone()),
+            name: binding.instance.name.clone(),
+            uid: binding.instance.uid.clone(),
+            generation: Some(binding.instance.observed_generation),
+        },
+    )))
 }
 
 async fn release_child_composition(
@@ -5834,8 +5892,55 @@ async fn release_child_composition(
                         })
                         .await
                     };
-                    let resolved = match resolution {
-                        Ok(Ok(resolved)) => resolved,
+                    let (cluster_pool, instance) = match resolution {
+                        Ok(Ok(resolved)) => {
+                            if resolved.lease.metadata.generation != reference.generation {
+                                return quarantine_lease(
+                                    lease,
+                                    ctx,
+                                    "child_composition_generation_changed",
+                                )
+                                .await;
+                            }
+                            (
+                                crate::crd::SandboxObjectReference {
+                                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                                    kind: "ClusterPool".into(),
+                                    namespace: Some(ctx.namespace.clone()),
+                                    name: resolved.pool.name_any(),
+                                    uid: resolved.pool.uid().unwrap_or_default(),
+                                    generation: resolved.pool.metadata.generation,
+                                },
+                                crate::crd::SandboxObjectReference {
+                                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                                    kind: "ClusterInstance".into(),
+                                    namespace: Some(ctx.namespace.clone()),
+                                    name: resolved.binding.instance.name.clone(),
+                                    uid: resolved.binding.instance.uid.clone(),
+                                    generation: Some(resolved.binding.instance.observed_generation),
+                                },
+                            )
+                        }
+                        Ok(Err(crate::lease_binding::BindingResolutionError::InstanceNotFound))
+                            if unrecorded_status.teardown_receipt.is_some() =>
+                        {
+                            match Box::pin(recover_torn_down_child_identity(
+                                ctx,
+                                &unrecorded,
+                                &reference,
+                            ))
+                            .await
+                            {
+                                TornDownChildIdentity::Recovered(identity) => *identity,
+                                TornDownChildIdentity::Retry => {
+                                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                                }
+                                TornDownChildIdentity::Quarantine(reason) => {
+                                    warn!(lease = %name, reason, "torn-down child identity is not recoverable");
+                                    return quarantine_lease(lease, ctx, reason).await;
+                                }
+                            }
+                        }
                         Ok(Err(error)) => {
                             warn!(lease = %name, reason = error.reason_code(), "unrecorded child binding is not reciprocally valid");
                             return quarantine_lease(
@@ -5850,26 +5955,9 @@ async fn release_child_composition(
                             return Ok(Action::requeue(std::time::Duration::from_secs(15)));
                         }
                     };
-                    if resolved.lease.metadata.generation != reference.generation {
-                        return quarantine_lease(
-                            lease,
-                            ctx,
-                            "child_composition_generation_changed",
-                        )
-                        .await;
-                    }
                     let placement = crate::sandbox::record_placement_once(
                         status.placement.as_ref(),
-                        crate::crd::ResolvedSandboxPlacement::ChildCluster {
-                            cluster_pool: crate::crd::SandboxObjectReference {
-                                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                                kind: "ClusterPool".into(),
-                                namespace: Some(ctx.namespace.clone()),
-                                name: resolved.pool.name_any(),
-                                uid: resolved.pool.uid().unwrap_or_default(),
-                                generation: resolved.pool.metadata.generation,
-                            },
-                        },
+                        crate::crd::ResolvedSandboxPlacement::ChildCluster { cluster_pool },
                         &ctx.namespace,
                     )
                     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
@@ -5893,14 +5981,7 @@ async fn release_child_composition(
                             });
                     proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
                     proposed.child_cluster_lease = Some(reference);
-                    proposed.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
-                        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                        kind: "ClusterInstance".into(),
-                        namespace: Some(ctx.namespace.clone()),
-                        name: resolved.binding.instance.name.clone(),
-                        uid: resolved.binding.instance.uid.clone(),
-                        generation: Some(resolved.binding.instance.observed_generation),
-                    });
+                    proposed.child_cluster_instance = Some(instance);
                     next.placement = Some(placement.clone());
                     next.target = Some(
                         crate::sandbox::merge_target_provenance(
@@ -6089,7 +6170,13 @@ async fn release_child_composition(
                     // this teardown future is already broad and runs on a
                     // normal Tokio worker stack.
                     return Box::pin(recover_child_instance_identity(
-                        lease, ctx, &status, recorded,
+                        lease,
+                        ctx,
+                        &status,
+                        &current,
+                        receipt,
+                        recorded,
+                        recorded_pool,
                     ))
                     .await;
                 }
@@ -6285,7 +6372,7 @@ async fn release_bound_child_composition(
             return Ok(Action::requeue(std::time::Duration::from_secs(15)));
         }
     };
-    if !live_child_pool_matches_recorded(&live_pool, recorded_pool) {
+    if !live_child_pool_matches_recorded(&live_pool, recorded_pool, ChildPoolCheck::Teardown) {
         return quarantine_lease(lease, ctx, "child_pool_identity_changed").await;
     }
 
@@ -6327,6 +6414,7 @@ async fn release_bound_child_composition(
         &status,
         &ctx.namespace,
         recorded_instance.is_some(),
+        ChildPoolCheck::Teardown,
     ) {
         return quarantine_lease(lease, ctx, "child_binding_provenance_changed").await;
     }
@@ -7160,6 +7248,37 @@ fn validated_child_receipt_token(
     validated_binding_receipt_token(lease, receipt, namespace)
 }
 
+/// The instance a child handle is bound to, when its receipt proves that exact
+/// instance torn down.
+///
+/// The reference is built from the handle's binding and then checked by
+/// [`validated_child_receipt_token`] against the recorded handle and pool, so
+/// the receipt only confirms an identity it did not supply.
+fn receipt_proven_child_instance(
+    lease: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
+    recorded_lease: &crate::crd::SandboxObjectReference,
+    recorded_pool: &crate::crd::SandboxObjectReference,
+) -> Option<crate::crd::SandboxObjectReference> {
+    let binding = lease.status.as_ref()?.binding.as_ref()?;
+    let instance = crate::crd::SandboxObjectReference {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "ClusterInstance".into(),
+        namespace: recorded_lease.namespace.clone(),
+        name: binding.instance.name.clone(),
+        uid: binding.instance.uid.clone(),
+        generation: Some(binding.instance.observed_generation),
+    };
+    validated_child_receipt_token(
+        lease,
+        receipt,
+        recorded_lease,
+        Some(&instance),
+        recorded_pool,
+    )?;
+    Some(instance)
+}
+
 /// Validate the producer-owned half of a retained receipt.
 ///
 /// The outer consumer additionally checks its independently checkpointed
@@ -7261,13 +7380,26 @@ fn recorded_child_pool<'a>(
     .then_some(cluster_pool)
 }
 
+/// Why a child's live pool is being compared with the recorded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildPoolCheck {
+    /// Building the composition against admitted configuration: the pool
+    /// generation must still be the one admitted.
+    Composition,
+    /// Tearing it down builds nothing, so only identity matters. Generations
+    /// only move forward, and pinning one here trapped every bound child
+    /// after any edit to the pool (#222).
+    Teardown,
+}
+
 fn live_child_pool_matches_recorded(
     pool: &crate::crd::ClusterPool,
     recorded: &crate::crd::SandboxObjectReference,
+    check: ChildPoolCheck,
 ) -> bool {
     pool.name_any() == recorded.name
         && pool.uid().as_deref() == Some(recorded.uid.as_str())
-        && pool.metadata.generation == recorded.generation
+        && (check == ChildPoolCheck::Teardown || pool.metadata.generation == recorded.generation)
         && pool.metadata.deletion_timestamp.is_none()
 }
 
@@ -7280,6 +7412,7 @@ fn resolved_child_binding_matches_recorded(
     status: &crate::crd::SandboxLeaseStatus,
     management_namespace: &str,
     require_recorded_instance: bool,
+    pool_check: ChildPoolCheck,
 ) -> bool {
     let Some(target) = status.target.as_ref() else {
         return false;
@@ -7298,7 +7431,7 @@ fn resolved_child_binding_matches_recorded(
         && resolved.lease.metadata.generation == recorded_lease.generation
         && resolved.binding.lease.name == recorded_lease.name
         && resolved.binding.lease.uid.as_deref() == Some(recorded_lease.uid.as_str());
-    let pool_matches = live_child_pool_matches_recorded(&resolved.pool, recorded_pool)
+    let pool_matches = live_child_pool_matches_recorded(&resolved.pool, recorded_pool, pool_check)
         && resolved.binding.pool.name == recorded_pool.name
         && resolved.binding.pool.uid.as_deref() == Some(recorded_pool.uid.as_str());
     if !lease_matches || !pool_matches {
@@ -8756,7 +8889,13 @@ async fn compose_child_target(
             )));
         }
     };
-    if !resolved_child_binding_matches_recorded(&binding, &status, &ctx.namespace, false) {
+    if !resolved_child_binding_matches_recorded(
+        &binding,
+        &status,
+        &ctx.namespace,
+        false,
+        ChildPoolCheck::Composition,
+    ) {
         return Err(SandboxPlacementError::Invalid(format!(
             "resolved child binding for SandboxLease {name} does not match its recorded ClusterLease/ClusterPool identity"
         )));
@@ -8801,7 +8940,13 @@ async fn compose_child_target(
         }
         return Ok(ChildTarget::Pending(Action::await_change()));
     }
-    if !resolved_child_binding_matches_recorded(&binding, &status, &ctx.namespace, true) {
+    if !resolved_child_binding_matches_recorded(
+        &binding,
+        &status,
+        &ctx.namespace,
+        true,
+        ChildPoolCheck::Composition,
+    ) {
         return Err(SandboxPlacementError::Invalid(format!(
             "resolved child binding for SandboxLease {name} does not match its recorded ClusterLease/Instance/ClusterPool provenance"
         )));
@@ -16863,6 +17008,110 @@ current-context: child
         }
     }
 
+    /// Editing the ClusterPool does not trap the child leases already bound
+    /// to it.
+    ///
+    /// Generations only move forward, so comparing the live pool generation
+    /// with the one recorded at composition failed forever after any edit,
+    /// and the release quarantined before it could ask the child to tear
+    /// down. Teardown builds nothing against the pool's configuration; the
+    /// pool's identity is its name, UID, and that it is not being deleted.
+    #[tokio::test]
+    async fn an_edited_cluster_pool_does_not_block_child_release() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut edited = child_cluster_pool_json();
+        edited["metadata"]["generation"] = 2.into();
+        edited["metadata"]["resourceVersion"] = "31".into();
+        edited["spec"]["size"] = 3.into();
+        Mock::given(method("GET"))
+            .and(path(CHILD_POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(edited))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Bound",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        mount_child_release_patch(&server).await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.child_teardown_mode =
+            Some(crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1);
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert!(
+            !recorded_phases(&server)
+                .await
+                .iter()
+                .any(|phase| phase == "Quarantined"),
+            "an unrelated pool edit is not a change of pool identity"
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            1,
+            "the child release is requested"
+        );
+    }
+
+    /// A pool replaced under the same name is still a different pool.
+    #[tokio::test]
+    async fn a_replaced_cluster_pool_still_quarantines_child_release() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut replaced = child_cluster_pool_json();
+        replaced["metadata"]["uid"] = "replacement-pool-uid".into();
+        Mock::given(method("GET"))
+            .and(path(CHILD_POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replaced))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Bound",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        mount_child_release_patch(&server).await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.child_teardown_mode =
+            Some(crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1);
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0,
+            "a different pool's cluster is never released"
+        );
+    }
+
     /// Reachable-child teardown retires the execution manifest one durable
     /// mutation per pass. It cannot clean scoped credentials, checkpoint a
     /// mode, or release the cluster in the same pass as that ledger mutation.
@@ -17425,6 +17674,86 @@ current-context: child
             checkpoint["placement"]["clusterPool"]["uid"],
             "cluster-pool-uid"
         );
+    }
+
+    /// The same recovery works once the instance is gone.
+    ///
+    /// A receipt exists only after verified teardown removed the instance, so
+    /// the reciprocal lookup 404s here. The handle's binding still names the
+    /// exact pool and instance, and the receipt proves that binding torn down.
+    #[tokio::test]
+    async fn an_unrecorded_child_receipt_recovers_identity_after_the_instance_is_gone() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        mount_missing_child_instance(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Recycling",
+                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.placement = None;
+        status.target = None;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let checkpoint = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("complete child recovery checkpoint");
+        assert_ne!(checkpoint["phase"], "Quarantined");
+        assert_eq!(
+            checkpoint["target"]["childClusterLease"]["uid"],
+            "child-lease-uid"
+        );
+        assert_eq!(
+            checkpoint["target"]["childClusterInstance"]["uid"],
+            "child-instance-uid"
+        );
+        assert_eq!(
+            checkpoint["placement"]["clusterPool"]["uid"],
+            "cluster-pool-uid"
+        );
+    }
+
+    async fn mount_missing_child_instance(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(CHILD_INSTANCE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": "NotFound",
+                "code": 404
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    fn cleanup_reason_of(status: &serde_json::Value) -> Option<String> {
+        status["conditions"]
+            .as_array()?
+            .iter()
+            .find(|condition| condition["type"] == "CleanupVerified")?["reason"]
+            .as_str()
+            .map(str::to_string)
     }
 
     /// A handle that is already terminating is not somebody else's.
@@ -18058,6 +18387,96 @@ current-context: child
             "an instance that was never recorded is recoverable, not a receipt mismatch: {phases:?}"
         );
         assert_eq!(phases.last().map(String::as_str), Some("Released"));
+    }
+
+    /// The unrecorded instance is recoverable after it is gone, which is the
+    /// only state a valid receipt can describe.
+    ///
+    /// Verified teardown writes the receipt once the instance is absent, so
+    /// by the time the outer lease sees it the `ClusterInstance` usually 404s.
+    /// Recovering the identity from a live reciprocal lookup could therefore
+    /// never succeed on this path, and the nightly
+    /// `cancelling_while_provisioning_leaves_nothing_behind` quarantined with
+    /// `child_binding_identity_unverifiable` (#236).
+    #[tokio::test]
+    async fn a_receipt_recovers_the_unrecorded_instance_after_it_is_gone() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        mount_missing_child_instance(&server).await;
+        mount_child_handle_cleanup(
+            &server,
+            2,
+            Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+        )
+        .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_instance = None;
+
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
+
+        let phases = recorded_phases(&server).await;
+        assert!(
+            !phases.iter().any(|phase| phase == "Quarantined"),
+            "a receipt proving the bound instance gone is not a reason to quarantine: {phases:?}"
+        );
+        assert_eq!(phases.last().map(String::as_str), Some("Released"));
+    }
+
+    /// Recovery takes the identity from the handle's binding, so a receipt
+    /// about some other instance cannot supply it, and the lease quarantines
+    /// on the receipt rather than recording an identity the receipt does not
+    /// prove.
+    #[tokio::test]
+    async fn a_receipt_about_another_instance_does_not_recover_identity() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        mount_missing_child_instance(&server).await;
+        mount_child_handle_cleanup(
+            &server,
+            2,
+            Some(verified_receipt("kobe-abc123", "another-instance-uid")),
+        )
+        .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_instance = None;
+
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status["target"]["childClusterInstance"].is_null()),
+            "no instance identity is recorded from an unproven receipt"
+        );
+        let last = statuses.last().expect("quarantine checkpoint");
+        assert_eq!(last["phase"], "Quarantined");
+        assert_eq!(
+            cleanup_reason_of(last).as_deref(),
+            Some("child_receipt_does_not_match")
+        );
     }
 
     /// Receipt-backed fallback still retires the durable execution inventory
