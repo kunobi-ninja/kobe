@@ -9,7 +9,7 @@ use ratatui::widgets::*;
 use std::io::{IsTerminal, stdout};
 use std::time::Duration;
 
-use super::config::{AuthMode, CliConfig};
+use super::config::{AuthMode, CliConfig, Scope, write_target_to_local};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
@@ -194,9 +194,13 @@ fn build_fields(config: &CliConfig, target: &EditTarget) -> Result<Vec<FormField
     ])
 }
 
+/// Apply the form to `config` and return it.
+///
+/// Every field the form does not show, such as `ssh_public_key`, passes
+/// through untouched.
 fn fields_to_config(
     fields: &[FormField],
-    previous: &CliConfig,
+    mut config: CliConfig,
     target: &EditTarget,
 ) -> Result<CliConfig> {
     let endpoint = if fields[0].value.is_empty() {
@@ -224,26 +228,14 @@ fn fields_to_config(
         Some(fields[3].value.clone())
     };
 
-    let mut config = CliConfig {
-        current_target: previous.current_target.clone(),
-        targets: previous.targets.clone(),
-        endpoint: previous.endpoint.clone(),
-        auth: previous.auth.clone(),
-        token: previous.token.clone(),
-        ssh_fingerprint: previous.ssh_fingerprint.clone(),
-        ..CliConfig::default()
-    };
-
     match target {
-        EditTarget::Legacy => Ok(CliConfig {
-            current_target: config.current_target,
-            targets: config.targets,
-            endpoint,
-            auth,
-            token,
-            ssh_fingerprint,
-            ..CliConfig::default()
-        }),
+        EditTarget::Legacy => {
+            config.endpoint = endpoint;
+            config.auth = auth;
+            config.token = token;
+            config.ssh_fingerprint = ssh_fingerprint;
+            Ok(config)
+        }
         EditTarget::Target(name) => {
             let target = config
                 .targets
@@ -258,6 +250,51 @@ fn fields_to_config(
             Ok(config)
         }
     }
+}
+
+/// Whether an edit to `target` belongs in `./.kobe.toml`.
+///
+/// A target the project file defines resolves from that file, including one
+/// that shadows a global target of the same name, so that is where the edit
+/// takes effect.
+fn edit_writes_local(merged: &CliConfig, target: &EditTarget) -> bool {
+    match target {
+        EditTarget::Target(name) => matches!(
+            merged.target_scopes.get(name),
+            Some(Scope::Local | Scope::Both)
+        ),
+        EditTarget::Legacy => false,
+    }
+}
+
+/// Save the form to the one file that defines the target.
+///
+/// The editor shows the merged view of the global and project files. Saving
+/// that view whole would copy project targets, and their tokens, into the
+/// global file, so each save starts from the file it writes.
+fn save_fields(fields: &[FormField], merged: &CliConfig, target: &EditTarget) -> Result<()> {
+    if edit_writes_local(merged, target) {
+        let EditTarget::Target(name) = target else {
+            unreachable!("only named targets live in the project file")
+        };
+        let entry = merged
+            .targets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe target list"))?;
+        let only_this_target = CliConfig {
+            targets: [(name.clone(), entry)].into(),
+            ..CliConfig::default()
+        };
+        let mut updated = fields_to_config(fields, only_this_target, target)?;
+        let entry = updated
+            .targets
+            .remove(name)
+            .expect("the target was just inserted");
+        write_target_to_local(name, entry)?;
+        return Ok(());
+    }
+    fields_to_config(fields, CliConfig::load_global()?, target)?.save()
 }
 
 fn cycle_select(field: &mut FormField, backwards: bool) -> bool {
@@ -368,9 +405,7 @@ pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
                         }
                     }
                     KeyCode::Char('s') => {
-                        let updated_config =
-                            fields_to_config(&state.fields, &config, &state.target)?;
-                        updated_config.save()?;
+                        save_fields(&state.fields, &config, &state.target)?;
                         state.dirty = false;
                         state.status = Some("Saved!".to_string());
                     }
@@ -405,9 +440,7 @@ pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
                 Mode::ConfirmQuit => match key.code {
                     KeyCode::Char('y') => break,
                     KeyCode::Char('s') => {
-                        let updated_config =
-                            fields_to_config(&state.fields, &config, &state.target)?;
-                        updated_config.save()?;
+                        save_fields(&state.fields, &config, &state.target)?;
                         break;
                     }
                     _ => state.mode = Mode::Navigate,
@@ -714,7 +747,7 @@ mod tests {
         ];
 
         let updated =
-            fields_to_config(&fields, &previous, &EditTarget::Target("prod".to_string())).unwrap();
+            fields_to_config(&fields, previous, &EditTarget::Target("prod".to_string())).unwrap();
 
         assert_eq!(
             updated.endpoint.as_deref(),
@@ -726,5 +759,65 @@ mod tests {
         assert_eq!(prod.endpoint, "https://new.example.com");
         assert_eq!(prod.auth, AuthMode::Ssh);
         assert_eq!(prod.ssh_fingerprint.as_deref(), Some("SHA256:test"));
+    }
+
+    /// The form shows four fields; saving must not reset the ones it hides.
+    /// `ssh_public_key` is what `kobe init --public-key` remembers, and
+    /// losing it silently changes which key sandboxes authorize.
+    #[test]
+    fn fields_to_config_keeps_fields_the_form_does_not_show() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "prod".to_string(),
+            KobeTarget {
+                default_pool: Some("agents".to_string()),
+                ..sample_target("https://prod.example.com", AuthMode::Oidc)
+            },
+        );
+        let config = CliConfig {
+            targets,
+            override_current_target: true,
+            ssh_public_key: Some("/home/me/.ssh/work.pub".to_string()),
+            ..CliConfig::default()
+        };
+        let target = EditTarget::Target("prod".to_string());
+        let mut fields = build_fields(&config, &target).unwrap();
+        fields[0].value = "https://new.example.com".to_string();
+
+        let updated = fields_to_config(&fields, config, &target).unwrap();
+
+        assert_eq!(
+            updated.ssh_public_key.as_deref(),
+            Some("/home/me/.ssh/work.pub")
+        );
+        assert!(updated.override_current_target);
+        let prod = &updated.targets["prod"];
+        assert_eq!(prod.endpoint, "https://new.example.com");
+        assert_eq!(prod.default_pool.as_deref(), Some("agents"));
+    }
+
+    /// An edit lands in the file the target resolves from. Writing a
+    /// project target to the global file would copy it, token and all, out
+    /// of the project.
+    #[test]
+    fn edits_go_to_the_file_that_defines_the_target() {
+        let mut config = CliConfig::default();
+        for (name, scope) in [
+            ("global", Scope::Global),
+            ("local", Scope::Local),
+            ("both", Scope::Both),
+        ] {
+            config.targets.insert(
+                name.to_string(),
+                sample_target("https://example.com", AuthMode::None),
+            );
+            config.target_scopes.insert(name.to_string(), scope);
+        }
+        let named = |name: &str| EditTarget::Target(name.to_string());
+
+        assert!(!edit_writes_local(&config, &named("global")));
+        assert!(edit_writes_local(&config, &named("local")));
+        assert!(edit_writes_local(&config, &named("both")));
+        assert!(!edit_writes_local(&config, &EditTarget::Legacy));
     }
 }

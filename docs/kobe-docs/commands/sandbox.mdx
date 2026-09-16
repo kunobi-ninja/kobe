@@ -139,6 +139,34 @@ For secrets and small inputs, not file transfer: the server refuses more than
 into a request that was never going to be accepted. Kobe stores none of it —
 only a digest of the request reaches the execution record.
 
+### Long-running commands with `--detach`
+
+By default `kobe exec` waits for the command and exits with its exit code.
+`--detach` returns as soon as the execution has started and prints how to reach
+it:
+
+```bash
+kobe exec dev --detach --timeout 1h -- make release
+```
+
+```text
+Started execution sbxe-91c4 (running)
+  kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4 --follow
+  kobe cancel sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
+```
+
+The exit code is `0` when the execution started. It says nothing about how the
+command will end; read that from `kobe logs --execution`. With `--output json`,
+the envelope carries the execution id and its current `state`, with no
+`exitCode` yet.
+
+A detached command is still bound by `--timeout`, and no execution runs longer
+than one hour. For longer work, run it in a
+[persistent session](#sessions-that-survive-a-disconnect)
+(`kobe attach dev --session build`), which the execution limit does not apply
+to. `kobe run` never detaches, because it releases the sandbox when the command
+returns.
+
 ## `kobe logs`
 
 A bounded tail of the sandbox's own output.

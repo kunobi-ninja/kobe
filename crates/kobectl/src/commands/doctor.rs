@@ -230,7 +230,7 @@ async fn endpoint_check(config: &ResolvedConfig) -> Check {
                 warn(
                     "endpoint",
                     format!("{detail}; target uses auth {}", config.auth),
-                    "kobe target set <target> --auth <one of the advertised methods>",
+                    "kobe config edit, and pick one of the advertised auth methods",
                 )
             }
         }
@@ -262,9 +262,9 @@ async fn session_check(config: &ResolvedConfig) -> Check {
                     "kobe status (answers the one-time trust prompt)"
                 }
                 AuthMode::Ssh => {
-                    "ssh-add your Ed25519 key, or kobe target set <target> --ssh-fingerprint <fp>"
+                    "ssh-add your Ed25519 key, or set its fingerprint with kobe config edit"
                 }
-                AuthMode::Token => "set KOBE_TOKEN or kobe target set <target> --token <token>",
+                AuthMode::Token => "set KOBE_TOKEN, or set the token with kobe config edit",
                 AuthMode::None => "",
             };
             fail("session", text, fix)
@@ -303,7 +303,7 @@ async fn pools_check(config: &ResolvedConfig) -> Check {
                 "default pool {default} is not ssh-capable; ssh-capable: {}",
                 ssh_capable.join(", ")
             ),
-            "kobe target set <target> --default-pool <pool>",
+            "kobe init --default-pool <pool>",
         ),
         None => warn(
             "pools",
@@ -311,7 +311,7 @@ async fn pools_check(config: &ResolvedConfig) -> Check {
                 "ssh-capable: {}; no default pool, so hosts must name one (kobe-<pool>-<name>)",
                 ssh_capable.join(", ")
             ),
-            "kobe init, or kobe target set <target> --default-pool <pool>",
+            "kobe init --default-pool <pool>",
         ),
     }
 }

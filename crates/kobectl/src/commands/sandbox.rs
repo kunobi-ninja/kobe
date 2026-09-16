@@ -281,20 +281,34 @@ pub async fn exec(
         output,
     )
     .await?;
-    if detach {
+    // An execution that already finished, or a server that ignored `detach`
+    // and waited, has a real result; report it like any other exec.
+    if detach && is_still_running(&result.state) {
         // A detached execution has no exit code yet, so reporting one would be
         // a lie. Report what the caller now owns instead: an id, and the two
         // commands that reach it. Exit 0 means "started", not "succeeded".
-        emit(&config, lease, &result, None, output)?;
-        if output == OutputFormat::Text {
-            println!("  kobe logs {lease} --execution {0}", result.id);
-            println!("  kobe cancel {lease} --execution {0}", result.id);
+        match output {
+            OutputFormat::Json => emit(&config, lease, &result, None, output)?,
+            OutputFormat::Text => {
+                println!(
+                    "Started execution {} ({})",
+                    result.id,
+                    result.state.to_ascii_lowercase()
+                );
+                println!("  kobe logs {lease} --execution {} --follow", result.id);
+                println!("  kobe cancel {lease} --execution {}", result.id);
+            }
         }
         return Ok(0);
     }
     let code = exit_code_for(&result);
     emit(&config, lease, &result, None, output)?;
     Ok(code)
+}
+
+/// Whether an execution has not produced a result yet.
+fn is_still_running(state: &str) -> bool {
+    state.eq_ignore_ascii_case("Queued") || state.eq_ignore_ascii_case("Running")
 }
 
 #[allow(clippy::too_many_arguments)]
