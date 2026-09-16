@@ -6,7 +6,7 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::io::stdout;
+use std::io::{IsTerminal, stdout};
 use std::time::Duration;
 
 use super::config::{AuthMode, CliConfig};
@@ -108,14 +108,14 @@ fn resolve_edit_target(config: &CliConfig, target_override: Option<&str>) -> Res
         if config.targets.contains_key(name) {
             return Ok(EditTarget::Target(name.to_string()));
         }
-        anyhow::bail!("Unknown target '{name}'. Run: kobe config list");
+        anyhow::bail!("Unknown target '{name}'. Run: kobe target list");
     }
 
     if let Some(name) = &config.current_target {
         if config.targets.contains_key(name) {
             return Ok(EditTarget::Target(name.clone()));
         }
-        anyhow::bail!("Current target '{name}' does not exist. Run: kobe config list");
+        anyhow::bail!("Current target '{name}' does not exist. Run: kobe target list");
     }
 
     Ok(EditTarget::Legacy)
@@ -133,7 +133,7 @@ fn build_fields(config: &CliConfig, target: &EditTarget) -> Result<Vec<FormField
             let target = config
                 .targets
                 .get(name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe target list"))?;
             (
                 target.endpoint.clone(),
                 target.auth.clone(),
@@ -248,7 +248,7 @@ fn fields_to_config(
             let target = config
                 .targets
                 .get_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe target list"))?;
             if let Some(endpoint) = endpoint {
                 target.endpoint = endpoint;
             }
@@ -286,6 +286,12 @@ fn cycle_select(field: &mut FormField, backwards: bool) -> bool {
 // ── Main TUI entry point ─────────────────────────────────────────────────
 
 pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
+    // Raw mode on a pipe never sees a keypress, so the editor would hang.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "the config editor needs a terminal; use `kobe target set` or `kobe config import` from scripts"
+        );
+    }
     let config = CliConfig::load()?;
     let target = resolve_edit_target(&config, target_override)?;
     let fields = build_fields(&config, &target)?;
