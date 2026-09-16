@@ -310,6 +310,8 @@ async fn authorize_key(config: &ResolvedConfig, lease_id: &str, public_key: &str
         Some("30s"),
         Some(&stdin),
         &sandbox::new_idempotency_key(),
+        // The key must be in place before the attach, so this one waits.
+        false,
         OutputFormat::Json,
     )
     .await

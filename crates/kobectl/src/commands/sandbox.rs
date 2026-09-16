@@ -174,6 +174,12 @@ struct ExecRequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<&'a str>,
     idempotency_key: &'a str,
+    /// Return once the execution is reserved instead of waiting for it.
+    ///
+    /// Omitted when false so an ordinary `kobe exec` keeps sending exactly the
+    /// body an older Kobe accepts.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    detach: bool,
     /// Base64 bytes for the remote process's stdin.
     ///
     /// Omitted entirely when unused, so an ordinary `kobe exec` keeps sending
@@ -241,6 +247,7 @@ pub async fn exec(
     cwd: Option<&str>,
     timeout: Option<&str>,
     forward_stdin: bool,
+    detach: bool,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
@@ -270,9 +277,21 @@ pub async fn exec(
         timeout,
         stdin.as_deref(),
         &new_idempotency_key(),
+        detach,
         output,
     )
     .await?;
+    if detach {
+        // A detached execution has no exit code yet, so reporting one would be
+        // a lie. Report what the caller now owns instead: an id, and the two
+        // commands that reach it. Exit 0 means "started", not "succeeded".
+        emit(&config, lease, &result, None, output)?;
+        if output == OutputFormat::Text {
+            println!("  kobe logs {lease} --execution {0}", result.id);
+            println!("  kobe cancel {lease} --execution {0}", result.id);
+        }
+        return Ok(0);
+    }
     let code = exit_code_for(&result);
     emit(&config, lease, &result, None, output)?;
     Ok(code)
@@ -287,6 +306,7 @@ pub(crate) async fn exec_once(
     timeout: Option<&str>,
     stdin: Option<&str>,
     idempotency_key: &str,
+    detach: bool,
     output: OutputFormat,
 ) -> Result<ExecutionResponse> {
     let path = format!("/v1/sandbox-leases/{lease}/executions");
@@ -295,6 +315,7 @@ pub(crate) async fn exec_once(
         cwd,
         timeout,
         idempotency_key,
+        detach,
         stdin,
     })?;
     let (status, payload) =
@@ -1279,8 +1300,11 @@ async fn exec_once_for_run(
         cwd,
         timeout,
         idempotency_key,
-        // `kobe run` leases, runs and releases in one shot; there is no
-        // interactive stdin to forward and no flag that asks for one.
+        // `kobe run` leases, runs and releases in one shot, so detaching from
+        // the command it exists to wait for would release the sandbox out from
+        // under it.
+        detach: false,
+        // No interactive stdin to forward and no flag that asks for one.
         stdin: None,
     })
     .map_err(|error| RunExecutionError::Failure(anyhow::Error::from(error)))?;
@@ -2285,6 +2309,7 @@ mod tests {
             cwd: Some("/workspace"),
             timeout: Some("60s"),
             idempotency_key: "key-1",
+            detach: false,
             stdin: None,
         })
         .unwrap();
@@ -2302,10 +2327,43 @@ mod tests {
             cwd: None,
             timeout: None,
             idempotency_key: "key-1",
+            detach: false,
             stdin: Some("czNjcmV0"),
         })
         .unwrap();
         assert_eq!(body["stdin"], "czNjcmV0");
+    }
+
+    /// `--detach` is opt-in on the wire as well as on the command line: an
+    /// ordinary exec must keep sending the body an older Kobe accepts, and a
+    /// detached one must actually say so rather than relying on a default.
+    #[test]
+    fn detach_is_absent_unless_it_was_asked_for() {
+        let argv = vec!["/agent".to_string(), "run".to_string()];
+        let plain = serde_json::to_value(ExecRequestBody {
+            command: &argv,
+            cwd: None,
+            timeout: None,
+            idempotency_key: "key-1",
+            detach: false,
+            stdin: None,
+        })
+        .unwrap();
+        assert!(
+            plain.get("detach").is_none(),
+            "a waiting exec sends no detach field at all"
+        );
+
+        let detached = serde_json::to_value(ExecRequestBody {
+            command: &argv,
+            cwd: None,
+            timeout: None,
+            idempotency_key: "key-1",
+            detach: true,
+            stdin: None,
+        })
+        .unwrap();
+        assert_eq!(detached["detach"], true);
     }
 
     /// `--stdin` refuses a file rather than buffering one.

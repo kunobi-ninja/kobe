@@ -177,6 +177,14 @@ enum Commands {
         /// --with-token` does not.
         #[arg(long)]
         stdin: bool,
+        /// Return once the command has started instead of waiting for it
+        ///
+        /// For work that outlives the connection: a multi-hour build survives
+        /// the exec returning, and `kobe logs --execution` and `kobe cancel
+        /// --execution` reach it afterwards. Without this a backgrounded
+        /// process dies with the execution that started it.
+        #[arg(long)]
+        detach: bool,
         /// The command to run, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -463,6 +471,15 @@ enum SandboxAction {
         /// --with-token` — completes rather than waiting for its timeout.
         #[arg(long)]
         stdin: bool,
+        /// Start the command and return once it is reserved, instead of
+        /// waiting for it to finish.
+        ///
+        /// For work that outlives the connection: a multi-hour build survives
+        /// the exec returning, and `kobe logs --execution` and `kobe cancel
+        /// --execution` reach it afterwards. Without this a backgrounded
+        /// process dies with the execution that started it.
+        #[arg(long)]
+        detach: bool,
         /// The command. Everything after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -757,6 +774,7 @@ async fn main() -> anyhow::Result<()> {
             cwd,
             timeout,
             stdin,
+            detach,
             command,
         } => {
             let lease =
@@ -769,6 +787,7 @@ async fn main() -> anyhow::Result<()> {
                     cwd,
                     timeout,
                     stdin,
+                    detach,
                     command,
                 },
                 target,
@@ -991,6 +1010,7 @@ async fn dispatch_resource_action(
             cwd,
             timeout,
             stdin,
+            detach,
             command,
         } => {
             commands::sandbox::exec(
@@ -999,6 +1019,7 @@ async fn dispatch_resource_action(
                 cwd.as_deref(),
                 timeout.as_deref(),
                 stdin,
+                detach,
                 target,
                 endpoint,
                 output,
