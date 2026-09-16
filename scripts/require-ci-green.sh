@@ -27,19 +27,37 @@ max_attempts="${CI_GREEN_MAX_ATTEMPTS:-80}" # ~40 min ceiling; `Check` is ~15 mi
 
 echo "Gating on CI for $sha — required jobs: ${required[*]}"
 
+# One commit can carry several CI runs: the tag push, the branch push it was
+# tagged from, and any manual dispatch. Only the tag run contains the
+# release-cli jobs, so picking the newest run and waiting on it is a coin toss
+# that a single dispatch can lose. v0.47.0 lost it — a nightly dispatched 21
+# seconds after the tag run became `.[0]`, its release-cli jobs never existed,
+# and both crates.io and every package lane timed out on a release whose
+# artefacts were already built and green. Look across every run for the commit
+# instead: a required job counts as green when ANY run for this exact commit
+# concluded it successfully, which is the question the gate is really asking.
 for attempt in $(seq 1 "$max_attempts"); do
-  run_id="$(gh run list --repo "$repo" --commit "$sha" --workflow CI \
-              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-  if [ -z "${run_id:-}" ] || [ "$run_id" = "null" ]; then
+  run_ids="$(gh run list --repo "$repo" --commit "$sha" --workflow CI \
+              --json databaseId --jq '.[].databaseId' 2>/dev/null || true)"
+  if [ -z "${run_ids:-}" ]; then
     echo "[$attempt/$max_attempts] no CI run for $sha yet; waiting ${interval}s"
     sleep "$interval"; continue
   fi
 
-  jobs="$(gh api "repos/$repo/actions/runs/$run_id/jobs?per_page=100")"
+  jobs='{"jobs":[]}'
+  for run_id in $run_ids; do
+    run_jobs="$(gh api "repos/$repo/actions/runs/$run_id/jobs?per_page=100")"
+    jobs="$(jq -s '{jobs: (.[0].jobs + .[1].jobs)}' <<<"$jobs $run_jobs")"
+  done
 
   failed=(); pending=(); ok=()
   for name in "${required[@]}"; do
-    obj="$(jq -c --arg n "$name" '.jobs[] | select(.name == $n)' <<<"$jobs" | head -1)"
+    # Prefer a completed success over any other copy of the same job name:
+    # a skipped release-cli in the branch run must not mask the real one.
+    obj="$(jq -c --arg n "$name" '
+      [.jobs[] | select(.name == $n)]
+      | (map(select(.status == "completed" and .conclusion == "success")) + .)
+      | first // empty' <<<"$jobs")"
     if [ -z "$obj" ]; then pending+=("$name (not started)"); continue; fi
     status="$(jq -r '.status' <<<"$obj")"
     concl="$(jq -r '.conclusion' <<<"$obj")"
