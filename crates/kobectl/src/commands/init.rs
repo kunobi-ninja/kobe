@@ -270,21 +270,16 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
             } else {
                 println!("  Ready.  ssh {try_host}");
             }
-            // The trailing `1` reads like an index into something. It is not:
-            // it is a name the caller invents, and inventing another one is
-            // how you get a second sandbox. Nothing else in the output says
-            // so, and getting it wrong is the difference between returning to
-            // your work and silently leasing a new machine.
-            println!();
-            report.note(
-                "The host is kobe-<pool>-<name>, and the name is yours. The first\n\
-                 connection leases a sandbox and later ones return to it, so a\n\
-                 different name is a different sandbox.",
-            );
-            report.note(format!(
-                "Append .<session>, as in {try_host}.main, for a shell that\n\
-                 outlives a dropped connection."
-            ));
+            // The trailing `1` reads like an index into machines that already
+            // exist. It is a name the caller invents, and inventing another
+            // one leases a second sandbox instead of reconnecting. One line,
+            // because that is the whole of what a first run needs; the dot
+            // suffix for persistent sessions belongs in the docs, not here.
+            report.note("        kobe-<pool>-<name>: a different name is a different sandbox.");
+            // Say that clusters are a different road by naming the road, not
+            // by denying this one. A reader who wanted a cluster gets the
+            // command; everyone else reads four words and moves on.
+            report.note("        For a cluster instead: kobe lease <pool>");
         }
         OutputFormat::Json => print_json(&InitOutput {
             target: target_name.unwrap_or_default(),
