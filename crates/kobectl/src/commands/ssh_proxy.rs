@@ -244,7 +244,7 @@ pub async fn ssh_proxy(command: SshProxyCommand<'_>) -> Result<i32> {
                 None => config.default_pool.clone().ok_or_else(|| {
                     anyhow::anyhow!(
                         "{} names no pool and the target has no default pool; use kobe-<pool>-<name> \
-                         (pools: {}) or set one with `kobe target set <target> --default-pool <pool>`",
+                         (pools: {}) or set one with `kobe init --default-pool <pool>`",
                         spec.alias,
                         if known_pools.is_empty() {
                             "none visible".to_string()

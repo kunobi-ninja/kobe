@@ -75,7 +75,7 @@ name. Omit the key instead.
 
 Use `kobe --target e2e` or `kobe target use e2e` without opting in.
 
-`--default-pool` on `kobe target set` is the pool `kobe ssh-proxy` uses when the SSH host does not name one.
+The default pool is the pool `ssh kobe-<name>` uses when the host does not name one. Set it on an existing target with `kobe init --default-pool <pool>`, which updates the file that defines the target and skips setup steps that are already done. `kobe target set --default-pool` also works, but it replaces the whole target, so pass its endpoint and auth again.
 
 ## Environment variables
 
