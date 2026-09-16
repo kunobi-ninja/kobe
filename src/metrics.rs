@@ -1324,6 +1324,51 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
 /// principal, and that is precisely the high-cardinality identifier this module
 /// forbids as a label; the throttle already logs the identity, so traces answer
 /// "who" and this series answers "how much, and is it growing".
+/// Sandbox stream registrations, by operation and how they ended up.
+///
+/// `kind` is the caller-facing operation (`attach`, `session`,
+/// `port-forward`, `exec`, `logs`, `execution*`), never a lease or principal
+/// id. `outcome` is `admitted` or the reason the slot was refused, so summing
+/// the metric counts attempts exactly once.
+pub static SANDBOX_STREAM_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_sandbox_stream_total",
+        "Sandbox stream registrations by operation and outcome",
+        &["kind", "outcome"]
+    )
+    .unwrap()
+});
+
+/// Sandbox streams open right now, by operation.
+///
+/// Incremented when a slot is admitted and decremented by the guard's Drop,
+/// so it follows the socket rather than the request.
+pub static SANDBOX_STREAMS_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_sandbox_streams_active",
+        "Currently-open sandbox streams by operation",
+        &["kind"]
+    )
+    .unwrap()
+});
+
+/// How long one sandbox stream stayed open.
+///
+/// Buckets run out to four hours because a persistent `session` is meant to
+/// outlive the connection that started it; an `attach` that lands in the tail
+/// of this histogram is a different signal from a session that does.
+pub static SANDBOX_STREAM_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_sandbox_stream_duration_seconds",
+        "How long one sandbox stream stayed open, by operation",
+        &["kind"],
+        vec![
+            0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 14400.0
+        ]
+    )
+    .unwrap()
+});
+
 pub static SANDBOX_ADMISSION_RATE_LIMITED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "kobe_sandbox_admission_rate_limited_total",
@@ -1443,6 +1488,9 @@ pub fn init() {
     // `rate(kobe_sandbox_admission_rate_limited_total[5m])` reads zero rather
     // than "no data" until the first throttle.
     LazyLock::force(&SANDBOX_ADMISSION_RATE_LIMITED_TOTAL);
+    LazyLock::force(&SANDBOX_STREAM_TOTAL);
+    LazyLock::force(&SANDBOX_STREAMS_ACTIVE);
+    LazyLock::force(&SANDBOX_STREAM_DURATION_SECONDS);
     // Lease timing
     LazyLock::force(&LEASE_QUEUE_WAIT_SECONDS);
     LazyLock::force(&LEASE_HOLD_SECONDS);
