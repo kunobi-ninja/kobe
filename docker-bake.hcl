@@ -27,6 +27,12 @@ variable "BUILD_DATE" {
   default = "unknown"
 }
 
+# Changes once a day in CI so the workspace image re-resolves its `@latest`
+# CLIs; constant locally so an ordinary build stays cacheable.
+variable "CLI_REFRESH" {
+  default = "pinned-by-default"
+}
+
 variable "PLATFORM" {
   default = "linux/amd64"
 }
@@ -230,6 +236,7 @@ target "agent-workspace" {
     BUILD_VERSION = BUILD_VERSION
     BUILD_COMMIT  = BUILD_COMMIT
     BUILD_DATE    = BUILD_DATE
+    CLI_REFRESH   = CLI_REFRESH
   }
 }
 

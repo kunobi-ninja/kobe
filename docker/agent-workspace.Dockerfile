@@ -139,9 +139,19 @@ ARG NODE_VERSION=24
 # sandbox, and a bad release is one re-lease away from gone, not a production
 # dependency. What a pin really bought was the ability to answer "which version
 # is in this image?", so that is recorded below instead of frozen.
+# Layer-cache buster. `@latest` resolves at build time, but the RUN string
+# never changes, so BuildKit would reuse this layer forever and "latest" would
+# quietly mean "whatever shipped the day the cache was written". The build uses
+# a local cache and CI sets no BUILD_DATE, while BUILD_COMMIT only moves when
+# main does — so on a quiet night nothing here would be reinstalled at all.
+# CI passes the date; a local build keeps the default and stays cacheable.
+ARG CLI_REFRESH=pinned-by-default
 # npm locates its bundled JavaScript relative to its executable. Keeping the
-# whole Node distribution together avoids a broken /usr/local symlink.
-RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
+# whole Node distribution together avoids a broken /usr/local symlink. npm's
+# cache is dropped at the end: it is written as root, never read at runtime,
+# and worth tens of megabytes in the published layer.
+RUN echo "cli refresh: ${CLI_REFRESH}" \
+    && MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
     && node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
     && PATH="$node_dir/bin:$PATH" \
     && export PATH \
@@ -153,7 +163,9 @@ RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
     && printf 'node %s\ncodex %s\nclaude-code %s\n' \
         "$(node --version)" "$(codex --version)" "$(claude --version)" \
         > /etc/kobe-workspace-versions \
-    && chmod 0644 /etc/kobe-workspace-versions
+    && chmod 0644 /etc/kobe-workspace-versions \
+    && npm cache clean --force \
+    && rm -rf /root/.npm
 
 # Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
 # the pinned tools visible there as well as to Kobe's direct-exec environment.
