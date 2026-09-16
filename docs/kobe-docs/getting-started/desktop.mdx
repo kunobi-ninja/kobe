@@ -5,9 +5,9 @@ description: Open a Linux desktop in a GUI sandbox through noVNC.
 
 # Desktop
 
-A GUI sandbox is a normal sandbox whose pool image is `zondax/kobe-agent-workspace-gui`. It adds Xvfb, Openbox, noVNC, Firefox, and the [Tauri 2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux). Firefox is registered for HTTP and HTTPS, so OAuth opened by a desktop app stays inside that browser.
+Any sandbox whose pool image is `zondax/kobe-agent-workspace` can run a Linux desktop. The image includes Xvfb, Openbox, noVNC, Firefox, and the [Tauri 2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux). Firefox is registered for HTTP and HTTPS, so OAuth opened by a desktop app stays inside that browser.
 
-You need a pool that already declares this image and publishes port 6080. Operators: [Images and runner](/docs/pools/images-and-runner). Callers: [Sandbox](/docs/getting-started/sandbox) for lease and SSH.
+The desktop does not start until you ask, and you need a pool that uses this image and publishes port 6080. Operators: [Images and runner](/docs/pools/images-and-runner). Callers: [Sandbox](/docs/getting-started/sandbox) for lease and SSH.
 
 ## Start the desktop
 

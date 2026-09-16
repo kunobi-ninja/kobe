@@ -131,6 +131,16 @@ All release binaries are signed (macOS codesigned and notarized, Windows code-si
 kobe --help
 ```
 
-You should see the list of subcommands. If the command is not found, put the binary on your `PATH`.
+You should see the commands grouped by task. If the command is not found, put the binary on your `PATH`.
+
+## Shell completions
+
+`kobe completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`. Load it from your shell's startup file:
+
+```sh
+source <(kobe completions zsh)          # ~/.zshrc
+source <(kobe completions bash)         # ~/.bashrc
+kobe completions fish | source          # ~/.config/fish/config.fish
+```
 
 Next: [point the CLI at an endpoint](/docs/getting-started/quick-start), or [deploy the operator](/docs/getting-started/deploy) if you are standing kobe up yourself.

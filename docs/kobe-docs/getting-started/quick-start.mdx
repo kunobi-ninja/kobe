@@ -11,11 +11,11 @@ This path leases a Kubernetes cluster. For sandboxes, see [Sandbox](/docs/gettin
   <Step>
     **Point the CLI at the endpoint**
 
-    `kobe config set` writes to `./.kobe.toml` in the current directory unless you pass `--global`. Use `--global` for an endpoint you want from any directory:
+    `kobe target set` writes to `./.kobe.toml` in the current directory unless you pass `--global`. Use `--global` for an endpoint you want from any directory:
 
     ```sh
-    kobe config set work --endpoint https://kobe.example.com --auth ssh --global
-    kobe config use work
+    kobe target set work --endpoint https://kobe.example.com --auth ssh --global
+    kobe target use work
     ```
 
     Or open the interactive editor:

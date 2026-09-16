@@ -36,7 +36,7 @@ export HCLOUD_TOKEN=...                       # from console.hetzner.cloud
 ./demo up                                     # helm install + apply CRs
 ./demo tunnel                                 # terminal B — keep running
 
-kobe config set demo --endpoint http://localhost:8080 --auth ssh
+kobe target set demo --endpoint http://localhost:8080 --auth ssh
 ./demo lease                                  # leases a k3s cluster from the pool (target 'demo'; override with KOBE_TARGET)
 KUBECONFIG=<that-path> kubectl get nodes      # works (TLS tunnel)
 ./demo deploy-ubuntu                          # SSA an ubuntu pod into the lease

@@ -32,7 +32,7 @@ cd demo/exoscale
 ./demo tunnel                            # port-forward + TLS terminator on :8443
 
 # Back in A — kobe CLI config:
-kobe config set demo --endpoint http://localhost:8080 --auth ssh
+kobe target set demo --endpoint http://localhost:8080 --auth ssh
 
 ./demo lease                             # leases a k3s cluster (target 'demo'; override with KOBE_TARGET), auto-patches kubeconfig to https://localhost:8443
 KUBECONFIG=<that-path> kubectl get nodes # works (over the TLS tunnel)

@@ -7,6 +7,8 @@ description: All kobe CLI commands with flags and examples.
 
 Global flags on every command: `--endpoint URL`, `--target NAME` (alias `--context`), `-o text|json`.
 
+`kobe --help` lists the commands by task. `kobe <command> --help` shows a command's flags, and `-h` gives the short form.
+
 ## Quick reference
 
 | Command | Description |
@@ -28,9 +30,10 @@ Global flags on every command: `--endpoint URL`, `--target NAME` (alias `--conte
 | `kobe port-forward <lease> <spec>` | Forward a declared port |
 | `kobe init` | Set this machine up for `ssh kobe-<pool>-<name>` ([details](/docs/commands/ssh)) |
 | `kobe doctor` | Read-only checks for `ssh kobe-…` |
-| `kobe ssh-proxy` | SSH `ProxyCommand` (not meant to run by hand) |
 | `kobe ssh-config` | Print the `ssh_config` block |
-| `kobe config …` | Named targets |
+| `kobe config` | Edit the CLI configuration |
+| `kobe target …` | List, switch, and define named targets |
+| `kobe completions <shell>` | Print a shell completion script |
 
 ---
 
@@ -177,17 +180,47 @@ Cluster only. Creates a lease, heartbeat-extends it for the command's lifetime, 
 ## `kobe config`
 
 ```sh
-kobe config                 # interactive TUI when no subcommand
-kobe config view
+kobe config                 # opens the editor
 kobe config edit [name]
-kobe config list
-kobe config current
-kobe config use work
-kobe config set work --endpoint https://kobe.example.com --auth ssh --global
+kobe config view
 kobe config export [path]
 kobe config import [path]
 ```
 
-`config set` writes `./.kobe.toml` unless you pass `--global` (`~/.config/kobe/config.json`). `--auth` is `none`, `token`, `oidc`, or `ssh`. `--token` is required for token auth. `--default-pool` is the pool `ssh-proxy` uses when the host does not name one.
+Bare `kobe config` opens the terminal editor for the current target. Without a terminal, such as in a script or with `-o json`, it prints its subcommands and exits 2. `view` shows the resolved configuration and where each value came from. `export` and `import` take `-` for stdout and stdin.
+
+---
+
+## `kobe target`
+
+```sh
+kobe target                 # same as kobe target list
+kobe target list
+kobe target current
+kobe target use work
+kobe target set work --endpoint https://kobe.example.com --auth ssh --global
+```
+
+`target set` writes `./.kobe.toml` unless you pass `--global` (`~/.config/kobe/config.json`). `--auth` is `none`, `token`, `oidc`, or `ssh`. `--token` is required for token auth. `--default-pool` is the pool `ssh kobe-<name>` uses when the host does not name one.
+
+`target use` switches the target for the current shell only. Other terminals keep theirs. Use `--target NAME` for a single command.
+
+`kobe config list`, `current`, `use`, and `set` still work as the older spellings of these commands.
 
 See [Configuration](/docs/getting-started/configuration).
+
+---
+
+## `kobe completions`
+
+```sh
+kobe completions bash|zsh|fish|elvish|powershell
+```
+
+Prints a completion script generated from the installed CLI. Load it from your shell's startup file:
+
+```sh
+source <(kobe completions zsh)          # ~/.zshrc
+source <(kobe completions bash)         # ~/.bashrc
+kobe completions fish | source          # ~/.config/fish/config.fish
+```

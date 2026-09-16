@@ -109,16 +109,21 @@ and a writable `/home/agent/work`. Clone projects there and run `mise install`;
 the image trusts mise configurations under that workspace and puts tool shims
 on `PATH` for direct `kobe exec` commands.
 
-`zondax/kobe-agent-workspace-gui` adds the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
-software rendering, Xvfb, Openbox, noVNC, Firefox, and a
-visible terminal. Callers: [Desktop](/docs/getting-started/desktop). Firefox is registered for HTTP and HTTPS links, so OAuth
-flows opened by desktop applications stay inside the noVNC desktop. Node, Rust,
-package managers, and other project tools still come from the project's
-`mise.toml`. Both images use the same release tags and runner. Pin a release
-tag or digest in your pool.
+The image also ships Node 24 with the Codex and Claude Code CLIs, on `PATH` for
+`kobe exec` and for SSH login shells. No credentials are baked in: each lease
+signs in its own user. The CLIs track their latest release at image build time.
 
-For a GUI pool, set these fields in its template (alongside your resource
-requests and limits):
+The same image carries a desktop: the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
+software rendering, Xvfb, Openbox, noVNC, Firefox, and a visible terminal.
+Callers: [Desktop](/docs/getting-started/desktop). Firefox is registered for
+HTTP and HTTPS links, so OAuth flows opened by desktop applications stay inside
+the noVNC desktop. There is no separate GUI image. Nothing starts the desktop
+until you ask, so a headless lease pays only the image size. Project tools
+beyond Node still come from the project's `mise.toml`. Pin a release tag or
+digest in your pool.
+
+To use the desktop from a pool, declare its port in the template (alongside
+your resource requests and limits):
 
 ```yaml
 template:
@@ -127,7 +132,7 @@ template:
   attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
   containers:
     - name: workspace
-      image: zondax/kobe-agent-workspace-gui:v0.47.0
+      image: zondax/kobe-agent-workspace:v0.47.0
   exposedPorts:
     - name: desktop
       container: workspace
@@ -176,6 +181,5 @@ cancelling its runner execution or releasing the lease stops the desktop.
 When started in tmux, use `Ctrl-c` in that pane to stop it. Only one desktop
 can run in a Sandbox.
 
-Build locally with `docker buildx bake agent-workspace-gui --load` (set
-`PLATFORM=linux/arm64` on an ARM host). The `default` and `push` Bake groups
-include both workspace variants.
+Build locally with `docker buildx bake agent-workspace --load` (set
+`PLATFORM=linux/arm64` on an ARM host).

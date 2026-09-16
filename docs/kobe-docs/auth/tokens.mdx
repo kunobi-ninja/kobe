@@ -48,8 +48,8 @@ If the Secret is missing, empty, or has no `token` key, the operator logs an err
 ## CLI
 
 ```sh
-kobe config set ci --endpoint https://kobe.example.com --auth token --token "$KOBE_TOKEN" --global
-kobe config use ci
+kobe target set ci --endpoint https://kobe.example.com --auth token --token "$KOBE_TOKEN" --global
+kobe target use ci
 kobe lease ci-small
 ```
 

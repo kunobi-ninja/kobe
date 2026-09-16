@@ -105,8 +105,8 @@ kubectl get clusterpool ci-small -n kobe-system
 ## Lease from your laptop
 
 ```sh
-kobe config set local --endpoint http://127.0.0.1:8080 --auth ssh --global
-kobe config use local
+kobe target set local --endpoint http://127.0.0.1:8080 --auth ssh --global
+kobe target use local
 kobe login
 kobe lease ci-small
 ```

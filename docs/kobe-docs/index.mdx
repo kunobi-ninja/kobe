@@ -61,8 +61,8 @@ A GUI pool ships Xvfb, Openbox, noVNC, and Firefox. Start the desktop, forward p
 If an operator already gave you an endpoint:
 
 ```sh
-kobe config set work --endpoint https://kobe.example.com --auth ssh --global
-kobe config use work
+kobe target set work --endpoint https://kobe.example.com --auth ssh --global
+kobe target use work
 kobe login
 kobe lease ci-small
 ```
