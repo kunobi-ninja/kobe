@@ -164,6 +164,39 @@ impl TeardownAcknowledgedProof {
     }
 }
 
+impl VerifiedTeardownEvidence {
+    /// Whether this is the one evidence object for `lease_uid`'s teardown
+    /// `attempt_id`: its deterministic name and identity labels, in
+    /// `namespace`, not being deleted, and owned by nothing that could
+    /// garbage-collect it. Content is checked separately by each caller.
+    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
+    pub fn is_evidence_for(&self, namespace: &str, lease_uid: &str, attempt_id: &str) -> bool {
+        let name = verified_teardown_evidence_name(lease_uid, attempt_id);
+        let labels = verified_teardown_evidence_labels(lease_uid, attempt_id);
+        self.metadata.name.as_deref() == Some(name.as_str())
+            && self.metadata.namespace.as_deref() == Some(namespace)
+            && self.metadata.deletion_timestamp.is_none()
+            && self
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_none_or(|owners| owners.is_empty())
+            && labels.iter().all(|(key, value)| {
+                self.metadata.labels.as_ref().and_then(|live| live.get(key)) == Some(value)
+            })
+    }
+
+    /// Whether `reference` pins exactly this object version.
+    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
+    pub fn is_referenced_by(&self, reference: &TeardownEvidenceReference) -> bool {
+        self.metadata.name.as_deref() == Some(reference.name.as_str())
+            && self.metadata.uid.as_deref() == Some(reference.uid.as_str())
+            && self.metadata.generation == Some(reference.generation)
+            && self.metadata.resource_version.as_deref()
+                == Some(reference.resource_version.as_str())
+    }
+}
+
 /// Deterministic name for one lease teardown attempt. The human-readable lease
 /// name is intentionally not authority; both exact UIDs/nonces feed the hash.
 #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.

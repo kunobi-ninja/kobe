@@ -55,11 +55,8 @@ fn live_cluster_pool_matches_sandbox_authority(
     authority.api_version == "kobe.kunobi.ninja/v1alpha1"
         && authority.kind == "ClusterPool"
         && authority.namespace == namespace
-        && authority.name == pool.name_any()
-        && pool.namespace().as_deref() == Some(namespace)
-        && pool.uid().as_deref() == Some(authority.uid.as_str())
+        && pool.is_recorded_pool(namespace, &authority.name, &authority.uid)
         && pool.metadata.generation == Some(authority.generation)
-        && pool.metadata.deletion_timestamp.is_none()
 }
 
 /// A binding records a pool UID but no generation. Its name and UID must match
@@ -73,11 +70,6 @@ fn binding_pool_matches_sandbox_authority(
         && binding.pool.uid.as_deref() == Some(authority.uid.as_str())
 }
 
-/// Produce the owner-independent metadata fence for one exact composition.
-///
-/// Unknown labels, annotations, and finalizers are preserved. The known
-/// identity fields are overwritten only after the caller has validated every
-/// pre-existing value against `identity`.
 fn sandbox_composition_retention_metadata(
     lease: &ClusterLease,
     identity: &SandboxCompositionIdentity,
@@ -87,44 +79,13 @@ fn sandbox_composition_retention_metadata(
     std::collections::BTreeMap<String, String>,
     Vec<String>,
 ) {
-    let now = chrono::Utc::now();
-    let mut labels = lease.metadata.labels.clone().unwrap_or_default();
-    labels.insert(
-        crate::sandbox::SANDBOX_LEASE_UID_LABEL.into(),
-        identity.outer_uid.clone(),
-    );
-    labels.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.into(),
-        "true".into(),
-    );
-    let mut annotations = lease.metadata.annotations.clone().unwrap_or_default();
-    annotations.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.into(),
-        identity.outer_name.clone(),
-    );
-    if stale_rejected {
-        annotations.insert(
-            crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION.into(),
-            identity.outer_uid.clone(),
-        );
-    }
-    let deadline_is_live = annotations
-        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
-    if !deadline_is_live {
-        annotations.insert(
-            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.into(),
-            crate::controllers::sandbox_child::child_handle_retention_deadline(now).to_rfc3339(),
-        );
-    }
-    let mut finalizers = lease.metadata.finalizers.clone().unwrap_or_default();
-    if !finalizers.iter().any(|finalizer| {
-        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
-    }) {
-        finalizers.push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.into());
-    }
-    (labels, annotations, finalizers)
+    crate::controllers::sandbox_child::child_handle_retention_metadata(
+        lease,
+        &identity.outer_name,
+        &identity.outer_uid,
+        stale_rejected,
+        chrono::Utc::now(),
+    )
 }
 
 fn sandbox_composition_retention_fence_matches(

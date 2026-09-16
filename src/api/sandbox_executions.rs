@@ -45,6 +45,7 @@ use crate::crd::{
     ExecutionState, ReuseVerdict, SandboxExecution, SandboxExecutionSpec, SandboxExecutionTarget,
     SandboxLease, execution_name, legacy_request_digest, request_digest, reuse_verdict,
 };
+use crate::sandbox::QuarantineReason;
 
 /// Finalizer that keeps an execution record present until its exact process
 /// group and Kubernetes record have both been cleaned.
@@ -1187,7 +1188,7 @@ async fn reap_unbound_execution_capacity(
                     let exact_uid = match execution_identity_holds(&execution, &lease) {
                         Ok(uid) => uid,
                         Err(reason) => {
-                            tracing::error!(execution = %entry.name, reason, "execution setup recovery found unverifiable identity");
+                            tracing::error!(execution = %entry.name, reason = reason.as_str(), "execution setup recovery found unverifiable identity");
                             continue;
                         }
                     };
@@ -1339,7 +1340,7 @@ pub enum ExecutionCleanupOutcome {
     /// [`cleanup_lease_executions_after_target_absence`] to retire it.
     AwaitTargetDestruction,
     Retry,
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 /// Whether a terminal runner report for a started execution requires target
@@ -1357,46 +1358,46 @@ fn runner_report_requires_target_destruction(
 fn cleanup_target(
     lease: &SandboxLease,
     execution: &SandboxExecution,
-) -> Result<crate::api::sandbox_access::SandboxTarget, &'static str> {
+) -> Result<crate::api::sandbox_access::SandboxTarget, QuarantineReason> {
     use crate::api::sandbox_access::{SandboxTarget, TargetPlacement};
     use crate::crd::ResolvedSandboxPlacement;
 
     let status = lease
         .status
         .as_ref()
-        .ok_or("execution_lease_status_missing")?;
+        .ok_or(QuarantineReason::ExecutionLeaseStatusMissing)?;
     let provenance = status
         .target
         .as_ref()
-        .ok_or("execution_target_provenance_missing")?;
+        .ok_or(QuarantineReason::ExecutionTargetProvenanceMissing)?;
     let claim = provenance
         .sandbox_claim
         .as_ref()
-        .ok_or("execution_claim_provenance_missing")?;
+        .ok_or(QuarantineReason::ExecutionClaimProvenanceMissing)?;
     let sandbox = provenance
         .sandbox
         .as_ref()
-        .ok_or("execution_sandbox_provenance_missing")?;
+        .ok_or(QuarantineReason::ExecutionSandboxProvenanceMissing)?;
     let pod = provenance
         .pod
         .as_ref()
-        .ok_or("execution_pod_provenance_missing")?;
+        .ok_or(QuarantineReason::ExecutionPodProvenanceMissing)?;
     let recorded = execution
         .spec
         .target
         .as_ref()
-        .ok_or("execution_runner_provenance_missing")?;
+        .ok_or(QuarantineReason::ExecutionRunnerProvenanceMissing)?;
     if provenance.namespace != recorded.namespace
         || pod.name != recorded.pod_name
         || pod.uid != recorded.pod_uid
         || execution.spec.pod_uid != recorded.pod_uid
     {
-        return Err("execution_runner_provenance_changed");
+        return Err(QuarantineReason::ExecutionRunnerProvenanceChanged);
     }
     let placement = match status.placement {
         Some(ResolvedSandboxPlacement::Management {}) => TargetPlacement::Management,
         Some(ResolvedSandboxPlacement::ChildCluster { .. }) => TargetPlacement::ChildCluster,
-        None => return Err("execution_placement_missing"),
+        None => return Err(QuarantineReason::ExecutionPlacementMissing),
     };
     Ok(SandboxTarget {
         lease_uid: execution.spec.lease_uid.clone(),
@@ -1420,12 +1421,14 @@ fn cleanup_target(
 fn execution_identity_holds(
     execution: &SandboxExecution,
     lease: &SandboxLease,
-) -> Result<String, &'static str> {
-    let lease_uid = lease.uid().ok_or("execution_parent_uid_missing")?;
+) -> Result<String, QuarantineReason> {
+    let lease_uid = lease
+        .uid()
+        .ok_or(QuarantineReason::ExecutionParentUidMissing)?;
     let uid = execution
         .uid()
         .filter(|uid| !uid.is_empty())
-        .ok_or("execution_uid_missing")?;
+        .ok_or(QuarantineReason::ExecutionUidMissing)?;
     if execution.namespace().as_deref() != lease.namespace().as_deref()
         || execution.spec.lease_uid != lease_uid
         || execution.spec.lease_name.as_deref() != Some(lease.name_any().as_str())
@@ -1448,7 +1451,7 @@ fn execution_identity_holds(
         || execution.metadata.finalizers.as_deref()
             != Some(&[SANDBOX_EXECUTION_FINALIZER.to_string()])
     {
-        return Err("execution_identity_unverifiable");
+        return Err(QuarantineReason::ExecutionIdentityUnverifiable);
     }
     Ok(uid)
 }
@@ -1460,11 +1463,15 @@ async fn remove_execution_record(
 ) -> ExecutionCleanupOutcome {
     let resource_version = match execution.resource_version() {
         Some(version) => version,
-        None => return ExecutionCleanupOutcome::Quarantine("execution_rv_missing"),
+        None => {
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionRvMissing);
+        }
     };
     let finalizers = execution.metadata.finalizers.clone().unwrap_or_default();
     if finalizers.as_slice() != [SANDBOX_EXECUTION_FINALIZER] {
-        return ExecutionCleanupOutcome::Quarantine("execution_finalizer_unverifiable");
+        return ExecutionCleanupOutcome::Quarantine(
+            QuarantineReason::ExecutionFinalizerUnverifiable,
+        );
     }
     let patch = serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": expected_uid },
@@ -1487,7 +1494,7 @@ async fn remove_execution_record(
             return ExecutionCleanupOutcome::Retry;
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return ExecutionCleanupOutcome::Quarantine("execution_delete_forbidden");
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionDeleteForbidden);
         }
         Err(_) => return ExecutionCleanupOutcome::Retry,
     }
@@ -1500,7 +1507,9 @@ async fn remove_execution_record(
         Err(_) => return ExecutionCleanupOutcome::Retry,
     };
     if current.uid().as_deref() != Some(expected_uid) {
-        return ExecutionCleanupOutcome::Quarantine("execution_replaced_during_cleanup");
+        return ExecutionCleanupOutcome::Quarantine(
+            QuarantineReason::ExecutionReplacedDuringCleanup,
+        );
     }
     let params = DeleteParams {
         preconditions: Some(Preconditions {
@@ -1513,7 +1522,7 @@ async fn remove_execution_record(
         Ok(_) => {}
         Err(kube::Error::Api(error)) if error.code == 404 => {}
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return ExecutionCleanupOutcome::Quarantine("execution_delete_forbidden");
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionDeleteForbidden);
         }
         Err(kube::Error::Api(error)) if error.code == 409 => {
             return ExecutionCleanupOutcome::Retry;
@@ -1523,7 +1532,7 @@ async fn remove_execution_record(
     match executions.get(&execution.name_any()).await {
         Err(kube::Error::Api(error)) if error.code == 404 => ExecutionCleanupOutcome::Checkpointed,
         Ok(replacement) if replacement.uid().as_deref() != Some(expected_uid) => {
-            ExecutionCleanupOutcome::Quarantine("execution_replaced_during_cleanup")
+            ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionReplacedDuringCleanup)
         }
         Ok(_) | Err(_) => ExecutionCleanupOutcome::Retry,
     }
@@ -1630,23 +1639,33 @@ async fn cleanup_lease_executions_inner(
     .await
     {
         Ok(manifest) => manifest,
-        Err(_) => return ExecutionCleanupOutcome::Quarantine("execution_manifest_unverifiable"),
+        Err(_) => {
+            return ExecutionCleanupOutcome::Quarantine(
+                QuarantineReason::ExecutionManifestUnverifiable,
+            );
+        }
     };
     if require_empty_manifest && !manifest.is_empty() {
-        return ExecutionCleanupOutcome::Quarantine("never_bound_execution_manifest_nonempty");
+        return ExecutionCleanupOutcome::Quarantine(
+            QuarantineReason::NeverBoundExecutionManifestNonempty,
+        );
     }
     let executions: Api<SandboxExecution> =
         Api::namespaced(management_client.clone(), execution_namespace);
     let listed = match executions.list(&ListParams::default()).await {
         Ok(listed) => listed,
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return ExecutionCleanupOutcome::Quarantine("execution_list_forbidden");
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionListForbidden);
         }
         Err(_) => return ExecutionCleanupOutcome::Retry,
     };
     let lease_uid = match lease.uid() {
         Some(uid) => uid,
-        None => return ExecutionCleanupOutcome::Quarantine("execution_parent_uid_missing"),
+        None => {
+            return ExecutionCleanupOutcome::Quarantine(
+                QuarantineReason::ExecutionParentUidMissing,
+            );
+        }
     };
     let mut owned = std::collections::BTreeMap::new();
     for execution in listed {
@@ -1659,17 +1678,19 @@ async fn cleanup_lease_executions_inner(
             continue;
         }
         if execution.spec.lease_uid != lease_uid || !labelled {
-            return ExecutionCleanupOutcome::Quarantine("execution_identity_unverifiable");
+            return ExecutionCleanupOutcome::Quarantine(
+                QuarantineReason::ExecutionIdentityUnverifiable,
+            );
         }
         if owned.insert(execution.name_any(), execution).is_some() {
-            return ExecutionCleanupOutcome::Quarantine("execution_name_duplicated");
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionNameDuplicated);
         }
     }
     if owned
         .keys()
         .any(|name| !manifest.iter().any(|entry| entry.name == *name))
     {
-        return ExecutionCleanupOutcome::Quarantine("execution_not_in_manifest");
+        return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionNotInManifest);
     }
 
     // One durable mutation per pass. Re-listing after every record prevents a
@@ -1708,7 +1729,9 @@ async fn cleanup_lease_executions_inner(
                 };
             }
             if entry.execution_uid.is_some() {
-                return ExecutionCleanupOutcome::Quarantine("bound_execution_missing");
+                return ExecutionCleanupOutcome::Quarantine(
+                    QuarantineReason::BoundExecutionMissing,
+                );
             }
             // Neither age nor a strong 404 proves that an API request whose
             // response was lost cannot still create this exact object.
@@ -1721,7 +1744,9 @@ async fn cleanup_lease_executions_inner(
         if entry.request_digest != execution.spec.request_digest
             || entry.pod_uid != execution.spec.pod_uid
         {
-            return ExecutionCleanupOutcome::Quarantine("execution_manifest_mismatch");
+            return ExecutionCleanupOutcome::Quarantine(
+                QuarantineReason::ExecutionManifestMismatch,
+            );
         }
         if entry.execution_uid.is_none() {
             return match crate::sandbox_access_ledger::expire_unbound_execution(
@@ -1741,7 +1766,9 @@ async fn cleanup_lease_executions_inner(
             };
         }
         if entry.execution_uid.as_deref() != Some(execution_uid.as_str()) {
-            return ExecutionCleanupOutcome::Quarantine("execution_manifest_mismatch");
+            return ExecutionCleanupOutcome::Quarantine(
+                QuarantineReason::ExecutionManifestMismatch,
+            );
         }
         let target = match cleanup_target(lease, &execution) {
             Ok(target) => target,
@@ -1786,7 +1813,9 @@ async fn cleanup_lease_executions_inner(
             .is_none()
         {
             if !state.is_terminal() {
-                return ExecutionCleanupOutcome::Quarantine("execution_state_unverifiable");
+                return ExecutionCleanupOutcome::Quarantine(
+                    QuarantineReason::ExecutionStateUnverifiable,
+                );
             }
             // Kobe never crossed its Running checkpoint, so no target-side
             // start was authorised. Preserve the setup-time terminal verdict

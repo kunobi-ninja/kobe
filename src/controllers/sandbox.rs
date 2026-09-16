@@ -46,6 +46,7 @@ use crate::crd::{
     SandboxCondition, SandboxConditionStatus, SandboxLease, SandboxLeasePhase,
     SandboxObjectReference, SandboxPlacement, SandboxPool, SandboxPoolStatus,
 };
+use crate::sandbox::QuarantineReason;
 use crate::sandbox::{
     AGENT_SANDBOX_API_VERSION, CHILD_SANDBOX_NAMESPACE, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND,
     SANDBOX_WARM_POOL_KIND, build_sandbox_claim, build_sandbox_template, build_sandbox_warm_pool,
@@ -170,7 +171,7 @@ pub(super) enum ManagementClaimTombstone {
     Retry(std::time::Duration),
     /// Durable identity uncertainty. The caller must quarantine while cleanup
     /// proof is still mutable, or record a durable post-proof failure.
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 #[derive(Debug)]
@@ -178,7 +179,7 @@ enum AllocationFence {
     Checkpointed,
     Draining(std::time::Duration),
     Ready,
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 /// What reachable execution cleanup permits the release state machine to do.
@@ -193,7 +194,7 @@ enum ExecutionCleanupAdvance {
     Checkpointed,
     DestroyTarget,
     Retry,
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 /// Re-list execution cleanup state after one durable child-resource mutation.
@@ -1094,13 +1095,22 @@ pub async fn reconcile_lease(
                 crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
                 | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
             ) => {
-                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable")
-                    .await;
+                return quarantine_unverifiable_gate(
+                    &lease,
+                    &ctx,
+                    QuarantineReason::AccessGateUnverifiable,
+                )
+                .await;
             }
             Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
                 response,
             ))) if response.code == 401 || response.code == 403 => {
-                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_forbidden").await;
+                return quarantine_unverifiable_gate(
+                    &lease,
+                    &ctx,
+                    QuarantineReason::AccessGateForbidden,
+                )
+                .await;
             }
             Err(error) => {
                 warn!(lease = %name, error = %error, "could not verify admitted Sandbox access gate");
@@ -2053,11 +2063,7 @@ fn new_claim_tombstone_deadline(
     lease: &SandboxLease,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
-    let retention = crate::api::sandbox::sandbox_lease_retention(configured.as_deref());
-    let create_window = chrono::Duration::from_std(SANDBOX_CLAIM_CREATE_TIMEOUT)
-        .expect("the fixed Claim create timeout fits chrono");
-    let retention_bound = now + retention + create_window + SANDBOX_CLAIM_TOMBSTONE_MARGIN;
+    let retention_bound = sandbox_retention_deadline(now);
     let provisioning_bound = lease
         .status
         .as_ref()
@@ -2473,40 +2479,17 @@ async fn ensure_internal_lease_fenced(
     let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
         return Ok(InternalHandleFence::Foreign);
     };
-    let mut labels = current.metadata.labels.clone().unwrap_or_default();
     let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
         return Ok(InternalHandleFence::Foreign);
     };
-    labels.insert(
-        crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
-        lease_uid,
-    );
-    labels.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.to_string(),
-        "true".into(),
-    );
-    let mut annotations = current.metadata.annotations.clone().unwrap_or_default();
-    annotations.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.to_string(),
-        lease.name_any(),
-    );
-    let deadline_is_live = annotations
-        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
-    if !deadline_is_live {
-        annotations.insert(
-            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.to_string(),
-            allocation_fence_deadline(now).to_rfc3339(),
+    let (labels, annotations, finalizers) =
+        crate::controllers::sandbox_child::child_handle_retention_metadata(
+            current,
+            &lease.name_any(),
+            &lease_uid,
+            false,
+            now,
         );
-    }
-    let mut finalizers = current.metadata.finalizers.clone().unwrap_or_default();
-    if !finalizers.iter().any(|finalizer| {
-        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
-    }) {
-        finalizers
-            .push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.to_string());
-    }
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
@@ -2531,7 +2514,12 @@ async fn ensure_internal_lease_fenced(
     }
 }
 
-fn allocation_fence_deadline(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+/// How long anything that fences a Sandbox lease must outlive it: the outer
+/// lease's audit retention, plus the bounded create window and a scheduling
+/// margin. Claim tombstones, allocation fences and child handles all use it.
+pub(crate) fn sandbox_retention_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
     let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
     now + crate::api::sandbox::sandbox_lease_retention(configured.as_deref())
         + chrono::Duration::from_std(SANDBOX_CLAIM_CREATE_TIMEOUT)
@@ -2600,7 +2588,7 @@ async fn ensure_allocation_fence(
             || recorded.uid.is_empty())
     {
         return Ok(AllocationFence::Quarantine(
-            "allocation_fence_provenance_invalid",
+            QuarantineReason::AllocationFenceProvenanceInvalid,
         ));
     }
 
@@ -2608,7 +2596,9 @@ async fn ensure_allocation_fence(
         Ok(fence) => fence,
         Err(kube::Error::Api(error)) if error.code == 404 => {
             if status.allocation_fence.is_some() {
-                return Ok(AllocationFence::Quarantine("allocation_fence_missing"));
+                return Ok(AllocationFence::Quarantine(
+                    QuarantineReason::AllocationFenceMissing,
+                ));
             }
             let now = chrono::Utc::now();
             let fence = k8s_openapi::api::coordination::v1::Lease {
@@ -2634,7 +2624,7 @@ async fn ensure_allocation_fence(
                         [
                             (
                                 SANDBOX_ALLOCATION_FENCE_RETAIN_UNTIL_ANNOTATION.to_string(),
-                                allocation_fence_deadline(now).to_rfc3339(),
+                                sandbox_retention_deadline(now).to_rfc3339(),
                             ),
                             (
                                 SANDBOX_ALLOCATION_FENCE_LEASE_NAME_ANNOTATION.to_string(),
@@ -2670,23 +2660,27 @@ async fn ensure_allocation_fence(
             };
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return Ok(AllocationFence::Quarantine("allocation_fence_unverifiable"));
+            return Ok(AllocationFence::Quarantine(
+                QuarantineReason::AllocationFenceUnverifiable,
+            ));
         }
         Err(error) => return Err(error.into()),
     };
     if !allocation_fence_matches(&fence, lease, &ctx.namespace) {
         return Ok(AllocationFence::Quarantine(
-            "allocation_fence_identity_changed",
+            QuarantineReason::AllocationFenceIdentityChanged,
         ));
     }
     let Some(fence_uid) = fence.uid().filter(|uid| !uid.is_empty()) else {
-        return Ok(AllocationFence::Quarantine("allocation_fence_uid_missing"));
+        return Ok(AllocationFence::Quarantine(
+            QuarantineReason::AllocationFenceUidMissing,
+        ));
     };
     if let Some(recorded) = status.allocation_fence.as_ref()
         && recorded.uid != fence_uid
     {
         return Ok(AllocationFence::Quarantine(
-            "allocation_fence_identity_changed",
+            QuarantineReason::AllocationFenceIdentityChanged,
         ));
     }
     if status.allocation_fence.is_none() {
@@ -2711,7 +2705,7 @@ async fn ensure_allocation_fence(
         .map(|time| time.with_timezone(&chrono::Utc))
     else {
         return Ok(AllocationFence::Quarantine(
-            "allocation_fence_timestamp_missing",
+            QuarantineReason::AllocationFenceTimestampMissing,
         ));
     };
     let drain = SANDBOX_CLAIM_CREATE_TIMEOUT + SANDBOX_ALLOCATION_DRAIN_MARGIN;
@@ -3331,7 +3325,7 @@ pub(super) async fn ensure_management_claim_tombstone(
         !claim_reference_has_expected_shape(reference, &ctx.namespace, &name)
     }) {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_provenance_invalid",
+            QuarantineReason::ClaimProvenanceInvalid,
         ));
     }
     let recorded = status.sandbox_claim_tombstone.as_ref();
@@ -3339,7 +3333,7 @@ pub(super) async fn ensure_management_claim_tombstone(
         !claim_reference_has_expected_shape(reference, &ctx.namespace, &name)
     }) {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_tombstone_provenance_invalid",
+            QuarantineReason::ClaimTombstoneProvenanceInvalid,
         ));
     }
 
@@ -3348,7 +3342,7 @@ pub(super) async fn ensure_management_claim_tombstone(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             if recorded.is_some() {
                 return Ok(ManagementClaimTombstone::Quarantine(
-                    "claim_tombstone_missing",
+                    QuarantineReason::ClaimTombstoneMissing,
                 ));
             }
             let now = chrono::Utc::now();
@@ -3378,7 +3372,7 @@ pub(super) async fn ensure_management_claim_tombstone(
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return Ok(ManagementClaimTombstone::Quarantine(
-                "claim_tombstone_unverifiable",
+                QuarantineReason::ClaimTombstoneUnverifiable,
             ));
         }
         Err(error) => return Err(error.into()),
@@ -3396,7 +3390,7 @@ pub(super) async fn ensure_management_claim_tombstone(
             })
     {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_tombstone_deleting_without_cleanup_fence",
+            QuarantineReason::ClaimTombstoneDeletingWithoutCleanupFence,
         ));
     }
     if !claim_matches_release_shape(
@@ -3405,14 +3399,14 @@ pub(super) async fn ensure_management_claim_tombstone(
         &warm_pool_name(&lease.spec.pool_ref.name),
     ) {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_tombstone_identity_unverifiable",
+            QuarantineReason::ClaimTombstoneIdentityUnverifiable,
         ));
     }
     if let Some(recorded) = recorded
         && observed.uid().as_deref() != Some(recorded.uid.as_str())
     {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_tombstone_identity_changed",
+            QuarantineReason::ClaimTombstoneIdentityChanged,
         ));
     }
 
@@ -3420,7 +3414,7 @@ pub(super) async fn ensure_management_claim_tombstone(
         && !exact_legacy_claim_owner(lease, &observed)
     {
         return Ok(ManagementClaimTombstone::Quarantine(
-            "claim_ownerref_legacy_unverifiable",
+            QuarantineReason::ClaimOwnerrefLegacyUnverifiable,
         ));
     }
     if !sandbox_claim_has_tombstone_shape(&observed)
@@ -3436,7 +3430,7 @@ pub(super) async fn ensure_management_claim_tombstone(
             }
             ManagementClaimFence::Foreign => {
                 return Ok(ManagementClaimTombstone::Quarantine(
-                    "claim_ownerref_legacy_unverifiable",
+                    QuarantineReason::ClaimOwnerrefLegacyUnverifiable,
                 ));
             }
         }
@@ -3495,7 +3489,7 @@ pub(super) async fn ensure_management_claim_tombstone(
 enum TargetFootprintCheck {
     Verified,
     Retry(&'static str),
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3549,7 +3543,7 @@ fn recorded_service_requirement(lease: &SandboxLease) -> Option<TargetFootprintC
     match status.target.as_ref()?.service_required? {
         false => Some(TargetFootprintCheck::Verified),
         true => Some(TargetFootprintCheck::Quarantine(
-            "required_service_provenance_missing",
+            QuarantineReason::RequiredServiceProvenanceMissing,
         )),
     }
 }
@@ -3582,15 +3576,17 @@ async fn missing_service_provenance_is_allowed(
             if !pool.spec.template.requires_service() {
                 TargetFootprintCheck::Verified
             } else {
-                TargetFootprintCheck::Quarantine("required_service_provenance_missing")
+                TargetFootprintCheck::Quarantine(QuarantineReason::RequiredServiceProvenanceMissing)
             }
         }
-        Ok(_) => TargetFootprintCheck::Quarantine("service_requirement_pool_identity_changed"),
+        Ok(_) => TargetFootprintCheck::Quarantine(
+            QuarantineReason::ServiceRequirementPoolIdentityChanged,
+        ),
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            TargetFootprintCheck::Quarantine("service_requirement_unverifiable")
+            TargetFootprintCheck::Quarantine(QuarantineReason::ServiceRequirementUnverifiable)
         }
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            TargetFootprintCheck::Quarantine("service_requirement_pool_missing")
+            TargetFootprintCheck::Quarantine(QuarantineReason::ServiceRequirementPoolMissing)
         }
         Err(_) => TargetFootprintCheck::Retry("service_requirement_lookup_transient"),
     }
@@ -3612,13 +3608,17 @@ async fn validate_management_target_provenance(
         .as_ref()
         .and_then(|status| status.target.as_ref())
     else {
-        return TargetFootprintCheck::Quarantine("management_target_provenance_missing");
+        return TargetFootprintCheck::Quarantine(
+            QuarantineReason::ManagementTargetProvenanceMissing,
+        );
     };
     if target.namespace != ctx.namespace {
-        return TargetFootprintCheck::Quarantine("management_target_namespace_changed");
+        return TargetFootprintCheck::Quarantine(
+            QuarantineReason::ManagementTargetNamespaceChanged,
+        );
     }
     let Some(claim) = target.sandbox_claim.as_ref() else {
-        return TargetFootprintCheck::Quarantine("claim_provenance_missing");
+        return TargetFootprintCheck::Quarantine(QuarantineReason::ClaimProvenanceMissing);
     };
     if !recorded_reference_is_exact(
         claim,
@@ -3626,7 +3626,9 @@ async fn validate_management_target_provenance(
         SANDBOX_CLAIM_KIND,
         &ctx.namespace,
     ) {
-        return TargetFootprintCheck::Quarantine("management_target_provenance_invalid");
+        return TargetFootprintCheck::Quarantine(
+            QuarantineReason::ManagementTargetProvenanceInvalid,
+        );
     }
     if target.sandbox.as_ref().is_some_and(|sandbox| {
         !recorded_reference_is_exact(
@@ -3642,7 +3644,9 @@ async fn validate_management_target_provenance(
         || (target.pod.is_some() && target.sandbox.is_none())
         || (target.service.is_some() && target.sandbox.is_none())
     {
-        return TargetFootprintCheck::Quarantine("management_target_provenance_invalid");
+        return TargetFootprintCheck::Quarantine(
+            QuarantineReason::ManagementTargetProvenanceInvalid,
+        );
     }
     if lease
         .status
@@ -3651,13 +3655,13 @@ async fn validate_management_target_provenance(
         .is_some()
         && target.pod.is_none()
     {
-        return TargetFootprintCheck::Quarantine("pod_provenance_missing");
+        return TargetFootprintCheck::Quarantine(QuarantineReason::PodProvenanceMissing);
     }
     match target.service.as_ref() {
         Some(service) if recorded_reference_is_exact(service, "v1", "Service", &ctx.namespace) => {
             TargetFootprintCheck::Verified
         }
-        Some(_) => TargetFootprintCheck::Quarantine("service_provenance_invalid"),
+        Some(_) => TargetFootprintCheck::Quarantine(QuarantineReason::ServiceProvenanceInvalid),
         None => missing_service_provenance_is_allowed(lease, ctx).await,
     }
 }
@@ -3698,7 +3702,7 @@ async fn checkpoint_management_descendants(
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                "claim_absence_unverifiable",
+                QuarantineReason::ClaimAbsenceUnverifiable,
             ));
         }
         Err(_) => {
@@ -3727,7 +3731,7 @@ async fn checkpoint_management_descendants(
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                "sandbox_absence_unverifiable",
+                QuarantineReason::SandboxAbsenceUnverifiable,
             ));
         }
         Err(_) => {
@@ -3744,7 +3748,7 @@ async fn checkpoint_management_descendants(
         &claim_ref.uid,
     ) {
         return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-            "sandbox_owner_identity_changed",
+            QuarantineReason::SandboxOwnerIdentityChanged,
         ));
     }
     let sandbox_ref = match target_reference(
@@ -3756,7 +3760,7 @@ async fn checkpoint_management_descendants(
         Ok(reference) => reference,
         Err(_) => {
             return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                "sandbox_identity_unverifiable",
+                QuarantineReason::SandboxIdentityUnverifiable,
             ));
         }
     };
@@ -3766,7 +3770,7 @@ async fn checkpoint_management_descendants(
         .is_some_and(|recorded| recorded != &sandbox_ref)
     {
         return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-            "sandbox_identity_changed_during_teardown",
+            QuarantineReason::SandboxIdentityChangedDuringTeardown,
         ));
     }
 
@@ -3799,20 +3803,22 @@ async fn checkpoint_management_descendants(
                     Ok(reference) => proposed.service = Some(reference),
                     Err(_) => {
                         return ManagementDescendantCheckpoint::Check(
-                            TargetFootprintCheck::Quarantine("service_identity_unverifiable"),
+                            TargetFootprintCheck::Quarantine(
+                                QuarantineReason::ServiceIdentityUnverifiable,
+                            ),
                         );
                     }
                 }
             }
             Ok(_) => {
                 return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                    "service_owner_identity_changed",
+                    QuarantineReason::ServiceOwnerIdentityChanged,
                 ));
             }
             Err(kube::Error::Api(error)) if error.code == 404 => {}
             Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
                 return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                    "service_absence_unverifiable",
+                    QuarantineReason::ServiceAbsenceUnverifiable,
                 ));
             }
             Err(_) => {
@@ -3839,7 +3845,7 @@ async fn checkpoint_management_descendants(
             Ok(pods) => pods,
             Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
                 return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                    "pod_enumeration_unverifiable",
+                    QuarantineReason::PodEnumerationUnverifiable,
                 ));
             }
             Err(_) => {
@@ -3850,7 +3856,7 @@ async fn checkpoint_management_descendants(
         };
         if matching.items.len() > 1 {
             return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                "pod_selector_ambiguous",
+                QuarantineReason::PodSelectorAmbiguous,
             ));
         }
         if let Some(pod) = matching.items.into_iter().next() {
@@ -3862,14 +3868,14 @@ async fn checkpoint_management_descendants(
                 &sandbox_ref.uid,
             ) {
                 return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
-                    "pod_owner_identity_changed",
+                    QuarantineReason::PodOwnerIdentityChanged,
                 ));
             }
             match target_reference("v1", "Pod", &ctx.namespace, &pod) {
                 Ok(reference) => proposed.pod = Some(reference),
                 Err(_) => {
                     return ManagementDescendantCheckpoint::Check(
-                        TargetFootprintCheck::Quarantine("pod_identity_unverifiable"),
+                        TargetFootprintCheck::Quarantine(QuarantineReason::PodIdentityUnverifiable),
                     );
                 }
             }
@@ -3920,8 +3926,8 @@ async fn exact_object_absence(
 fn classify_exact_absence(
     absence: ExactObjectAbsence,
     present: &'static str,
-    replaced: &'static str,
-    unverifiable: &'static str,
+    replaced: QuarantineReason,
+    unverifiable: QuarantineReason,
     transient: &'static str,
 ) -> TargetFootprintCheck {
     match absence {
@@ -3968,7 +3974,7 @@ async fn exact_owned_storage_is_absent(
             })
             .collect(),
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return TargetFootprintCheck::Quarantine("pvc_enumeration_unverifiable");
+            return TargetFootprintCheck::Quarantine(QuarantineReason::PvcEnumerationUnverifiable);
         }
         Err(_) => return TargetFootprintCheck::Retry("pvc_enumeration_transient"),
     };
@@ -3991,7 +3997,7 @@ async fn exact_owned_storage_is_absent(
             })
             .count(),
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return TargetFootprintCheck::Quarantine("pv_enumeration_unverifiable");
+            return TargetFootprintCheck::Quarantine(QuarantineReason::PvEnumerationUnverifiable);
         }
         Err(_) => return TargetFootprintCheck::Retry("pv_enumeration_transient"),
     };
@@ -4007,7 +4013,7 @@ async fn exact_owned_storage_is_absent(
             pv_count = associated_volumes,
             "unexpected persistent storage is still associated with a Sandbox"
         );
-        TargetFootprintCheck::Quarantine("unexpected_persistent_storage")
+        TargetFootprintCheck::Quarantine(QuarantineReason::UnexpectedPersistentStorage)
     }
 }
 
@@ -4058,11 +4064,15 @@ async fn claim_labelled_sandboxes_absent(
             {
                 TargetFootprintCheck::Retry("claim_labelled_sandbox_still_present")
             }
-            Some(_) => TargetFootprintCheck::Quarantine("claim_labelled_sandbox_replaced"),
-            None => TargetFootprintCheck::Quarantine("claim_labelled_sandbox_unrecorded"),
+            Some(_) => {
+                TargetFootprintCheck::Quarantine(QuarantineReason::ClaimLabelledSandboxReplaced)
+            }
+            None => {
+                TargetFootprintCheck::Quarantine(QuarantineReason::ClaimLabelledSandboxUnrecorded)
+            }
         },
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            TargetFootprintCheck::Quarantine("sandbox_enumeration_unverifiable")
+            TargetFootprintCheck::Quarantine(QuarantineReason::SandboxEnumerationUnverifiable)
         }
         Err(_) => TargetFootprintCheck::Retry("sandbox_enumeration_transient"),
     }
@@ -4078,8 +4088,8 @@ async fn exact_owned_objects_absent(
     sandbox: &SandboxObjectReference,
     recorded: Option<&SandboxObjectReference>,
     present: &'static str,
-    replaced: &'static str,
-    unverifiable: &'static str,
+    replaced: QuarantineReason,
+    unverifiable: QuarantineReason,
     transient: &'static str,
 ) -> TargetFootprintCheck {
     match api.list(&ListParams::default()).await {
@@ -4129,7 +4139,7 @@ async fn unresolved_sandbox_children_absent(
     sandboxes: &Api<DynamicObject>,
     claim: &SandboxObjectReference,
     present: &'static str,
-    unverifiable: &'static str,
+    unverifiable: QuarantineReason,
     transient: &'static str,
 ) -> TargetFootprintCheck {
     let objects = match api.list(&ListParams::default()).await {
@@ -4220,7 +4230,7 @@ async fn management_target_footprint_absent(
         )
         || tombstone.name != claim.name
     {
-        return TargetFootprintCheck::Quarantine("claim_tombstone_provenance_invalid");
+        return TargetFootprintCheck::Quarantine(QuarantineReason::ClaimTombstoneProvenanceInvalid);
     }
     let sandbox = target.sandbox.as_ref();
 
@@ -4230,8 +4240,8 @@ async fn management_target_footprint_absent(
         let check = classify_exact_absence(
             exact_object_absence(&sandboxes, sandbox, claim).await,
             "sandbox_still_present",
-            "sandbox_identity_changed_during_teardown",
-            "sandbox_absence_unverifiable",
+            QuarantineReason::SandboxIdentityChangedDuringTeardown,
+            QuarantineReason::SandboxAbsenceUnverifiable,
             "sandbox_absence_transient",
         );
         if check != TargetFootprintCheck::Verified {
@@ -4248,8 +4258,8 @@ async fn management_target_footprint_absent(
         let check = classify_exact_absence(
             exact_object_absence(&pods, pod, sandbox).await,
             "pod_still_present",
-            "pod_identity_changed_during_teardown",
-            "pod_absence_unverifiable",
+            QuarantineReason::PodIdentityChangedDuringTeardown,
+            QuarantineReason::PodAbsenceUnverifiable,
             "pod_absence_transient",
         );
         if check != TargetFootprintCheck::Verified {
@@ -4266,8 +4276,8 @@ async fn management_target_footprint_absent(
         let check = classify_exact_absence(
             exact_object_absence(&services, service, sandbox).await,
             "service_still_present",
-            "service_identity_changed_during_teardown",
-            "service_absence_unverifiable",
+            QuarantineReason::ServiceIdentityChangedDuringTeardown,
+            QuarantineReason::ServiceAbsenceUnverifiable,
             "service_absence_transient",
         );
         if check != TargetFootprintCheck::Verified {
@@ -4293,8 +4303,8 @@ async fn management_target_footprint_absent(
                 sandbox,
                 target.pod.as_ref(),
                 "sandbox_owned_pod_still_present",
-                "sandbox_owned_pod_replaced",
-                "pod_enumeration_unverifiable",
+                QuarantineReason::SandboxOwnedPodReplaced,
+                QuarantineReason::PodEnumerationUnverifiable,
                 "pod_enumeration_transient",
             )
             .await,
@@ -4303,8 +4313,8 @@ async fn management_target_footprint_absent(
                 sandbox,
                 target.service.as_ref(),
                 "sandbox_owned_service_still_present",
-                "sandbox_owned_service_replaced",
-                "service_enumeration_unverifiable",
+                QuarantineReason::SandboxOwnedServiceReplaced,
+                QuarantineReason::ServiceEnumerationUnverifiable,
                 "service_enumeration_transient",
             )
             .await,
@@ -4321,7 +4331,7 @@ async fn management_target_footprint_absent(
                     &sandboxes,
                     claim_ref,
                     "unresolved_sandbox_owned_pod_present",
-                    "pod_owner_chain_unverifiable",
+                    QuarantineReason::PodOwnerChainUnverifiable,
                     "pod_owner_chain_transient",
                 )
                 .await,
@@ -4330,7 +4340,7 @@ async fn management_target_footprint_absent(
                     &sandboxes,
                     claim_ref,
                     "unresolved_sandbox_owned_service_present",
-                    "service_owner_chain_unverifiable",
+                    QuarantineReason::ServiceOwnerChainUnverifiable,
                     "service_owner_chain_transient",
                 )
                 .await,
@@ -4379,7 +4389,7 @@ async fn admission_only_management_footprint_absent(
         )
         || tombstone.name != claim_name(&lease.name_any())
     {
-        return TargetFootprintCheck::Quarantine("admission_only_provenance_invalid");
+        return TargetFootprintCheck::Quarantine(QuarantineReason::AdmissionOnlyProvenanceInvalid);
     }
 
     let sandboxes: Api<DynamicObject> =
@@ -4397,7 +4407,7 @@ async fn admission_only_management_footprint_absent(
                 &core_resource("Pod", "pods"),
             ),
             "admission_only_sandbox_owned_pod_present",
-            "pod_owner_chain_unverifiable",
+            QuarantineReason::PodOwnerChainUnverifiable,
             "pod_owner_chain_transient",
         ),
         (
@@ -4407,7 +4417,7 @@ async fn admission_only_management_footprint_absent(
                 &core_resource("Service", "services"),
             ),
             "admission_only_sandbox_owned_service_present",
-            "service_owner_chain_unverifiable",
+            QuarantineReason::ServiceOwnerChainUnverifiable,
             "service_owner_chain_transient",
         ),
     ] {
@@ -4470,7 +4480,7 @@ async fn pre_create_footprint_absent(
         )
         || tombstone.name != claim_name(&lease.name_any())
     {
-        return TargetFootprintCheck::Quarantine("pre_create_provenance_invalid");
+        return TargetFootprintCheck::Quarantine(QuarantineReason::PreCreateProvenanceInvalid);
     }
 
     // The child handle carries a whole nested cluster. Its deterministic name
@@ -4480,7 +4490,9 @@ async fn pre_create_footprint_absent(
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let handle = crate::controllers::sandbox_child::internal_lease_name(&lease.name_any());
     match internal.get(&handle).await {
-        Ok(_) => return TargetFootprintCheck::Quarantine("pre_create_child_handle_present"),
+        Ok(_) => {
+            return TargetFootprintCheck::Quarantine(QuarantineReason::PreCreateChildHandlePresent);
+        }
         Err(kube::Error::Api(error)) if error.code == 404 => {}
         Err(_) => return TargetFootprintCheck::Retry("pre_create_child_handle_unreadable"),
     }
@@ -4503,7 +4515,7 @@ async fn pre_create_footprint_absent(
                 &core_resource("Pod", "pods"),
             ),
             "pre_create_sandbox_owned_pod_present",
-            "pod_owner_chain_unverifiable",
+            QuarantineReason::PodOwnerChainUnverifiable,
             "pod_owner_chain_transient",
         ),
         (
@@ -4513,7 +4525,7 @@ async fn pre_create_footprint_absent(
                 &core_resource("Service", "services"),
             ),
             "pre_create_sandbox_owned_service_present",
-            "service_owner_chain_unverifiable",
+            QuarantineReason::ServiceOwnerChainUnverifiable,
             "service_owner_chain_transient",
         ),
     ] {
@@ -4580,10 +4592,20 @@ async fn checkpoint_never_started_management_claim(
         };
     }
     if next.claim_cleanup_fence != Some(crate::crd::SandboxClaimCleanupFence::FinalizerV1) {
-        return quarantine_lease(lease, ctx, "claim_provenance_missing_after_absence").await;
+        return quarantine_lease(
+            lease,
+            ctx,
+            QuarantineReason::ClaimProvenanceMissingAfterAbsence,
+        )
+        .await;
     }
     let Some(target) = next.target.as_mut() else {
-        return quarantine_lease(lease, ctx, "management_target_provenance_missing").await;
+        return quarantine_lease(
+            lease,
+            ctx,
+            QuarantineReason::ManagementTargetProvenanceMissing,
+        )
+        .await;
     };
     if target.namespace != ctx.namespace
         || target.sandbox_claim.is_some()
@@ -4595,7 +4617,12 @@ async fn checkpoint_never_started_management_claim(
         )
         || tombstone.name != claim_name(&lease.name_any())
     {
-        return quarantine_lease(lease, ctx, "claim_tombstone_provenance_invalid").await;
+        return quarantine_lease(
+            lease,
+            ctx,
+            QuarantineReason::ClaimTombstoneProvenanceInvalid,
+        )
+        .await;
     }
     target.sandbox_claim = Some(tombstone.clone());
     if patch_lease_status_fenced(ctx, lease, &next).await? {
@@ -4621,7 +4648,7 @@ async fn drive_release(
     // assigned a clean outcome safely, so hold its capacity for operator
     // review instead of inventing "Requested".
     if reason == ReleaseReason::MissingCause && status.release_cause.is_none() {
-        return quarantine_lease(lease, ctx, "release_cause_missing").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ReleaseCauseMissing).await;
     }
 
     // Make the intent visible in status first. Until the phase moves, capacity
@@ -4682,11 +4709,14 @@ async fn drive_release(
             Err(
                 crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
                 | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
-            ) => return quarantine_lease(lease, ctx, "access_drain_unverifiable").await,
+            ) => {
+                return quarantine_lease(lease, ctx, QuarantineReason::AccessDrainUnverifiable)
+                    .await;
+            }
             Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
                 response,
             ))) if response.code == 401 || response.code == 403 => {
-                return quarantine_lease(lease, ctx, "access_drain_forbidden").await;
+                return quarantine_lease(lease, ctx, QuarantineReason::AccessDrainForbidden).await;
             }
             Err(error) => {
                 warn!(lease = %name, error = %error, "could not prove Sandbox access drained");
@@ -4708,7 +4738,7 @@ async fn drive_release(
                 lease,
                 ctx,
                 "AllocationFenceInvalid",
-                reason,
+                reason.as_str(),
                 std::time::Duration::from_secs(300),
             )
             .await;
@@ -4766,7 +4796,8 @@ async fn drive_release(
             ))
         })?;
         if target.namespace != ctx.namespace || pod.name.is_empty() || pod.uid.is_empty() {
-            return quarantine_lease(lease, ctx, "credential_provenance_invalid").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::CredentialProvenanceInvalid)
+                .await;
         }
         match crate::api::sandbox_credentials::cleanup_scoped_identities(
             &ctx.client,
@@ -4782,7 +4813,12 @@ async fn drive_release(
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
             crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
-                return quarantine_lease(lease, ctx, "credential_cleanup_unverifiable").await;
+                return quarantine_lease(
+                    lease,
+                    ctx,
+                    QuarantineReason::CredentialCleanupUnverifiable,
+                )
+                .await;
             }
         }
     }
@@ -4904,7 +4940,8 @@ async fn drive_release(
                 }
             }
             Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-                return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
+                return quarantine_lease(lease, ctx, QuarantineReason::ClaimAbsenceUnverifiable)
+                    .await;
             }
             Err(error) => {
                 warn!(lease = %name, error = %error, "could not recover upstream claim identity");
@@ -4956,13 +4993,14 @@ async fn drive_release(
             ))
         })?;
         if !claim_is_for_lease(&observed, &lease_uid) {
-            return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ClaimIdentityUnverifiable).await;
         }
         if observed.metadata.deletion_timestamp.is_some() {
             if !metadata_has_no_owner_references(&observed.metadata)
                 || !sandbox_claim_cleanup_finalizer_present(&observed)
             {
-                return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
+                return quarantine_lease(lease, ctx, QuarantineReason::ClaimIdentityUnverifiable)
+                    .await;
             }
         } else {
             match ensure_management_claim_fenced(&claims, &observed, lease, &ctx.namespace).await? {
@@ -4972,7 +5010,12 @@ async fn drive_release(
                     return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                 }
                 ManagementClaimFence::Foreign => {
-                    return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ClaimIdentityUnverifiable,
+                    )
+                    .await;
                 }
             }
         }
@@ -5000,7 +5043,7 @@ async fn drive_release(
                 service_required: None,
             });
         if target.namespace != ctx.namespace {
-            return quarantine_lease(lease, ctx, "claim_namespace_changed").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ClaimNamespaceChanged).await;
         }
         target.sandbox_claim = Some(reference);
         if patch_lease_status_fenced(ctx, lease, &next).await? {
@@ -5017,7 +5060,7 @@ async fn drive_release(
         || recorded_claim.name != claim
         || recorded_claim.uid.is_empty()
     {
-        return quarantine_lease(lease, ctx, "claim_provenance_invalid").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ClaimProvenanceInvalid).await;
     }
 
     match checkpoint_management_descendants(lease, ctx, &claims).await {
@@ -5074,7 +5117,12 @@ async fn drive_release(
                 )
                 .is_err()
                 {
-                    return quarantine_lease(lease, ctx, "claim_tombstone_identity_changed").await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ClaimTombstoneIdentityChanged,
+                    )
+                    .await;
                 }
                 (tombstone_ref, prior_claim_uid)
             }
@@ -5115,7 +5163,12 @@ async fn checkpoint_child_receipt_absence(
     let status = lease.status.clone().unwrap_or_default();
     if let Some(existing) = status.child_teardown_receipt_acknowledgement.as_deref() {
         if existing != token {
-            return quarantine_lease(lease, ctx, "child_receipt_acknowledgement_changed").await;
+            return quarantine_lease(
+                lease,
+                ctx,
+                QuarantineReason::ChildReceiptAcknowledgementChanged,
+            )
+            .await;
         }
         if footprint_absence_proven(&status) {
             return Ok(Action::await_change());
@@ -5361,7 +5414,7 @@ enum RecordedChildAccess {
     /// Only a child Hyper/Service transport failure selects receipt fallback.
     TransportUnreachable,
     /// Identity, authentication, or credential ambiguity is not unreachability.
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 /// Re-authenticate one bound child through the exact Secret checkpoint.
@@ -5382,24 +5435,26 @@ async fn recorded_child_access(
         .as_ref()
         .and_then(|target| target.child_cluster_kubeconfig_secret.as_ref())
     else {
-        return RecordedChildAccess::Quarantine("child_kubeconfig_provenance_missing");
+        return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigProvenanceMissing);
     };
     let Some(recorded_digest) = status
         .target
         .as_ref()
         .and_then(|target| target.child_cluster_kubeconfig_sha256.as_deref())
     else {
-        return RecordedChildAccess::Quarantine("child_kubeconfig_provenance_missing");
+        return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigProvenanceMissing);
     };
     let secret_name = crate::backend::kubeconfig_secret_name(&instance.name);
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let secret = match secrets.get(&secret_name).await {
         Ok(secret) => secret,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_missing");
+            return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigSecretMissing);
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_forbidden");
+            return RecordedChildAccess::Quarantine(
+                QuarantineReason::ChildKubeconfigSecretForbidden,
+            );
         }
         Err(_) => {
             return RecordedChildAccess::Retry("child_kubeconfig_management_read_retry");
@@ -5408,28 +5463,32 @@ async fn recorded_child_access(
     let observation = match child_kubeconfig_secret_observation(&secret, &ctx.namespace, instance) {
         Ok(observation) => observation,
         Err(_) => {
-            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_malformed");
+            return RecordedChildAccess::Quarantine(
+                QuarantineReason::ChildKubeconfigSecretMalformed,
+            );
         }
     };
     if require_exact_child_kubeconfig_secret(recorded_secret, recorded_digest, &observation)
         .is_err()
     {
-        return RecordedChildAccess::Quarantine("child_kubeconfig_secret_replaced");
+        return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigSecretReplaced);
     }
     let kubeconfig = match String::from_utf8(observation.kubeconfig_payload) {
         Ok(kubeconfig) => kubeconfig,
         Err(_) => {
-            return RecordedChildAccess::Quarantine("child_kubeconfig_payload_invalid");
+            return RecordedChildAccess::Quarantine(
+                QuarantineReason::ChildKubeconfigPayloadInvalid,
+            );
         }
     };
     let child = match crate::backend::virtual_client_from_kubeconfig(&kubeconfig).await {
         Ok(child) => child,
         Err(_) => {
-            return RecordedChildAccess::Quarantine("child_kubeconfig_client_invalid");
+            return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigClientInvalid);
         }
     };
     let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
-        return RecordedChildAccess::Quarantine("child_parent_uid_missing");
+        return RecordedChildAccess::Quarantine(QuarantineReason::ChildParentUidMissing);
     };
     let namespaces: Api<Namespace> = Api::all(child.clone());
     match namespaces.get(CHILD_SANDBOX_NAMESPACE).await {
@@ -5438,9 +5497,9 @@ async fn recorded_child_access(
         {
             RecordedChildAccess::Reachable(child)
         }
-        Ok(_) => RecordedChildAccess::Quarantine("child_namespace_identity_changed"),
+        Ok(_) => RecordedChildAccess::Quarantine(QuarantineReason::ChildNamespaceIdentityChanged),
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            RecordedChildAccess::Quarantine("child_api_authentication_failed")
+            RecordedChildAccess::Quarantine(QuarantineReason::ChildApiAuthenticationFailed)
         }
         Err(kube::Error::Api(error)) if (500..=599).contains(&error.code) => {
             RecordedChildAccess::Retry("child_api_server_retry")
@@ -5448,8 +5507,10 @@ async fn recorded_child_access(
         Err(kube::Error::HyperError(_) | kube::Error::Service(_)) => {
             RecordedChildAccess::TransportUnreachable
         }
-        Err(kube::Error::Api(_)) => RecordedChildAccess::Quarantine("child_namespace_unverifiable"),
-        Err(_) => RecordedChildAccess::Quarantine("child_api_response_unverifiable"),
+        Err(kube::Error::Api(_)) => {
+            RecordedChildAccess::Quarantine(QuarantineReason::ChildNamespaceUnverifiable)
+        }
+        Err(_) => RecordedChildAccess::Quarantine(QuarantineReason::ChildApiResponseUnverifiable),
     }
 }
 
@@ -5464,7 +5525,7 @@ async fn checkpoint_child_teardown_mode(
     let mut next = lease.status.clone().unwrap_or_default();
     if let Some(current) = next.child_teardown_mode {
         if current != mode {
-            return quarantine_lease(lease, ctx, "child_teardown_mode_changed").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ChildTeardownModeChanged).await;
         }
         return Ok(Action::await_change());
     }
@@ -5618,11 +5679,16 @@ async fn recover_child_instance_identity(
     let Some(instance) = receipt_proven_child_instance(current, receipt, recorded, recorded_pool)
     else {
         warn!(lease = %name, "child receipt does not prove teardown of the handle's bound instance");
-        return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildReceiptDoesNotMatch).await;
     };
     let mut next = status.clone();
     let Some(target) = next.target.as_mut() else {
-        return quarantine_lease(lease, ctx, "child_composition_provenance_invalid").await;
+        return quarantine_lease(
+            lease,
+            ctx,
+            QuarantineReason::ChildCompositionProvenanceInvalid,
+        )
+        .await;
     };
     target.child_cluster_instance = Some(instance);
     if patch_lease_status_fenced(ctx, lease, &next).await? {
@@ -5642,7 +5708,7 @@ enum TornDownChildIdentity {
         )>,
     ),
     Retry,
-    Quarantine(&'static str),
+    Quarantine(QuarantineReason),
 }
 
 /// Recover the pool and instance of an unrecorded child handle whose instance
@@ -5660,29 +5726,41 @@ async fn recover_torn_down_child_identity(
     reference: &crate::crd::SandboxObjectReference,
 ) -> TornDownChildIdentity {
     let Some(status) = handle.status.as_ref() else {
-        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+        return TornDownChildIdentity::Quarantine(
+            QuarantineReason::ChildBindingIdentityUnverifiable,
+        );
     };
     let (Some(binding), Some(receipt)) =
         (status.binding.as_ref(), status.teardown_receipt.as_ref())
     else {
-        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+        return TornDownChildIdentity::Quarantine(
+            QuarantineReason::ChildBindingIdentityUnverifiable,
+        );
     };
     if binding.lease.name != reference.name
         || binding.lease.uid.as_deref() != Some(reference.uid.as_str())
     {
-        return TornDownChildIdentity::Quarantine("child_binding_identity_unverifiable");
+        return TornDownChildIdentity::Quarantine(
+            QuarantineReason::ChildBindingIdentityUnverifiable,
+        );
     }
     if validated_binding_receipt_token(handle, receipt, &ctx.namespace).is_none() {
-        return TornDownChildIdentity::Quarantine("child_receipt_does_not_match_precheckpoint");
+        return TornDownChildIdentity::Quarantine(
+            QuarantineReason::ChildReceiptDoesNotMatchPrecheckpoint,
+        );
     }
     let pools: Api<crate::crd::ClusterPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let live_pool = match pools.get(&binding.pool.name).await {
         Ok(pool) => pool,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            return TornDownChildIdentity::Quarantine("child_pool_provenance_unavailable");
+            return TornDownChildIdentity::Quarantine(
+                QuarantineReason::ChildPoolProvenanceUnavailable,
+            );
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return TornDownChildIdentity::Quarantine("child_pool_provenance_unverifiable");
+            return TornDownChildIdentity::Quarantine(
+                QuarantineReason::ChildPoolProvenanceUnverifiable,
+            );
         }
         Err(error) => {
             warn!(pool = %binding.pool.name, error = %error, "could not read the torn-down child's pool");
@@ -5698,7 +5776,7 @@ async fn recover_torn_down_child_identity(
         generation: live_pool.metadata.generation,
     };
     if !live_child_pool_matches_recorded(&live_pool, &pool, ChildPoolCheck::Teardown) {
-        return TornDownChildIdentity::Quarantine("child_pool_identity_changed");
+        return TornDownChildIdentity::Quarantine(QuarantineReason::ChildPoolIdentityChanged);
     }
     TornDownChildIdentity::Recovered(Box::new((
         pool,
@@ -5764,7 +5842,7 @@ async fn release_child_composition(
                         return quarantine_lease(
                             lease,
                             ctx,
-                            "child_composition_identity_unverifiable",
+                            QuarantineReason::ChildCompositionIdentityUnverifiable,
                         )
                         .await;
                     }
@@ -5778,18 +5856,27 @@ async fn release_child_composition(
                             return quarantine_lease(
                                 lease,
                                 ctx,
-                                "child_composition_identity_unverifiable",
+                                QuarantineReason::ChildCompositionIdentityUnverifiable,
                             )
                             .await;
                         }
                     }
                 }
                 let Some(unrecorded_uid) = unrecorded.uid().filter(|uid| !uid.is_empty()) else {
-                    return quarantine_lease(lease, ctx, "child_composition_uid_missing").await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildCompositionUidMissing,
+                    )
+                    .await;
                 };
                 let Some(unrecorded_generation) = unrecorded.metadata.generation else {
-                    return quarantine_lease(lease, ctx, "child_composition_generation_missing")
-                        .await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildCompositionGenerationMissing,
+                    )
+                    .await;
                 };
                 warn!(
                     lease = %name,
@@ -5860,7 +5947,7 @@ async fn release_child_composition(
                     return quarantine_lease(
                         lease,
                         ctx,
-                        "child_receipt_does_not_match_precheckpoint",
+                        QuarantineReason::ChildReceiptDoesNotMatchPrecheckpoint,
                     )
                     .await;
                 }
@@ -5898,7 +5985,7 @@ async fn release_child_composition(
                                 return quarantine_lease(
                                     lease,
                                     ctx,
-                                    "child_composition_generation_changed",
+                                    QuarantineReason::ChildCompositionGenerationChanged,
                                 )
                                 .await;
                             }
@@ -5936,7 +6023,7 @@ async fn release_child_composition(
                                     return Ok(Action::requeue(std::time::Duration::from_secs(15)));
                                 }
                                 TornDownChildIdentity::Quarantine(reason) => {
-                                    warn!(lease = %name, reason, "torn-down child identity is not recoverable");
+                                    warn!(lease = %name, reason = reason.as_str(), "torn-down child identity is not recoverable");
                                     return quarantine_lease(lease, ctx, reason).await;
                                 }
                             }
@@ -5946,7 +6033,7 @@ async fn release_child_composition(
                             return quarantine_lease(
                                 lease,
                                 ctx,
-                                "child_binding_identity_unverifiable",
+                                QuarantineReason::ChildBindingIdentityUnverifiable,
                             )
                             .await;
                         }
@@ -6006,7 +6093,7 @@ async fn release_child_composition(
                         return quarantine_lease(
                             lease,
                             ctx,
-                            "child_precheckpoint_state_unverifiable",
+                            QuarantineReason::ChildPrecheckpointStateUnverifiable,
                         )
                         .await;
                     }
@@ -6030,8 +6117,12 @@ async fn release_child_composition(
                                 service_required: None,
                             });
                     if target.namespace != CHILD_SANDBOX_NAMESPACE {
-                        return quarantine_lease(lease, ctx, "child_target_namespace_changed")
-                            .await;
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            QuarantineReason::ChildTargetNamespaceChanged,
+                        )
+                        .await;
                     }
                     target.child_cluster_lease = Some(reference);
                 }
@@ -6047,13 +6138,23 @@ async fn release_child_composition(
             // deterministic object is provenance loss, not proof that no
             // cluster was allocated; keep the slot withheld.
             Err(kube::Error::Api(error)) if error.code == 404 => {
-                return quarantine_lease(lease, ctx, "child_composition_provenance_missing").await;
+                return quarantine_lease(
+                    lease,
+                    ctx,
+                    QuarantineReason::ChildCompositionProvenanceMissing,
+                )
+                .await;
             }
             // Cannot tell whether a cluster is out there. Withhold rather than
             // release: an under-counted pool is recoverable, a stranded cluster
             // with its slot already returned is not.
             Err(_) => {
-                return quarantine_lease(lease, ctx, "child_composition_unverifiable").await;
+                return quarantine_lease(
+                    lease,
+                    ctx,
+                    QuarantineReason::ChildCompositionUnverifiable,
+                )
+                .await;
             }
         },
     };
@@ -6065,7 +6166,12 @@ async fn release_child_composition(
         || recorded.uid.is_empty()
         || recorded.generation.is_none()
     {
-        return quarantine_lease(lease, ctx, "child_composition_provenance_invalid").await;
+        return quarantine_lease(
+            lease,
+            ctx,
+            QuarantineReason::ChildCompositionProvenanceInvalid,
+        )
+        .await;
     }
     let recorded_instance = status
         .target
@@ -6098,8 +6204,12 @@ async fn release_child_composition(
                     chrono::Utc::now(),
                     true,
                 ) {
-                    return quarantine_lease(lease, ctx, "child_composition_identity_changed")
-                        .await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildCompositionIdentityChanged,
+                    )
+                    .await;
                 }
             } else {
                 match ensure_internal_lease_fenced(&internal, &current, lease).await? {
@@ -6109,8 +6219,12 @@ async fn release_child_composition(
                         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                     }
                     InternalHandleFence::Foreign => {
-                        return quarantine_lease(lease, ctx, "child_composition_identity_changed")
-                            .await;
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            QuarantineReason::ChildCompositionIdentityChanged,
+                        )
+                        .await;
                     }
                 }
             }
@@ -6121,7 +6235,12 @@ async fn release_child_composition(
             // the immutable evidence object created by the isolated authority.
             if let Some(receipt) = child_status.teardown_receipt.as_ref() {
                 let Some(recorded_pool) = recorded_pool else {
-                    return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildPoolProvenanceInvalid,
+                    )
+                    .await;
                 };
                 // Keep the immutable-evidence lookup off this already broad
                 // child teardown future. The controller is spawned on normal
@@ -6137,12 +6256,20 @@ async fn release_child_composition(
                 {
                     Ok(Some(evidence)) => evidence,
                     Ok(None) => {
-                        return quarantine_lease(lease, ctx, "child_receipt_authority_unverified")
-                            .await;
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            QuarantineReason::ChildReceiptAuthorityUnverified,
+                        )
+                        .await;
                     }
                     Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-                        return quarantine_lease(lease, ctx, "child_receipt_authority_unavailable")
-                            .await;
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            QuarantineReason::ChildReceiptAuthorityUnavailable,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         warn!(lease = %name, error = %error, "could not read authoritative teardown evidence");
@@ -6187,7 +6314,12 @@ async fn release_child_composition(
                     recorded_instance,
                     recorded_pool,
                 ) else {
-                    return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildReceiptDoesNotMatch,
+                    )
+                    .await;
                 };
                 if status.child_teardown_receipt_acknowledgement.as_deref() != Some(token.as_str())
                     || status.child_teardown_evidence.as_ref() != Some(&evidence)
@@ -6199,7 +6331,7 @@ async fn release_child_composition(
                         return quarantine_lease(
                             lease,
                             ctx,
-                            "child_receipt_acknowledgement_changed",
+                            QuarantineReason::ChildReceiptAcknowledgementChanged,
                         )
                         .await;
                     }
@@ -6238,7 +6370,8 @@ async fn release_child_composition(
             // repaired evidence while the handle still carries its earlier
             // Quarantined phase.
             if child_status.phase == crate::crd::LeasePhase::Quarantined {
-                return quarantine_lease(lease, ctx, "child_teardown_quarantined").await;
+                return quarantine_lease(lease, ctx, QuarantineReason::ChildTeardownQuarantined)
+                    .await;
             }
 
             // A terminal handle that never acquired either binding identity is
@@ -6256,7 +6389,7 @@ async fn release_child_composition(
                             return quarantine_lease(
                                 lease,
                                 ctx,
-                                "child_unbound_proof_checkpoint_changed",
+                                QuarantineReason::ChildUnboundProofCheckpointChanged,
                             )
                             .await;
                         }
@@ -6287,8 +6420,12 @@ async fn release_child_composition(
                     return finish_release(lease, ctx, reason).await;
                 }
                 if child_status.cluster_name.is_some() || recorded_instance.is_some() {
-                    return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable")
-                        .await;
+                    return quarantine_lease(
+                        lease,
+                        ctx,
+                        QuarantineReason::ChildBindingIdentityUnverifiable,
+                    )
+                    .await;
                 }
                 if matches!(
                     child_status.phase,
@@ -6310,13 +6447,13 @@ async fn release_child_composition(
         // receipt went with it, so there is nothing left that can prove this
         // lease's cluster was destroyed — and #74 is explicit that the
         // disappearance of a name is not evidence.
-        Ok(_) => quarantine_lease(lease, ctx, "child_receipt_unavailable").await,
+        Ok(_) => quarantine_lease(lease, ctx, QuarantineReason::ChildReceiptUnavailable).await,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            quarantine_lease(lease, ctx, "child_receipt_unavailable").await
+            quarantine_lease(lease, ctx, QuarantineReason::ChildReceiptUnavailable).await
         }
         // Cannot tell whether the tenant's cluster is still running.
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            quarantine_lease(lease, ctx, "child_absence_unverifiable").await
+            quarantine_lease(lease, ctx, QuarantineReason::ChildAbsenceUnverifiable).await
         }
         Err(error) => {
             warn!(lease = %name, error = %error, "could not check child cluster lease");
@@ -6347,11 +6484,12 @@ async fn release_bound_child_composition(
         .and_then(|target| target.child_cluster_instance.as_ref());
 
     if !crate::controllers::sandbox_child::internal_lease_has_secret_uid_protocol(current) {
-        return quarantine_lease(lease, ctx, "child_kubeconfig_protocol_missing").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildKubeconfigProtocolMissing)
+            .await;
     }
 
     let Some(recorded_pool) = recorded_child_pool(&status, &ctx.namespace) else {
-        return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildPoolProvenanceInvalid).await;
     };
 
     // A durable receipt/NeverBound proof is self-contained. The live pool is
@@ -6362,10 +6500,16 @@ async fn release_bound_child_composition(
     let live_pool = match cluster_pools.get(&recorded_pool.name).await {
         Ok(pool) => pool,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            return quarantine_lease(lease, ctx, "child_pool_provenance_unavailable").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ChildPoolProvenanceUnavailable)
+                .await;
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return quarantine_lease(lease, ctx, "child_pool_provenance_unverifiable").await;
+            return quarantine_lease(
+                lease,
+                ctx,
+                QuarantineReason::ChildPoolProvenanceUnverifiable,
+            )
+            .await;
         }
         Err(error) => {
             warn!(lease = %name, error = %error, "could not validate recorded child pool");
@@ -6373,7 +6517,7 @@ async fn release_bound_child_composition(
         }
     };
     if !live_child_pool_matches_recorded(&live_pool, recorded_pool, ChildPoolCheck::Teardown) {
-        return quarantine_lease(lease, ctx, "child_pool_identity_changed").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildPoolIdentityChanged).await;
     }
 
     // Resolve the reciprocal live lease/instance/pool tuple before release,
@@ -6402,7 +6546,12 @@ async fn release_bound_child_composition(
         Ok(Ok(resolved)) => resolved,
         Ok(Err(error)) => {
             warn!(lease = %name, reason = error.reason_code(), "child reciprocal binding is not valid for release");
-            return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable").await;
+            return quarantine_lease(
+                lease,
+                ctx,
+                QuarantineReason::ChildBindingIdentityUnverifiable,
+            )
+            .await;
         }
         Err(error) => {
             warn!(lease = %name, error = %error, "child binding resolver task did not complete");
@@ -6416,7 +6565,7 @@ async fn release_bound_child_composition(
         recorded_instance.is_some(),
         ChildPoolCheck::Teardown,
     ) {
-        return quarantine_lease(lease, ctx, "child_binding_provenance_changed").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildBindingProvenanceChanged).await;
     }
 
     // Binding may win after the handle checkpoint. Persist the exact validated
@@ -6425,10 +6574,12 @@ async fn release_bound_child_composition(
     if recorded_instance.is_none() {
         let mut next = status.clone();
         let Some(target) = next.target.as_mut() else {
-            return quarantine_lease(lease, ctx, "child_target_provenance_missing").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ChildTargetProvenanceMissing)
+                .await;
         };
         if target.namespace != CHILD_SANDBOX_NAMESPACE {
-            return quarantine_lease(lease, ctx, "child_target_namespace_changed").await;
+            return quarantine_lease(lease, ctx, QuarantineReason::ChildTargetNamespaceChanged)
+                .await;
         }
         target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
             api_version: "kobe.kunobi.ninja/v1alpha1".into(),
@@ -6454,12 +6605,17 @@ async fn release_bound_child_composition(
     );
     if internal_release_started && status.child_teardown_mode.is_none() {
         // Never reinterpret missing credentials after destruction started.
-        return quarantine_lease(lease, ctx, "child_teardown_mode_missing").await;
+        return quarantine_lease(lease, ctx, QuarantineReason::ChildTeardownModeMissing).await;
     }
 
     if status.child_teardown_mode.is_none() {
         let Some(expected_instance) = recorded_instance else {
-            return quarantine_lease(lease, ctx, "child_credential_target_unverifiable").await;
+            return quarantine_lease(
+                lease,
+                ctx,
+                QuarantineReason::ChildCredentialTargetUnverifiable,
+            )
+            .await;
         };
         let target = match status.target.as_ref() {
             Some(target)
@@ -6470,7 +6626,12 @@ async fn release_bound_child_composition(
                 target
             }
             _ => {
-                return quarantine_lease(lease, ctx, "child_credential_target_unverifiable").await;
+                return quarantine_lease(
+                    lease,
+                    ctx,
+                    QuarantineReason::ChildCredentialTargetUnverifiable,
+                )
+                .await;
             }
         };
         match recorded_child_access(lease, ctx, expected_instance).await {
@@ -6520,7 +6681,7 @@ async fn release_bound_child_composition(
                         return quarantine_lease(
                             lease,
                             ctx,
-                            "child_credential_target_unverifiable",
+                            QuarantineReason::ChildCredentialTargetUnverifiable,
                         )
                         .await;
                     };
@@ -6528,7 +6689,7 @@ async fn release_bound_child_composition(
                         return quarantine_lease(
                             lease,
                             ctx,
-                            "child_credential_target_unverifiable",
+                            QuarantineReason::ChildCredentialTargetUnverifiable,
                         )
                         .await;
                     }
@@ -6549,7 +6710,7 @@ async fn release_bound_child_composition(
                             return quarantine_lease(
                                 lease,
                                 ctx,
-                                "child_credential_cleanup_unverifiable",
+                                QuarantineReason::ChildCredentialCleanupUnverifiable,
                             )
                             .await;
                         }
@@ -6680,27 +6841,8 @@ async fn authoritative_child_receipt_matches(
     let evidence_api: Api<crate::crd::VerifiedTeardownEvidence> =
         Api::namespaced(client.clone(), namespace);
     let evidence = evidence_api.get(&reference.name).await?;
-    let expected_labels =
-        crate::crd::verified_teardown_evidence_labels(&lease_uid, &receipt.attempt_id);
-    let labels_match = expected_labels.iter().all(|(key, value)| {
-        evidence
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|live| live.get(key))
-            == Some(value)
-    });
-    let identity_matches = evidence.uid().as_deref() == Some(reference.uid.as_str())
-        && evidence.metadata.generation == Some(reference.generation)
-        && evidence.resource_version().as_deref() == Some(reference.resource_version.as_str())
-        && evidence.namespace().as_deref() == Some(namespace)
-        && evidence.metadata.deletion_timestamp.is_none()
-        && evidence
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(|owners| owners.is_empty())
-        && labels_match;
+    let identity_matches = evidence.is_referenced_by(reference)
+        && evidence.is_evidence_for(namespace, &lease_uid, &receipt.attempt_id);
     let content_matches = evidence.spec.lease.name == lease.name_any()
         && evidence.spec.lease.uid.as_deref() == Some(lease_uid.as_str())
         && evidence.spec.attempt_id == receipt.attempt_id
@@ -7324,27 +7466,9 @@ fn validated_binding_receipt_token(
     {
         return None;
     }
-    let mut required_subjects = manifest.required_subjects();
-    required_subjects.push(crate::crd::TeardownSubject::ConnectTokenSecret);
-    let mut recorded_identities = manifest.recorded_identities();
-    recorded_identities.push(connect_token.canonical_id());
-    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
-    let scope = crate::crd::TeardownScope {
-        lease: &binding.lease,
-        instance: &manifest.instance,
-        pool: &binding.pool,
-        backend_type: &backend_type,
-        config_digest: &binding.backend.config_digest,
-        instance_spec_digest: &binding.instance_spec_digest,
-        creation_manifest_digest: &manifest_digest,
-        cleanup_mode: binding.cleanup_mode,
-        attempt_id: durable_attempt,
-        creation_manifest: Some(manifest),
-        connect_token_identity: Some(connect_token),
-        required_subjects: &required_subjects,
-        instance_name: &binding.instance.name,
-        recorded_identities: &recorded_identities,
-    };
+    let plan =
+        crate::crd::BindingTeardownPlan::new(binding, manifest, manifest_digest, connect_token);
+    let scope = plan.scope(durable_attempt);
     receipt
         .permits_release_for(&scope)
         .then(|| receipt.acknowledgement_token())
@@ -7397,10 +7521,11 @@ fn live_child_pool_matches_recorded(
     recorded: &crate::crd::SandboxObjectReference,
     check: ChildPoolCheck,
 ) -> bool {
-    pool.name_any() == recorded.name
-        && pool.uid().as_deref() == Some(recorded.uid.as_str())
+    recorded
+        .namespace
+        .as_deref()
+        .is_some_and(|namespace| pool.is_recorded_pool(namespace, &recorded.name, &recorded.uid))
         && (check == ChildPoolCheck::Teardown || pool.metadata.generation == recorded.generation)
-        && pool.metadata.deletion_timestamp.is_none()
 }
 
 /// Validate the complete reciprocal tuple against the immutable outer status.
@@ -7572,7 +7697,7 @@ async fn acknowledge_child_proof(
 async fn quarantine_lease(
     lease: &SandboxLease,
     ctx: &SandboxContext,
-    reason: &str,
+    reason: QuarantineReason,
 ) -> Result<Action, SandboxPlacementError> {
     quarantine_lease_with_cause(lease, ctx, reason, None).await
 }
@@ -7590,7 +7715,7 @@ async fn quarantine_lease(
 async fn quarantine_unverifiable_gate(
     lease: &SandboxLease,
     ctx: &SandboxContext,
-    reason: &str,
+    reason: QuarantineReason,
 ) -> Result<Action, SandboxPlacementError> {
     quarantine_lease_with_cause(
         lease,
@@ -7604,13 +7729,13 @@ async fn quarantine_unverifiable_gate(
 async fn quarantine_lease_with_cause(
     lease: &SandboxLease,
     ctx: &SandboxContext,
-    reason: &str,
+    reason: QuarantineReason,
     stamp_cause: Option<crate::crd::SandboxReleaseCause>,
 ) -> Result<Action, SandboxPlacementError> {
     let name = lease.name_any();
     let mut next = lease.status.clone().unwrap_or_default();
     if footprint_absence_proven(&next) {
-        warn!(lease = %name, reason, "refusing to quarantine after footprint absence was proven");
+        warn!(lease = %name, reason = reason.as_str(), "refusing to quarantine after footprint absence was proven");
         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
     }
     let phase = crate::sandbox::transition_sandbox_phase(
@@ -7628,14 +7753,14 @@ async fn quarantine_lease_with_cause(
     next.conditions = with_cleanup_condition(
         lease,
         crate::crd::SandboxConditionStatus::False,
-        reason,
+        reason.as_str(),
         "Teardown could not be verified; capacity is withheld",
     );
     if !patch_lease_status_fenced(ctx, lease, &next).await? {
         debug!(lease = %name, "quarantine checkpoint lost a status race");
         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
     }
-    warn!(lease = %name, reason, "Sandbox lease quarantined; capacity withheld");
+    warn!(lease = %name, reason = reason.as_str(), "Sandbox lease quarantined; capacity withheld");
     Ok(Action::requeue(std::time::Duration::from_secs(300)))
 }
 
@@ -14786,7 +14911,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(proof, Action::await_change());
-        let stale_quarantine = quarantine_lease(&lease, &ctx, "stale_uncertainty")
+        let stale_quarantine = quarantine_lease(&lease, &ctx, QuarantineReason::StaleUncertainty)
             .await
             .unwrap();
         assert_eq!(
@@ -14833,7 +14958,7 @@ pub(crate) mod tests {
         mount_one_winning_status_patch(&server).await;
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
 
-        let quarantine = quarantine_lease(&lease, &ctx, "absence_unverifiable")
+        let quarantine = quarantine_lease(&lease, &ctx, QuarantineReason::AbsenceUnverifiable)
             .await
             .unwrap();
         assert_eq!(
@@ -14889,9 +15014,10 @@ pub(crate) mod tests {
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
         assert!(lease.status.as_ref().unwrap().release_cause.is_none());
 
-        let quarantine = quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable")
-            .await
-            .unwrap();
+        let quarantine =
+            quarantine_unverifiable_gate(&lease, &ctx, QuarantineReason::AccessGateUnverifiable)
+                .await
+                .unwrap();
         assert_eq!(
             quarantine,
             Action::requeue(std::time::Duration::from_secs(300))
@@ -19057,7 +19183,7 @@ current-context: child
 
         assert_eq!(
             validate_management_target_provenance(&lease, &ctx).await,
-            TargetFootprintCheck::Quarantine("required_service_provenance_missing")
+            TargetFootprintCheck::Quarantine(QuarantineReason::RequiredServiceProvenanceMissing)
         );
     }
 
@@ -19078,7 +19204,9 @@ current-context: child
 
         assert_eq!(
             validate_management_target_provenance(&lease, &ctx).await,
-            TargetFootprintCheck::Quarantine("service_requirement_pool_identity_changed")
+            TargetFootprintCheck::Quarantine(
+                QuarantineReason::ServiceRequirementPoolIdentityChanged
+            )
         );
         assert!(
             pool_was_read(&server).await,
