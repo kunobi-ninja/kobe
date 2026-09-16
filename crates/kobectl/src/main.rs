@@ -361,6 +361,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// List, switch, and define named targets
+    ///
+    /// With no subcommand, lists them.
+    Target {
+        #[command(subcommand)]
+        action: Option<TargetAction>,
+    },
 }
 
 /// Kind-specific adapters retained behind the hidden compatibility namespace.
@@ -486,42 +493,66 @@ enum ConfigAction {
         /// Target to edit [default: the current target]
         name: Option<String>,
     },
+    /// Same as `kobe target list`
+    #[command(hide = true)]
+    List,
+    /// Same as `kobe target current`
+    #[command(hide = true)]
+    Current,
+    /// Same as `kobe target use`
+    #[command(hide = true)]
+    Use(UseTargetArgs),
+    /// Same as `kobe target set`
+    #[command(hide = true)]
+    Set(SetTargetArgs),
+}
+
+/// Named targets: which Kobe server a command talks to, and how it signs in.
+#[derive(Subcommand)]
+enum TargetAction {
     /// List named targets
     List,
     /// Show the current target and where it was selected
     Current,
     /// Switch the current target for this shell
-    Use {
-        /// Target name
-        name: String,
-    },
+    Use(UseTargetArgs),
     /// Create or replace a named target
     ///
     /// Writes to `./.kobe.toml` so the target follows the project. Pass
     /// --global to write to `~/.config/kobe/config.json` instead, for
-    /// endpoints you use from any directory.
-    Set {
-        /// Target name
-        name: String,
-        /// Kobe server URL
-        #[arg(long, value_name = "URL")]
-        endpoint: String,
-        /// Auth mode: none, token, oidc, or ssh
-        #[arg(long, value_name = "MODE")]
-        auth: Option<String>,
-        /// Bearer token for --auth token
-        #[arg(long)]
-        token: Option<String>,
-        /// SSH key fingerprint for --auth ssh
-        #[arg(long = "ssh-fingerprint", value_name = "FINGERPRINT")]
-        ssh_fingerprint: Option<String>,
-        /// Pool that `ssh kobe-<name>` uses when the host name does not name one
-        #[arg(long = "default-pool", value_name = "POOL")]
-        default_pool: Option<String>,
-        /// Write to `~/.config/kobe/config.json` instead of `./.kobe.toml`
-        #[arg(long)]
-        global: bool,
-    },
+    /// endpoints you use from any directory. Then switch to it with `kobe
+    /// target use NAME`.
+    Set(SetTargetArgs),
+}
+
+#[derive(clap::Args)]
+struct UseTargetArgs {
+    /// Target name
+    name: String,
+}
+
+#[derive(clap::Args)]
+struct SetTargetArgs {
+    /// Target name
+    name: String,
+    /// Kobe server URL
+    #[arg(long, value_name = "URL")]
+    endpoint: String,
+    /// Auth mode: none, token, oidc, or ssh
+    #[arg(long, value_name = "MODE")]
+    auth: Option<String>,
+    /// Bearer token for --auth token
+    #[arg(long)]
+    token: Option<String>,
+    /// SSH key fingerprint for --auth ssh
+    #[arg(long = "ssh-fingerprint", value_name = "FINGERPRINT")]
+    ssh_fingerprint: Option<String>,
+    /// Pool that `ssh kobe-<name>` uses when the host name does not name one
+    #[arg(long = "default-pool", value_name = "POOL")]
+    default_pool: Option<String>,
+    /// Write to `~/.config/kobe/config.json` instead of `./.kobe.toml`
+    #[arg(long)]
+    global: bool,
 }
 
 #[tokio::main]
@@ -822,6 +853,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 commands::config_interactive(name.as_deref().or(target))
             }
+            // The target subcommands lived here before `kobe target`; the
+            // old spellings stay parseable so scripts keep working.
+            Some(ConfigAction::List) => run_target_action(TargetAction::List, output).await,
+            Some(ConfigAction::Current) => run_target_action(TargetAction::Current, output).await,
+            Some(ConfigAction::Use(args)) => {
+                run_target_action(TargetAction::Use(args), output).await
+            }
+            Some(ConfigAction::Set(args)) => {
+                run_target_action(TargetAction::Set(args), output).await
+            }
             // Bare `kobe config` opens the editor when a person is at the
             // keyboard. Scripts and `-o json` get the subcommand list instead,
             // because a raw-mode editor would hang a pipe.
@@ -831,32 +872,11 @@ async fn main() -> anyhow::Result<()> {
             {
                 commands::config_interactive(target)
             }
-            Some(ConfigAction::List) => commands::config_list_targets(output).await,
-            Some(ConfigAction::Current) => commands::config_current_target(output).await,
-            Some(ConfigAction::Use { name }) => commands::config_use_target(&name, output).await,
-            Some(ConfigAction::Set {
-                name,
-                endpoint,
-                auth,
-                token,
-                ssh_fingerprint,
-                default_pool,
-                global,
-            }) => {
-                commands::config_set_target(commands::SetTargetCommand {
-                    name: &name,
-                    endpoint: &endpoint,
-                    auth: auth.as_deref(),
-                    token: token.as_deref(),
-                    ssh_fingerprint: ssh_fingerprint.as_deref(),
-                    default_pool: default_pool.as_deref(),
-                    global,
-                    output,
-                })
-                .await
-            }
             None => exit_with_config_help(),
         },
+        Commands::Target { action } => {
+            run_target_action(action.unwrap_or(TargetAction::List), output).await
+        }
     };
     // One place decides how a failure reaches the caller: every command
     // prints the same `kobe:` prefix in text mode and the same structured
@@ -1093,6 +1113,37 @@ fn requests_resource_json(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
+async fn run_target_action(action: TargetAction, output: OutputFormat) -> anyhow::Result<()> {
+    match action {
+        TargetAction::List => commands::config_list_targets(output).await,
+        TargetAction::Current => commands::config_current_target(output).await,
+        TargetAction::Use(UseTargetArgs { name }) => {
+            commands::config_use_target(&name, output).await
+        }
+        TargetAction::Set(SetTargetArgs {
+            name,
+            endpoint,
+            auth,
+            token,
+            ssh_fingerprint,
+            default_pool,
+            global,
+        }) => {
+            commands::config_set_target(commands::SetTargetCommand {
+                name: &name,
+                endpoint: &endpoint,
+                auth: auth.as_deref(),
+                token: token.as_deref(),
+                ssh_fingerprint: ssh_fingerprint.as_deref(),
+                default_pool: default_pool.as_deref(),
+                global,
+                output,
+            })
+            .await
+        }
+    }
+}
+
 /// Print `kobe config`'s help to stderr and exit 2, like any other missing
 /// subcommand. Rendering from the built root keeps the usage line reading
 /// `kobe config` instead of a bare `config`.
@@ -1266,5 +1317,47 @@ mod tests {
         };
         assert_eq!(target.as_deref(), Some("dev"));
         assert_eq!(ttl, "30m");
+    }
+
+    /// `kobe target` owns the target commands; the `kobe config` spellings
+    /// they had before must keep parsing, because scripts call them.
+    #[test]
+    fn target_commands_parse_under_both_spellings() {
+        let cli = Cli::try_parse_from(["kobe", "target"]).unwrap();
+        assert!(matches!(cli.command, Commands::Target { action: None }));
+
+        let cli = Cli::try_parse_from(["kobe", "target", "set", "prod", "--endpoint", "https://k"])
+            .unwrap();
+        let Commands::Target {
+            action: Some(TargetAction::Set(args)),
+        } = cli.command
+        else {
+            panic!("expected target set")
+        };
+        assert_eq!(
+            (args.name.as_str(), args.endpoint.as_str()),
+            ("prod", "https://k")
+        );
+
+        for legacy in [
+            vec!["kobe", "config", "list"],
+            vec!["kobe", "config", "current"],
+            vec!["kobe", "config", "use", "prod"],
+            vec!["kobe", "config", "set", "prod", "--endpoint", "https://k"],
+        ] {
+            let cli = Cli::try_parse_from(&legacy).unwrap();
+            assert!(
+                matches!(cli.command, Commands::Config { action: Some(_) }),
+                "{legacy:?}"
+            );
+        }
+    }
+
+    /// Bare `kobe config` is not a parse error: it opens the editor or
+    /// prints the subcommand list, decided after parsing.
+    #[test]
+    fn bare_config_parses_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["kobe", "config"]).unwrap();
+        assert!(matches!(cli.command, Commands::Config { action: None }));
     }
 }

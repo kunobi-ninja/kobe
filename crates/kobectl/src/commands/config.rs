@@ -9,7 +9,7 @@ use super::{OutputFormat, print_json};
 
 /// Where a target definition lives. Computed during `CliConfig::load`
 /// based on which file each target appears in. Not serialized — pure
-/// runtime metadata for `kobe config list` / `current` UX.
+/// runtime metadata for `kobe target list` / `current` UX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
@@ -18,7 +18,7 @@ pub enum Scope {
     /// Defined only in the local project config (`./.kobe.toml`).
     Local,
     /// Defined in BOTH global and local. The local definition wins
-    /// when resolving (overlay order). `kobe config list` flags these
+    /// when resolving (overlay order). `kobe target list` flags these
     /// so users see the conflict instead of being silently surprised.
     Both,
 }
@@ -356,7 +356,7 @@ impl CliConfig {
     ///
     /// 1. `--target <name>` flag (one-shot, no persistence).
     /// 2. **Per-shell session file** at `<cache>/sessions/<ppid>.json`
-    ///    (set by `kobe config use <name>`). Different terminal
+    ///    (set by `kobe target use <name>`). Different terminal
     ///    windows resolve independently because their parent shells
     ///    have distinct PIDs. See `session.rs`.
     /// 3. Legacy `current_target` field in the config file (kept for
@@ -383,7 +383,7 @@ impl CliConfig {
                 .or_else(|| self.current_target.clone());
             if let Some(name) = target_name {
                 let target = self.targets.get(&name).ok_or_else(|| {
-                    anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
+                    anyhow::anyhow!("Unknown target '{name}'. Run: kobe target list")
                 })?;
                 return Ok(ResolvedConfig {
                     target: Some(name),
@@ -414,7 +414,7 @@ impl CliConfig {
             let target = self
                 .targets
                 .get(&name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe target list"))?;
 
             return Ok(ResolvedConfig {
                 target: Some(name),
@@ -440,14 +440,14 @@ impl CliConfig {
         if !self.targets.is_empty() {
             anyhow::bail!(
                 "No current target configured for this shell. \
-                 Run: kobe config use <name> (active for this terminal only) \
+                 Run: kobe target use <name> (active for this terminal only) \
                  or pass --target <name>. \
-                 Available targets: kobe config list."
+                 Available targets: kobe target list."
             );
         }
 
         anyhow::bail!(
-            "No endpoint configured. Run: kobe config set <name> --endpoint <url> ..., use kobe config import, or pass --endpoint <url>"
+            "No endpoint configured. Run: kobe target set <name> --endpoint <url> ..., use kobe config import, or pass --endpoint <url>"
         )
     }
 }
@@ -536,9 +536,9 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
 /// endpoints you reuse across many projects.
 ///
 /// Does NOT touch the active-target session file. Defining a target
-/// and switching to it are separate operations; run `kobe config use
+/// and switching to it are separate operations; run `kobe target use
 /// <name>` afterwards to make it active for this shell.
-/// Arguments of `kobe config set`.
+/// Arguments of `kobe target set`.
 pub struct SetTargetCommand<'a> {
     pub name: &'a str,
     pub endpoint: &'a str,
@@ -593,7 +593,7 @@ pub async fn config_set_target(command: SetTargetCommand<'_>) -> Result<()> {
         OutputFormat::Text => {
             println!("Set target {name}");
             println!("Wrote: {}", written_path.display());
-            println!("(use this target now: kobe config use {name})");
+            println!("(use this target now: kobe target use {name})");
         }
         OutputFormat::Json => print_json(&TargetMutationOutput {
             name,
@@ -637,7 +637,7 @@ pub async fn config_use_target(name: &str, output: OutputFormat) -> Result<()> {
     let config = CliConfig::load()?;
     if !config.targets.contains_key(name) {
         anyhow::bail!(
-            "Unknown target '{name}'. Run: kobe config list (or define one with: kobe config set {name} --endpoint <url>)"
+            "Unknown target '{name}'. Run: kobe target list (or define one with: kobe target set {name} --endpoint <url>)"
         );
     }
 
@@ -672,8 +672,8 @@ pub async fn config_current_target(output: OutputFormat) -> Result<()> {
             None => {
                 anyhow::bail!(
                     "No active target set for this shell. \
-                     Run: kobe config use <name>. \
-                     Available targets: kobe config list."
+                     Run: kobe target use <name>. \
+                     Available targets: kobe target list."
                 )
             }
         },
@@ -681,7 +681,7 @@ pub async fn config_current_target(output: OutputFormat) -> Result<()> {
 
     if !config.targets.contains_key(&current_target) {
         anyhow::bail!(
-            "Active target '{current_target}' is not defined. Run: kobe config list (or remove the stale state with: kobe config use <other>)."
+            "Active target '{current_target}' is not defined. Run: kobe target list (or remove the stale state with: kobe target use <other>)."
         );
     }
 
@@ -692,7 +692,7 @@ pub async fn config_current_target(output: OutputFormat) -> Result<()> {
                 path.display()
             ),
             None => println!(
-                "{current_target}\n  source: legacy config file (consider running: kobe config use {current_target})"
+                "{current_target}\n  source: legacy config file (consider running: kobe target use {current_target})"
             ),
         },
         OutputFormat::Json => {
@@ -901,7 +901,7 @@ fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()>
         } else {
             println!("resolved: none");
             println!(
-                "hint:     run 'kobe config set <name> --endpoint <url> ...' or pass --endpoint"
+                "hint:     run 'kobe target set <name> --endpoint <url> ...' or pass --endpoint"
             );
         }
         return Ok(());
@@ -1440,8 +1440,8 @@ mod tests {
     }
 
     /// The two "nothing resolved" failures give different advice:
-    /// with targets defined the user needs `kobe config use`, without
-    /// them they need `kobe config set`. Pin both, because the message
+    /// with targets defined the user needs `kobe target use`, without
+    /// them they need `kobe target set`. Pin both, because the message
     /// *is* the UX for a first-run user.
     #[test]
     fn resolve_error_distinguishes_no_active_target_from_no_config_at_all() {
@@ -1449,13 +1449,13 @@ mod tests {
 
         let with_targets = config_with(&[("prod", "https://prod.test")]);
         let err = with_targets.resolve(None, None).unwrap_err().to_string();
-        assert!(err.contains("kobe config use <name>"), "got: {err}");
+        assert!(err.contains("kobe target use <name>"), "got: {err}");
 
         let empty = CliConfig::default();
         let err = empty.resolve(None, None).unwrap_err().to_string();
-        assert!(err.contains("kobe config set <name>"), "got: {err}");
+        assert!(err.contains("kobe target set <name>"), "got: {err}");
         assert!(
-            !err.contains("kobe config use"),
+            !err.contains("kobe target use"),
             "must not suggest selecting among zero targets: {err}"
         );
     }
@@ -1553,7 +1553,7 @@ mod tests {
     /// The local project file is TOML. A target defined there must
     /// survive `toml::to_string_pretty` → `toml::from_str`, which is
     /// exactly what `write_target_to_local` does on every
-    /// `kobe config set`.
+    /// `kobe target set`.
     #[test]
     fn local_target_round_trips_through_toml() {
         let mut local = CliConfig::default();
@@ -1579,7 +1579,7 @@ mod tests {
     /// `./.kobe.toml` before adding the new target. If that file still
     /// carries pre-targets flat keys (`endpoint`, `token`, …), the
     /// struct now holds a scalar *after* a table — the classic TOML
-    /// "values must be emitted before tables" hazard. `kobe config set`
+    /// "values must be emitted before tables" hazard. `kobe target set`
     /// must not blow up on such a file.
     #[test]
     fn local_config_with_both_flat_legacy_keys_and_targets_still_serializes() {
