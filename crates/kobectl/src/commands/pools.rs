@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::config::ResolvedConfig;
 use super::leases::LeaseSummary;
-use super::{OutputFormat, authed_client, get_auth_header_for_output, with_auth};
+use super::{OutputFormat, Reaching, authed_client, get_auth_header_for_output, with_auth};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,7 +95,8 @@ pub(crate) async fn fetch_pools_for_config_with_output(
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/pools")), &token)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to list pools (HTTP {})", response.status());
@@ -117,7 +118,8 @@ pub(crate) async fn fetch_pool_for_config_with_output(
         &token,
     )
     .send()
-    .await?;
+    .await
+    .reaching(config)?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();

@@ -9,7 +9,7 @@ use super::state::{
     endpoint_kubeconfigs, find_orphan_kubeconfigs, forget_endpoint_kubeconfigs, forget_kubeconfig,
     local_kubeconfig_candidates, remove_kubeconfig,
 };
-use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +69,8 @@ pub async fn purge(
         let token = get_auth_header(&config, "DELETE", &path, b"").await?;
         let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
             .send()
-            .await?;
+            .await
+            .reaching(&config)?;
         match response.status().as_u16() {
             200..=299 | 404 => {
                 if !lease.is_sandbox() {
