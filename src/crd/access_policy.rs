@@ -162,6 +162,26 @@ pub struct SandboxAccessRule {
     /// Maximum runtime TTL, starting only once the Sandbox is Ready.
     #[schemars(length(min = 1))]
     pub max_ttl: String,
+    /// How long a lease may go untouched before it can no longer be extended.
+    ///
+    /// Absent keeps the original behaviour: an extension may never move expiry
+    /// past `max_ttl` measured from readiness, so a lease has a fixed lifetime
+    /// however actively it is used. That ceiling measures age, and age is not
+    /// abandonment — a box used every day and one forgotten yesterday are
+    /// identical when measured from `readyAt`.
+    ///
+    /// Present, each extension is bounded by `now + maxIdle` instead. A caller
+    /// that keeps extending keeps its box; one that stops loses it within
+    /// `maxIdle` of the last extension. Reclaiming abandoned capacity is what
+    /// the original ceiling was for, and this reclaims on the signal that
+    /// actually means abandoned.
+    ///
+    /// `maxExtensions` does not apply while this is set. Bounding the *count*
+    /// of extensions would cap the lifetime again and defeat the point; the
+    /// idle window is the control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub max_idle: Option<String>,
     /// Maximum active Sandbox leases for this identity, separate from Cluster
     /// lease concurrency.
     pub max_concurrent_leases: u32,

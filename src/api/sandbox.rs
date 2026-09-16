@@ -4971,17 +4971,6 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
             "not_ready",
         );
     }
-    if status.extensions_count >= grant.max_extensions {
-        return sandbox_error_with_reason(
-            StatusCode::CONFLICT,
-            "Maximum Sandbox lease extensions reached",
-            Some(format!(
-                "{} of {} already used",
-                status.extensions_count, grant.max_extensions
-            )),
-            "extension_budget_exhausted",
-        );
-    }
 
     let Some(extension) = parse_duration(&request.extend_ttl) else {
         return sandbox_error(
@@ -5035,19 +5024,8 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     // never have requested at creation - which is what made reusing the
     // `lease` verb defensible in the first place.
     let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
-    let pool_max_ttl = match pools.get(&lease.spec.pool_ref.name).await {
-        Ok(pool) => match parse_duration(&pool.spec.max_ttl)
-            .filter(|duration| *duration > chrono::Duration::zero())
-        {
-            Some(duration) => duration,
-            None => {
-                return sandbox_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "SandboxPool maximum TTL is invalid",
-                    None,
-                );
-            }
-        },
+    let pool_spec = match pools.get(&lease.spec.pool_ref.name).await {
+        Ok(pool) => pool.spec,
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return sandbox_error(
                 StatusCode::CONFLICT,
@@ -5056,6 +5034,37 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
             );
         }
         Err(err) => return sandbox_infra_error("Failed to read the SandboxPool", err),
+    };
+    let Some(pool_max_ttl) =
+        parse_duration(&pool_spec.max_ttl).filter(|duration| *duration > chrono::Duration::zero())
+    else {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SandboxPool maximum TTL is invalid",
+            None,
+        );
+    };
+    // The idle window is the administrator's to offer. A grant may narrow one
+    // the pool declares, but it cannot introduce one: a policy that could would
+    // hand a caller unbounded lifetime on a pool whose operator never agreed to
+    // it, which is the same escalation the `maxTtl` clamp above exists to stop.
+    let max_idle = match pool_spec.max_idle.as_deref() {
+        None => None,
+        Some(raw) => {
+            let Some(pool_idle) =
+                parse_duration(raw).filter(|duration| *duration > chrono::Duration::zero())
+            else {
+                return sandbox_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SandboxPool idle window is invalid",
+                    None,
+                );
+            };
+            Some(match grant.max_idle {
+                Some(grant_idle) => pool_idle.min(grant_idle),
+                None => pool_idle,
+            })
+        }
     };
 
     // Refuse to extend a status whose expiry is not the value this derivation
@@ -5081,14 +5090,51 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
         );
     }
 
+    // The count budget rations how incrementally a caller reaches a FIXED
+    // ceiling. With an idle window there is no fixed ceiling to ration, and a
+    // count would quietly become the lifetime limit again — the exact shape the
+    // idle window replaces. Checked here rather than earlier because whether it
+    // applies is not known until the pool has been read.
+    if max_idle.is_none() && status.extensions_count >= grant.max_extensions {
+        return sandbox_error_with_reason(
+            StatusCode::CONFLICT,
+            "Maximum Sandbox lease extensions reached",
+            Some(format!(
+                "{} of {} already used",
+                status.extensions_count, grant.max_extensions
+            )),
+            "extension_budget_exhausted",
+        );
+    }
+
     let new_expiry = current_expiry + extension;
-    let ceiling = ready_at + grant.max_ttl.min(pool_max_ttl);
+    // Two ceilings, and which one applies is the pool's decision.
+    //
+    // Without an idle window the ceiling is anchored at readiness, so a lease
+    // has a fixed lifetime however actively it is used. With one it is anchored
+    // at NOW, so extending is always possible and stopping is what ends the
+    // lease — within `max_idle` of the last extension. That is the same
+    // reclamation the fixed ceiling was for, keyed on abandonment instead of
+    // age.
+    //
+    // Both take the LOWER of the caller's grant and the pool's own maximum,
+    // exactly as creation clamps it. Using the grant alone let a caller extend
+    // past an administrator's pool limit to runtime they could never have
+    // requested at creation - which is what made reusing the `lease` verb
+    // defensible in the first place.
+    let (ceiling, reason) = match max_idle {
+        Some(idle) => (chrono::Utc::now() + idle, "max_idle_ceiling"),
+        None => (
+            ready_at + grant.max_ttl.min(pool_max_ttl),
+            "max_ttl_ceiling",
+        ),
+    };
     if new_expiry > ceiling {
         return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Extension would exceed the maximum Sandbox TTL",
             Some(format!("maximum expiry is {}", ceiling.to_rfc3339())),
-            "max_ttl_ceiling",
+            reason,
         );
     }
 
@@ -8293,6 +8339,7 @@ mod tests {
                         SandboxVerb::Release,
                     ],
                     max_ttl: chrono::Duration::hours(2),
+                    max_idle: None,
                     max_concurrent_leases: 2,
                     max_extensions: 2,
                     resource_ceiling: SandboxResourceCeiling {
@@ -9861,6 +9908,16 @@ mod tests {
         server: &MockServer,
         lease: serde_json::Value,
     ) -> Arc<std::sync::Mutex<Option<serde_json::Value>>> {
+        mount_extendable_with_pool(server, lease, pool_json()).await
+    }
+
+    /// As [`mount_extendable`], with the served pool spelled out so a test can
+    /// give it a `maxIdle`.
+    async fn mount_extendable_with_pool(
+        server: &MockServer,
+        lease: serde_json::Value,
+        pool: serde_json::Value,
+    ) -> Arc<std::sync::Mutex<Option<serde_json::Value>>> {
         let name = lease["metadata"]["name"].as_str().unwrap().to_string();
         let lease_path = sandbox_lease_path(&name);
         mount_sandbox_crds(server).await;
@@ -9868,7 +9925,7 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
             .mount(server)
             .await;
         Mock::given(method("GET"))
@@ -10068,6 +10125,119 @@ mod tests {
 
         let response = extend(&server, "sandbox-budget", "1m").await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    /// The pool's `maxIdle`, with a generous window.
+    fn pool_json_with_max_idle(max_idle: &str) -> serde_json::Value {
+        let mut pool = pool_json();
+        pool["spec"]["maxIdle"] = serde_json::json!(max_idle);
+        pool
+    }
+
+    /// An idle window replaces the fixed ceiling rather than adding to it.
+    ///
+    /// This is the same request `extension_cannot_exceed_the_granted_runtime_ceiling`
+    /// asserts is refused: the fixture's effective fixed ceiling is `readyAt + 2h`
+    /// and `+2h` lands past it. With an idle window the ceiling is anchored at
+    /// now instead, so a lease being actively extended is no longer bounded by
+    /// how long ago it started — which is the whole point.
+    #[tokio::test]
+    async fn an_idle_window_lets_a_lease_extend_past_the_fixed_ceiling() {
+        let server = MockServer::start().await;
+        let captured = mount_extendable_with_pool(
+            &server,
+            extendable_lease_json("sandbox-idle-extends", 0),
+            pool_json_with_max_idle("24h"),
+        )
+        .await;
+
+        let response = extend(&server, "sandbox-idle-extends", "2h").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an idle window must not inherit the readiness-anchored ceiling"
+        );
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "a granted extension writes status"
+        );
+    }
+
+    /// The window is still a ceiling: it bounds how far ahead expiry may be
+    /// pushed in one step, so an abandoned lease is reclaimed within it.
+    #[tokio::test]
+    async fn an_idle_window_still_bounds_how_far_expiry_may_move() {
+        let server = MockServer::start().await;
+        let captured = mount_extendable_with_pool(
+            &server,
+            extendable_lease_json("sandbox-idle-bounded", 0),
+            pool_json_with_max_idle("30m"),
+        )
+        .await;
+
+        // Expiry is already readyAt + 1h, so any extension lands well past a
+        // 30m window measured from now.
+        let response = extend(&server, "sandbox-idle-bounded", "2h").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "a refused extension must not write status"
+        );
+    }
+
+    /// The count budget rations progress toward a FIXED ceiling. With an idle
+    /// window there is no fixed ceiling to ration, and leaving the count in
+    /// force would quietly restore the lifetime limit the window replaces —
+    /// five extensions and the box dies however actively it is used.
+    #[tokio::test]
+    async fn an_idle_window_suspends_the_extension_count_budget() {
+        let server = MockServer::start().await;
+        // identity() grants two extensions, and this lease has spent both.
+        let captured = mount_extendable_with_pool(
+            &server,
+            extendable_lease_json("sandbox-idle-budget", 2),
+            pool_json_with_max_idle("24h"),
+        )
+        .await;
+
+        let response = extend(&server, "sandbox-idle-budget", "1m").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a spent count budget must not cap a lease bounded by idleness"
+        );
+        assert!(captured.lock().unwrap().is_some());
+    }
+
+    /// A grant may narrow an idle window the pool offers; it may not create
+    /// one. Otherwise a policy could hand its holder unbounded lifetime on a
+    /// pool whose administrator never agreed to it — the same escalation the
+    /// `maxTtl` clamp exists to stop.
+    #[tokio::test]
+    async fn a_grant_cannot_introduce_an_idle_window_the_pool_does_not_offer() {
+        let server = MockServer::start().await;
+        let captured =
+            mount_extendable(&server, extendable_lease_json("sandbox-idle-escalate", 0)).await;
+
+        let mut caller = identity();
+        caller.policy.sandbox.as_mut().unwrap().max_idle = Some(chrono::Duration::hours(24));
+
+        let response = extend_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            caller,
+            Path("sandbox-idle-escalate".into()),
+            Json(ExtendSandboxLeaseRequest {
+                extend_ttl: "2h".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "the pool decides whether an idle window exists"
+        );
         assert!(captured.lock().unwrap().is_none());
     }
 

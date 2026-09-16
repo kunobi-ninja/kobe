@@ -66,8 +66,32 @@ spec:
                 x-kubernetes-validations:
                 - message: trusted-runc must not set runtimeClassName; hardened tiers must set it
                   rule: (self.tier == 'trusted-runc' && !has(self.runtimeClassName)) || (self.tier in ['gvisor', 'kata'] && has(self.runtimeClassName))
+              maxIdle:
+                description: |-
+                  How long a lease may go untouched before it can no longer be extended.
+
+                  Absent, a lease has a fixed lifetime however actively it is used: the
+                  extension ceiling is `readyAt + maxTtl`, which measures age rather than
+                  abandonment. A box used every day and one forgotten yesterday look the
+                  same from `readyAt`.
+
+                  Present, each extension is bounded by `now + maxIdle` instead, so a box
+                  lives while someone keeps extending it and is reclaimed within `maxIdle`
+                  of the last extension. The pool still self-cleans — sooner than before
+                  for a box abandoned early in its TTL.
+
+                  The effective window is the lower of this and the caller's grant, the
+                  same clamp `maxTtl` already uses.
+                minLength: 1
+                nullable: true
+                type: string
               maxTtl:
-                description: Maximum runtime TTL this pool will accept, independent of caller policy.
+                description: |-
+                  Maximum runtime TTL this pool will accept, independent of caller policy.
+
+                  Two jobs: it caps the TTL a caller may request at creation, and — unless
+                  `maxIdle` is set — it caps the lifetime an extension can reach, measured
+                  from readiness. `maxIdle` replaces only the second.
                 minLength: 1
                 type: string
               placement:

@@ -10181,6 +10181,7 @@ pub(crate) mod tests {
                 warm_capacity: 0,
                 default_ttl: "1h".into(),
                 max_ttl: "8h".into(),
+                max_idle: None,
                 provisioning_timeout: "10m".into(),
                 placement: SandboxPlacement::Management {},
                 transport: SandboxTransport::Direct,

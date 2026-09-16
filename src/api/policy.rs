@@ -26,8 +26,15 @@ pub struct SandboxPolicy {
     pub allowed_pools: Vec<String>,
     pub verbs: Vec<SandboxVerb>,
     pub max_ttl: chrono::Duration,
+    /// Idle window after which a lease may no longer be extended.
+    ///
+    /// `None` keeps the fixed-lifetime ceiling, `readyAt + max_ttl`. `Some`
+    /// replaces it with `now + max_idle` at each extension and suspends
+    /// `max_extensions`; see [`crate::crd::access_policy::SandboxAccessRule`].
+    pub max_idle: Option<chrono::Duration>,
     pub max_concurrent_leases: u32,
     /// Runtime TTL extensions allowed per Sandbox lease, bounded by `max_ttl`.
+    /// Not enforced while `max_idle` is set.
     pub max_extensions: u32,
     pub resource_ceiling: SandboxResourceCeiling,
 }
@@ -184,6 +191,7 @@ mod tests {
                 allowed_pools: vec!["agent-*".into()],
                 verbs: vec![SandboxVerb::Lease, SandboxVerb::Release],
                 max_ttl: chrono::Duration::minutes(30),
+                max_idle: None,
                 max_concurrent_leases: 3,
                 max_extensions: 2,
                 resource_ceiling: SandboxResourceCeiling {
