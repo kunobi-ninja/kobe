@@ -43,15 +43,31 @@ FROM debian:bookworm-slim
 # machine reaches this sandbox through `kobe attach`, which runs `kobe-sshd`
 # (below) as the workload user in inetd mode. No port is opened.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        autocutsel \
         build-essential \
         ca-certificates \
         curl \
+        dbus \
+        file \
+        firefox-esr \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation2 \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-noto-core \
         gh \
         git \
         iproute2 \
         jq \
         less \
+        libayatana-appindicator3-dev \
+        libgl1-mesa-dri \
+        librsvg2-dev \
         libssl-dev \
+        libwebkit2gtk-4.1-dev \
+        novnc \
+        openbox \
         openssh-client \
         openssh-server \
         pkg-config \
@@ -59,6 +75,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
         tmux \
         unzip \
+        websockify \
+        wget \
+        x11-utils \
+        x11-xserver-utils \
+        x11vnc \
+        xauth \
+        xdg-utils \
+        xterm \
+        xvfb \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -85,6 +110,10 @@ RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
 # caller's side hands that stream to the local `ssh`. The configuration is
 # root-owned so the workload cannot loosen it; the host key is generated per
 # sandbox under $HOME on first use, so the image ships no key material.
+COPY --chmod=0755 docker/scripts/kobe-desktop docker/scripts/kobe-desktop-up /usr/local/bin/
+COPY --chown=65532:65532 docker/scripts/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
+COPY --chown=65532:65532 docker/scripts/kobe-mimeapps.list /home/agent/.config/mimeapps.list
+
 COPY docker/scripts/kobe-sshd_config /etc/kobe/sshd_config
 COPY docker/scripts/kobe-sshd /usr/local/bin/kobe-sshd
 RUN chmod 0644 /etc/kobe/sshd_config && chmod 0755 /usr/local/bin/kobe-sshd
@@ -202,6 +231,18 @@ ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:$PATH
 ENV MISE_TRUSTED_CONFIG_PATHS=/home/agent/work
 ENV MISE_YES=1
 
+# Fixed desktop paths so independent runner executions join the SAME desktop:
+# a second `kobe exec` has no shell and no way to discover a random one. All of
+# it is writable by the workload, with no /run and no root. Setting these does
+# not start anything — `kobe-desktop-up` does, as an explicit foreground
+# execution — so a headless lease pays nothing for them being here.
+ENV DISPLAY=:99 \
+    XDG_RUNTIME_DIR=/home/agent/.cache/kobe-desktop \
+    XAUTHORITY=/home/agent/.cache/kobe-desktop/Xauthority \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/home/agent/.cache/kobe-desktop/bus \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    WEBKIT_DISABLE_DMABUF_RENDERER=1
+
 WORKDIR /home/agent/work
 
 # --- Build-time proof -------------------------------------------------------
@@ -265,7 +306,7 @@ LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.title="kobe-agent-workspace"
-LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, and kobe-runner"
+LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, kobe-runner, and an opt-in loopback-only desktop"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
 # Idle until the lease drives it. TERM is trapped so a released lease tears the
