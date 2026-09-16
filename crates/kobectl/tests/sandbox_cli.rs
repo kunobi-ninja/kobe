@@ -218,12 +218,32 @@ fn spawn_child(endpoint: &str, args: &[&str]) -> (tempfile::TempDir, Child) {
 }
 
 fn spawn_child_with_auth(endpoint: &str, auth: &str, args: &[&str]) -> (tempfile::TempDir, Child) {
+    let directory = child_directory(endpoint, auth);
+    let child = spawn_in(&directory, args);
+    (directory, child)
+}
+
+/// Like [`spawn_child`], with an SSH public key in place before `kobe`
+/// starts. Writing it after the spawn raced the child, which could read a
+/// half-written key and fail on its format.
+fn spawn_child_with_public_key(endpoint: &str, args: &[&str]) -> (tempfile::TempDir, Child) {
+    let directory = child_directory(endpoint, "none");
+    write_public_key(&directory);
+    let child = spawn_in(&directory, args);
+    (directory, child)
+}
+
+fn child_directory(endpoint: &str, auth: &str) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join(".kobe.toml"),
         format!("endpoint = {endpoint:?}\nauth = {auth:?}\n"),
     )
     .unwrap();
+    directory
+}
+
+fn spawn_in(directory: &tempfile::TempDir, args: &[&str]) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kobe"));
     command
         .current_dir(directory.path())
@@ -232,7 +252,7 @@ fn spawn_child_with_auth(endpoint: &str, auth: &str, args: &[&str]) -> (tempfile
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    (directory, command.spawn().unwrap())
+    command.spawn().unwrap()
 }
 
 fn wait_output(mut child: Child) -> Output {
@@ -1961,11 +1981,10 @@ fn ssh_proxy_authorizes_the_key_then_attaches_to_the_named_sandbox() {
             _ => panic!("unexpected ssh-proxy request: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(
+    let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &["ssh-proxy", "kobe-small-1", "--pool", "small"],
     );
-    write_public_key(&directory);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2024,11 +2043,10 @@ fn ssh_proxy_names_the_missing_sshd_instead_of_closing_silently() {
             _ => panic!("no attach may be attempted without kobe-sshd: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(
+    let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &["ssh-proxy", "kobe-small-1", "--pool", "small"],
     );
-    write_public_key(&directory);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2083,8 +2101,8 @@ fn ssh_proxy_creates_the_sandbox_when_the_name_is_new() {
             _ => panic!("unexpected ssh-proxy request: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(&server.endpoint(), &["ssh-proxy", "kobe-small-1"]);
-    write_public_key(&directory);
+    let (_directory, child) =
+        spawn_child_with_public_key(&server.endpoint(), &["ssh-proxy", "kobe-small-1"]);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2116,8 +2134,8 @@ fn ssh_proxy_without_a_pool_explains_how_to_name_one() {
             _ => panic!("nothing may be created without a pool: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(&server.endpoint(), &["ssh-proxy", "kobe-dev"]);
-    write_public_key(&directory);
+    let (_directory, child) =
+        spawn_child_with_public_key(&server.endpoint(), &["ssh-proxy", "kobe-dev"]);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2136,7 +2154,7 @@ fn ssh_proxy_no_create_refuses_a_missing_sandbox() {
             _ => panic!("--no-create must not create: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(
+    let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &[
             "ssh-proxy",
@@ -2146,7 +2164,6 @@ fn ssh_proxy_no_create_refuses_a_missing_sandbox() {
             "--no-create",
         ],
     );
-    write_public_key(&directory);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2178,11 +2195,10 @@ fn ssh_proxy_refuses_a_cluster_lease() {
             _ => panic!("a cluster lease must be refused before any other call: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(
+    let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &["ssh-proxy", "kobe-ci-small-1", "--pool", "ci-small"],
     );
-    write_public_key(&directory);
     let output = wait_output(child);
 
     assert_eq!(output.status.code(), Some(125));
@@ -2404,11 +2420,10 @@ fn init_refuses_a_pool_that_cannot_serve_ssh() {
             _ => panic!("unexpected request: {request:?}"),
         }
     });
-    let (directory, child) = spawn_child(
+    let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &["init", "--default-pool", "ci-small", "--yes"],
     );
-    write_public_key(&directory);
     let output = wait_output(child);
     assert_eq!(output.status.code(), Some(125));
     let stderr = String::from_utf8_lossy(&output.stderr);
