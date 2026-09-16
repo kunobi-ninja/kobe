@@ -194,15 +194,16 @@ RUN echo "cli refresh: ${CLI_REFRESH}" \
         > /etc/kobe-workspace-versions \
     && chmod 0644 /etc/kobe-workspace-versions \
     && npm cache clean --force \
-    && rm -rf /root/.npm
+    && rm -rf /root/.npm \
+    && ln -sfn "$node_dir" /opt/kobe/node
 
 # Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
 # the pinned tools visible there as well as to Kobe's direct-exec environment.
-# Ask mise where it actually put Node rather than rebuilding the path from the
-# version spec: with a major-only pin the install directory is not named after
-# the spec. Double quotes expand it at build time while $PATH stays literal.
-RUN node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
-    && printf '%s\n' "export PATH=$node_dir/bin:\$PATH" \
+# A Debian login shell resets PATH, so ENV PATH alone does not survive an
+# interactive SSH session. This covers that case; ENV PATH below covers the
+# shell-less one. Both point at the stable symlink rather than the versioned
+# directory, so neither has to know which patch release mise resolved.
+RUN printf '%s\n' 'export PATH=/opt/kobe/node/bin:$PATH' \
       > /etc/profile.d/kobe-node-tools.sh \
     && chmod 0644 /etc/profile.d/kobe-node-tools.sh
 
@@ -222,7 +223,11 @@ ENV HOME=/home/agent
 # shell: they are real executables on PATH that dispatch to the version the
 # project's `mise.toml` pins. Putting them first is what makes a bare `cargo`
 # resolve at all in this image.
-ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:$PATH
+# `/opt/kobe/node/bin` is on PATH because Kobe's runner executes argv with NO
+# shell: `kobe exec -- claude ...` never reads /etc/profile.d, so a profile
+# line alone left the CLIs installed and unreachable, which is exactly what
+# shipped in v0.48.0. The symlink keeps this stable across Node patch bumps.
+ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/opt/kobe/node/bin:$PATH
 
 # mise refuses to read a config file it has not been told to trust, which in a
 # freshly cloned repo means `mise install` stops and waits for a human that a
@@ -289,6 +294,13 @@ RUN kobe-sshd --check \
         | grep -q in-session-42 \
     && rm -rf "$HOME/.ssh" /tmp/proof-client /tmp/proof-client.pub /tmp/proof-batch \
         /var/run/kobe/sessions/proof.*
+
+# The AI CLIs must resolve with NO shell, the way `kobe exec` invokes argv.
+# `env -i` strips the environment down to the image's own PATH, which is the
+# only thing a runner execution inherits: a profile.d line would not survive
+# this, and in v0.48.0 that is exactly how the CLIs shipped unreachable.
+RUN env -i PATH="$PATH" claude --version >/dev/null \
+    && env -i PATH="$PATH" codex --version >/dev/null
 
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.
