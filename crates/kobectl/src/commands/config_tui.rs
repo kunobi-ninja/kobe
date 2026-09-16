@@ -6,7 +6,7 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::io::stdout;
+use std::io::{IsTerminal, stdout};
 use std::time::Duration;
 
 use super::config::{AuthMode, CliConfig};
@@ -286,6 +286,12 @@ fn cycle_select(field: &mut FormField, backwards: bool) -> bool {
 // ── Main TUI entry point ─────────────────────────────────────────────────
 
 pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
+    // Raw mode on a pipe never sees a keypress, so the editor would hang.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "the config editor needs a terminal; use `kobe config set` or `kobe config import` from scripts"
+        );
+    }
     let config = CliConfig::load()?;
     let target = resolve_edit_target(&config, target_override)?;
     let fields = build_fields(&config, &target)?;

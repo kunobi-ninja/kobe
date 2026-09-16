@@ -1,25 +1,56 @@
 mod commands;
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use commands::OutputFormat;
+use std::io::IsTerminal;
+
+/// Help colors, the palette cargo uses. clap strips them when the output is
+/// not a terminal, so piped help stays plain text.
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .invalid(AnsiColor::Yellow.on_default().effects(Effects::BOLD));
+
+/// Heading for the options every command accepts. Keeping them apart stops
+/// them from interleaving with a command's own flags in its help.
+const GLOBAL_OPTIONS: &str = "Global options";
 
 #[derive(Parser)]
 #[command(
     name = "kobe",
-    about = "Pooled resource lease manager",
-    version = commands::cli_version()
+    about = "Lease clusters and sandboxes from Kobe pools",
+    version = commands::cli_version(),
+    styles = STYLES
 )]
 struct Cli {
-    /// One-off endpoint override using the selected target's auth.
-    #[arg(long, global = true, value_name = "URL")]
+    /// Use this endpoint with the selected target's auth
+    #[arg(long, global = true, value_name = "URL", help_heading = GLOBAL_OPTIONS)]
     endpoint: Option<String>,
 
-    /// Named CLI target to use.
-    #[arg(long = "target", alias = "context", global = true, value_name = "NAME")]
+    /// Use this named target instead of the current one
+    #[arg(
+        long = "target",
+        alias = "context",
+        global = true,
+        value_name = "NAME",
+        help_heading = GLOBAL_OPTIONS
+    )]
     target: Option<String>,
 
-    /// Output format.
-    #[arg(long, short = 'o', global = true, value_enum, default_value_t = OutputFormat::Text)]
+    /// Output format
+    #[arg(
+        long,
+        short = 'o',
+        global = true,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help_heading = GLOBAL_OPTIONS
+    )]
     output: OutputFormat,
 
     #[command(subcommand)]
@@ -28,162 +59,191 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show status overview
+    /// Show your leases, the pools you can use, and who you are signed in as
     Status {
-        /// Include released and expired leases. Both text and JSON hide
-        /// them by default, so the two views answer alike
+        /// Include released and expired leases
+        ///
+        /// Text and JSON both hide them by default, so the two views agree.
         #[arg(long)]
         all: bool,
     },
-    /// Show CLI and endpoint versions
+    /// Show the CLI and server versions
     Version,
-    /// Authenticate with the Kobe service.
+    /// Sign in to the Kobe server
     ///
-    /// Default flow opens the system browser and listens on a localhost
-    /// callback. With --device, prints a verification URL + user code
-    /// for completing auth on any device with a browser — useful over
-    /// SSH, in CI, or on headless hosts.
+    /// Opens the system browser and listens on a localhost callback. With
+    /// --device, prints a URL and a code to finish sign-in on any device with
+    /// a browser instead: over SSH, in CI, or on a headless host.
     Login {
-        /// Use the RFC 8628 Device Authorization Grant flow instead of
-        /// opening a local browser. Prints a URL + code for the user
-        /// to complete on a phone/laptop.
+        /// Sign in on another device (RFC 8628 device authorization)
         #[arg(long)]
         device: bool,
     },
-    /// Lease an executable resource, run one command, and release it.
+    /// Lease a sandbox, run one command in it, and release it
     Run {
+        /// Pool to lease from
         pool: String,
+        /// Lease TTL, e.g. 2h (pool default when omitted)
         #[arg(long)]
         ttl: Option<String>,
-        #[arg(long)]
+        /// Working directory for the command
+        #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        #[arg(long)]
+        /// Stop the command after this long, e.g. 30s or 5m
+        #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// The command to run, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Run a command in a lease that supports `exec`.
+    /// Run a command in a lease and exit with its exit code
     Exec {
+        /// Lease id, name, or pool
         lease: String,
-        #[arg(long)]
+        /// Working directory for the command
+        #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        #[arg(long)]
+        /// Stop the command after this long, e.g. 30s or 5m
+        #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
-        /// Forward this process's stdin to the remote command, then close it.
+        /// Send this process's stdin to the command, then close it
         ///
-        /// How a secret reaches a Sandbox without being typed into the command
-        /// line: the exec argv becomes a URL the target apiserver audit-logs
-        /// verbatim, so `--token s3cret` records the token where
+        /// Use it to pass a secret without putting it on the command line. The
+        /// exec argv becomes a URL that the target apiserver audit-logs
+        /// verbatim, so `--token s3cret` records the token and
         /// `printf %s "$TOKEN" | kobe exec ... --stdin -- gh auth login
         /// --with-token` does not.
         #[arg(long)]
         stdin: bool,
+        /// The command to run, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Read logs from a lease that supports `logs`.
+    /// Read a lease's logs, or the output of one execution
     Logs {
+        /// Lease id, name, or pool
         lease: String,
-        #[arg(long, conflicts_with = "tail")]
+        /// Read the output of this execution instead of the lease's logs
+        #[arg(long, value_name = "ID", conflicts_with = "tail")]
         execution: Option<String>,
+        /// Keep reading until the execution finishes
         #[arg(long, requires = "execution")]
         follow: bool,
-        #[arg(long, conflicts_with = "execution")]
+        /// Show only the last N lines
+        #[arg(long, value_name = "N", conflicts_with = "execution")]
         tail: Option<i64>,
     },
-    /// Cancel an execution owned by a compatible lease.
+    /// Cancel a running execution
     Cancel {
+        /// Lease id, name, or pool
         lease: String,
-        #[arg(long)]
+        /// Execution id, as printed by `kobe exec`
+        #[arg(long, value_name = "ID")]
         execution: String,
     },
-    /// Attach to a lease that supports `attach`.
+    /// Open a terminal in a lease
     ///
-    /// With no lease, picks the only attachable one or opens a picker.
+    /// With no lease, uses the only one you can attach to, or asks you to
+    /// pick. With --session, the shell survives disconnects: `~.` at the start
+    /// of a line detaches, and attaching again resumes it.
     Attach {
+        /// Lease id, name, or pool. `LEASE.NAME` is `LEASE --session NAME`
         lease: Option<String>,
+        /// Container to attach to
         #[arg(long)]
         container: Option<String>,
+        /// Run without allocating a terminal
         #[arg(long)]
         no_tty: bool,
-        /// Attach to a persistent session, creating it on first use.
-        /// `LEASE.NAME` is the same as `LEASE --session NAME`.
+        /// Attach to a persistent session, creating it on first use
         #[arg(long, value_name = "NAME", conflicts_with = "no_tty")]
         session: Option<String>,
-        /// Where `kobe-runner` lives in the sandbox, for `--session`.
-        #[arg(long, requires = "session")]
+        /// Path of `kobe-runner` in the sandbox, for --session
+        #[arg(long, value_name = "PATH", requires = "session")]
         runner_path: Option<String>,
+        /// Command to run instead of the default shell, after `--`
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Forward a declared port from a compatible lease.
+    /// Forward a local port to a port the pool declares
     PortForward {
+        /// Lease id, name, or pool
         lease: String,
+        /// LOCAL:REMOTE, where REMOTE is a port name or number (8080:http)
         spec: String,
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Local address to listen on
+        ///
+        /// Loopback by default. Binding to a network address exposes the
+        /// forwarded port to your LAN.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
         bind: String,
     },
-    /// Serve an SSH connection to a sandbox on stdin/stdout (an ssh ProxyCommand).
+    /// Carry an SSH connection to a sandbox (used as the ssh ProxyCommand)
     ///
     /// `ssh kobe-<pool>-<name>` resolves the host name to one of your
     /// sandboxes, creating it on first use, authorizes your public key in it,
     /// and runs the sandbox's sshd over `kobe attach`. Install the ssh_config
     /// block with `kobe ssh-config`. Not meant to be run by hand.
+    #[command(hide = true)]
     SshProxy {
         /// Host name as ssh passes it (`%n`): kobe-<pool>-<name> or kobe-<name>,
-        /// optionally followed by `.<session>`.
+        /// optionally followed by `.<session>`
         host: String,
-        /// Pool for a new sandbox. Overrides the host name and the target's default pool.
+        /// Pool for a new sandbox. Overrides the host name and the target's default pool
         #[arg(long)]
         pool: Option<String>,
-        /// TTL for a new sandbox (pool default when omitted).
+        /// TTL for a new sandbox (pool default when omitted)
         #[arg(long)]
         ttl: Option<String>,
-        /// Maximum time to wait for a new sandbox to become ready (e.g. 30s, 5m).
+        /// How long to wait for a new sandbox to become ready, e.g. 30s or 5m
         #[arg(long, value_name = "DURATION")]
         wait_timeout: Option<String>,
-        /// Connect to an existing sandbox only; never create one.
+        /// Connect to an existing sandbox only; never create one
         #[arg(long)]
         no_create: bool,
-        /// Public key file to authorize inside the sandbox.
+        /// Public key file to authorize inside the sandbox
         #[arg(long, value_name = "PATH")]
         public_key: Option<String>,
     },
-    /// Set this machine up for `ssh kobe-<pool>-<name>`.
+    /// Set up this machine: target, sign-in, default pool, and ssh
     ///
-    /// Writes a target with --endpoint (or uses the current one), completes
-    /// login or the one-time trust answer, picks a default pool, finds your
-    /// public key, installs the ssh_config block, and proves `ssh -G`
-    /// resolves it. Every step is skipped when already done.
+    /// Writes a target with --endpoint (or uses the current one), signs in or
+    /// records the one-time trust answer, picks a default pool, finds your
+    /// public key, installs the ssh_config block, and checks that `ssh -G`
+    /// resolves it. Steps that are already done are skipped.
     Init {
-        /// Create or replace a target at this endpoint and make it current.
+        /// Create or replace a target at this endpoint and make it current
         #[arg(long, value_name = "URL")]
         endpoint: Option<String>,
-        /// Name for the target written by --endpoint (default: `default`).
+        /// Name for the target written by --endpoint [default: default]
         #[arg(long, value_name = "NAME", requires = "endpoint")]
         name: Option<String>,
-        /// Auth mode for --endpoint (none, token, oidc, ssh). Discovered when omitted.
-        #[arg(long, requires = "endpoint")]
+        /// Auth mode for --endpoint: none, token, oidc, or ssh (discovered when omitted)
+        #[arg(long, value_name = "MODE", requires = "endpoint")]
         auth: Option<String>,
-        /// Bearer token for --auth token.
+        /// Bearer token for --auth token
         #[arg(long, requires = "endpoint")]
         token: Option<String>,
-        /// Pool `kobe ssh-proxy` uses when the host name does not name one.
+        /// Pool that `ssh kobe-<name>` uses when the host name does not name one
         #[arg(long = "default-pool", value_name = "POOL")]
         default_pool: Option<String>,
-        /// Public key file to authorize inside sandboxes; remembered in the config.
+        /// Public key file to authorize inside sandboxes (saved to the config)
         #[arg(long, value_name = "PATH")]
         public_key: Option<String>,
-        /// Never prompt; take every default.
+        /// Never prompt; accept every default
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Check everything `ssh kobe-<pool>-<name>` depends on, without changing anything.
-    Doctor,
-    /// Print the ssh_config block that routes `kobe-*` hosts through `kobe ssh-proxy`.
+    /// Check the ssh setup without changing anything
     ///
-    /// Append it to `~/.ssh/config` (or a file it includes). Uses the absolute
-    /// path of this executable, and carries `--target` when one is given.
+    /// Checks the target, endpoint, sign-in, pools, public key, and the
+    /// ssh_config block that `ssh kobe-<pool>-<name>` depends on.
+    Doctor,
+    /// Print the ssh_config block for `ssh kobe-<pool>-<name>`
+    ///
+    /// Append it to `~/.ssh/config` or a file it includes. The block uses the
+    /// absolute path of this executable, and carries `--target` when one is
+    /// given.
     SshConfig,
     /// Deprecated compatibility namespace for the original Sandbox CLI.
     #[command(hide = true)]
@@ -191,95 +251,112 @@ enum Commands {
         #[command(subcommand)]
         action: SandboxAction,
     },
-    /// Remove stored credentials. Also revokes the refresh + access
-    /// tokens at the IdP (RFC 7009) so a leaked token can't outlive
-    /// `kobe logout`.
+    /// Sign out and revoke your tokens
+    ///
+    /// Removes stored credentials and revokes the refresh and access tokens at
+    /// the identity provider (RFC 7009), so a leaked token stops working too.
     Logout,
     /// Lease a resource from a pool and wait until it is ready
     Lease {
-        /// Pool name (e.g. ci-small or agents)
+        /// Pool to lease from, e.g. ci-small or agents
         pool: Option<String>,
-        /// Lease TTL
+        /// How long the lease lasts
         #[arg(long, default_value = "1h")]
         ttl: String,
-        /// Return immediately after creating the lease request
+        /// Return as soon as the lease is requested
         #[arg(long)]
         no_wait: bool,
-        /// Maximum time to wait for the lease to become usable (e.g. 30s, 5m, 1h)
+        /// How long to wait for the lease to become ready, e.g. 30s, 5m, 1h
         #[arg(long, value_name = "DURATION", conflicts_with = "no_wait")]
         wait_timeout: Option<String>,
-        /// Cluster resources only: write kubeconfig to this path
+        /// Write the cluster's kubeconfig to this path (clusters only)
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<String>,
-        /// Name this lease (#107 P2). Unique among your active leases, so you can
-        /// reference it by name later: `kobe extend pr-106 30m`.
+        /// Name the lease so other commands can refer to it
+        ///
+        /// Names are unique among your active leases: `kobe lease ci --name
+        /// pr-106`, then `kobe extend pr-106`.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Attach an opaque JSON object to the lease. Pass inline JSON or
-        /// `@path` to read it from a file. Metadata is descriptive only.
+        /// Attach a JSON object to the lease: inline JSON or @path
+        ///
+        /// Metadata is descriptive only; Kobe does not act on it.
         #[arg(long, value_name = "JSON|@PATH")]
         metadata_json: Option<String>,
-        /// Idempotent (#107 P3): with --name, reuse the existing active lease of
-        /// that name (extending its TTL) instead of failing on the duplicate —
-        /// "lease again means renew". Safe to call unconditionally at job start.
-        /// Reused leases keep their original metadata.
+        /// Reuse your active lease with --name, extending it, instead of failing
+        ///
+        /// Makes `kobe lease` safe to call unconditionally at job start: a
+        /// second call renews the lease. A reused lease keeps its original
+        /// metadata.
         #[arg(long, requires = "name")]
         ensure: bool,
-        /// Heartbeat-extend the lease until interrupted (#107 P3). Re-extends by
-        /// `--ttl` at half-TTL intervals until Ctrl-C or the server ceiling.
+        /// Keep extending the lease until interrupted
+        ///
+        /// Extends by --ttl at half-TTL intervals until Ctrl-C or the server's
+        /// maximum lease time.
         #[arg(long, conflicts_with = "no_wait")]
         keepalive: bool,
     },
-    /// Run a command with a kubeconfig-capable lease, then release it (#107 P3).
+    /// Lease a cluster, run a command with its kubeconfig, then release it
     ///
-    /// Creates a lease, heartbeat-extends it for the command's lifetime, then
-    /// releases it (even on failure/signal). `kobe with-lease --ttl 1h -- kubectl get pods`.
+    /// The lease is kept alive while the command runs and released when it
+    /// exits, including on failure or a signal. The command sees the lease's
+    /// kubeconfig in KUBECONFIG: `kobe with-lease ci-small -- kubectl get
+    /// pods`.
     WithLease {
-        /// Pool name (e.g. ci-small)
+        /// Pool to lease from, e.g. ci-small
         pool: Option<String>,
-        /// Lease TTL / heartbeat window
+        /// Lease TTL, also the keepalive window
         #[arg(long, default_value = "1h")]
         ttl: String,
-        /// Attach an opaque JSON object to the lease. Pass inline JSON or
-        /// `@path` to read it from a file. Metadata is descriptive only.
+        /// Attach a JSON object to the lease: inline JSON or @path
+        ///
+        /// Metadata is descriptive only; Kobe does not act on it.
         #[arg(long, value_name = "JSON|@PATH")]
         metadata_json: Option<String>,
-        /// Command to run (after `--`), with the lease kubeconfig in KUBECONFIG.
+        /// The command to run, after `--`
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Extend the TTL of an active lease
+    /// Add time to an active lease
     ///
-    /// TARGET selects the lease by id or pool. When omitted: if you hold a
-    /// single active lease it is used; otherwise you are prompted to pick one
-    /// (or, with `--output json`, the command errors and lists candidates).
+    /// With no lease, extends the only one you hold, or asks you to pick. With
+    /// `--output json` and several leases it fails and lists them instead.
     Extend {
-        /// Lease id or pool to extend (optional when you hold one lease)
-        #[arg(id = "lease_selector")]
+        /// Lease id, name, or pool (optional when you hold one lease)
+        #[arg(id = "lease_selector", value_name = "LEASE")]
         target: Option<String>,
-        /// Duration to add to the current expiry (e.g. 30m, 1h)
+        /// Time to add to the current expiry, e.g. 30m or 1h
         #[arg(long, default_value = "30m")]
         ttl: String,
     },
     /// Release a lease
+    ///
+    /// With no lease, releases the only one you hold, or asks you to pick.
+    /// With `--output json` and several leases it releases the first active
+    /// one.
     Release {
-        /// Lease ID
+        /// Lease id, name, or pool
+        #[arg(value_name = "LEASE")]
         lease_id: Option<String>,
     },
-    /// Release all active leases and remove local cluster kubeconfigs
+    /// Release all your leases and remove their kubeconfigs
     Purge {
-        /// Skip the confirmation prompt
+        /// Do not ask for confirmation
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Only remove kubeconfigs whose lease no longer exists server-side
-        /// (phase Released or Expired, or absent from the server entirely).
-        /// Active leases are not released. Files in `~/.kube/kobe-*.yaml`
-        /// that Kobe never recorded itself are not touched. Use this to clean
-        /// up files left behind by TTL expiry.
+        /// Only remove kubeconfigs of leases that are gone; release nothing
+        ///
+        /// Removes kubeconfigs whose lease was released, expired, or no longer
+        /// exists on the server. Active leases are left alone, and files in
+        /// `~/.kube/kobe-*.yaml` that kobe did not record are not touched. Use
+        /// it to clean up after leases that expired.
         #[arg(long)]
         orphans_only: bool,
     },
-    /// Manage CLI configuration
+    /// Edit the CLI configuration
+    ///
+    /// With no subcommand, opens the editor in a terminal.
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -392,58 +469,56 @@ enum SandboxAction {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Show current configuration
+    /// Show the resolved configuration and where each value comes from
     View,
     /// Export the saved configuration as JSON
     Export {
-        /// Destination path, or '-' for stdout
+        /// Destination file, or `-` for stdout
         path: Option<String>,
     },
-    /// Import configuration from JSON
+    /// Import a configuration exported with `kobe config export`
     Import {
-        /// Source path, or '-' for stdin
+        /// Source file, or `-` for stdin
         path: Option<String>,
     },
-    /// Edit configuration in the TUI
+    /// Edit a target in the terminal editor
     Edit {
-        /// Target name to edit (defaults to current target, else legacy config)
+        /// Target to edit [default: the current target]
         name: Option<String>,
     },
     /// List named targets
     List,
-    /// Show the current named target
+    /// Show the current target and where it was selected
     Current,
-    /// Select the current named target
+    /// Switch the current target for this shell
     Use {
         /// Target name
         name: String,
     },
-    /// Create or replace a named target. By default writes to the
-    /// local `./.kobe.toml` so the definition follows the project;
-    /// pass `--global` to write to `~/.config/kobe/config.json`
-    /// instead (use this for endpoints you want available from any
-    /// directory).
+    /// Create or replace a named target
+    ///
+    /// Writes to `./.kobe.toml` so the target follows the project. Pass
+    /// --global to write to `~/.config/kobe/config.json` instead, for
+    /// endpoints you use from any directory.
     Set {
         /// Target name
         name: String,
-        /// Kobe API endpoint
-        #[arg(long)]
+        /// Kobe server URL
+        #[arg(long, value_name = "URL")]
         endpoint: String,
-        /// Auth mode (none, token, oidc, ssh)
-        #[arg(long)]
+        /// Auth mode: none, token, oidc, or ssh
+        #[arg(long, value_name = "MODE")]
         auth: Option<String>,
-        /// Static bearer token for auth=token
+        /// Bearer token for --auth token
         #[arg(long)]
         token: Option<String>,
-        /// SSH key fingerprint for auth=ssh
-        #[arg(long = "ssh-fingerprint")]
+        /// SSH key fingerprint for --auth ssh
+        #[arg(long = "ssh-fingerprint", value_name = "FINGERPRINT")]
         ssh_fingerprint: Option<String>,
-        /// Pool `kobe ssh-proxy` uses when the host name does not name one
+        /// Pool that `ssh kobe-<name>` uses when the host name does not name one
         #[arg(long = "default-pool", value_name = "POOL")]
         default_pool: Option<String>,
-        /// Write to the global config file (`~/.config/kobe/config.json`)
-        /// instead of the local `./.kobe.toml`. Use for endpoints you
-        /// reuse across many projects.
+        /// Write to `~/.config/kobe/config.json` instead of `./.kobe.toml`
         #[arg(long)]
         global: bool,
     },
@@ -747,6 +822,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 commands::config_interactive(name.as_deref().or(target))
             }
+            // Bare `kobe config` opens the editor when a person is at the
+            // keyboard. Scripts and `-o json` get the subcommand list instead,
+            // because a raw-mode editor would hang a pipe.
+            None if output == OutputFormat::Text
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal() =>
+            {
+                commands::config_interactive(target)
+            }
             Some(ConfigAction::List) => commands::config_list_targets(output).await,
             Some(ConfigAction::Current) => commands::config_current_target(output).await,
             Some(ConfigAction::Use { name }) => commands::config_use_target(&name, output).await,
@@ -771,7 +855,7 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await
             }
-            None => print_config_help(),
+            None => exit_with_config_help(),
         },
     };
     // One place decides how a failure reaches the caller: every command
@@ -1009,14 +1093,21 @@ fn requests_resource_json(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
-fn print_config_help() -> anyhow::Result<()> {
-    let mut cmd = Cli::command();
-    let config_cmd = cmd
-        .find_subcommand_mut("config")
-        .ok_or_else(|| anyhow::anyhow!("config command is not available"))?;
-    config_cmd.print_help()?;
-    println!();
-    Ok(())
+/// Print `kobe config`'s help to stderr and exit 2, like any other missing
+/// subcommand. Rendering from the built root keeps the usage line reading
+/// `kobe config` instead of a bare `config`.
+fn exit_with_config_help() -> ! {
+    let mut cli = Cli::command();
+    cli.build();
+    if let Some(config) = cli.find_subcommand_mut("config") {
+        let help = config.render_help();
+        if std::io::stderr().is_terminal() {
+            eprintln!("{}", help.ansi());
+        } else {
+            eprintln!("{help}");
+        }
+    }
+    std::process::exit(2)
 }
 
 #[cfg(test)]
