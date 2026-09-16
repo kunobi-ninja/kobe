@@ -29,9 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chmod=0755 docker/kobe-desktop docker/kobe-desktop-up /usr/local/bin/
-COPY --chown=65532:65532 docker/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
-COPY --chown=65532:65532 docker/kobe-mimeapps.list /home/agent/.config/mimeapps.list
+COPY --chmod=0755 docker/scripts/kobe-desktop docker/scripts/kobe-desktop-up /usr/local/bin/
+COPY --chown=65532:65532 docker/scripts/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
+COPY --chown=65532:65532 docker/scripts/kobe-mimeapps.list /home/agent/.config/mimeapps.list
 
 USER 65532:65532
 
