@@ -1,7 +1,7 @@
 mod commands;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind};
 use commands::OutputFormat;
 use std::io::IsTerminal;
 
@@ -19,6 +19,68 @@ const STYLES: Styles = Styles::styled()
 /// Heading for the options every command accepts. Keeping them apart stops
 /// them from interleaving with a command's own flags in its help.
 const GLOBAL_OPTIONS: &str = "Global options";
+
+/// Top-level help sections, in print order. clap lists subcommands in one
+/// flat block; twenty commands read better grouped by what you are doing.
+/// A test keeps this table and the command tree in step.
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Get started",
+        &["init", "login", "logout", "status", "doctor"],
+    ),
+    (
+        "Leases",
+        &["lease", "extend", "release", "with-lease", "purge"],
+    ),
+    (
+        "Sandboxes",
+        &["run", "exec", "attach", "logs", "cancel", "port-forward"],
+    ),
+    (
+        "Setup",
+        &["config", "target", "ssh-config", "completions", "version"],
+    ),
+];
+
+/// The command tree with the grouped top-level help. Parse through this,
+/// not `Cli::command()`, so `kobe --help` and `kobe help` both use it.
+fn cli_command() -> clap::Command {
+    let command = Cli::command();
+    let template = root_help_template(&command);
+    command.help_template(template)
+}
+
+/// Render [`COMMAND_GROUPS`] into a clap help template. The styles are
+/// embedded as ANSI codes; clap strips them when output is not a terminal.
+fn root_help_template(command: &clap::Command) -> String {
+    let styles = command.get_styles();
+    let header = styles.get_header();
+    let literal = styles.get_literal();
+    let width = COMMAND_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut template = String::from("{about-with-newline}\n{usage-heading} {usage}\n");
+    for (heading, names) in COMMAND_GROUPS {
+        template.push_str(&format!("\n{header}{heading}:{header:#}\n"));
+        for name in *names {
+            let about = command
+                .find_subcommand(name)
+                .and_then(|subcommand| subcommand.get_about())
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            template.push_str(&format!("  {literal}{name:<width$}{literal:#}  {about}\n"));
+        }
+    }
+    template.push_str(&format!(
+        "\n{header}Options:{header:#}\n{{options}}\n\n\
+         Run `{literal}kobe <command> --help{literal:#}` for a command's options."
+    ));
+    template
+}
 
 #[derive(Parser)]
 #[command(
@@ -580,8 +642,19 @@ async fn main() -> anyhow::Result<()> {
     commands::session::gc_dead_sessions();
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let cli = match Cli::try_parse_from(&args) {
+    let parsed = cli_command()
+        .try_get_matches_from(&args)
+        .and_then(|matches| Cli::from_arg_matches(&matches));
+    let cli = match parsed {
         Ok(cli) => cli,
+        // Bare `kobe` is asking what kobe does, not making a mistake.
+        Err(error)
+            if args.len() == 1
+                && error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
+        {
+            cli_command().print_help()?;
+            std::process::exit(0)
+        }
         Err(error)
             if matches!(
                 error.kind(),
@@ -1372,5 +1445,41 @@ mod tests {
     fn bare_config_parses_without_a_subcommand() {
         let cli = Cli::try_parse_from(["kobe", "config"]).unwrap();
         assert!(matches!(cli.command, Commands::Config { action: None }));
+    }
+
+    /// Every visible command appears in exactly one help group, and every
+    /// group entry is a real, visible command. A new command without a group
+    /// would otherwise vanish from `kobe --help`.
+    #[test]
+    fn help_groups_cover_every_visible_command_once() {
+        let command = Cli::command();
+        let mut visible: Vec<&str> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+        let mut grouped: Vec<&str> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        visible.sort_unstable();
+        grouped.sort_unstable();
+        assert_eq!(grouped, visible);
+    }
+
+    #[test]
+    fn root_help_lists_groups_and_global_options() {
+        let help = cli_command().render_help().to_string();
+        for heading in [
+            "Get started:",
+            "Leases:",
+            "Sandboxes:",
+            "Setup:",
+            "Options:",
+        ] {
+            assert!(help.contains(heading), "missing {heading}:\n{help}");
+        }
+        assert!(help.contains("--target <NAME>"), "{help}");
+        assert!(!help.contains("ssh-proxy"), "{help}");
     }
 }
