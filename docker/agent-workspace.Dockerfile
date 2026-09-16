@@ -85,8 +85,8 @@ RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
 # caller's side hands that stream to the local `ssh`. The configuration is
 # root-owned so the workload cannot loosen it; the host key is generated per
 # sandbox under $HOME on first use, so the image ships no key material.
-COPY docker/kobe-sshd_config /etc/kobe/sshd_config
-COPY docker/kobe-sshd /usr/local/bin/kobe-sshd
+COPY docker/scripts/kobe-sshd_config /etc/kobe/sshd_config
+COPY docker/scripts/kobe-sshd /usr/local/bin/kobe-sshd
 RUN chmod 0644 /etc/kobe/sshd_config && chmod 0755 /usr/local/bin/kobe-sshd
 
 # --- mise -------------------------------------------------------------------
