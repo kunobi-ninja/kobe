@@ -20,6 +20,7 @@ mod ssh_setup;
 mod state;
 mod status;
 mod version;
+pub(crate) mod vnc;
 mod with_lease;
 
 use clap::ValueEnum;

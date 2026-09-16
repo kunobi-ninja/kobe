@@ -34,7 +34,15 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Sandboxes",
-        &["run", "exec", "attach", "logs", "cancel", "port-forward"],
+        &[
+            "run",
+            "exec",
+            "attach",
+            "vnc",
+            "logs",
+            "cancel",
+            "port-forward",
+        ],
     ),
     (
         "Setup",
@@ -189,6 +197,15 @@ enum Commands {
         /// The command to run, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Drive a Sandbox desktop over VNC, headless
+    ///
+    /// Reaches the desktop through the same authenticated stream as
+    /// `port-forward`, so it needs no open port and no SSH agent. Nothing
+    /// opens a window: a screenshot lands in a file, input goes to the server.
+    Vnc {
+        #[command(subcommand)]
+        action: VncCommand,
     },
     /// Read a lease's logs, or the output of one execution
     Logs {
@@ -451,6 +468,65 @@ enum Commands {
 }
 
 /// Kind-specific adapters retained behind the hidden compatibility namespace.
+/// What `kobe vnc` can do to a desktop.
+#[derive(Subcommand)]
+enum VncCommand {
+    /// Write the desktop to a PNG file
+    Screenshot {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Where to write the image
+        #[arg(long, short = 'f', default_value = "screenshot.png")]
+        out: std::path::PathBuf,
+        /// VNC port inside the Sandbox
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+    },
+    /// Click at a pixel
+    Click {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Pixel to click, as `X,Y`
+        #[arg(long, value_name = "X,Y")]
+        at: String,
+        /// left, middle, or right
+        #[arg(long, default_value = "left")]
+        button: String,
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+    },
+    /// Move the pointer without pressing anything
+    Move {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Pixel to move to, as `X,Y`
+        #[arg(long, value_name = "X,Y")]
+        at: String,
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+    },
+    /// Type printable text
+    Type {
+        /// Lease id, name, or pool
+        lease: String,
+        /// The text to type
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+    },
+    /// Press one named key, such as return or escape
+    Key {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Key name
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
+    },
+}
+
 #[derive(Subcommand)]
 enum SandboxAction {
     /// Run a command in an existing sandbox and return its exact exit code.
@@ -796,6 +872,62 @@ async fn main() -> anyhow::Result<()> {
                 output,
             )
             .await
+        }
+        Commands::Vnc { action } => {
+            fn at(value: &str) -> anyhow::Result<(u16, u16)> {
+                let (x, y) = value
+                    .split_once(',')
+                    .ok_or_else(|| anyhow::anyhow!("--at takes X,Y such as 640,480"))?;
+                Ok((x.trim().parse()?, y.trim().parse()?))
+            }
+            let (lease, port, todo) = match action {
+                VncCommand::Screenshot { lease, out, port } => (
+                    lease,
+                    port,
+                    commands::vnc::VncAction::Screenshot { path: out },
+                ),
+                VncCommand::Click {
+                    lease,
+                    at: spec,
+                    button,
+                    port,
+                } => {
+                    let (x, y) = at(&spec)?;
+                    let button = commands::vnc::Button::parse(&button)?;
+                    (
+                        lease,
+                        port,
+                        commands::vnc::VncAction::Click { x, y, button },
+                    )
+                }
+                VncCommand::Move {
+                    lease,
+                    at: spec,
+                    port,
+                } => {
+                    let (x, y) = at(&spec)?;
+                    (lease, port, commands::vnc::VncAction::Move { x, y })
+                }
+                VncCommand::Type { lease, text, port } => {
+                    (lease, port, commands::vnc::VncAction::Type { text })
+                }
+                VncCommand::Key { lease, key, port } => {
+                    (lease, port, commands::vnc::VncAction::Key { name: key })
+                }
+            };
+            let lease = commands::require_lease_capability(
+                &lease,
+                "port-forward",
+                target,
+                endpoint,
+                output,
+            )
+            .await
+            .unwrap_or_else(|error| exit_resource_error(error, output));
+            let code = commands::vnc::run(&lease, port, todo, target, endpoint, output)
+                .await
+                .unwrap_or_else(|error| exit_resource_error(error, output));
+            std::process::exit(code);
         }
         Commands::Logs {
             lease,
