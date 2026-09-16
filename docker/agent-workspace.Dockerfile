@@ -126,9 +126,15 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
 # NOT baked in; each lease authenticates its own user at runtime. Node comes
 # from the same pinned tool manager the workspace already uses, then sits at a
 # stable root-owned path so `kobe exec` reaches it without a login shell.
+# Node stays pinned: it is the runtime both CLIs sit on, and a major bump
+# breaking them would be indistinguishable from the CLIs themselves breaking.
 ARG NODE_VERSION=24.18.1
-ARG CODEX_VERSION=0.154.0
-ARG CLAUDE_CODE_VERSION=2.1.268
+# The CLIs are NOT pinned. They ship often, a pinned version starts rotting the
+# day it is written, and the nightly rebuild exists precisely so the baseline
+# keeps up. The blast radius is small: this is developer tooling inside a
+# sandbox, and a bad release is one re-lease away from gone, not a production
+# dependency. What a pin really bought was the ability to answer "which version
+# is in this image?", so that is recorded below instead of frozen.
 # npm locates its bundled JavaScript relative to its executable. Keeping the
 # whole Node distribution together avoids a broken /usr/local symlink.
 RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
@@ -136,10 +142,14 @@ RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
     && PATH="$node_dir/bin:$PATH" \
     && export PATH \
     && npm install --global --prefix "$node_dir" --no-audit --no-fund \
-        "@openai/codex@${CODEX_VERSION}" \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@openai/codex@latest" \
+        "@anthropic-ai/claude-code@latest" \
     && codex --version \
-    && claude --version
+    && claude --version \
+    && printf 'node %s\ncodex %s\nclaude-code %s\n' \
+        "$(node --version)" "$(codex --version)" "$(claude --version)" \
+        > /etc/kobe-workspace-versions \
+    && chmod 0644 /etc/kobe-workspace-versions
 
 # Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
 # the pinned tools visible there as well as to Kobe's direct-exec environment.
