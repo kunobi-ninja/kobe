@@ -102,6 +102,21 @@ impl Reporter {
         Self { output, color }
     }
 
+    /// Explanatory prose under the report. Dimmed, because it is there for
+    /// the first run and should not compete with the result on later ones.
+    fn note(&self, body: impl AsRef<str>) {
+        if self.output != OutputFormat::Text {
+            return;
+        }
+        for line in body.as_ref().lines() {
+            if self.color {
+                println!("  \x1b[2m{line}\x1b[0m");
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+
     fn step(&self, name: &str, detail: impl AsRef<str>) {
         if self.output != OutputFormat::Text {
             return;
@@ -255,6 +270,21 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
             } else {
                 println!("  Ready.  ssh {try_host}");
             }
+            // The trailing `1` reads like an index into something. It is not:
+            // it is a name the caller invents, and inventing another one is
+            // how you get a second sandbox. Nothing else in the output says
+            // so, and getting it wrong is the difference between returning to
+            // your work and silently leasing a new machine.
+            println!();
+            report.note(
+                "The host is kobe-<pool>-<name>, and the name is yours. The first\n\
+                 connection leases a sandbox and later ones return to it, so a\n\
+                 different name is a different sandbox.",
+            );
+            report.note(format!(
+                "Append .<session>, as in {try_host}.main, for a shell that\n\
+                 outlives a dropped connection."
+            ));
         }
         OutputFormat::Json => print_json(&InitOutput {
             target: target_name.unwrap_or_default(),
