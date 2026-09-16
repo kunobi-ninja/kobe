@@ -126,9 +126,13 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
 # NOT baked in; each lease authenticates its own user at runtime. Node comes
 # from the same pinned tool manager the workspace already uses, then sits at a
 # stable root-owned path so `kobe exec` reaches it without a login shell.
-# Node stays pinned: it is the runtime both CLIs sit on, and a major bump
-# breaking them would be indistinguishable from the CLIs themselves breaking.
-ARG NODE_VERSION=24.18.1
+# Node is pinned to a MAJOR, not to a patch. The major is what can break the
+# CLIs that sit on it, and a break there would be indistinguishable from the
+# CLIs breaking by themselves; patches within the major are security fixes we
+# want the nightly rebuild to pick up, and an exact pin would have quietly
+# kept reinstalling known CVEs. `lts` is deliberately not used: it moves to 26
+# in October, and that jump would arrive on a night nobody is watching.
+ARG NODE_VERSION=24
 # The CLIs are NOT pinned. They ship often, a pinned version starts rotting the
 # day it is written, and the nightly rebuild exists precisely so the baseline
 # keeps up. The blast radius is small: this is developer tooling inside a
@@ -153,9 +157,11 @@ RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
 
 # Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
 # the pinned tools visible there as well as to Kobe's direct-exec environment.
-# Double quotes so NODE_VERSION expands at build time while $PATH stays literal
-# in the written file: single quotes would emit the variable name itself.
-RUN printf '%s\n' "export PATH=/opt/kobe/mise/installs/node/${NODE_VERSION}/bin:\$PATH" \
+# Ask mise where it actually put Node rather than rebuilding the path from the
+# version spec: with a major-only pin the install directory is not named after
+# the spec. Double quotes expand it at build time while $PATH stays literal.
+RUN node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
+    && printf '%s\n' "export PATH=$node_dir/bin:\$PATH" \
       > /etc/profile.d/kobe-node-tools.sh \
     && chmod 0644 /etc/profile.d/kobe-node-tools.sh
 
