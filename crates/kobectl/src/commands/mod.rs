@@ -277,10 +277,32 @@ async fn oidc_token_noninteractive(
     Ok(token)
 }
 
+/// The SSH audience an endpoint advertises, discovered once per process.
+///
+/// Every authorized request needs the audience, and every request signs its
+/// own `(method, path, body)`, so a command that makes several requests used
+/// to re-fetch `/v1/status` for each one. An endpoint does not change its
+/// audience underneath a running command; a stale entry cannot outlive the
+/// process.
+fn audience_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
+    // The guard is dropped before any await, so the lock never spans one.
+    if let Ok(cache) = audience_cache().lock()
+        && let Some(hit) = cache.get(endpoint)
+    {
+        return Ok(hit.clone());
+    }
+
     // Try twice — the server may not have loaded policies on first attempt
     for attempt in 0..2 {
-        let resp: serde_json::Value = reqwest::get(format!("{endpoint}/v1/status"))
+        let resp: serde_json::Value = authed_client()
+            .get(format!("{endpoint}/v1/status"))
+            .send()
             .await?
             .json()
             .await?;
@@ -289,6 +311,9 @@ async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
                 if method["type"].as_str() == Some("ssh")
                     && let Some(audience) = method["audience"].as_str()
                 {
+                    if let Ok(mut cache) = audience_cache().lock() {
+                        cache.insert(endpoint.to_string(), audience.to_string());
+                    }
                     return Ok(audience.to_string());
                 }
             }
@@ -525,8 +550,15 @@ impl<T> Reaching<T> for Result<T, reqwest::Error> {
     }
 }
 
+/// The process-wide HTTP client.
+///
+/// `reqwest::Client` owns a connection pool, so building a fresh one per
+/// request threw that pool away and paid a new TCP and TLS handshake for every
+/// call. One client lets the commands that make several requests reuse a
+/// single kept-alive connection. Cloning is cheap and shares the pool.
 pub(crate) fn authed_client() -> reqwest::Client {
-    reqwest::Client::new()
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
 }
 
 /// Add auth header to a request builder if available.

@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use super::config::{AuthMode, CliConfig};
 use super::leases::{
-    LeaseSummary, fetch_all_leases, fetch_lease, format_lease_status_line, is_status_hidden_phase,
+    LeaseSummary, fetch_all_leases, format_lease_status_line, is_status_hidden_phase,
     lease_cluster_label,
 };
 use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
@@ -139,17 +139,21 @@ pub async fn status(
     };
     let auth_mode = config.auth.to_string();
 
+    // The pool listing and the lease listing are independent reads, so the
+    // slower one no longer waits on the faster. Each still carries its own
+    // authorization.
     let (pools, pools_error, leases) = if auth_error.is_some() {
         (Vec::new(), None, Vec::new())
     } else {
-        let (pools, pools_error) = match fetch_pools_for_config(&config).await {
+        let (pools, leases) =
+            tokio::join!(fetch_pools_for_config(&config), fetch_all_leases(&config));
+        let (pools, pools_error) = match pools {
             Ok(pools) => (pools, None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
-        let leases = fetch_all_leases(&config).await.unwrap_or_default();
-        (pools, pools_error, leases)
+        (pools, pools_error, leases.unwrap_or_default())
     };
-    let leases = enrich_leases(&config, leases).await;
+    let leases = attach_kubeconfig_paths(&config, leases);
 
     // Orphan detection only makes sense when we successfully fetched leases —
     // otherwise we don't know which lease IDs are actually active server-side
@@ -276,43 +280,32 @@ pub async fn status(
     Ok(())
 }
 
-async fn enrich_leases(
+/// Fill in where each lease's kubeconfig lives locally.
+///
+/// This used to `GET /v1/leases/{id}` per lease to re-read fields the listing
+/// already carries: `phase`, `capabilities`, `cluster_name`, `expires_at`,
+/// `queue_position`, `alias` and `metadata` for Cluster leases, and
+/// `transport`/`iroh` for Sandbox ones. The detail route's only addition is
+/// the kubeconfig body, which [`LeaseSummary`] has no field for and the loop
+/// discarded. Serving one costs the operator a binding resolution and a
+/// freshly minted connect token, and cost the caller another signature from
+/// its SSH agent, over an inventory that is mostly released leases the text
+/// output then hides.
+///
+/// Reading the listing correctly is what made that fetch removable; see the
+/// spelling note on [`LeaseSummary`]. The kubeconfig path is local, so it
+/// needs no request at all.
+fn attach_kubeconfig_paths(
     config: &super::config::ResolvedConfig,
     leases: Vec<LeaseSummary>,
 ) -> Vec<LeaseSummary> {
-    let mut enriched = Vec::with_capacity(leases.len());
-
-    for lease in leases {
-        let kubeconfig_path = resolve_kubeconfig_path(&config.endpoint, &lease.id);
-        match fetch_lease(config, &lease.id).await {
-            Ok(detail) => enriched.push(LeaseSummary {
-                id: detail.id,
-                phase: detail.phase,
-                resource_kind: detail.resource_kind,
-                capabilities: detail.capabilities,
-                profile: detail.profile,
-                cluster_name: detail.cluster_name.or(lease.cluster_name),
-                expires_at: detail.expires_at.or(lease.expires_at),
-                queue_position: if detail.queue_position == 0 {
-                    lease.queue_position
-                } else {
-                    detail.queue_position
-                },
-                requester: lease.requester,
-                kubeconfig_path,
-                alias: lease.alias,
-                metadata: detail.metadata.or(lease.metadata),
-                transport: detail.transport.or(lease.transport),
-                iroh: detail.iroh.or(lease.iroh),
-            }),
-            Err(_) => enriched.push(LeaseSummary {
-                kubeconfig_path,
-                ..lease
-            }),
-        }
-    }
-
-    enriched
+    leases
+        .into_iter()
+        .map(|lease| LeaseSummary {
+            kubeconfig_path: resolve_kubeconfig_path(&config.endpoint, &lease.id),
+            ..lease
+        })
+        .collect()
 }
 
 #[cfg(test)]

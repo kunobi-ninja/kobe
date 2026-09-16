@@ -403,7 +403,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // CREATE/bind request is still in flight. Registering later would leave a
     // window in which teardown clears the execution manifest, then the delayed
     // request creates a finalised record after absence was already certified.
-    let guard = match register_live_stream(&state, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target, "execution").await {
         Ok(guard) => guard,
         Err(denied) => {
             return stream_registration_denied(&identity, &id, "execution", denied);
@@ -1380,7 +1380,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                         None,
                     );
                 };
-                let guard = match register_live_stream(&state, &lease, &target).await {
+                let guard = match register_live_stream(&state, &lease, &target, "execution").await {
                     Ok(guard) => guard,
                     Err(denied) => {
                         return stream_registration_denied(&identity, &id, "execution", denied);
@@ -1568,7 +1568,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     // Output reads are live operations too. Holding a guard ensures release,
     // expiry, or quarantine interrupts every runner call below rather than
     // allowing a second stream read under authority that has ended.
-    let guard = match register_live_stream(&state, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target, "execution-logs").await {
         Ok(guard) => guard,
         Err(denied) => {
             return stream_registration_denied(&identity, &id, "execution-logs", denied);
@@ -1796,7 +1796,7 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
     // it must enter the same distributed gate. Otherwise it could resolve a
     // Ready lease, race a release that observes an empty gate, and mint a new
     // credential while teardown is already removing the target.
-    let guard = match register_live_stream(&state, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target, "execution-cancel").await {
         Ok(guard) => guard,
         Err(denied) => {
             return stream_registration_denied(&identity, &id, "execution-cancel", denied);
@@ -2265,6 +2265,7 @@ async fn register_live_stream<B: ClusterBackend>(
     state: &AppState<B>,
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
+    kind: &'static str,
 ) -> Result<crate::api::sandbox_streams::StreamGuard, StreamRegistrationDenied> {
     let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let identity = crate::api::sandbox_streams::StreamIdentity::from_ready_lease(lease)
@@ -2303,6 +2304,7 @@ async fn register_live_stream<B: ClusterBackend>(
         &lease.name_any(),
         &target.lease_uid,
         &identity,
+        kind,
     )
     .await
     {
@@ -2424,6 +2426,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
     id: &str,
     intent: UpgradeIntent,
     requested_container: Option<&str>,
+    kind: &'static str,
 ) -> Result<UpgradeContext, Response> {
     use crate::api::sandbox_access as access;
 
@@ -2461,7 +2464,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
     // over the limit gets a status rather than a socket that closes at once,
     // and the guard travels with the context so the claim cannot be dropped in
     // between.
-    let guard = register_live_stream(state, &lease, &target)
+    let guard = register_live_stream(state, &lease, &target, kind)
         .await
         .map_err(|denied| stream_registration_denied(identity, id, operation.as_str(), denied))?;
     let revoked = guard.cancelled();
@@ -2549,6 +2552,7 @@ async fn sandbox_attach<B: ClusterBackend>(
         &id,
         UpgradeIntent::Attach(query.command.clone()),
         query.container.as_deref(),
+        "attach",
     )
     .await
     {
@@ -2651,11 +2655,19 @@ async fn sandbox_port_forward<B: ClusterBackend>(
         return response;
     }
 
-    let context =
-        match prepare_upgrade(&state, &identity, &id, UpgradeIntent::PortForward, None).await {
-            Ok(context) => context,
-            Err(response) => return response,
-        };
+    let context = match prepare_upgrade(
+        &state,
+        &identity,
+        &id,
+        UpgradeIntent::PortForward,
+        None,
+        "port-forward",
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     // Only what the pool declared. Without this the forward is a general
     // tunnel into the Pod's network namespace, reaching a debug listener or a
@@ -2851,11 +2863,19 @@ async fn sandbox_session<B: ClusterBackend>(
         );
     };
 
-    let context =
-        match prepare_upgrade(&state, &identity, &id, intent, request.container.as_deref()).await {
-            Ok(context) => context,
-            Err(response) => return response,
-        };
+    let context = match prepare_upgrade(
+        &state,
+        &identity,
+        &id,
+        intent,
+        request.container.as_deref(),
+        "session",
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
     let resolved_port = if let Some(port) = port.as_deref() {
         match context.target.resolve_port(port) {
@@ -3043,7 +3063,7 @@ async fn sandbox_exec<B: ClusterBackend>(
     // being torn down. The guard deregisters on every exit path, including a
     // panic — a leaked registration would later report cancelling something
     // that ended long ago.
-    let guard = match register_live_stream(&state, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target, "exec").await {
         Ok(guard) => guard,
         Err(denied) => return stream_registration_denied(&identity, &id, "exec", denied),
     };
@@ -3180,7 +3200,7 @@ async fn sandbox_logs<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "logs", denied),
     };
 
-    let guard = match register_live_stream(&state, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target, "logs").await {
         Ok(guard) => guard,
         Err(denied) => return stream_registration_denied(&identity, &id, "logs", denied),
     };
@@ -9960,8 +9980,15 @@ mod tests {
         // through it. Attach requires `exec`: an interactive shell is not a
         // weaker grant than a one-shot command.
         for intent in [UpgradeIntent::Attach(None), UpgradeIntent::PortForward] {
-            let denied =
-                prepare_upgrade(&test_state(&server), &restricted, id, intent.clone(), None).await;
+            let denied = prepare_upgrade(
+                &test_state(&server),
+                &restricted,
+                id,
+                intent.clone(),
+                None,
+                "attach",
+            )
+            .await;
             let response = denied.err().expect("upgrade must be refused");
             assert_eq!(
                 response.status(),

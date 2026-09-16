@@ -143,6 +143,12 @@ pub struct StreamGuard {
     lease_uid: String,
     id: u64,
     token: CancellationToken,
+    /// Caller-facing operation this stream serves, for metrics only. A
+    /// `&'static str` from a fixed set, never an identifier, so the series
+    /// cannot be widened by a caller.
+    kind: &'static str,
+    /// When the slot was admitted, so Drop can report how long it was held.
+    started: std::time::Instant,
     /// Global lease/principal registration. Its Drop removes the API-server
     /// CAS entries only after the local socket guard itself is released.
     distributed: Option<crate::sandbox_access_ledger::AccessGuard>,
@@ -164,6 +170,12 @@ impl StreamGuard {
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
+        crate::metrics::SANDBOX_STREAMS_ACTIVE
+            .with_label_values(&[self.kind])
+            .dec();
+        crate::metrics::SANDBOX_STREAM_DURATION_SECONDS
+            .with_label_values(&[self.kind])
+            .observe(self.started.elapsed().as_secs_f64());
         let registry = self.registry.clone();
         let lease_uid = self.lease_uid.clone();
         let id = self.id;
@@ -194,7 +206,7 @@ impl StreamRegistry {
         lease_uid: &str,
         identity: &StreamIdentity,
     ) -> StreamGuard {
-        self.try_register(lease_uid, identity, usize::MAX, usize::MAX)
+        self.try_register(lease_uid, identity, "test", usize::MAX, usize::MAX)
             .await
             .expect("an unbounded registration cannot be refused")
     }
@@ -210,6 +222,7 @@ impl StreamRegistry {
         self: &Arc<Self>,
         lease_uid: &str,
         identity: &StreamIdentity,
+        kind: &'static str,
         lease_limit: usize,
         principal_limit: usize,
     ) -> Option<StreamGuard> {
@@ -236,6 +249,14 @@ impl StreamRegistry {
             .copied()
             .unwrap_or_default();
         if lease_count >= lease_limit || principal_count >= principal_limit {
+            let outcome = if lease_count >= lease_limit {
+                "refused_lease_limit"
+            } else {
+                "refused_principal_limit"
+            };
+            crate::metrics::SANDBOX_STREAM_TOTAL
+                .with_label_values(&[kind, outcome])
+                .inc();
             return None;
         }
         state
@@ -263,11 +284,19 @@ impl StreamRegistry {
             }
         });
 
+        crate::metrics::SANDBOX_STREAM_TOTAL
+            .with_label_values(&[kind, "admitted"])
+            .inc();
+        crate::metrics::SANDBOX_STREAMS_ACTIVE
+            .with_label_values(&[kind])
+            .inc();
         Some(StreamGuard {
             registry: self.clone(),
             lease_uid: lease_uid.to_string(),
             id,
             token,
+            kind,
+            started: std::time::Instant::now(),
             distributed: None,
         })
     }
@@ -455,11 +484,13 @@ pub async fn register_bounded(
     registry: &Arc<StreamRegistry>,
     lease_uid: &str,
     identity: &StreamIdentity,
+    kind: &'static str,
 ) -> Option<StreamGuard> {
     registry
         .try_register(
             lease_uid,
             identity,
+            kind,
             MAX_STREAMS_PER_LEASE,
             MAX_STREAMS_PER_PRINCIPAL,
         )
@@ -487,8 +518,10 @@ pub async fn register_confirmed(
     lease_name: &str,
     expected_uid: &str,
     expected_identity: &StreamIdentity,
+    kind: &'static str,
 ) -> Result<ConfirmedStreamRegistration, kube::Error> {
-    let Some(guard) = register_bounded(registry, expected_uid, expected_identity).await else {
+    let Some(guard) = register_bounded(registry, expected_uid, expected_identity, kind).await
+    else {
         return Ok(ConfirmedStreamRegistration::LimitReached);
     };
     let current = match leases.get(lease_name).await {
@@ -771,6 +804,84 @@ mod tests {
         handle_watch_event(registry, event, &mut None).await;
     }
 
+    /// The stream metrics have to follow the socket, not the request: a slot
+    /// that is admitted must show up as open and only stop being open when the
+    /// guard is dropped, or "how many sessions are live" is a number that
+    /// drifts upward forever.
+    #[tokio::test]
+    async fn an_admitted_stream_is_counted_open_until_its_guard_drops() {
+        let registry = StreamRegistry::new();
+        let alice = principal_identity("alice");
+        let kind = "session-metrics-test";
+        let active = || {
+            crate::metrics::SANDBOX_STREAMS_ACTIVE
+                .with_label_values(&[kind])
+                .get()
+        };
+        let admitted = || {
+            crate::metrics::SANDBOX_STREAM_TOTAL
+                .with_label_values(&[kind, "admitted"])
+                .get()
+        };
+        let observed = || {
+            crate::metrics::SANDBOX_STREAM_DURATION_SECONDS
+                .with_label_values(&[kind])
+                .get_sample_count()
+        };
+
+        let active_before = active();
+        let admitted_before = admitted();
+        let observed_before = observed();
+
+        let guard = registry
+            .try_register("lease-a", &alice, kind, 4, 4)
+            .await
+            .expect("the first registration is under every limit");
+        assert_eq!(active(), active_before + 1, "an admitted slot is open");
+        assert_eq!(admitted(), admitted_before + 1);
+        assert_eq!(
+            observed(),
+            observed_before,
+            "an open stream has no duration yet"
+        );
+
+        drop(guard);
+        assert_eq!(active(), active_before, "dropping the guard closes it");
+        assert_eq!(
+            observed(),
+            observed_before + 1,
+            "the closed stream reports how long it was held"
+        );
+    }
+
+    /// A refusal is counted too, and under its own outcome, so a pool that is
+    /// turning callers away cannot look identical to one nobody is using.
+    #[tokio::test]
+    async fn a_refused_stream_is_counted_under_the_limit_it_hit() {
+        let registry = StreamRegistry::new();
+        let alice = principal_identity("alice");
+        let kind = "lease-limit-metrics-test";
+        let refused = || {
+            crate::metrics::SANDBOX_STREAM_TOTAL
+                .with_label_values(&[kind, "refused_lease_limit"])
+                .get()
+        };
+
+        let before = refused();
+        let _held = registry
+            .try_register("lease-a", &alice, kind, 1, 4)
+            .await
+            .expect("the first registration fits");
+        assert!(
+            registry
+                .try_register("lease-a", &alice, kind, 1, 4)
+                .await
+                .is_none(),
+            "the second exceeds the per-lease limit"
+        );
+        assert_eq!(refused(), before + 1);
+    }
+
     /// The API must remain closed through Init and every InitApply; only the
     /// terminal marker establishes a complete revocation baseline.
     #[tokio::test]
@@ -859,6 +970,7 @@ mod tests {
                 "sbx-1",
                 "lease-uid-1",
                 &expected_identity,
+                "test",
             )
             .await
             .unwrap(),
@@ -905,6 +1017,7 @@ mod tests {
                 "sbx-1",
                 "lease-uid-1",
                 &expected_identity,
+                "test",
             )
             .await
             .unwrap(),
@@ -943,6 +1056,7 @@ mod tests {
                 "sbx-1",
                 "lease-uid-1",
                 &expected_identity,
+                "test",
             )
             .await
         });
@@ -1073,20 +1187,24 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..MAX_STREAMS_PER_LEASE {
             guards.push(
-                register_bounded(&registry, "lease-a", &alice)
+                register_bounded(&registry, "lease-a", &alice, "test")
                     .await
                     .expect("under the limit"),
             );
         }
         assert!(
-            register_bounded(&registry, "lease-a", &alice)
+            register_bounded(&registry, "lease-a", &alice, "test")
                 .await
                 .is_none(),
             "the limit must actually bind"
         );
         // Another lease is unaffected: the limit is per-lease, so one busy
         // caller cannot lock everybody else out.
-        assert!(register_bounded(&registry, "lease-b", &bob).await.is_some());
+        assert!(
+            register_bounded(&registry, "lease-b", &bob, "test")
+                .await
+                .is_some()
+        );
 
         // Closing one frees a slot.
         guards.pop();
@@ -1097,7 +1215,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(
-            register_bounded(&registry, "lease-a", &alice)
+            register_bounded(&registry, "lease-a", &alice, "test")
                 .await
                 .is_some()
         );
@@ -1118,7 +1236,9 @@ mod tests {
             .map(|_| {
                 let registry = registry.clone();
                 let identity = identity.clone();
-                tokio::spawn(async move { register_bounded(&registry, "lease-a", &identity).await })
+                tokio::spawn(async move {
+                    register_bounded(&registry, "lease-a", &identity, "test").await
+                })
             })
             .collect();
 
@@ -1148,7 +1268,7 @@ mod tests {
                 let registry = registry.clone();
                 let alice = alice.clone();
                 tokio::spawn(async move {
-                    register_bounded(&registry, &format!("lease-{index}"), &alice).await
+                    register_bounded(&registry, &format!("lease-{index}"), &alice, "test").await
                 })
             })
             .collect();
@@ -1167,7 +1287,7 @@ mod tests {
 
         let bob = principal_identity("bob");
         assert!(
-            register_bounded(&registry, "bob-lease", &bob)
+            register_bounded(&registry, "bob-lease", &bob, "test")
                 .await
                 .is_some(),
             "one saturated principal must not lock another out"
@@ -1183,7 +1303,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(
-            register_bounded(&registry, "alice-replacement", &alice)
+            register_bounded(&registry, "alice-replacement", &alice, "test")
                 .await
                 .is_some(),
             "dropping a guard must return its principal slot"
