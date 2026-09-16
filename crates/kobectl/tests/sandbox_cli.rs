@@ -384,6 +384,56 @@ fn flat_exec_routes_an_executable_lease_without_a_kind_namespace() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
 }
 
+/// `--detach` returns before there is an exit code. It must say how to reach
+/// the execution, not claim the execution ended.
+#[test]
+fn exec_detach_reports_a_started_execution() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                "id": "sandbox-test",
+                "phase": "Ready",
+                "pool": "agents",
+                "alias": "dev"
+                }])
+                .to_string(),
+            ),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["detach"], true);
+                reply(stream, 200, &[], &execution_body("Running", None))
+            }
+            _ => panic!("unexpected detached exec request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--detach", "--", "make", "build"],
+    );
+    let output = wait_output(child);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Started execution sbxe-test (running)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("kobe logs sandbox-test --execution sbxe-test --follow"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("ended"), "{stderr}");
+}
+
 #[test]
 fn flat_exec_rejects_a_cluster_lease_by_capability() {
     let server = Server::start(move |request, stream| {

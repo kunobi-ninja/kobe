@@ -179,10 +179,11 @@ enum Commands {
         stdin: bool,
         /// Return once the command has started instead of waiting for it
         ///
-        /// For work that outlives the connection: a multi-hour build survives
-        /// the exec returning, and `kobe logs --execution` and `kobe cancel
-        /// --execution` reach it afterwards. Without this a backgrounded
-        /// process dies with the execution that started it.
+        /// Prints the execution id. `kobe logs --execution` and `kobe cancel
+        /// --execution` reach it afterwards. The command still stops at
+        /// --timeout, and no execution runs longer than one hour. Without
+        /// this, a process backgrounded inside the command dies with the
+        /// execution that started it.
         #[arg(long)]
         detach: bool,
         /// The command to run, after `--`
@@ -471,13 +472,13 @@ enum SandboxAction {
         /// --with-token` — completes rather than waiting for its timeout.
         #[arg(long)]
         stdin: bool,
-        /// Start the command and return once it is reserved, instead of
-        /// waiting for it to finish.
+        /// Return once the command has started instead of waiting for it
         ///
-        /// For work that outlives the connection: a multi-hour build survives
-        /// the exec returning, and `kobe logs --execution` and `kobe cancel
-        /// --execution` reach it afterwards. Without this a backgrounded
-        /// process dies with the execution that started it.
+        /// Prints the execution id. `kobe logs --execution` and `kobe cancel
+        /// --execution` reach it afterwards. The command still stops at
+        /// --timeout, and no execution runs longer than one hour. Without
+        /// this, a process backgrounded inside the command dies with the
+        /// execution that started it.
         #[arg(long)]
         detach: bool,
         /// The command. Everything after `--`.

@@ -23,7 +23,7 @@ Global flags on every command: `--endpoint URL`, `--target NAME` (alias `--conte
 | `kobe purge` | Release all active leases and remove local kubeconfigs |
 | `kobe with-lease <pool> -- <cmd>` | Cluster lease around one command, then release |
 | `kobe run <pool> -- <cmd>` | Sandbox: create, run one command, release ([details](/docs/commands/sandbox)) |
-| `kobe exec <lease> -- <cmd>` | Run a command in a lease that supports `exec` |
+| `kobe exec <lease> -- <cmd>` | Run a command in a lease that supports `exec` (`--detach` to return once it starts) |
 | `kobe logs <lease>` | Read output from a lease that supports `logs` |
 | `kobe cancel <lease> --execution <id>` | Cancel a running execution |
 | `kobe attach [lease]` | Interactive session through `attach` |
