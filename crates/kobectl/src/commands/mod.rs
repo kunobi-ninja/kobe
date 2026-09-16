@@ -228,7 +228,7 @@ async fn get_auth_header_with_interaction(
         AuthMode::Ssh => {
             let client = kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
             // Discover audience from /v1/status — retry once if server hasn't loaded policies yet
-            let audience = discover_ssh_audience(&config.endpoint).await?;
+            let audience = discover_ssh_audience(config).await?;
             tofu_check(&config.endpoint, &audience, interaction).await?;
             let header = client.authorize(&audience, method, path, body).await?;
             Ok(Some(header))
@@ -290,7 +290,8 @@ fn audience_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
     CACHE.get_or_init(Default::default)
 }
 
-async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
+async fn discover_ssh_audience(config: &ResolvedConfig) -> anyhow::Result<String> {
+    let endpoint = config.endpoint.as_str();
     // The guard is dropped before any await, so the lock never spans one.
     if let Ok(cache) = audience_cache().lock()
         && let Some(hit) = cache.get(endpoint)
@@ -303,7 +304,8 @@ async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
         let resp: serde_json::Value = authed_client()
             .get(format!("{endpoint}/v1/status"))
             .send()
-            .await?
+            .await
+            .reaching(config)?
             .json()
             .await?;
         if let Some(methods) = resp["auth"]["methods"].as_array() {
@@ -547,6 +549,28 @@ impl<T> Reaching<T> for Result<T, reqwest::Error> {
                 classify_unreachable(&error),
             ))
         })
+    }
+}
+
+/// Whether human output on stdout may carry terminal styles.
+///
+/// Off when stdout is redirected or `NO_COLOR` is set, so `kobe status | grep`
+/// and saved logs stay plain text. Decided once per process.
+pub(crate) fn stdout_color() -> bool {
+    static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COLOR.get_or_init(|| {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none()
+    })
+}
+
+/// `text` wrapped in the SGR style `sgr` (`"1"` bold, `"33"` yellow) when
+/// [`stdout_color`] allows it, and unchanged otherwise.
+pub(crate) fn styled(sgr: &str, text: impl std::fmt::Display) -> String {
+    if stdout_color() {
+        format!("\x1b[{sgr}m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 

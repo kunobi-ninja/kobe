@@ -11,7 +11,7 @@ use super::leases::{LeaseDetail, LeaseSummary, fetch_lease};
 use super::picker::{PickerItem, run_picker};
 use super::pools::{PoolSummary, fetch_pool_for_config_with_output, fetch_pools_for_config};
 use super::state::record_kubeconfig;
-use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
 
 pub struct LeaseCreateCommand<'a> {
     pub pool: Option<&'a str>,
@@ -97,7 +97,8 @@ pub(crate) async fn create_lease_request(
         .header("Content-Type", "application/json")
         .body(body_bytes)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
 
     let status = response.status();
     if !status.is_success() {
@@ -469,7 +470,8 @@ pub(crate) async fn wait_for_usable_lease(
             let token = get_auth_header(config, "GET", &path, b"").await?;
             let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
                 .send()
-                .await?;
+                .await
+                .reaching(config)?;
             match response.status().as_u16() {
                 200 => {
                     let detail: LeaseDetail = response.json().await?;

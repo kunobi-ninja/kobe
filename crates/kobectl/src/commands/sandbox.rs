@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 
 use super::config::{CliConfig, ResolvedConfig};
 use super::{
-    OutputFormat, authed_client, get_auth_header_for_output, get_auth_header_noninteractive,
-    print_json, with_auth,
+    OutputFormat, Reaching, authed_client, get_auth_header_for_output,
+    get_auth_header_noninteractive, print_json, with_auth,
 };
 
 async fn sandbox_auth_header(
@@ -335,8 +335,7 @@ pub(crate) async fn exec_once(
     let (status, payload) =
         retry_transport_once(|| send_exec_request(config, &path, &body, output))
             .await
-            .map_err(ExecRequestAttemptError::into_inner)
-            .context("could not reach the Kobe endpoint")?;
+            .map_err(ExecRequestAttemptError::into_inner)?;
     if !status.is_success() {
         // The server's own message, not a guess. A CLI that invents an
         // explanation for a status it does not understand sends people looking
@@ -367,7 +366,8 @@ async fn send_exec_request(
     .body(body.to_vec())
     .send()
     .await
-    .map_err(|error| ExecRequestAttemptError::Transport(error.into()))?;
+    .reaching(config)
+    .map_err(ExecRequestAttemptError::Transport)?;
     let status = response.status();
     let payload = response
         .text()
@@ -1327,9 +1327,7 @@ async fn exec_once_for_run(
             .await
             .map_err(|error| match error {
                 ExecRequestAttemptError::Auth(error) => RunExecutionError::Failure(error),
-                ExecRequestAttemptError::Transport(error) => RunExecutionError::Disconnected(
-                    error.context("could not reach the Kobe endpoint"),
-                ),
+                ExecRequestAttemptError::Transport(error) => RunExecutionError::Disconnected(error),
             })?;
     if !status.is_success() {
         return Err(RunExecutionError::Failure(anyhow::anyhow!(
@@ -1517,12 +1515,8 @@ async fn send_create_headers(
                 "sandbox create response headers exceeded {CREATE_TIMEOUT:?}"
             ))
         })?
-        .map_err(|error| {
-            CreateHeaderFailure::Transport(
-                anyhow::Error::from(error)
-                    .context("could not reach the Kobe endpoint while creating a sandbox"),
-            )
-        })
+        .reaching(config)
+        .map_err(CreateHeaderFailure::Transport)
 }
 
 /// Poll the deterministic keyed Location until the still-running create
@@ -1545,7 +1539,8 @@ async fn recover_expected_lease(
             let token = sandbox_auth_header(config, "GET", &path, b"", output).await?;
             let response = with_auth(authed_client().get(&absolute), &token)
                 .send()
-                .await?;
+                .await
+                .reaching(config)?;
             let status = response.status();
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
@@ -1617,7 +1612,7 @@ async fn wait_until_ready(
         )
         .await
         .map_err(|_| ready_deadline_error(lease))?
-        .context("could not reach the Kobe endpoint")
+        .reaching(config)
         .map_err(RunExecutionError::Failure)?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1874,7 +1869,7 @@ pub async fn logs(
     )
     .send()
     .await
-    .context("could not reach the Kobe endpoint")?;
+    .reaching(&config)?;
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -2018,11 +2013,8 @@ async fn read_execution_logs_once(
     )
     .send()
     .await
-    .map_err(|error| {
-        LogReadFailure::Transport(
-            anyhow::Error::from(error).context("could not reach the Kobe endpoint"),
-        )
-    })?;
+    .reaching(config)
+    .map_err(LogReadFailure::Transport)?;
     let status = response.status();
     if !status.is_success() {
         let payload = response.bytes().await.unwrap_or_default();
@@ -2150,7 +2142,7 @@ pub async fn cancel(
     )
     .send()
     .await
-    .context("could not reach the Kobe endpoint")?;
+    .reaching(&config)?;
 
     let status = response.status();
     let payload = response.text().await.unwrap_or_default();

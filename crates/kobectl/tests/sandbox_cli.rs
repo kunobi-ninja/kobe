@@ -384,6 +384,59 @@ fn flat_exec_routes_an_executable_lease_without_a_kind_namespace() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
 }
 
+/// Piped text output carries no terminal escapes, so `kobe status | grep`
+/// matches what a person sees.
+#[test]
+fn piped_status_is_plain_text() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&["none"])),
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+            _ => panic!("unexpected status request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(&server.endpoint(), &["status"]);
+    let output = wait_output(child);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("Leases"), "{stdout}");
+    assert!(stdout.contains("Pools"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+}
+
+/// Every command explains an unreachable endpoint the same way `kobe status`
+/// does, instead of printing reqwest's raw error chain.
+#[test]
+fn commands_explain_an_unreachable_endpoint() {
+    // Bind and drop a listener so the port is known to be closed.
+    let endpoint = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    for args in [
+        vec!["status"],
+        vec!["lease", "ci-small", "--no-wait"],
+        vec!["release", "lease-1"],
+        vec!["extend", "lease-1", "--ttl", "30m"],
+        vec!["exec", "sandbox-a1b2c3d4e5f60718293a4b5c", "--", "true"],
+        vec!["logs", "sandbox-a1b2c3d4e5f60718293a4b5c", "--tail", "5"],
+    ] {
+        let (_directory, child) = spawn_child(&endpoint, &args);
+        let output = wait_output(child);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(0), "{args:?}");
+        assert!(
+            stderr.contains("cannot reach kobe at"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("error sending request"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 /// `--detach` returns before there is an exit code. It must say how to reach
 /// the execution, not claim the execution ended.
 #[test]

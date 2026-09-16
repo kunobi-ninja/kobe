@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::config::{CliConfig, ResolvedConfig};
 use super::leases::format_relative_time;
 use super::select::{OnAmbiguous, resolve_lease_id};
-use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
 
 /// Sandbox lease ids are self-identifying, so the client routes to the right
 /// endpoint without a lookup. Mirrors the server's `LEASE_ID_PREFIX`.
@@ -69,7 +69,8 @@ pub(crate) async fn extend_lease(
         .header("Content-Type", "application/json")
         .body(body)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
 
     let status = response.status();
     if !status.is_success() {

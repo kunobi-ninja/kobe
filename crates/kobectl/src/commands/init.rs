@@ -96,9 +96,7 @@ struct Reporter {
 
 impl Reporter {
     fn new(output: OutputFormat) -> Self {
-        let color = output == OutputFormat::Text
-            && std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none();
+        let color = output == OutputFormat::Text && super::stdout_color();
         Self { output, color }
     }
 
@@ -303,7 +301,13 @@ async fn discover_auth_mode(endpoint: &str) -> Result<AuthMode> {
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("could not reach {url}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!(super::unreachable_message(
+                endpoint,
+                None,
+                super::classify_unreachable(&error),
+            ))
+        })?;
     if !response.status().is_success() {
         anyhow::bail!("{url} answered HTTP {}", response.status());
     }

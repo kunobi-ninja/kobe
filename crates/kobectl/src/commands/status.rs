@@ -10,7 +10,8 @@ use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
 use super::purge::live_lease_ids;
 use super::state::{find_orphan_kubeconfigs, resolve_kubeconfig_path};
 use super::{
-    OutputFormat, Reaching, authed_client, cli_version, get_auth_header, print_json, with_auth,
+    OutputFormat, Reaching, authed_client, cli_version, get_auth_header, print_json, styled,
+    with_auth,
 };
 
 #[derive(Serialize)]
@@ -240,7 +241,7 @@ pub async fn status(
         visible.sort_by_key(|lease| is_status_hidden_phase(&lease.phase));
     }
 
-    println!("\x1b[1mLeases\x1b[0m");
+    println!("{}", styled("1", "Leases"));
     if visible.is_empty() {
         if hidden == 0 {
             println!("  none");
@@ -268,14 +269,15 @@ pub async fn status(
         }
     }
     if !orphan_kubeconfigs.is_empty() {
-        println!(
-            "  \x1b[33m{} orphan kubeconfig(s) detected (lease no longer exists). Run `kobe purge --orphans-only` to clean up.\x1b[0m",
+        let warning = format!(
+            "{} orphan kubeconfig(s) detected (lease no longer exists). Run `kobe purge --orphans-only` to clean up.",
             orphan_kubeconfigs.len()
         );
+        println!("  {}", styled("33", warning));
     }
     println!();
 
-    println!("\x1b[1mPools\x1b[0m");
+    println!("{}", styled("1", "Pools"));
     if let Some(err) = &pools_error {
         println!("  Error listing pools: {err}");
         println!();

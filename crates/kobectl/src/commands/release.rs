@@ -5,7 +5,7 @@ use super::config::{CliConfig, ResolvedConfig};
 use super::extend::is_sandbox_lease;
 use super::select::{OnAmbiguous, resolve_lease_id};
 use super::state::remove_kubeconfig;
-use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReleaseOutcome {
@@ -31,7 +31,8 @@ pub(crate) async fn release_lease(
     let client = authed_client();
     let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
         .send()
-        .await?;
+        .await
+        .reaching(config)?;
     let status = response.status();
     let outcome = if status.is_success() {
         ReleaseOutcome::Released
