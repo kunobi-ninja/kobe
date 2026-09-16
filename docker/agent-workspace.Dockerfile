@@ -39,6 +39,12 @@ FROM debian:bookworm-slim
 # joins the container's own idle process and a dropped connection loses the
 # session — the exact failure an 8h agent lease must not have.
 #
+# `scrot` is how the desktop gets looked at without a browser. The image
+# shipped Xvfb, a window manager and noVNC with nothing able to photograph the
+# result, so an agent could start a desktop and never see it. One command,
+# `scrot -o /tmp/shot.png`, and it pulls in imlib2 rather than the whole of
+# ImageMagick.
+#
 # `openssh-server` is for `kobe ssh-proxy`: an SSH client on the caller's
 # machine reaches this sandbox through `kobe attach`, which runs `kobe-sshd`
 # (below) as the workload user in inetd mode. No port is opened.
@@ -73,6 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         procps \
         ripgrep \
+        scrot \
         tmux \
         unzip \
         websockify \
