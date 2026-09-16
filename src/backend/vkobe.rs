@@ -1460,11 +1460,25 @@ pub fn build_deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
+                    // Two annotation families on purpose. A cluster running
+                    // Prometheus selects on `prometheus.io/*`; the SigNoz
+                    // k8s-infra collectors select on `signoz.io/*` and ignore
+                    // the Prometheus ones entirely. Carrying only the first
+                    // set is why `kobe_sync_proxy_*` existed in this binary
+                    // but never appeared in SigNoz: the guest pod serves
+                    // /metrics and nothing was ever asked to read it. The
+                    // operator's own Deployment already carries the
+                    // `signoz.io/*` set (see the chart); this brings the
+                    // sidecar that actually sees exec/attach/port-forward
+                    // tunnels up to the same footing.
                     annotations: Some({
                         let mut ann = BTreeMap::new();
                         ann.insert("prometheus.io/scrape".to_string(), "true".to_string());
                         ann.insert("prometheus.io/port".to_string(), metrics_port.to_string());
                         ann.insert("prometheus.io/path".to_string(), "/metrics".to_string());
+                        ann.insert("signoz.io/scrape".to_string(), "true".to_string());
+                        ann.insert("signoz.io/port".to_string(), metrics_port.to_string());
+                        ann.insert("signoz.io/path".to_string(), "/metrics".to_string());
                         ann
                     }),
                     ..Default::default()
@@ -2129,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deployment_has_prometheus_annotations() {
+    fn test_deployment_is_scrapable_by_prometheus_and_signoz() {
         let config = test_kobe_sync_config();
         let dep = build_deployment(
             "cluster-1",
@@ -2157,6 +2171,22 @@ mod tests {
         assert_eq!(
             annotations.get("prometheus.io/port"),
             Some(&"9090".to_string())
+        );
+        // The SigNoz collectors read their own family and nothing else, so a
+        // pod annotated only for Prometheus is invisible to them however well
+        // it serves /metrics.
+        assert_eq!(
+            annotations.get("signoz.io/scrape"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            annotations.get("signoz.io/port"),
+            Some(&"9090".to_string()),
+            "the SigNoz port must follow the same metrics port, not a constant"
+        );
+        assert_eq!(
+            annotations.get("signoz.io/path"),
+            Some(&"/metrics".to_string())
         );
     }
 
