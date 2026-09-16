@@ -425,6 +425,18 @@ spec:
                 - null
                 nullable: true
                 type: string
+              releasingAt:
+                description: |-
+                  When the lease entered `Releasing`, RFC 3339.
+
+                  Teardown holds the caller's quota slot until absence is proven, so the
+                  gap between this and the terminal phase is time the caller cannot lease
+                  again. Nothing measured it: a slow teardown and a stuck one looked the
+                  same from outside, and with a two-lease grant that is the difference
+                  between working and waiting. Written once, beside the cause, by the
+                  same checkpoint.
+                nullable: true
+                type: string
               sandboxClaimTombstone:
                 description: |-
                   Exact management-cluster `SandboxClaim` retained as an inert release
