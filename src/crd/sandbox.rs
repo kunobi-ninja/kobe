@@ -1108,6 +1108,17 @@ pub struct SandboxLeaseStatus {
     /// evidence-gated path rather than holding finalizer and quota forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cause: Option<SandboxReleaseCause>,
+
+    /// When the lease entered `Releasing`, RFC 3339.
+    ///
+    /// Teardown holds the caller's quota slot until absence is proven, so the
+    /// gap between this and the terminal phase is time the caller cannot lease
+    /// again. Nothing measured it: a slow teardown and a stuck one looked the
+    /// same from outside, and with a two-lease grant that is the difference
+    /// between working and waiting. Written once, beside the cause, by the
+    /// same checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub releasing_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<ResolvedSandboxPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

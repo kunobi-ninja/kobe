@@ -4674,6 +4674,9 @@ async fn drive_release(
         let mut next = status.clone();
         next.phase = phase;
         next.release_cause = proposed_cause;
+        if next.releasing_at.is_none() {
+            next.releasing_at = Some(chrono::Utc::now().to_rfc3339());
+        }
         if admitted_pending_is_allocation_free(lease, &status) {
             next.claim_cleanup_fence = Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1);
         } else if pre_create_is_allocation_free(lease, &status) {
@@ -5231,6 +5234,28 @@ async fn checkpoint_child_receipt_handoff(
     patch_lease_status_fenced(ctx, lease, &next).await
 }
 
+/// Record how long teardown held the caller's slot, from the `Releasing`
+/// checkpoint to this terminal phase.
+///
+/// Silent when `releasingAt` is absent: a lease that entered Releasing under
+/// an older operator has no start, and inventing one would report a teardown
+/// that lasted since the epoch.
+fn observe_teardown_duration(status: &crate::crd::SandboxLeaseStatus, outcome: &str) {
+    let Some(started) = status.releasing_at.as_deref() else {
+        return;
+    };
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(started) else {
+        return;
+    };
+    let seconds = (chrono::Utc::now() - started.with_timezone(&chrono::Utc)).num_milliseconds();
+    if seconds < 0 {
+        return;
+    }
+    crate::metrics::SANDBOX_TEARDOWN_DURATION_SECONDS
+        .with_label_values(&[outcome])
+        .observe(seconds as f64 / 1000.0);
+}
+
 /// Release the admission reservations and reach the terminal phase.
 ///
 /// Only ever called once the footprint has been *proven* absent — by an exact
@@ -5297,6 +5322,7 @@ async fn finish_release(
         true,
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    observe_teardown_duration(&status, "completed");
     let mut next = status;
     next.phase = terminal;
     next.conditions = with_cleanup_condition(
@@ -7744,6 +7770,7 @@ async fn quarantine_lease_with_cause(
         false,
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    observe_teardown_duration(&next, "quarantined");
     next.phase = phase;
     // The first cause wins forever; stamping never overwrites one that a
     // decided teardown already persisted.
@@ -12903,6 +12930,46 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
     // Teardown
     // -----------------------------------------------------------------------
+
+    /// Teardown holds the caller's quota slot until absence is proven, so the
+    /// time it takes is time the caller cannot lease again. Nothing measured
+    /// it before, which made a slow teardown and a stuck one look identical.
+    #[test]
+    fn teardown_duration_is_recorded_per_outcome() {
+        fn count(outcome: &str) -> u64 {
+            crate::metrics::SANDBOX_TEARDOWN_DURATION_SECONDS
+                .with_label_values(&[outcome])
+                .get_sample_count()
+        }
+        let mut status = crate::crd::SandboxLeaseStatus {
+            releasing_at: Some((chrono::Utc::now() - chrono::Duration::seconds(7)).to_rfc3339()),
+            ..Default::default()
+        };
+
+        let before = count("completed");
+        observe_teardown_duration(&status, "completed");
+        assert_eq!(
+            count("completed"),
+            before + 1,
+            "a finished teardown is timed"
+        );
+
+        let before = count("quarantined");
+        observe_teardown_duration(&status, "quarantined");
+        assert_eq!(
+            count("quarantined"),
+            before + 1,
+            "a quarantine is timed separately: it keeps the slot indefinitely \
+             and must never read as a slow success"
+        );
+
+        // A lease that entered Releasing under an older operator has no start.
+        // Inventing one would report a teardown lasting since the epoch.
+        status.releasing_at = None;
+        let before = count("completed");
+        observe_teardown_duration(&status, "completed");
+        assert_eq!(count("completed"), before, "no start, no observation");
+    }
 
     /// Only a clean terminal checkpoint permits Kobe's finalizer to leave,
     /// and another controller's finalizer is preserved byte-for-byte.

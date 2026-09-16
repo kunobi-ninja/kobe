@@ -1369,6 +1369,24 @@ pub static SANDBOX_STREAM_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::n
     .unwrap()
 });
 
+/// How long a Sandbox lease spent tearing down, by how it ended.
+///
+/// Measured from the `Releasing` checkpoint to the terminal phase, which is
+/// exactly the window where the caller's quota slot is still held: teardown
+/// proves absence before it returns capacity, on purpose, so this is time a
+/// caller cannot lease again. `outcome` separates a teardown that completed
+/// from one that quarantined, because the second keeps the slot indefinitely
+/// and should never be read as a slow success.
+pub static SANDBOX_TEARDOWN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_sandbox_teardown_duration_seconds",
+        "Time from the Releasing checkpoint to the terminal phase, by outcome",
+        &["outcome"],
+        vec![1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0]
+    )
+    .unwrap()
+});
+
 pub static SANDBOX_ADMISSION_RATE_LIMITED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "kobe_sandbox_admission_rate_limited_total",
@@ -1488,6 +1506,7 @@ pub fn init() {
     // `rate(kobe_sandbox_admission_rate_limited_total[5m])` reads zero rather
     // than "no data" until the first throttle.
     LazyLock::force(&SANDBOX_ADMISSION_RATE_LIMITED_TOTAL);
+    LazyLock::force(&SANDBOX_TEARDOWN_DURATION_SECONDS);
     LazyLock::force(&SANDBOX_STREAM_TOTAL);
     LazyLock::force(&SANDBOX_STREAMS_ACTIVE);
     LazyLock::force(&SANDBOX_STREAM_DURATION_SECONDS);
