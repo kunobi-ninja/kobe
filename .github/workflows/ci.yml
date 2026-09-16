@@ -8,6 +8,15 @@ on:
     # exactly backwards, since the point of holding work off main is to prove
     # it carries no regressions first.
     branches: [main, "epic/**"]
+    # `labeled` exists so applying `ci:conformance` starts a run that includes
+    # the k3s gate (see the `conformance` job). A re-run replays the ORIGINAL
+    # event payload, so without this trigger a label added after the last push
+    # would be invisible and the only way to opt in would be an empty commit.
+    #
+    # The cost is that every other label — `bug`, `wip`, anything — also fires
+    # the workflow. The `changes` job short-circuits those to `code=false`,
+    # which skips every job cheaply rather than rebuilding on a triage label.
+    types: [opened, synchronize, reopened, labeled]
     # No `paths:` filter. A filtered-out PR starts no run, so the required
     # `Rust Checks` never reports and the PR stays blocked forever (this hit
     # every docs-only PR). The `changes` job decides instead; a job skipped by
@@ -75,12 +84,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [[ "$EVENT" != "pull_request" ]]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The workflow listens for `labeled` so `ci:conformance` can opt a PR
+          # into the k3s gate. Every other label reaches here too, and rebuilding
+          # the whole tree because someone triaged a PR would be absurd — the
+          # diff has not changed since the run that already covered it.
+          if [[ "$ACTION" == "labeled" && "$LABEL" != "ci:conformance" ]]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Label '$LABEL' does not affect CI; skipping."
             exit 0
           fi
           code=false
@@ -499,10 +519,28 @@ jobs:
   # `publish.needs` yet: a flaky e2e must not block an urgent release —
   # promote once the main-push signal proves stable. No `container:` block:
   # like `docker-dry-run`, this needs the host Docker socket for kind + buildx.
+  # Opt-in on pull requests, automatic everywhere that matters.
+  #
+  # This gate stands up a real kind cluster and takes ~28 minutes on a large
+  # runner. It is NOT in branch protection's required checks, so on a PR it
+  # blocked nothing and duplicated the run that fires on the very next push to
+  # main. Paying for it twice per change bought about half an hour of earlier
+  # warning; it now runs once, at merge.
+  #
+  # A PR that touches something this gate is the only proof for — cluster
+  # lifecycle, teardown evidence, the runner inside a real pod, the CLI paths
+  # the harness drives (`kobe attach` over a pty, `kobe port-forward`) — opts
+  # in with the `ci:conformance` label, which is why `labeled` is a trigger.
+  # That judgement is a human's: no path filter can make it, because the
+  # harness exercises the CLI as well as the operator.
+  #
+  # Unchanged: push to main, tags, nightly schedule and manual dispatch all
+  # still run it, and schedule/dispatch still run the full backend matrix.
   conformance:
     if: >-
-      ${{ github.event_name == 'pull_request'
-          || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+          || (github.event_name == 'pull_request'
+              && contains(github.event.pull_request.labels.*.name, 'ci:conformance'))
           || (github.event_name == 'push'
               && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) }}
     needs: [checks]
