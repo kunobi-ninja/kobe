@@ -2573,7 +2573,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     if binding.cleanup_mode != CleanupMode::VerifiedDestroy {
         if already_quarantined {
             return Some(
-                quarantine_instance(ctx, instance, name, namespace, "binding_mode_missing").await,
+                quarantine_instance(
+                    ctx,
+                    instance,
+                    name,
+                    namespace,
+                    InstanceQuarantineReason::BindingModeMissing,
+                )
+                .await,
             );
         }
         return None;
@@ -2590,19 +2597,42 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                  releasing on the unverified path"
             );
             return Some(
-                quarantine_instance(ctx, instance, name, namespace, "lease_unreadable").await,
+                quarantine_instance(
+                    ctx,
+                    instance,
+                    name,
+                    namespace,
+                    InstanceQuarantineReason::LeaseUnreadable,
+                )
+                .await,
             );
         }
     };
     if !lease_uid_matches_binding(&lease, binding) {
         warn!(instance = %name, "verified teardown lease UID differs from binding provenance");
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "lease_uid_mismatch").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::LeaseUidMismatch,
+            )
+            .await,
         );
     }
     if lease.spec.cleanup_mode.unwrap_or_default() != binding.cleanup_mode {
         warn!(instance = %name, "lease cleanup mode differs from immutable binding provenance");
-        return Some(quarantine_instance(ctx, instance, name, namespace, "mode_downgraded").await);
+        return Some(
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::ModeDowngraded,
+            )
+            .await,
+        );
     }
 
     // The concrete immutable manifest, not a category list reconstructed at
@@ -2614,7 +2644,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             "verified teardown requested but no sealed creation manifest exists; quarantining"
         );
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_missing").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::CreationManifestMissing,
+            )
+            .await,
         );
     };
     if manifest.validate().is_err()
@@ -2624,22 +2661,50 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         || manifest.config_digest != binding.backend.config_digest
     {
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_invalid").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::CreationManifestInvalid,
+            )
+            .await,
         );
     }
     let Ok(manifest_digest) = manifest.digest() else {
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_invalid").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::CreationManifestInvalid,
+            )
+            .await,
         );
     };
     if binding.creation_manifest_digest.as_deref() != Some(manifest_digest.as_str()) {
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "binding_manifest_mismatch").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::BindingManifestMismatch,
+            )
+            .await,
         );
     }
     if binding.creation_manifest.as_ref() != Some(manifest) {
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "binding_manifest_mismatch").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::BindingManifestMismatch,
+            )
+            .await,
         );
     }
     let Some(connect_token_identity) = binding.connect_token.as_ref() else {
@@ -2649,7 +2714,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                 instance,
                 name,
                 namespace,
-                "connect_token_footprint_missing",
+                InstanceQuarantineReason::ConnectTokenFootprintMissing,
             )
             .await,
         );
@@ -2686,7 +2751,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             return Some(advance_verified_instance_deletion(ctx, instance, name, namespace).await);
         }
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "receipt_manifest_mismatch").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::ReceiptManifestMismatch,
+            )
+            .await,
         );
     }
 
@@ -2717,8 +2789,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         }
         Some(_) => {
             return Some(
-                quarantine_instance(ctx, instance, name, namespace, "pending_attempt_mismatch")
-                    .await,
+                quarantine_instance(
+                    ctx,
+                    instance,
+                    name,
+                    namespace,
+                    InstanceQuarantineReason::PendingAttemptMismatch,
+                )
+                .await,
             );
         }
         None if receipt_authority_is_separate() => {
@@ -2779,14 +2857,27 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                      falling back to unverified cleanup"
                 );
                 return Some(
-                    quarantine_instance(ctx, instance, name, namespace, "backend_unsupported")
-                        .await,
+                    quarantine_instance(
+                        ctx,
+                        instance,
+                        name,
+                        namespace,
+                        InstanceQuarantineReason::BackendUnsupported,
+                    )
+                    .await,
                 );
             }
         },
         None => {
             return Some(
-                quarantine_instance(ctx, instance, name, namespace, "backend_unresolvable").await,
+                quarantine_instance(
+                    ctx,
+                    instance,
+                    name,
+                    namespace,
+                    InstanceQuarantineReason::BackendUnresolvable,
+                )
+                .await,
             );
         }
     };
@@ -2862,7 +2953,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             "teardown could not be proven complete; quarantining capacity"
         );
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "teardown_unverified").await,
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                InstanceQuarantineReason::TeardownUnverified,
+            )
+            .await,
         );
     }
 
@@ -3291,11 +3389,53 @@ async fn persist_verified_teardown_evidence(
     })
 }
 
+/// Why a ClusterInstance teardown holds its capacity instead of releasing it.
+///
+/// A closed vocabulary. The value is written into instance and lease status
+/// reason and a log field, so it stays bounded and stable; each wire name is
+/// the variant in snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceQuarantineReason {
+    BackendUnresolvable,
+    BackendUnsupported,
+    BindingManifestMismatch,
+    BindingModeMissing,
+    ConnectTokenFootprintMissing,
+    CreationManifestInvalid,
+    CreationManifestMissing,
+    LeaseUidMismatch,
+    LeaseUnreadable,
+    ModeDowngraded,
+    PendingAttemptMismatch,
+    ReceiptManifestMismatch,
+    TeardownUnverified,
+}
+
+impl InstanceQuarantineReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendUnresolvable => "backend_unresolvable",
+            Self::BackendUnsupported => "backend_unsupported",
+            Self::BindingManifestMismatch => "binding_manifest_mismatch",
+            Self::BindingModeMissing => "binding_mode_missing",
+            Self::ConnectTokenFootprintMissing => "connect_token_footprint_missing",
+            Self::CreationManifestInvalid => "creation_manifest_invalid",
+            Self::CreationManifestMissing => "creation_manifest_missing",
+            Self::LeaseUidMismatch => "lease_uid_mismatch",
+            Self::LeaseUnreadable => "lease_unreadable",
+            Self::ModeDowngraded => "mode_downgraded",
+            Self::PendingAttemptMismatch => "pending_attempt_mismatch",
+            Self::ReceiptManifestMismatch => "receipt_manifest_mismatch",
+            Self::TeardownUnverified => "teardown_unverified",
+        }
+    }
+}
+
 async fn mark_exact_lease_quarantined<B: ClusterBackend>(
     ctx: &InstanceContext<B>,
     binding: &crate::crd::LeaseBinding,
     namespace: &str,
-    reason: &str,
+    reason: InstanceQuarantineReason,
 ) -> Result<ClusterLease, anyhow::Error> {
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
     let lease = leases.get(&binding.lease.name).await?;
@@ -3320,7 +3460,7 @@ async fn mark_exact_lease_quarantined<B: ClusterBackend>(
     let previous_phase = status.phase.clone();
     let previous_conditions = status.conditions.clone();
     status.phase = LeasePhase::Quarantined;
-    status.message = Some(format!("teardown quarantined: {reason}"));
+    status.message = Some(format!("teardown quarantined: {}", reason.as_str()));
     status.conditions = crate::controllers::lease::derive_lease_conditions(
         &status,
         &previous_conditions,
@@ -3409,14 +3549,14 @@ async fn quarantine_instance<B: ClusterBackend>(
     instance: &ClusterInstance,
     name: &str,
     namespace: &str,
-    reason: &str,
+    reason: InstanceQuarantineReason,
 ) -> Result<Action, InstanceError> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
     let mut next = instance.status.clone().unwrap_or_default();
     let transition_time = chrono::Utc::now().to_rfc3339();
     next.phase = ClusterInstancePhase::Quarantined;
     next.state_since = Some(transition_time.clone());
-    next.message = Some(format!("quarantined: {reason}"));
+    next.message = Some(format!("quarantined: {}", reason.as_str()));
     let previous_conditions = instance
         .status
         .as_ref()
@@ -5137,9 +5277,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        mark_exact_lease_quarantined(&ctx, &binding, "test-ns", "proof_missing")
-            .await
-            .unwrap();
+        mark_exact_lease_quarantined(
+            &ctx,
+            &binding,
+            "test-ns",
+            InstanceQuarantineReason::TeardownUnverified,
+        )
+        .await
+        .unwrap();
         let patch = server
             .received_requests()
             .await
@@ -5170,9 +5315,14 @@ mod tests {
             .mount(&replacement_server)
             .await;
         assert!(
-            mark_exact_lease_quarantined(&replacement_ctx, &binding, "test-ns", "proof_missing",)
-                .await
-                .is_err()
+            mark_exact_lease_quarantined(
+                &replacement_ctx,
+                &binding,
+                "test-ns",
+                InstanceQuarantineReason::TeardownUnverified,
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             replacement_server
