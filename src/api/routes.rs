@@ -5278,6 +5278,7 @@ mod tests {
                 SandboxVerb::Release,
             ],
             max_ttl: chrono::Duration::hours(4),
+            max_idle: None,
             max_concurrent_leases: 2,
             max_extensions: 0,
             resource_ceiling: SandboxResourceCeiling {

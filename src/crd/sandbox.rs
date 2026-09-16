@@ -57,8 +57,30 @@ pub struct SandboxPoolSpec {
     pub default_ttl: String,
 
     /// Maximum runtime TTL this pool will accept, independent of caller policy.
+    ///
+    /// Two jobs: it caps the TTL a caller may request at creation, and — unless
+    /// `maxIdle` is set — it caps the lifetime an extension can reach, measured
+    /// from readiness. `maxIdle` replaces only the second.
     #[schemars(length(min = 1))]
     pub max_ttl: String,
+
+    /// How long a lease may go untouched before it can no longer be extended.
+    ///
+    /// Absent, a lease has a fixed lifetime however actively it is used: the
+    /// extension ceiling is `readyAt + maxTtl`, which measures age rather than
+    /// abandonment. A box used every day and one forgotten yesterday look the
+    /// same from `readyAt`.
+    ///
+    /// Present, each extension is bounded by `now + maxIdle` instead, so a box
+    /// lives while someone keeps extending it and is reclaimed within `maxIdle`
+    /// of the last extension. The pool still self-cleans — sooner than before
+    /// for a box abandoned early in its TTL.
+    ///
+    /// The effective window is the lower of this and the caller's grant, the
+    /// same clamp `maxTtl` already uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub max_idle: Option<String>,
 
     /// Maximum time allowed for placement and Sandbox provisioning. Runtime TTL
     /// starts only after readiness and is therefore separate from this deadline.
@@ -1502,6 +1524,7 @@ mod tests {
             warm_capacity: 2,
             default_ttl: "1h".into(),
             max_ttl: "8h".into(),
+            max_idle: None,
             provisioning_timeout: "10m".into(),
             placement: SandboxPlacement::Management {},
             transport: SandboxTransport::Direct,

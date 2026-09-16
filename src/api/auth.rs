@@ -755,10 +755,28 @@ fn access_rule_to_policy(rule: &AccessRule) -> crate::api::policy::Policy {
                 warn!(%error, "Invalid Sandbox resource ceiling; dropping Sandbox grant");
                 return None;
             }
+            // A stated but unusable idle window drops the whole grant, exactly as
+            // an unusable `max_ttl` does. Falling back to the fixed ceiling would
+            // hand the caller the lifetime the operator was trying to replace,
+            // which is the wrong direction to fail in.
+            let max_idle = match grant.max_idle.as_deref() {
+                None => None,
+                Some(raw) => match crate::pool::parse_duration(raw) {
+                    Some(duration) if duration > chrono::Duration::zero() => Some(duration),
+                    _ => {
+                        warn!(
+                            raw_value = %raw,
+                            "Sandbox max_idle must be a positive duration; dropping Sandbox grant"
+                        );
+                        return None;
+                    }
+                },
+            };
             Some(crate::api::policy::SandboxPolicy {
                 allowed_pools: grant.pools.clone(),
                 verbs: grant.verbs.clone(),
                 max_ttl,
+                max_idle,
                 max_concurrent_leases: grant.max_concurrent_leases,
                 max_extensions: grant.max_extensions,
                 resource_ceiling: grant.resource_ceiling.clone(),
@@ -1248,6 +1266,7 @@ mod tests {
                     crate::crd::SandboxVerb::Exec,
                 ],
                 max_ttl: "30m".into(),
+                max_idle: None,
                 max_concurrent_leases: 3,
                 max_extensions: 2,
                 resource_ceiling: crate::crd::SandboxResourceCeiling {
@@ -1284,6 +1303,7 @@ mod tests {
                 pools: vec!["*".into()],
                 verbs: vec![crate::crd::SandboxVerb::Lease],
                 max_ttl: "invalid".into(),
+                max_idle: None,
                 max_concurrent_leases: 3,
                 max_extensions: 2,
                 resource_ceiling: crate::crd::SandboxResourceCeiling {
