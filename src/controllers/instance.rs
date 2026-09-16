@@ -327,7 +327,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
     if !receipt_authority_reciprocal_binding_matches(&instance, &lease, binding) {
         return Ok(Action::requeue(std::time::Duration::from_secs(30)));
     }
-    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
+    let backend_type = crate::crd::receipt_backend_type(&binding.backend.backend_type);
     let pending = match lease
         .status
         .as_ref()
@@ -2642,7 +2642,6 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             quarantine_instance(ctx, instance, name, namespace, "binding_manifest_mismatch").await,
         );
     }
-    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
     let Some(connect_token_identity) = binding.connect_token.as_ref() else {
         return Some(
             quarantine_instance(
@@ -2655,10 +2654,12 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             .await,
         );
     };
-    let mut plan = manifest.required_subjects();
-    plan.push(crate::crd::TeardownSubject::ConnectTokenSecret);
-    let mut recorded_identities = manifest.recorded_identities();
-    recorded_identities.push(connect_token_identity.canonical_id());
+    let plan = crate::crd::BindingTeardownPlan::new(
+        binding,
+        manifest,
+        manifest_digest.clone(),
+        connect_token_identity,
+    );
 
     // A completed verified receipt may already be durable from a previous
     // reconcile that crashed before finalizer removal. Consume it instead of
@@ -2671,22 +2672,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     }) && existing.outcome == TeardownOutcome::Verified
     {
         let existing = existing.clone();
-        let expected = crate::crd::TeardownScope {
-            lease: &binding.lease,
-            instance: &manifest.instance,
-            pool: &binding.pool,
-            backend_type: &backend_type,
-            config_digest: &binding.backend.config_digest,
-            instance_spec_digest: &binding.instance_spec_digest,
-            creation_manifest_digest: &manifest_digest,
-            cleanup_mode: binding.cleanup_mode,
-            attempt_id: durable_attempt,
-            creation_manifest: Some(manifest),
-            connect_token_identity: Some(connect_token_identity),
-            required_subjects: &plan,
-            instance_name: name,
-            recorded_identities: &recorded_identities,
-        };
+        let expected = plan.scope(durable_attempt);
         if existing.attempt_id == durable_attempt && existing.permits_release_for(&expected) {
             info!(instance = %name, attempt = %existing.attempt_id, "consuming already-persisted verified teardown receipt");
             if let Err(error) = mark_exact_lease_recycling_after_verified(
@@ -2746,7 +2732,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                 lease: binding.lease.clone(),
                 instance: manifest.instance.clone(),
                 pool: binding.pool.clone(),
-                backend_type: backend_type.clone(),
+                backend_type: plan.backend_type().to_string(),
                 config_digest: binding.backend.config_digest.clone(),
                 instance_spec_digest: binding.instance_spec_digest.clone(),
                 creation_manifest_digest: manifest_digest.clone(),
@@ -2860,22 +2846,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
     };
 
-    let expected = crate::crd::TeardownScope {
-        lease: &binding.lease,
-        instance: &manifest.instance,
-        pool: &binding.pool,
-        backend_type: &persisted_receipt.backend_type,
-        config_digest: &binding.backend.config_digest,
-        instance_spec_digest: &binding.instance_spec_digest,
-        creation_manifest_digest: &manifest_digest,
-        cleanup_mode: binding.cleanup_mode,
-        attempt_id: &pending.attempt_id,
-        creation_manifest: Some(manifest),
-        connect_token_identity: Some(connect_token_identity),
-        required_subjects: &plan,
-        instance_name: name,
-        recorded_identities: &recorded_identities,
-    };
+    let expected = plan.scope(&pending.attempt_id);
     if persisted_receipt.outcome != TeardownOutcome::Verified
         || !persisted_receipt.permits_release_for(&expected)
     {
@@ -3020,7 +2991,7 @@ fn pending_receipt_matches(
         && receipt.lease == binding.lease
         && receipt.instance == *instance
         && receipt.pool == binding.pool
-        && receipt.backend_type == format!("{:?}", binding.backend.backend_type).to_lowercase()
+        && receipt.backend_type == crate::crd::receipt_backend_type(&binding.backend.backend_type)
         && receipt.config_digest == binding.backend.config_digest
         && receipt.instance_spec_digest == binding.instance_spec_digest
         && receipt.creation_manifest_digest == manifest_digest
@@ -3250,30 +3221,6 @@ fn persisted_receipt_matches_retry(persisted: &TeardownReceipt, retried: &Teardo
     normalized == *retried
 }
 
-fn evidence_object_identity_matches(
-    evidence: &VerifiedTeardownEvidence,
-    expected_name: &str,
-    expected_namespace: &str,
-    expected_labels: &std::collections::BTreeMap<String, String>,
-) -> bool {
-    evidence.name_any() == expected_name
-        && evidence.namespace().as_deref() == Some(expected_namespace)
-        && evidence.metadata.deletion_timestamp.is_none()
-        && evidence
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(|owners| owners.is_empty())
-        && expected_labels.iter().all(|(key, value)| {
-            evidence
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|live| live.get(key))
-                == Some(value)
-        })
-}
-
 /// Create the immutable, separately-authorized receipt record before mirroring
 /// it into mutable ClusterLease status. A 409 is adoptable only when immutable
 /// identity labels and the complete observation match; its already-persisted
@@ -3305,16 +3252,11 @@ async fn persist_verified_teardown_evidence(
         lease_uid,
         &receipt.attempt_id,
     ));
-    let expected_labels = desired
-        .metadata
-        .labels
-        .clone()
-        .expect("evidence identity labels were just assigned");
     let evidence = match evidence_api.create(&PostParams::default(), &desired).await {
         Ok(created) => created,
         Err(kube::Error::Api(error)) if error.code == 409 => {
             let existing = evidence_api.get(&name).await?;
-            if !evidence_object_identity_matches(&existing, &name, namespace, &expected_labels)
+            if !existing.is_evidence_for(namespace, lease_uid, &receipt.attempt_id)
                 || existing.spec.lease != spec.lease
                 || existing.spec.attempt_id != spec.attempt_id
                 || !persisted_receipt_matches_retry(&existing.spec.receipt, receipt)
@@ -3325,7 +3267,7 @@ async fn persist_verified_teardown_evidence(
         }
         Err(error) => return Err(error.into()),
     };
-    if !evidence_object_identity_matches(&evidence, &name, namespace, &expected_labels)
+    if !evidence.is_evidence_for(namespace, lease_uid, &receipt.attempt_id)
         || evidence.spec.lease != spec.lease
         || evidence.spec.attempt_id != spec.attempt_id
         || !persisted_receipt_matches_retry(&evidence.spec.receipt, receipt)

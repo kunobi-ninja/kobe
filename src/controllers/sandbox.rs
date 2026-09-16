@@ -6680,27 +6680,8 @@ async fn authoritative_child_receipt_matches(
     let evidence_api: Api<crate::crd::VerifiedTeardownEvidence> =
         Api::namespaced(client.clone(), namespace);
     let evidence = evidence_api.get(&reference.name).await?;
-    let expected_labels =
-        crate::crd::verified_teardown_evidence_labels(&lease_uid, &receipt.attempt_id);
-    let labels_match = expected_labels.iter().all(|(key, value)| {
-        evidence
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|live| live.get(key))
-            == Some(value)
-    });
-    let identity_matches = evidence.uid().as_deref() == Some(reference.uid.as_str())
-        && evidence.metadata.generation == Some(reference.generation)
-        && evidence.resource_version().as_deref() == Some(reference.resource_version.as_str())
-        && evidence.namespace().as_deref() == Some(namespace)
-        && evidence.metadata.deletion_timestamp.is_none()
-        && evidence
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(|owners| owners.is_empty())
-        && labels_match;
+    let identity_matches = evidence.is_referenced_by(reference)
+        && evidence.is_evidence_for(namespace, &lease_uid, &receipt.attempt_id);
     let content_matches = evidence.spec.lease.name == lease.name_any()
         && evidence.spec.lease.uid.as_deref() == Some(lease_uid.as_str())
         && evidence.spec.attempt_id == receipt.attempt_id
@@ -7324,27 +7305,9 @@ fn validated_binding_receipt_token(
     {
         return None;
     }
-    let mut required_subjects = manifest.required_subjects();
-    required_subjects.push(crate::crd::TeardownSubject::ConnectTokenSecret);
-    let mut recorded_identities = manifest.recorded_identities();
-    recorded_identities.push(connect_token.canonical_id());
-    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
-    let scope = crate::crd::TeardownScope {
-        lease: &binding.lease,
-        instance: &manifest.instance,
-        pool: &binding.pool,
-        backend_type: &backend_type,
-        config_digest: &binding.backend.config_digest,
-        instance_spec_digest: &binding.instance_spec_digest,
-        creation_manifest_digest: &manifest_digest,
-        cleanup_mode: binding.cleanup_mode,
-        attempt_id: durable_attempt,
-        creation_manifest: Some(manifest),
-        connect_token_identity: Some(connect_token),
-        required_subjects: &required_subjects,
-        instance_name: &binding.instance.name,
-        recorded_identities: &recorded_identities,
-    };
+    let plan =
+        crate::crd::BindingTeardownPlan::new(binding, manifest, manifest_digest, connect_token);
+    let scope = plan.scope(durable_attempt);
     receipt
         .permits_release_for(&scope)
         .then(|| receipt.acknowledgement_token())

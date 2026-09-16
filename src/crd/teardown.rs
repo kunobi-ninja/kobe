@@ -1028,6 +1028,76 @@ pub struct TeardownScope<'a> {
     pub recorded_identities: &'a [String],
 }
 
+/// Lowercase backend name as it appears in receipts and pending attempts.
+pub fn receipt_backend_type(backend_type: &BackendType) -> String {
+    format!("{backend_type:?}").to_lowercase()
+}
+
+/// Everything a `VerifiedDestroy` binding commits a receipt to prove.
+///
+/// The controller that writes a receipt and every consumer that later trusts
+/// it validate against this one derivation, taken only from the binding's
+/// sealed creation manifest and connect token. Consumers still validate
+/// independently; they cannot disagree about what the exact footprint is.
+#[derive(Debug, Clone)]
+pub struct BindingTeardownPlan<'a> {
+    binding: &'a super::LeaseBinding,
+    manifest: &'a TeardownCreationManifest,
+    connect_token: &'a KubernetesResourceIdentity,
+    manifest_digest: String,
+    backend_type: String,
+    required_subjects: Vec<TeardownSubject>,
+    recorded_identities: Vec<String>,
+}
+
+impl<'a> BindingTeardownPlan<'a> {
+    /// Callers validate `manifest` against `binding` first; this only derives.
+    pub fn new(
+        binding: &'a super::LeaseBinding,
+        manifest: &'a TeardownCreationManifest,
+        manifest_digest: String,
+        connect_token: &'a KubernetesResourceIdentity,
+    ) -> Self {
+        let mut required_subjects = manifest.required_subjects();
+        required_subjects.push(TeardownSubject::ConnectTokenSecret);
+        let mut recorded_identities = manifest.recorded_identities();
+        recorded_identities.push(connect_token.canonical_id());
+        Self {
+            binding,
+            manifest,
+            connect_token,
+            manifest_digest,
+            backend_type: receipt_backend_type(&binding.backend.backend_type),
+            required_subjects,
+            recorded_identities,
+        }
+    }
+
+    pub fn backend_type(&self) -> &str {
+        &self.backend_type
+    }
+
+    /// The scope one teardown attempt must satisfy.
+    pub fn scope<'s>(&'s self, attempt_id: &'s str) -> TeardownScope<'s> {
+        TeardownScope {
+            lease: &self.binding.lease,
+            instance: &self.manifest.instance,
+            pool: &self.binding.pool,
+            backend_type: &self.backend_type,
+            config_digest: &self.binding.backend.config_digest,
+            instance_spec_digest: &self.binding.instance_spec_digest,
+            creation_manifest_digest: &self.manifest_digest,
+            cleanup_mode: self.binding.cleanup_mode,
+            attempt_id,
+            creation_manifest: Some(self.manifest),
+            connect_token_identity: Some(self.connect_token),
+            required_subjects: &self.required_subjects,
+            instance_name: &self.manifest.instance.name,
+            recorded_identities: &self.recorded_identities,
+        }
+    }
+}
+
 /// The name a subject's resource must have, where naming is deterministic.
 ///
 /// This is the non-circular half of identity checking: it comes from the
