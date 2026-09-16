@@ -120,6 +120,63 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
     && rm -f /tmp/mise-install.sh \
     && /usr/local/bin/mise --version | grep -q "${MISE_VERSION#v}"
 
+# AI coding CLIs are part of the workspace baseline: a project cannot install
+# them before an agent starts, so an agent that arrives to an empty box spends
+# its first minutes installing its own tooling. Credentials are deliberately
+# NOT baked in; each lease authenticates its own user at runtime. Node comes
+# from the same pinned tool manager the workspace already uses, then sits at a
+# stable root-owned path so `kobe exec` reaches it without a login shell.
+# Node is pinned to a MAJOR, not to a patch. The major is what can break the
+# CLIs that sit on it, and a break there would be indistinguishable from the
+# CLIs breaking by themselves; patches within the major are security fixes we
+# want the nightly rebuild to pick up, and an exact pin would have quietly
+# kept reinstalling known CVEs. `lts` is deliberately not used: it moves to 26
+# in October, and that jump would arrive on a night nobody is watching.
+ARG NODE_VERSION=24
+# The CLIs are NOT pinned. They ship often, a pinned version starts rotting the
+# day it is written, and the nightly rebuild exists precisely so the baseline
+# keeps up. The blast radius is small: this is developer tooling inside a
+# sandbox, and a bad release is one re-lease away from gone, not a production
+# dependency. What a pin really bought was the ability to answer "which version
+# is in this image?", so that is recorded below instead of frozen.
+# Layer-cache buster. `@latest` resolves at build time, but the RUN string
+# never changes, so BuildKit would reuse this layer forever and "latest" would
+# quietly mean "whatever shipped the day the cache was written". The build uses
+# a local cache and CI sets no BUILD_DATE, while BUILD_COMMIT only moves when
+# main does — so on a quiet night nothing here would be reinstalled at all.
+# CI passes the date; a local build keeps the default and stays cacheable.
+ARG CLI_REFRESH=pinned-by-default
+# npm locates its bundled JavaScript relative to its executable. Keeping the
+# whole Node distribution together avoids a broken /usr/local symlink. npm's
+# cache is dropped at the end: it is written as root, never read at runtime,
+# and worth tens of megabytes in the published layer.
+RUN echo "cli refresh: ${CLI_REFRESH}" \
+    && MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
+    && node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
+    && PATH="$node_dir/bin:$PATH" \
+    && export PATH \
+    && npm install --global --prefix "$node_dir" --no-audit --no-fund \
+        "@openai/codex@latest" \
+        "@anthropic-ai/claude-code@latest" \
+    && codex --version \
+    && claude --version \
+    && printf 'node %s\ncodex %s\nclaude-code %s\n' \
+        "$(node --version)" "$(codex --version)" "$(claude --version)" \
+        > /etc/kobe-workspace-versions \
+    && chmod 0644 /etc/kobe-workspace-versions \
+    && npm cache clean --force \
+    && rm -rf /root/.npm
+
+# Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
+# the pinned tools visible there as well as to Kobe's direct-exec environment.
+# Ask mise where it actually put Node rather than rebuilding the path from the
+# version spec: with a major-only pin the install directory is not named after
+# the spec. Double quotes expand it at build time while $PATH stays literal.
+RUN node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
+    && printf '%s\n' "export PATH=$node_dir/bin:\$PATH" \
+      > /etc/profile.d/kobe-node-tools.sh \
+    && chmod 0644 /etc/profile.d/kobe-node-tools.sh
+
 COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner \
