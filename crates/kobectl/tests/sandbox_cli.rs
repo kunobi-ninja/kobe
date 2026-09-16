@@ -669,6 +669,68 @@ fn flat_status_reports_one_mixed_pool_and_lease_inventory() {
     assert_eq!(kinds, HashSet::from(["Cluster", "Sandbox"]));
 }
 
+/// The text view hides Released and Expired leases behind `--all`. JSON used
+/// to ignore that flag and always dump the whole inventory, so one live
+/// sandbox came back alongside every tombstone the caller had ever released
+/// and a script had to re-implement the filter the CLI already owns.
+#[test]
+fn status_json_hides_dead_leases_unless_all_is_asked_for() {
+    fn inventory() -> String {
+        json!([
+            { "id": "sandbox-live", "phase": "Ready", "pool": "agents",
+              "alias": "live", "resourceKind": "Sandbox" },
+            { "id": "sandbox-gone", "phase": "Released", "pool": "agents",
+              "alias": "gone", "resourceKind": "Sandbox" },
+            { "id": "sandbox-stale", "phase": "Expired", "pool": "agents",
+              "alias": "stale", "resourceKind": "Sandbox" }
+        ])
+        .to_string()
+    }
+    fn serve() -> Server {
+        Server::start(move |request, stream| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/status") => {
+                    reply(stream, 200, &[], &json!({ "version": "test" }).to_string())
+                }
+                ("GET", "/v1/pools") => reply(stream, 200, &[], "[]"),
+                ("GET", "/v1/leases") => reply(stream, 200, &[], &inventory()),
+                _ => panic!("unexpected status request: {request:?}"),
+            }
+        })
+    }
+    fn aliases(arguments: &[&str]) -> Vec<String> {
+        let server = serve();
+        let (_directory, child) = spawn_child(&server.endpoint(), arguments);
+        let output = wait_output(child);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        status["leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|lease| lease["alias"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    assert_eq!(
+        aliases(&["status", "--output", "json"]),
+        vec!["live".to_string()],
+        "only what still exists"
+    );
+    let mut every = aliases(&["status", "--output", "json", "--all"]);
+    every.sort();
+    assert_eq!(
+        every,
+        vec!["gone".to_string(), "live".to_string(), "stale".to_string()],
+        "--all still returns the full inventory"
+    );
+}
+
 #[test]
 fn run_uses_one_json_envelope_for_terminal_and_release_outcomes() {
     for (remote_state, remote_exit, release_status, expected_exit, outcome, released) in [

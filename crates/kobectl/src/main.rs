@@ -30,8 +30,8 @@ struct Cli {
 enum Commands {
     /// Show status overview
     Status {
-        /// Include released and expired leases in text output. JSON always
-        /// includes the full inventory.
+        /// Include released and expired leases. Both text and JSON hide
+        /// them by default, so the two views answer alike
         #[arg(long)]
         all: bool,
     },

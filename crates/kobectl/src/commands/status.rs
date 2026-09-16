@@ -177,6 +177,21 @@ pub async fn status(
     }
 
     if output == OutputFormat::Json {
+        // Hide dead leases here exactly as the text view does. JSON used to
+        // carry the whole inventory, so a caller with one live sandbox got
+        // that sandbox plus every tombstone it had ever released, and the
+        // human and the script saw different answers to the same command.
+        // Nothing is lost by default: a Released lease records no time of
+        // death, only the expiry it never reached, so it cannot be ordered or
+        // read as history. `--all` still returns everything.
+        let leases: Vec<LeaseSummary> = if show_all {
+            leases
+        } else {
+            leases
+                .into_iter()
+                .filter(|lease| !is_status_hidden_phase(&lease.phase))
+                .collect()
+        };
         return print_json(&StatusOutput {
             cli_version: cli_version().to_string(),
             target: config.target.clone(),
