@@ -552,6 +552,28 @@ impl<T> Reaching<T> for Result<T, reqwest::Error> {
     }
 }
 
+/// Whether human output on stdout may carry terminal styles.
+///
+/// Off when stdout is redirected or `NO_COLOR` is set, so `kobe status | grep`
+/// and saved logs stay plain text. Decided once per process.
+pub(crate) fn stdout_color() -> bool {
+    static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COLOR.get_or_init(|| {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none()
+    })
+}
+
+/// `text` wrapped in the SGR style `sgr` (`"1"` bold, `"33"` yellow) when
+/// [`stdout_color`] allows it, and unchanged otherwise.
+pub(crate) fn styled(sgr: &str, text: impl std::fmt::Display) -> String {
+    if stdout_color() {
+        format!("\x1b[{sgr}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// The process-wide HTTP client.
 ///
 /// `reqwest::Client` owns a connection pool, so building a fresh one per

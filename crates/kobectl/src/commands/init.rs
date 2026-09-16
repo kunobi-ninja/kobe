@@ -96,9 +96,7 @@ struct Reporter {
 
 impl Reporter {
     fn new(output: OutputFormat) -> Self {
-        let color = output == OutputFormat::Text
-            && std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none();
+        let color = output == OutputFormat::Text && super::stdout_color();
         Self { output, color }
     }
 
