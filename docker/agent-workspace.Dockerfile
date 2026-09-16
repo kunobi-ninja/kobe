@@ -120,6 +120,35 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
     && rm -f /tmp/mise-install.sh \
     && /usr/local/bin/mise --version | grep -q "${MISE_VERSION#v}"
 
+# AI coding CLIs are part of the workspace baseline: a project cannot install
+# them before an agent starts, so an agent that arrives to an empty box spends
+# its first minutes installing its own tooling. Credentials are deliberately
+# NOT baked in; each lease authenticates its own user at runtime. Node comes
+# from the same pinned tool manager the workspace already uses, then sits at a
+# stable root-owned path so `kobe exec` reaches it without a login shell.
+ARG NODE_VERSION=24.18.1
+ARG CODEX_VERSION=0.154.0
+ARG CLAUDE_CODE_VERSION=2.1.268
+# npm locates its bundled JavaScript relative to its executable. Keeping the
+# whole Node distribution together avoids a broken /usr/local symlink.
+RUN MISE_DATA_DIR=/opt/kobe/mise mise install "node@${NODE_VERSION}" \
+    && node_dir="$(MISE_DATA_DIR=/opt/kobe/mise mise where "node@${NODE_VERSION}")" \
+    && PATH="$node_dir/bin:$PATH" \
+    && export PATH \
+    && npm install --global --prefix "$node_dir" --no-audit --no-fund \
+        "@openai/codex@${CODEX_VERSION}" \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && codex --version \
+    && claude --version
+
+# Interactive SSH starts a login shell, whose Debian profile resets PATH. Keep
+# the pinned tools visible there as well as to Kobe's direct-exec environment.
+# Double quotes so NODE_VERSION expands at build time while $PATH stays literal
+# in the written file: single quotes would emit the variable name itself.
+RUN printf '%s\n' "export PATH=/opt/kobe/mise/installs/node/${NODE_VERSION}/bin:\$PATH" \
+      > /etc/profile.d/kobe-node-tools.sh \
+    && chmod 0644 /etc/profile.d/kobe-node-tools.sh
+
 COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner \
