@@ -1,15 +1,13 @@
 ---
 title: Installation
-description: How to install the kobe CLI.
+description: Install the kobe CLI.
 ---
 
 # Installation
 
-The `kobe` CLI is a self-contained binary. It connects to a kobe operator endpoint — the operator itself runs in your Kubernetes cluster.
+The `kobe` CLI is a self-contained binary. It talks to a kobe operator endpoint. To install the operator itself, see [Deploy](/docs/getting-started/deploy).
 
-## Install the CLI
-
-All release binaries are signed (macOS codesigned + notarized, Windows code-signed, Linux/apt PGP-signed via GCP-KMS).
+All release binaries are signed (macOS codesigned and notarized, Windows code-signed, Linux/apt PGP-signed via GCP-KMS).
 
 <Tabs items={["mise (recommended)", "Homebrew", "apt (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "Chocolatey (Windows)", "AUR (Arch Linux)", "cargo", "Nix", "from source"]}>
   <Tab value="mise (recommended)">
@@ -27,7 +25,7 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     "github:kunobi-ninja/kobe" = "latest"
     ```
 
-    Running `mise install` in the project root will install the pinned version.
+    Running `mise install` in the project root installs the pinned version.
   </Tab>
   <Tab value="Homebrew">
     macOS and Linux, via the Kunobi tap:
@@ -36,7 +34,7 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     brew install kunobi-ninja/kunobi/kobe
     ```
 
-    Pre-release (RC/beta) builds are published as a separate formula:
+    Pre-release (RC/beta) builds are a separate formula:
 
     ```sh
     brew install kunobi-ninja/kunobi/kobe-unstable
@@ -123,7 +121,7 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     cargo install --git https://github.com/kunobi-ninja/kobe --bin kobe
     ```
 
-    This compiles the CLI only. Rust 1.85 or later is required.
+    This compiles the CLI only. Rust 1.94.1 or later is required (`Cargo.toml` `rust-version`).
   </Tab>
 </Tabs>
 
@@ -133,51 +131,6 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
 kobe --help
 ```
 
-You should see the list of available subcommands. If the command isn't found, make sure the binary is on your `PATH`.
+You should see the list of subcommands. If the command is not found, put the binary on your `PATH`.
 
-## Deploy the operator
-
-The `kobe-operator` binary runs in your host Kubernetes cluster. Refer to the Helm chart or Flux deployment in the kobe repository for production setup. The operator requires:
-
-- A host Kubernetes cluster (k3s, k0s, EKS, GKE, or any conformant cluster)
-- Permission to manage Kobe CRDs, including `ClusterPool`, `ClusterLease`, `ClusterInstance`, `SandboxPool`, `SandboxLease`, `AccessPolicy`, and `KobeStore`
-- Network access between the operator and a kobe endpoint your clients can reach
-
-Install the CRDs:
-
-```sh
-cargo run --bin crdgen -- all | kubectl apply -f -
-```
-
-Or apply them from the Helm chart, which bundles the generated CRD manifests.
-
-Helm does not upgrade objects from a chart's `crds/` directory. Before upgrading
-an existing Kobe release to a version that adds CRDs, apply the new chart's CRD
-manifests explicitly, then upgrade the operator.
-
-`SandboxPool`, `SandboxLease` and `SandboxExecution` are deliberately not
-operator startup prerequisites, so existing cluster-lease endpoints can remain
-available during a staged upgrade. Until the Sandbox CRDs are installed and
-established, the Sandbox API is unavailable; a `503 Service Unavailable` means
-Kobe could not verify Sandbox admission against Kubernetes. Install the CRDs
-before enabling Sandbox API clients.
-
-The three are checked per endpoint rather than all at once, so a partial
-install degrades legibly instead of failing everything: leasing needs
-`SandboxPool` and `SandboxLease`, and the execution endpoints additionally
-need `SandboxExecution`. A cluster with the first two but not the third can
-still lease and connect — only `POST /v1/sandbox-leases/{id}/executions` and
-its siblings report the missing CRD, and they say which one.
-
-### Separate teardown authority
-
-On Kubernetes 1.30 or newer, set `teardownAuthority.separate=true` to run
-teardown proof production under a dedicated ServiceAccount. Helm installs two
-fail-closed `ValidatingAdmissionPolicy` boundaries: ordinary lifecycle code
-cannot forge or erase protected evidence, and it cannot replace the authority
-namespace or cluster-scoped RBAC. The authority validates the live policies,
-bindings, and its authenticated identity before it starts.
-
-The default remains the compatibility single-process mode for older API
-servers. In that mode, the ordinary control plane also publishes teardown
-evidence, so it does not provide the same identity separation.
+Next: [point the CLI at an endpoint](/docs/getting-started/quick-start), or [deploy the operator](/docs/getting-started/deploy) if you are standing kobe up yourself.

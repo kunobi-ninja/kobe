@@ -1,35 +1,98 @@
 ---
 title: kobe
-description: Pre-warmed Kubernetes cluster pools for instant CI and developer environments.
+description: Warm pools of Kubernetes clusters and sandboxes, leased on demand.
 ---
 
 # Introduction
 
-kobe is a Kubernetes operator that manages fleets of virtual clusters. It keeps warm pools of ready environments so CI jobs and developers can lease a Kubernetes cluster through a small HTTP API or the `kobe` CLI.
+kobe keeps warm pools of environments and hands them out as time-bounded leases. Callers use the `kobe` CLI or a small HTTP API. Two pool kinds exist:
 
-Instead of creating a fresh cluster for every request, kobe continuously reconciles `ClusterPool` resources, provisions `ClusterInstance` objects in the background, and binds `ClusterLease` objects to ready instances on demand. The result is fast handoff, predictable TTL enforcement, and clean environment recycling after use.
+- **Cluster** — a full Kubernetes API. CI gets a kubeconfig without creating a cluster per job.
+- **Sandbox** — a bounded container. You get `exec`, logs, port-forward, SSH, and an optional desktop. You never see the Kubernetes cluster underneath.
+
+TTL is enforced server-side. Release or expiry recycles the instance and queues a replacement.
+
+## What you can do
+
+**Lease a cluster for CI**
 
 ```sh
-# create a lease
-curl -X POST https://kobe.example.com/v1/leases \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"profile":"ci-small"}'
-
-# check the lease
-curl https://kobe.example.com/v1/leases/$LEASE_ID \
-  -H "Authorization: Bearer $TOKEN"
-
-# release when done
-curl -X DELETE https://kobe.example.com/v1/leases/$LEASE_ID \
-  -H "Authorization: Bearer $TOKEN"
+kobe lease ci-small
+# or wrap a job so the lease dies with the process
+kobe with-lease ci-small -- make e2e
 ```
 
-When a lease is released or expires, kobe recycles the backing instance and queues a fresh replacement so the pool stays warm.
+GitHub Actions can do the same with the job's OIDC token and no stored secret. See [GitHub Actions](/docs/getting-started/github-actions).
+
+**Treat a sandbox like a machine**
+
+```sh
+kobe init --endpoint https://kobe.example.com
+ssh kobe-agents-dev
+scp ./app kobe-agents-dev:work/
+```
+
+The first `ssh` creates the sandbox. Later connections reuse it. `scp`, `sftp`, and an editor's remote mode go through the same `ProxyCommand`. The SSH client never learns kobe exists. See [SSH](/docs/commands/ssh).
+
+**Keep a shell after you drop the laptop**
+
+```sh
+ssh kobe-agents-dev.main
+kobe attach kobe-agents-dev --session main
+```
+
+The session runs under `kobe-runner` in the sandbox. Reconnect and the screen is as you left it.
+
+**Run an agent command with a real exit code**
+
+```sh
+kobe run agents -- /agent test
+printf %s "$GITHUB_TOKEN" | kobe exec agents --stdin -- gh auth login --with-token
+```
+
+`run` owns create, exec, and release in one process. argv is sent as-is (no shell). Secrets go on stdin so they stay out of the target apiserver audit log. JSON mode is for headless agents. See [executable commands](/docs/commands/sandbox).
+
+**Open a Linux desktop in the browser**
+
+A GUI pool ships Xvfb, Openbox, noVNC, and Firefox. Start the desktop, forward port 6080, and open VNC. OAuth flows stay inside that Firefox. See [Desktop](/docs/getting-started/desktop).
+
+## Five-minute cluster trial
+
+If an operator already gave you an endpoint:
+
+```sh
+kobe config set work --endpoint https://kobe.example.com --auth ssh --global
+kobe config use work
+kobe login
+kobe lease ci-small
+```
+
+The CLI writes a kubeconfig under `~/.kube/` and prints the path:
+
+```sh
+export KUBECONFIG=~/.kube/kobe-ci-small-<id>.yaml
+kubectl get nodes
+kobe release <lease-id>
+```
+
+No endpoint yet? [Deploy the operator](/docs/getting-started/deploy), then come back.
+
+## Current support
+
+| Area | Support |
+|---|---|
+| Cluster backends | k3s (default), k0s, vcluster, CAPI. vkobe exists but is on hold |
+| Sandbox runtime | Kubernetes Agent Sandbox v1.0.0, `trusted-runc` only |
+| Auth | OIDC, SSH Ed25519, static bearer tokens |
+| CLI | macOS, Linux, Windows |
+| Helm chart | `oci://registry-1.docker.io/zondax/kobe` |
 
 <Cards>
-  <Card title="Installation" href="/docs/getting-started/installation" description="Install the kobe CLI" />
-  <Card title="Quick start" href="/docs/getting-started/quick-start" description="Lease your first cluster in minutes" />
-  <Card title="Pools" href="/docs/pools/overview" description="Define cluster templates with ClusterPool" />
-  <Card title="How it works" href="/docs/how-it-works/architecture" description="Operator, API, pool lifecycle" />
+  <Card title="Install the CLI" href="/docs/getting-started/installation" description="mise, Homebrew, apt, winget, and other channels" />
+  <Card title="Deploy the operator" href="/docs/getting-started/deploy" description="Helm install, AccessPolicy, first ClusterPool" />
+  <Card title="Lease a cluster" href="/docs/getting-started/quick-start" description="login, lease, kubectl, with-lease" />
+  <Card title="Lease a sandbox" href="/docs/getting-started/sandbox" description="kobe run, exec, ssh kobe-…" />
+  <Card title="GUI desktop" href="/docs/getting-started/desktop" description="noVNC desktop in a sandbox" />
+  <Card title="GitHub Actions" href="/docs/getting-started/github-actions" description="OIDC lease with kobe-action" />
+  <Card title="Helm and operations" href="/docs/operate/helm" description="Values, upgrades, metrics, troubleshooting" />
 </Cards>

@@ -5,32 +5,32 @@ description: All kobe CLI commands with flags and examples.
 
 # Command reference
 
+Global flags on every command: `--endpoint URL`, `--target NAME` (alias `--context`), `-o text|json`.
+
 ## Quick reference
 
 | Command | Description |
 |---|---|
-| `kobe status` | Show endpoint status, auth methods, and pool summary |
-| `kobe version` | Show CLI and endpoint versions |
-| `kobe run` | Lease an executable resource, run one command, release it ([details](/commands/sandbox)) |
-| `kobe exec` | Run a command in a lease that supports `exec` (`--stdin` forwards a secret without putting it in argv) |
-| `kobe logs` | Read output from a lease that supports `logs` |
-| `kobe cancel` | Cancel a running execution |
-| `kobe attach` | Open an interactive session through an `attach` capability |
-| `kobe port-forward` | Forward a declared port through a `port-forward` capability |
-| `kobe init` | Set this machine up for `ssh kobe-<pool>-<name>`: target, login, default pool, public key, `ssh_config` ([details](/commands/ssh)) |
-| `kobe doctor` | Check everything `ssh kobe-…` depends on, without changing anything |
-| `kobe ssh-proxy` | Serve an SSH connection to a sandbox on stdin/stdout, as an ssh `ProxyCommand` ([details](/commands/ssh)) |
-| `kobe ssh-config` | Print the `ssh_config` block that routes `kobe-*` hosts through `kobe ssh-proxy` |
-| `kobe login` | Authenticate with the kobe service |
-| `kobe logout` | Remove stored credentials |
-| `kobe lease <pool>` | Lease the resource provided by a pool |
-| `kobe release <lease-id>` | Release a lease |
-| `kobe config view` | Print current configuration |
-| `kobe config edit` | Open the configuration TUI |
-| `kobe config list` | List named targets |
-| `kobe config current` | Show the current target |
-| `kobe config use <name>` | Switch the current target |
-| `kobe config set <name> --endpoint ...` | Create or replace a named target |
+| `kobe status` | Endpoint status, auth methods, pools, your leases |
+| `kobe version` | CLI and endpoint versions |
+| `kobe login` | Authenticate (`--device` for headless) |
+| `kobe logout` | Drop stored credentials and revoke OIDC tokens at the IdP |
+| `kobe lease [pool]` | Lease from a pool |
+| `kobe extend [lease]` | Add time to an active lease |
+| `kobe release [lease]` | Release a lease |
+| `kobe purge` | Release all active leases and remove local kubeconfigs |
+| `kobe with-lease <pool> -- <cmd>` | Cluster lease around one command, then release |
+| `kobe run <pool> -- <cmd>` | Sandbox: create, run one command, release ([details](/docs/commands/sandbox)) |
+| `kobe exec <lease> -- <cmd>` | Run a command in a lease that supports `exec` |
+| `kobe logs <lease>` | Read output from a lease that supports `logs` |
+| `kobe cancel <lease> --execution <id>` | Cancel a running execution |
+| `kobe attach [lease]` | Interactive session through `attach` |
+| `kobe port-forward <lease> <spec>` | Forward a declared port |
+| `kobe init` | Set this machine up for `ssh kobe-<pool>-<name>` ([details](/docs/commands/ssh)) |
+| `kobe doctor` | Read-only checks for `ssh kobe-…` |
+| `kobe ssh-proxy` | SSH `ProxyCommand` (not meant to run by hand) |
+| `kobe ssh-config` | Print the `ssh_config` block |
+| `kobe config …` | Named targets |
 
 ---
 
@@ -41,13 +41,11 @@ kobe status
 kobe status --all
 ```
 
-Queries `GET /v1/status` on the configured endpoint. Shows the operator version, available auth methods, your leases, and pool summary. `GET /v1/status` itself does not require authentication; lease and pool rows do.
+Queries `GET /v1/status`. Shows operator version, auth methods, your leases, and pool summary. `GET /v1/status` itself does not require authentication; lease and pool rows do.
 
-Text output hides released and expired leases (they stay on the server for retention). Pass `--all` to list them. JSON (`-o json`) always includes the full inventory.
+Text output hides released and expired leases. Pass `--all` to list them. JSON (`-o json`) hides them too unless `--all` is set.
 
-Authenticated pool rows include the pool phase and a `quarantined` count. A
-non-zero count means cleanup evidence is incomplete and that capacity remains
-withheld; it is not reported as healthy or available.
+Authenticated pool rows include the pool phase and a `quarantined` count. A non-zero count means cleanup evidence is incomplete and that capacity remains withheld.
 
 ---
 
@@ -57,7 +55,7 @@ withheld; it is not reported as healthy or available.
 kobe version
 ```
 
-Prints the local CLI version and, when reachable, the endpoint version reported by `GET /v1/status`.
+Prints the local CLI version and, when reachable, the endpoint version from `GET /v1/status`.
 
 ---
 
@@ -65,15 +63,16 @@ Prints the local CLI version and, when reachable, the endpoint version reported 
 
 ```sh
 kobe login
+kobe login --device
 ```
 
-Authenticates with the configured kobe endpoint. The flow depends on the configured `auth` mode:
+Authenticates with the configured endpoint:
 
 - `ssh` — challenges your SSH agent to sign with your Ed25519 key
 - `token` — validates the token set in config or `KOBE_TOKEN`
-- `oidc` — opens a browser for OIDC authentication
+- `oidc` — opens a browser (default) or prints a URL and code with `--device` (RFC 8628)
 
-On successful login, kobe stores a session token locally. Subsequent commands use the stored token without re-prompting.
+On success, kobe stores a session token locally.
 
 ---
 
@@ -83,105 +82,112 @@ On successful login, kobe stores a session token locally. Subsequent commands us
 kobe logout
 ```
 
-Removes the stored session token and credentials from the local config. The next command that requires auth will prompt you to log in again.
+Removes stored credentials. For OIDC, also revokes refresh and access tokens at the IdP (RFC 7009).
 
 ---
 
 ## `kobe lease`
 
 ```sh
-kobe lease <pool> [--ttl <duration>] [--kubeconfig <path>] [--metadata-json <json|@path>] [--no-wait]
+kobe lease [pool] [--ttl <duration>] [--kubeconfig <path>] [--name <alias>] [--ensure] [--keepalive] [--no-wait] [--wait-timeout <duration>] [--metadata-json <json|@path>]
 ```
 
-Creates a lease from the specified pool. The pool's `resourceKind` determines
-what is allocated and which actions are available. Cluster leases write a
-kubeconfig; executable resources expose actions such as `exec` and `logs`.
+Creates a lease. The pool's resource kind decides what you get: a kubeconfig for Cluster, exec/logs/attach for Sandbox.
+
+If you omit the pool, the CLI picks when you have one default, or opens a picker (JSON mode errors and lists candidates).
 
 ```sh
 kobe lease ci-small
 kobe lease ci-small --ttl 30m
 kobe lease ci-small --kubeconfig /tmp/kube.yaml
 kobe lease agents --ttl 30m
-kobe lease ci-small --metadata-json '{"github":{"actor":"lenij","pullRequest":3835}}'
+kobe lease ci-small --name pr-3835 --ensure
+kobe lease ci-small --keepalive
+kobe lease ci-small --metadata-json '{"github":{"pullRequest":3835}}'
 kobe lease ci-small --metadata-json @lease-metadata.json
 kobe lease ci-small --no-wait
 ```
 
-Prints the lease ID, resource kind, capabilities, and expiry on success.
-While waiting, the CLI names the resource kind and what "ready" means
-(kubeconfig for Cluster, canary for Sandbox). Ctrl-C stops waiting and
-prints `kobe release <id>`; it does not release the lease.
+Prints the lease ID, resource kind, capabilities, and expiry. While waiting, Ctrl-C stops waiting and prints `kobe release <id>`; it does not release the lease.
 
-If the CLI version is older than the operator, `kobe status` and `kobe lease`
-print a warning.
-
-**Flags**
+If the CLI is older than the operator, `kobe status` and `kobe lease` print a warning.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--ttl` | pool default | Requested lease TTL. Capped by AccessPolicy `maxTtl`. |
-| `--kubeconfig` | `~/.kube/kobe-<id>` | Cluster resources only: path to write the kubeconfig. |
-| `--no-wait` | disabled | Return after creating the lease instead of waiting for readiness. |
+| `--ttl` | `1h` | Requested TTL. Capped by AccessPolicy `maxTtl`. |
+| `--kubeconfig` | `~/.kube/kobe-<pool>-<short-id>.yaml` | Cluster only: path to write the kubeconfig. |
+| `--name` | unset | Alias unique among your active leases. |
+| `--ensure` | disabled | With `--name`, reuse that active lease (extend TTL) instead of failing. Original metadata is kept. |
+| `--keepalive` | disabled | Heartbeat-extend by `--ttl` at half-TTL intervals until interrupted. Conflicts with `--no-wait`. |
+| `--no-wait` | disabled | Return after creating the lease. |
 | `--wait-timeout` | unset | Maximum time to wait for the lease to become usable. |
-| `--metadata-json` | unset | Opaque descriptive JSON object, passed inline or read from `@path`. Metadata is bounded by the server and never affects lease behavior. |
-
-Metadata is stored with the lease and returned to its owner. Do not include
-credentials or secrets; cluster administrators can inspect it.
-When `--ensure` reuses an existing named lease, that lease keeps its original metadata.
+| `--metadata-json` | unset | Opaque JSON object, inline or `@path`. Cluster leases only. Bounded by the server. Never include secrets. |
 
 ---
 
-## Lease visibility
+## `kobe extend`
 
 ```sh
-kobe status
+kobe extend [--ttl 30m]
+kobe extend <lease-id-or-pool> --ttl 1h
 ```
 
-The current CLI does not expose a standalone `kobe leases` command anymore. Use `kobe status` for an endpoint summary plus your live leases. Released and expired records are omitted from text unless you pass `--all`. Query `GET /v1/leases` or `kobe status -o json` for the full inventory.
+Adds `--ttl` (default `30m`) to the current expiry, subject to `maxExtensions` and the policy ceiling. With no selector, uses your only active lease or opens a picker (JSON mode lists candidates and exits).
 
 ---
 
 ## `kobe release`
 
 ```sh
-kobe release <lease-id>
+kobe release [lease-id]
 ```
 
-Releases a lease immediately. Kobe performs the cleanup required by that
-resource kind and makes the pool capacity reusable. Use this when work finishes
-before the TTL expires.
+Releases immediately. Omit the id when you hold a single active lease.
+
+---
+
+## `kobe purge`
 
 ```sh
-kobe release lease-a1b2c3d4e5f6
+kobe purge
+kobe purge -y
+kobe purge --orphans-only
 ```
+
+Without `--orphans-only`, releases every active lease for this identity and deletes kubeconfig files kobe recorded for this endpoint. `--orphans-only` only removes kubeconfigs whose leases are already Released, Expired, or absent. Files in `~/.kube/kobe-*.yaml` that kobe never recorded are left alone. `-y` skips the confirmation prompt.
+
+---
+
+## `kobe with-lease`
+
+```sh
+kobe with-lease <pool> [--ttl 1h] [--metadata-json <json|@path>] -- kubectl get nodes
+```
+
+Cluster only. Creates a lease, heartbeat-extends it for the command's lifetime, puts the kubeconfig in `KUBECONFIG`, then releases on exit (success, failure, or signal). The pool must expose `kubeconfig`. For sandboxes, use `kobe run`.
+
+---
+
+## Executable commands
+
+`kobe run`, `exec`, `logs`, `cancel`, `attach`, and `port-forward` are documented in [executable resource commands](/docs/commands/sandbox). `kobe init`, `doctor`, `ssh-proxy`, and `ssh-config` are in [SSH](/docs/commands/ssh).
 
 ---
 
 ## `kobe config`
 
 ```sh
+kobe config                 # interactive TUI when no subcommand
 kobe config view
-kobe config edit
+kobe config edit [name]
 kobe config list
 kobe config current
 kobe config use work
-kobe config set work --endpoint https://kobe.example.com --auth ssh
+kobe config set work --endpoint https://kobe.example.com --auth ssh --global
+kobe config export [path]
+kobe config import [path]
 ```
 
-The CLI stores named targets in `~/.config/kobe/config.json`. Most users set up one or more targets and switch between them with `kobe config use`.
+`config set` writes `./.kobe.toml` unless you pass `--global` (`~/.config/kobe/config.json`). `--auth` is `none`, `token`, `oidc`, or `ssh`. `--token` is required for token auth. `--default-pool` is the pool `ssh-proxy` uses when the host does not name one.
 
-**Common subcommands**
-
-| Command | Description |
-|---|---|
-| `kobe config view` | Show the full config, including named targets |
-| `kobe config edit` | Open the TUI editor |
-| `kobe config list` | List named targets |
-| `kobe config current` | Show the current target |
-| `kobe config use <name>` | Switch the active target |
-| `kobe config set <name> ...` | Create or replace a named target (`--default-pool` sets the pool `kobe ssh-proxy` falls back to) |
-
-```sh
-kobe config set work --endpoint https://kobe.example.com --auth ssh
-kobe config use work
-```
+See [Configuration](/docs/getting-started/configuration).

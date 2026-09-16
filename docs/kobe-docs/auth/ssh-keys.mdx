@@ -24,7 +24,7 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: AccessPolicy
 metadata:
   name: developers-ssh
-  namespace: kobe
+  namespace: kobe-system
 spec:
   auth:
     ssh:
@@ -54,7 +54,8 @@ ssh-add ~/.ssh/id_ed25519
 Then log in:
 
 ```sh
-kobe config set auth ssh
+kobe config set work --endpoint https://kobe.example.com --auth ssh --global
+kobe config use work
 kobe login
 ```
 

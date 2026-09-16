@@ -1,0 +1,62 @@
+---
+title: Observability
+description: Prometheus metrics, SigNoz scrape, and traces.
+---
+
+# Observability
+
+The operator serves Prometheus text on `GET /metrics` (no auth) on the HTTP port. `/healthz` is the liveness probe.
+
+High-cardinality identifiers (`instance_name`, `cluster_name`, `claim_name`) are never metric labels. Use traces for per-object detail.
+
+## Scraping
+
+The chart sets SigNoz pod annotations by default (`signoz.scrape: true`). They are inert unless a collector looks for `signoz.io/scrape`. For Prometheus Operator, set `serviceMonitor.enabled: true`.
+
+Traces are off until you set an OTLP endpoint:
+
+```yaml
+telemetry:
+  otlp:
+    endpoint: http://signoz-otel-collector.signoz:4317
+    serviceName: kobe-operator
+    resourceAttributes: "deployment.environment.name=production,k8s.cluster.name=prod"
+```
+
+## Metrics that answer operator questions
+
+| Question | Series |
+|---|---|
+| What build is running? | `kobe_build_info` |
+| How many clusters in each phase? | `kobe_clusters{profile,state}` |
+| Are leases waiting? | `kobe_queue_depth`, `kobe_lease_oldest_pending_age_seconds` |
+| Is create stuck? | `kobe_instance_oldest_creating_age_seconds`, `kobe_instance_create_duration_seconds` |
+| Fast vs queued bind | `kobe_claims_total{event}`, `kobe_claim_bind_duration_seconds` |
+| Why did we recycle? | `kobe_instance_recycles_total{reason}` |
+| Bootstrap failing? | `kobe_bootstrap_failures_total`, `kobe_instance_bootstrap_duration_seconds` |
+| Golden image vs fresh | `kobe_provision_method_total{method="fresh\|restore"}`, `kobe_golden_backup_total` |
+| Health probes | `kobe_health_checks_total{result}` |
+| Reconcile health | `kobe_reconciliations_total`, `kobe_pool_reconcile_duration_seconds` |
+| IPAM | `kobe_ipam_bind_duration_seconds` |
+
+`reason` on `kobe_instance_recycles_total` is a closed set: `spec_drift`, `bootstrap_failed`, `health_failed`, `lease_released`, `kobestore_degraded`, `ipam_conflict`, `manual`. Not every value is emitted yet; dashboards can still list the full set.
+
+## Suggested alerts
+
+Pool not filling:
+
+```promql
+kobe_instance_oldest_creating_age_seconds > 600
+```
+
+Queue not draining:
+
+```promql
+kobe_lease_oldest_pending_age_seconds > 300
+```
+
+Drift recycle during an upgrade (see [Upgrades](/docs/operate/upgrades)):
+
+```promql
+rate(kobe_instance_recycles_total{reason="spec_drift"}[5m])
+```

@@ -135,7 +135,7 @@ spec:
 
 vkobe clusters share the host cluster's node pool. Pods scheduled in the virtual cluster are translated and created as host pods, making them subject to the host's resource constraints and scheduling.
 
-**When to use:** When you want the lowest possible overhead per cluster, don't need full node isolation, and are comfortable with a proxy-based architecture.
+**When to use:** Do not start a new vkobe pool. Prefer `vcluster` for density. This section remains so existing pools can be read.
 
 ### KobeStore CRD
 

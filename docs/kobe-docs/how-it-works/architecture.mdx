@@ -1,76 +1,81 @@
 ---
 title: Architecture
-description: The operator, HTTP API, pool manager, and runtime backends - and how a lease flows through them.
+description: Operator, HTTP API, pool manager, backends, and how cluster and sandbox leases flow through them.
 ---
 
 # Architecture
 
-kobe has three main components — the **operator**, the **HTTP API**, and the **pool manager** — plus pluggable **runtime backends** that do the actual cluster provisioning. Understanding what each one does makes it easier to configure pools correctly and diagnose problems.
+kobe is an in-cluster operator with an embedded HTTP API. Callers never talk to Kubernetes as themselves. They authenticate to the API; the operator creates lease objects and binds them to warm capacity.
 
-## The operator
+## Components
 
-`kobe-operator` is a Kubernetes controller that runs in your host cluster. It watches `ClusterPool`, `ClusterInstance`, `ClusterLease`, `AccessPolicy`, and `KobeStore` resources and reconciles them continuously.
+| Piece | What it does |
+|---|---|
+| `kobe-operator` | Controllers plus the HTTP API. Multi-replica with leader election: only the leader runs controllers; every replica serves the API. |
+| Pool manager | In-process. Decides create / bind / recycle / destroy for each pool. |
+| Backends | Provision a `ClusterInstance` (k3s, k0s, vcluster, CAPI, vkobe). |
+| Agent Sandbox | Upstream runtime for `SandboxPool` when `agentSandbox.mode` is `managed` or `external`. |
+| `kobe` CLI | Client. Cluster leases get a kubeconfig; sandboxes get exec / logs / attach / SSH. |
 
-`ClusterPool` defines the desired pool shape. The pool controller keeps enough `ClusterInstance` objects around to satisfy that shape. The instance controller provisions and health-checks the underlying backend resources. The lease controller binds `ClusterLease` objects to ready instances, generates short-lived kubeconfigs, and enforces release and expiry.
-
-## The HTTP API
-
-The API server is embedded in the operator process. It handles lease requests, authentication, and pool status queries.
+## Cluster lease flow
 
 ```
 parse request
     ↓
 authenticate (SSH / OIDC / token)
     ↓
-enforce AccessPolicy (pool allowlist, TTL cap, concurrency limit)
+enforce AccessPolicy (pool allowlist, TTL cap, concurrency)
     ↓
-create ClusterLease CRD
+create ClusterLease
     ↓
-wait for operator to bind a ready ClusterInstance
+bind a Ready ClusterInstance
     ↓
-return kubeconfig with short-lived client certificate
+return kubeconfig with a short-lived client certificate
 ```
 
-Concurrency is bounded at 200 simultaneous API requests for DoS protection. Infrastructure routes (`/healthz`, `/metrics`) are exempt.
-
-## The pool manager
-
-The pool manager runs inside the operator and tracks the state of every instance across all pools. It makes decisions about when to create, recycle, or destroy instances based on pool spec and current state.
-
-Each pool instance moves through these states:
+The pool controller keeps enough `ClusterInstance` objects to satisfy `size` or `scaling.minReady`. The instance controller provisions and health-checks the backend. The lease controller binds, issues kubeconfig, and enforces release and expiry.
 
 ```
-Creating -> Ready (warm) -> Leased -> Recycling -> [destroyed, replaced]
+Creating → Ready (warm) → Leased → Recycling → destroyed, replaced
 ```
 
-The pool manager uses a per-pool lock to prevent races when multiple requests try to assign the same ready instance concurrently.
+## Sandbox lease flow
 
-## Runtime backends
+```
+parse request
+    ↓
+authenticate and enforce AccessPolicy.sandbox
+    ↓
+create SandboxLease
+    ↓
+admit against pool quota (ledger)
+    ↓
+bind a certified warm Sandbox (or create one)
+    ↓
+Ready — exec / logs / attach / port-forward
+```
 
-The instance controller delegates actual cluster provisioning to a per-pool
-backend: nested **k3s** / **k0s** clusters (today's production path),
-**vcluster** for high-density virtual clusters, or **CAPI** for
-provider-managed real infrastructure. All backends satisfy the same
-`ClusterBackend` contract — provision, health-check, readiness-gate, recycle —
-so pools, leases, and admission behave identically regardless of runtime.
-See [Backends](/docs/pools/backends) for configuration and
-[Runtime strategy](/docs/how-it-works/runtime-strategy) for which runtime to
-pick and where the roadmap is heading.
+Callers never send a Pod spec. The `SandboxPool` template is the whole workload surface. See [Sandbox pools](/docs/pools/sandbox-pools).
 
-> **Note:** development of the in-house `kobe-sync` sidecar and the `vkobe`
-> backend built on it is **on hold** — see
-> [Runtime strategy](/docs/how-it-works/runtime-strategy). Existing pools keep
-> working; prefer `vcluster` for new density pools.
+`POST /v1/leases` admits either kind from the pool name. Clients do not pick Cluster vs Sandbox URLs. Kind-specific verbs (`exec`, `logs`, `attach`, `port-forward`, `executions`) are also served under `/v1/leases/:id/…`.
 
-## High availability
+## Backends
 
-The operator supports multi-replica deployments via leader election. Only the leader runs controllers; replicas are warm standbys that take over within seconds if the leader pod fails. The API server runs on all replicas — requests are load-balanced, and any replica can serve them.
+The instance controller delegates provisioning to the pool's `spec.backend.type`. All backends satisfy the same contract — provision, health-check, readiness, recycle — so admission and leases behave the same. See [Backends](/docs/pools/backends) and [Runtime strategy](/docs/how-it-works/runtime-strategy).
+
+Development of the in-house `kobe-sync` sidecar and the `vkobe` backend is on hold. Existing vkobe pools keep working; prefer `vcluster` for new density pools.
+
+## API bounds
+
+Concurrency is bounded at 200 simultaneous API requests. Infrastructure routes (`/healthz`, `/metrics`) are exempt.
 
 ## Binaries
 
 | Binary | Role |
 |---|---|
-| `kobe-operator` | Operator + HTTP API server |
-| `kobe` | CLI client |
-| `crdgen` | CRD schema generator |
-| `kobe-sync` | Per-cluster runtime for the `vkobe` backend (development on hold) |
+| `kobe-operator` | Operator + HTTP API |
+| `kobe` | CLI |
+| `crdgen` | CRD schema generator (build-time) |
+| `kobe-sync` | Per-cluster runtime for `vkobe` (on hold) |
+| `kobe-host-reaper` | Node DaemonSet; unmounts stale lease directories |
+| `kobe-runner` | In-sandbox supervisor for durable exec and sessions |

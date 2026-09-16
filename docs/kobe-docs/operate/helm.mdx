@@ -1,0 +1,82 @@
+---
+title: Helm
+description: Chart values that change how the operator runs.
+---
+
+# Helm
+
+Install and first-pool YAML are in [Deploy](/docs/getting-started/deploy). This page is the values that change behaviour. The chart is `oci://registry-1.docker.io/zondax/kobe`. Chart version, GitHub tag, and `zondax/kobe-operator:vX.Y.Z` stay in lockstep.
+
+Release namespace is where the Deployment lives. `operatorNamespace` is where the operator watches CRs (`ClusterPool`, `AccessPolicy`, `SandboxPool`, …). Default watch namespace is `kunobi-pool`. Set both to the same namespace unless you have a reason not to.
+
+```sh
+helm upgrade --install kobe oci://registry-1.docker.io/zondax/kobe \
+  --version 0.47.0 \
+  --namespace kobe-system \
+  --set operatorNamespace=kobe-system \
+  --set replicas=2
+```
+
+## Values that matter
+
+| Value | Default | Effect |
+|---|---|---|
+| `replicas` | `2` | API on every replica; controllers on the leader only |
+| `operatorNamespace` | `kunobi-pool` | Watch namespace for CRs |
+| `ingress.enabled` / `ingress.host` | off | Expose the HTTP API |
+| `agentSandbox.mode` | `disabled` | `managed` installs Agent Sandbox v1.0.0; `external` uses yours |
+| `teardownAuthority.separate` | `false` | Dedicated identity for teardown proof (Kubernetes 1.30+) |
+| `hostReaper.enabled` | `true` | Node DaemonSet that unmounts stale `/var/lib/kobe/leases/` trees |
+| `postgres.url` / `postgres.urlSecret` | empty | Shared PostgreSQL for k3s/k0s datastores |
+| `signoz.scrape` | `true` | Pod annotations for SigNoz; inert without a collector |
+| `serviceMonitor.enabled` | `false` | Prometheus Operator ServiceMonitor |
+| `telemetry.otlp.endpoint` | empty | OTLP/gRPC traces |
+
+### Ingress
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  host: kobe.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+```
+
+`ingress.host` is required when ingress is enabled. TLS secret name defaults to `<release>-tls`.
+
+### Sandbox mode
+
+`disabled` (default) serves no Sandbox API. `managed` installs the chart-pinned Agent Sandbox v1.0.0 runtime by image digest and publishes a retained `BootstrapConfig` for child k3s pools. `external` installs nothing; you must already run Agent Sandbox v1.0.0.
+
+Child placement requires `managed` mode. For a release named `kobe`, the default BootstrapConfig reference is:
+
+```yaml
+spec:
+  bootstraps:
+    - name: kobe-agent-sandbox-v1-0-0
+```
+
+When Sandbox mode is enabled, the chart creates a ledger namespace `<release>-sandbox-ledger-<hash>` with a ValidatingAdmissionPolicy (Lease mutations only from the operator ServiceAccount) and a Lease object quota (`agentSandbox.reservationObjectLimit`, default 4096, minimum 4). The namespace, policy, binding, and quota are retained on Helm uninstall. Do not delete them until every SandboxLease and reservation is verified absent. Requires Kubernetes 1.30+ with the ValidatingAdmissionPolicy and ResourceQuota admission plugins.
+
+`agentSandbox.irohRelay` is `public` (n0 relays), `disabled`, or a comma-separated list of self-hosted relay URLs. Pools that request iroh transport are refused if relays are disabled.
+
+### Teardown authority
+
+On Kubernetes 1.30+, `teardownAuthority.separate=true` runs teardown proof under a dedicated ServiceAccount. Helm installs two fail-closed ValidatingAdmissionPolicy boundaries: ordinary lifecycle code cannot forge or erase protected evidence, and it cannot replace the authority namespace or cluster-scoped RBAC. The default is single-process mode for older API servers.
+
+### Host reaper
+
+On by default. A per-node DaemonSet unmounts and removes stale subtrees under `hostReaper.leaseRoot` (default `/var/lib/kobe/leases/`), gated by the operator-written `kobe-live-instances` ConfigMap. Disable it on clusters where no `ClusterPool` uses `kubeletSharedMount`.
+
+`hostReaper.cgroupCleanup.enabled` is off by default. Nested privileged k3s members using cgroupfs can leak empty cgroup directories; turn this on only after the selected host-reaper image includes those flags.
+
+### PostgreSQL
+
+Needed when k3s/k0s pools use `backend.datastore`. Prefer `postgres.urlSecret` so a password rotation reloads without restarting the operator. The account needs `CREATEDB` and `CREATEROLE`; a superuser is recommended. Connect to a single writable primary, not a load-balanced replica. PgBouncer session pooling is supported; transaction/statement pooling is not.
+
+Clusters provisioned before per-cluster roles existed still hold the shared admin credential. Recycle datastore-backed pools after upgrading that change.
+
+Full comments live in `charts/kobe/values.yaml`. Do not copy the entire file into GitOps; set the keys you need.

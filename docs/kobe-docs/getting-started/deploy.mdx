@@ -1,0 +1,127 @@
+---
+title: Deploy
+description: Install the kobe operator with Helm and lease from a first pool.
+---
+
+# Deploy the operator
+
+The operator runs in a host Kubernetes cluster and serves the HTTP API your CLI talks to. The chart is published to Docker Hub OCI.
+
+You need a conformant cluster (k3s, k0s, EKS, GKE, or similar), `helm` v3.14+, and `kubectl`. Kubernetes 1.30 or newer is required for ValidatingAdmissionPolicy features used by teardown isolation and sandbox admission.
+
+## Install
+
+Pick a namespace for the release and for the CRs the operator watches. They can be the same. The chart default watch namespace is `kunobi-pool`; the example below uses `kobe-system` for both.
+
+```sh
+kubectl create namespace kobe-system
+
+helm install kobe oci://registry-1.docker.io/zondax/kobe \
+  --version 0.47.0 \
+  --namespace kobe-system \
+  --set operatorNamespace=kobe-system
+```
+
+Chart version, GitHub release tag, and operator image tag stay in lockstep: chart `0.47.0` pulls `zondax/kobe-operator:v0.47.0`. Pin `--version` to a [released tag](https://github.com/kunobi-ninja/kobe/releases).
+
+Confirm the operator is up:
+
+```sh
+kubectl get pods -n kobe-system
+kubectl port-forward -n kobe-system svc/kobe 8080:8080
+curl http://localhost:8080/healthz
+```
+
+`GET /v1/status` does not require auth and reports the operator version.
+
+### CRDs on upgrade
+
+Helm applies objects from a chart's `crds/` directory on first install only. Before upgrading to a version that adds or changes CRDs, apply the new manifests, then upgrade the operator:
+
+```sh
+helm pull oci://registry-1.docker.io/zondax/kobe --version 0.47.0 --untar
+kubectl apply -f kobe/crds/
+helm upgrade kobe oci://registry-1.docker.io/zondax/kobe \
+  --version 0.47.0 \
+  --namespace kobe-system \
+  --set operatorNamespace=kobe-system
+```
+
+`SandboxPool`, `SandboxLease`, and `SandboxExecution` are not operator startup prerequisites. Cluster leases keep working if those CRDs are missing. Sandbox API routes return `503` until the CRDs they need are established.
+
+## Allow a caller
+
+Create an `AccessPolicy` in the watch namespace. This one authenticates Ed25519 SSH keys:
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: developers-ssh
+  namespace: kobe-system
+spec:
+  auth:
+    ssh:
+      authorizedKeys:
+        - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... you@laptop"
+  rules:
+    - pools: ["ci-small"]
+      maxTtl: 2h
+      maxConcurrentLeases: 2
+      maxExtensions: 2
+```
+
+OIDC (GitHub Actions, Clerk) and static tokens are covered under [Authentication](/docs/auth/overview).
+
+## Create a pool
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ci-small
+  namespace: kobe-system
+spec:
+  size: 2
+  ttl: 1h
+  backend:
+    type: k3s
+  cluster:
+    version: v1.31.3+k3s1
+    servers: 1
+    agents: 0
+  resources:
+    limits:
+      cpu: "750m"
+      memory: 1Gi
+```
+
+Wait until `status.ready` is at least 1:
+
+```sh
+kubectl get clusterpool ci-small -n kobe-system
+```
+
+## Lease from your laptop
+
+```sh
+kobe config set local --endpoint http://127.0.0.1:8080 --auth ssh --global
+kobe config use local
+kobe login
+kobe lease ci-small
+```
+
+For a public URL, enable ingress on the chart. See [Helm](/docs/operate/helm).
+
+## Cloud walkthroughs
+
+The repo ships scripted demos that provision a host cluster, install this chart, and lease from it:
+
+- [Hetzner](https://github.com/kunobi-ninja/kobe/tree/main/demo/hetzner)
+- [Exoscale](https://github.com/kunobi-ninja/kobe/tree/main/demo/exoscale)
+
+## Next
+
+- [Cluster quick start](/docs/getting-started/quick-start)
+- [Lease a sandbox](/docs/getting-started/sandbox) — set `agentSandbox.mode=managed` first; the default is `disabled`
+- [Helm values](/docs/operate/helm) — replicas, ingress, postgres, host-reaper, teardown authority

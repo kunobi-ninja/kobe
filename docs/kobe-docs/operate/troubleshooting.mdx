@@ -1,0 +1,73 @@
+---
+title: Troubleshooting
+description: Pool not filling, queued leases, quarantine, sandbox 503s, and CLI reachability.
+---
+
+# Troubleshooting
+
+Start with `kobe status` (caller) or `kubectl get clusterpool,clusterinstance,clusterlease -n kobe-system` (operator). Then pick the symptom.
+
+## Pool stuck `Creating`
+
+Instances stay in `Creating` until the control plane is reachable, addons have been applied, and every `readinessGates` entry passes. They recycle if they stay there too long (`creatingTimeout`, default 10m).
+
+Check:
+
+```sh
+kubectl get clusterinstance -n kobe-system -o wide
+kubectl describe clusterinstance <name> -n kobe-system
+kubectl logs -n kobe-system deploy/kobe -c kobe-operator --tail=200
+```
+
+Common causes: image pull on the inner k3s/k0s version, not enough CPU/memory on the host for `resources.limits`, bootstrap Job failing (`kobe_bootstrap_failures_total`), datastore PostgreSQL unreachable.
+
+`kobe_instance_oldest_creating_age_seconds` and `kobe_instance_create_duration_seconds` tell you whether this is slow or stuck. See [Observability](/docs/operate/observability).
+
+## Lease stays `Pending`
+
+The API accepted the request; no Ready instance was free. `kobe_queue_depth` and `kobe_lease_oldest_pending_age_seconds` show whether the queue is moving.
+
+- Fixed `size` pool: raise `size`, or wait for a recycle.
+- Scaling pool: `maxClusters` may already be hit, or `queueTimeout` (default 5m) will expire the waiter.
+- AccessPolicy `maxConcurrentLeases` returns `429`, not a long Pending.
+
+## `Quarantined`
+
+Verified cleanup could not prove that every exact resource is gone. The instance stays unavailable and still counts against pool capacity. The pool phase is `Quarantined`, never `Healthy`.
+
+Inspect the `ClusterInstance` and `ClusterLease` receipt before retrying cleanup. `ClusterLease.spec.cleanupMode` is write-once. `VerifiedDestroy` is eligible only for k3s with embedded SQLite; unsupported backends are rejected before bind.
+
+Do not delete ledger or receipt objects to "free" the slot. That is how you hand capacity back on no evidence.
+
+## Sandbox API returns 503
+
+The operator could not verify Sandbox admission against Kubernetes. Install the Sandbox CRDs (`SandboxPool`, `SandboxLease`; executions also need `SandboxExecution`) and set `agentSandbox.mode` to `managed` or `external`. The three CRDs are checked per endpoint, so a partial install fails only the routes that need the missing type.
+
+`kobe status` reports the operator version. An old operator listing a new `SandboxPool` with `portRange` can fail the whole pool list; apply CRDs, upgrade the operator, then write ranged ports. See [Ports](/docs/pools/ports).
+
+## `kobe` cannot reach the endpoint
+
+The CLI classifies transport failures:
+
+| Message | Usual cause |
+|---|---|
+| host name does not resolve | VPN / typo |
+| nothing is listening there | ingress or port-forward down |
+| connection timed out | firewall or missing route |
+| TLS handshake failed | host does not match the certificate |
+
+`kobe config view` shows where the endpoint came from (target vs `--endpoint`).
+
+JSON mode never opens a browser or asks TOFU questions. Run `kobe login` in text mode first.
+
+## SSH to a sandbox fails
+
+```sh
+kobe doctor
+```
+
+Each line is a check: binary, target, auth, SSH-capable pools, default pool, `ssh_config` Include, `ssh -G`. Failures name the command that fixes them; most of the time that is `kobe init`. See [SSH](/docs/commands/ssh).
+
+## CLI older than the operator
+
+`kobe status` and `kobe lease` print a warning. Upgrade the CLI from [Installation](/docs/getting-started/installation). New CRD fields (for example `portRange`) require the matching operator version before you apply them.

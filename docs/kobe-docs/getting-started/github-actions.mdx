@@ -13,7 +13,7 @@ repository stores no kobe secret.
 ## Allow the repository to lease
 
 Create an `AccessPolicy` that trusts GitHub's OIDC issuer. The action
-requests tokens for the audience `kobe-system` unless you set `audience`, so
+requests tokens for audience `kobe-system` unless you set `audience`, so
 the policy must accept the same value:
 
 ```yaml
@@ -21,7 +21,7 @@ apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: AccessPolicy
 metadata:
   name: github-ci
-  namespace: kobe
+  namespace: kobe-system
 spec:
   auth:
     oidc:
@@ -41,6 +41,10 @@ spec:
 Each rule limits which pools the repository may use, for how long, and how
 many leases it may hold at once. See [OIDC](/docs/auth/oidc) for other claims
 you can match on.
+
+If you set a custom `audience` on the action, change the policy to match.
+Do not leave the action on `kobe-system` and the policy on a different
+audience.
 
 ## Lease a cluster in a workflow
 
