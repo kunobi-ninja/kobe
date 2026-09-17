@@ -156,6 +156,28 @@ The key travels on the execution's stdin, never in argv, so it does not land
 in the target cluster's audit log. This uses `kobe exec`, so the pool must
 declare `runnerPath`.
 
+## Copying files
+
+Everything that rides SSH rides this: `scp`, `sftp` and `rsync` all work
+against a `kobe-*` host with no extra setup, because they read the same
+`ssh_config` block `kobe init` wrote.
+
+```bash
+scp ./overlay.tar kobe-agent-workspace-dev:/tmp/
+scp kobe-agent-workspace-dev:/tmp/results.json .
+rsync -az ./src/ kobe-agent-workspace-dev:/home/agent/work/src/
+```
+
+The sandbox is created on the first connection, so these work from cold.
+
+**A transfer is not an execution.** It travels on the same stream as the SSH
+session, so it does not count against the per-lease execution limit and cannot
+exhaust it. That matters because running out of executions leaves a running job
+unreachable: no logs, no cancel.
+
+This is the answer to moving a file rather than `kobe exec`, which converts its
+output to text and corrupts anything binary on the way back.
+
 ## Sessions and the operation limit
 
 Kobe admits at most eight simultaneous operations per sandbox. One SSH
