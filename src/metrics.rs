@@ -1318,12 +1318,6 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .unwrap()
 });
 
-/// Sandbox admission attempts refused by the per-principal rate limiter.
-///
-/// Unlabelled on purpose. The only dimension anyone would want here is *which*
-/// principal, and that is precisely the high-cardinality identifier this module
-/// forbids as a label; the throttle already logs the identity, so traces answer
-/// "who" and this series answers "how much, and is it growing".
 /// Sandbox stream registrations, by operation and how they ended up.
 ///
 /// `kind` is the caller-facing operation (`attach`, `session`,
@@ -1387,6 +1381,31 @@ pub static SANDBOX_TEARDOWN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock:
     .unwrap()
 });
 
+/// Calls to a sandbox runner, by how each one ended.
+///
+/// `outcome` is `ok` or the failure's reason code (`runner_unreachable`,
+/// `runner_unreadable`, `runner_forgot_execution`, …), so the series counts
+/// every call exactly once and a failure rate is a ratio of its own labels.
+///
+/// This exists because a runner that stops answering is invisible otherwise:
+/// the caller gets a 502, the lease still reads Ready, and the only durable
+/// trace is an INFO log line. A rate here is alertable; grepping logs after a
+/// CI failure is not.
+pub static SANDBOX_RUNNER_CALL_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_sandbox_runner_call_total",
+        "Calls to a sandbox runner by outcome",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Sandbox admission attempts refused by the per-principal rate limiter.
+///
+/// Unlabelled on purpose. The only dimension anyone would want here is *which*
+/// principal, and that is precisely the high-cardinality identifier this module
+/// forbids as a label; the throttle already logs the identity, so traces answer
+/// "who" and this series answers "how much, and is it growing".
 pub static SANDBOX_ADMISSION_RATE_LIMITED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "kobe_sandbox_admission_rate_limited_total",
@@ -1510,6 +1529,17 @@ pub fn init() {
     LazyLock::force(&SANDBOX_STREAM_TOTAL);
     LazyLock::force(&SANDBOX_STREAMS_ACTIVE);
     LazyLock::force(&SANDBOX_STREAM_DURATION_SECONDS);
+    LazyLock::force(&SANDBOX_RUNNER_CALL_TOTAL);
+    // Forcing a *labelled* family only registers it; Prometheus emits no series
+    // until some label combination is observed, so an alert on a label that has
+    // never occurred still reads "no data". These two are the ratio the runner
+    // alert needs — calls that worked, and calls where the runner went silent —
+    // so both are seeded at zero and the alert is live from startup.
+    for outcome in ["ok", "runner_unreachable"] {
+        SANDBOX_RUNNER_CALL_TOTAL
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
     // Lease timing
     LazyLock::force(&LEASE_QUEUE_WAIT_SECONDS);
     LazyLock::force(&LEASE_HOLD_SECONDS);
@@ -1623,6 +1653,24 @@ mod tests {
         assert!(
             output.contains("test-profile"),
             "gather() should contain the label value 'test-profile' after increment"
+        );
+    }
+
+    /// The runner-call counter must exist before the first runner call.
+    ///
+    /// An alert on `rate(kobe_sandbox_runner_call_total{outcome="runner_unreachable"}[5m])`
+    /// is useless if the series only appears once a runner has already gone
+    /// silent: the alert would read "no data" during exactly the window it is
+    /// meant to cover. `init()` forces it, so this asserts the family is
+    /// exposed with no call having happened.
+    #[test]
+    fn runner_call_counter_is_exposed_before_any_call() {
+        init();
+
+        let output = gather();
+        assert!(
+            output.contains("kobe_sandbox_runner_call_total"),
+            "gather() should expose kobe_sandbox_runner_call_total before the first runner call"
         );
     }
 

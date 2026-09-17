@@ -660,7 +660,30 @@ async fn read_stream_to_cap(
 /// A truncated reply is `Unreadable` rather than an attempt at partial JSON,
 /// and a denial from the resolver is `Unreachable` — from Kobe's side those are
 /// the same fact: nobody can currently say what the command is doing.
+/// Every runner call goes through here, so this is where the outcome is
+/// counted. A runner that stops answering produces a 502 and an INFO log line
+/// and nothing else; `kobe_sandbox_runner_call_total` makes the rate visible
+/// without reading logs.
 async fn call(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    argv: &[String],
+    stdin: Option<&[u8]>,
+    timeout: std::time::Duration,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<u8>, RunnerCallFailure> {
+    let outcome = call_inner(client, target, container, argv, stdin, timeout, shutdown).await;
+    crate::metrics::SANDBOX_RUNNER_CALL_TOTAL
+        .with_label_values(&[match &outcome {
+            Ok(_) => "ok",
+            Err(failure) => failure.reason_code(),
+        }])
+        .inc();
+    outcome
+}
+
+async fn call_inner(
     client: &kube::Client,
     target: &SandboxTarget,
     container: &str,
