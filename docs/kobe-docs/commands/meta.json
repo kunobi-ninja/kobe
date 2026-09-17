@@ -3,6 +3,7 @@
   "pages": [
     "reference",
     "sandbox",
+    "vnc",
     "ssh"
   ]
 }
