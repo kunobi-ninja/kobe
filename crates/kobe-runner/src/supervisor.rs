@@ -451,6 +451,12 @@ fn feed(sink: Option<std::process::ChildStdin>, bytes: Option<Vec<u8>>) -> std::
 fn spawn(request: &StartRequest, with_stdin: bool) -> std::io::Result<Child> {
     let mut command = Command::new(&request.argv[0]);
     command.args(&request.argv[1..]);
+    // `KOBE_CPUS`/`CARGO_BUILD_JOBS`/`RUST_TEST_THREADS`, sized from the real
+    // cgroup quota rather than the host's CPU count (#272). This is a shell-
+    // less `execve`, so a container-start script's `export` would never reach
+    // it — see `kobe_runner::cpu`'s module docs for why the value has to be
+    // set right here instead.
+    crate::cpu::apply_defaults(&mut command);
     if let Some(cwd) = &request.cwd {
         // `chdir`, applied by the kernel at exec. Never `cd X && ...`: a shell
         // there would make quoting the security boundary, and the boundary is a
