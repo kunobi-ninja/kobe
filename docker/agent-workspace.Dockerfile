@@ -214,6 +214,27 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/node/bin:$PATH' \
       > /etc/profile.d/kobe-node-tools.sh \
     && chmod 0644 /etc/profile.d/kobe-node-tools.sh
 
+# `nproc` inside this container reports the HOST's CPU count, not the cgroup
+# quota Kubernetes actually enforces on it — commonly a fraction of the host's
+# (#272). `kobe-runner` (below) computes the real number at runtime from
+# `/sys/fs/cgroup/cpu.max` and sets it, plus sane `CARGO_BUILD_JOBS` /
+# `RUST_TEST_THREADS` defaults, on every process it spawns — see its `cpu`
+# module for why that has to happen in the runner itself rather than here: a
+# shell-less `kobe exec` never sources this file, so this script cannot be
+# the source of the value, only an announcement of it. All it does is print
+# the runner's own `KOBE_CPUS` on an interactive login shell, so a human
+# attaching sees the real ceiling immediately instead of discovering it after
+# a build runs eight times slower than expected. This is a mitigation, not a
+# fix: it changes nothing for a tool that reads `nproc` directly.
+RUN printf '%s\n' \
+      'if [ -n "$KOBE_CPUS" ] && [ -t 1 ]; then' \
+      '  echo "kobe: this sandbox is capped at $KOBE_CPUS CPU(s) (cgroup quota)." >&2' \
+      '  echo "kobe: cargo/rustc default to that many jobs via CARGO_BUILD_JOBS/RUST_TEST_THREADS." >&2' \
+      '  echo "kobe: nproc still reports the host CPU count, not this cap -- a tool that reads nproc directly is still wrong. See #272." >&2' \
+      'fi' \
+      > /etc/profile.d/kobe-cpu-quota.sh \
+    && chmod 0644 /etc/profile.d/kobe-cpu-quota.sh
+
 COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner \

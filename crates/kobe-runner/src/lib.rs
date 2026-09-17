@@ -12,6 +12,7 @@
 //! The operator depends on this crate for [`protocol`] alone. Everything else
 //! here runs inside the Sandbox container.
 
+pub mod cpu;
 pub mod protocol;
 #[cfg(unix)]
 pub mod session;

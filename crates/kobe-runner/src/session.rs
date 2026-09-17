@@ -853,6 +853,10 @@ fn spawn_shell(name: &str, argv: &[String], slave: &OwnedFd) -> io::Result<Child
     if std::env::var_os("TERM").is_none() {
         command.env("TERM", "xterm-256color");
     }
+    // `KOBE_CPUS`/`CARGO_BUILD_JOBS`/`RUST_TEST_THREADS`, sized from the real
+    // cgroup quota rather than the host's CPU count (#272), so a `cargo build`
+    // typed into an attached session does not oversubscribe it either.
+    crate::cpu::apply_defaults(&mut command);
     command
         .env("KOBE_SESSION", name)
         .stdin(Stdio::from(slave.try_clone()?))

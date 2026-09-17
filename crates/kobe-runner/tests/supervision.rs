@@ -50,7 +50,13 @@ fn runner(scratch: &Scratch, arguments: &[&str]) -> Command {
     command
         .arg("--state-dir")
         .arg(scratch.path().join("spool"))
-        .args(arguments);
+        .args(arguments)
+        // `cpu_quota_env_defaults_reach_a_shell_less_child` below asserts the
+        // runner's own CPU-derived defaults, which only holds if neither is
+        // already sitting in this test binary's own environment — e.g. a
+        // developer's shell, or an outer `cargo test` invocation.
+        .env_remove("CARGO_BUILD_JOBS")
+        .env_remove("RUST_TEST_THREADS");
     command
 }
 
@@ -914,6 +920,46 @@ fn a_working_directory_is_applied_as_a_chdir() {
             .trim(),
         workdir.to_str().unwrap()
     );
+}
+
+/// The CPU-quota env defaults (#272) reach the command with NO shell in the
+/// way — the exact path a real `kobe exec` takes, and the one a container-
+/// start script's `export` cannot reach (see `kobe_runner::cpu`'s module
+/// docs). `/usr/bin/env` with no arguments prints its own environment and is
+/// executed directly via `execve`, so this proves the variables are on the
+/// child's environment block itself, not merely visible to some shell that
+/// happened to source a profile script.
+#[test]
+fn cpu_quota_env_defaults_reach_a_shell_less_child() {
+    let scratch = Scratch::new();
+    // A generous cap: this test's own ambient environment (whatever
+    // developer or CI shell happens to run it) can carry many kilobytes of
+    // unrelated variables ahead of `KOBE_CPUS` alphabetically, and the point
+    // here is to read the child's real environment, not to exercise the
+    // output-retention cap that other tests already cover.
+    start(&scratch, "sbxe-cpu-env", &["/usr/bin/env"], 30, 1 << 20);
+
+    let report = settled(&scratch, "sbxe-cpu-env", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Succeeded);
+
+    let stdout = String::from_utf8(read_stream(&scratch, "sbxe-cpu-env", "stdout")).unwrap();
+    let value_of = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("{key} missing from the child's environment:\n{stdout}"))
+    };
+
+    // Always present, and a plain positive integer, on whatever host this
+    // test happens to run on (a real cgroup v2 quota in CI's Sandbox image, a
+    // host-CPU-count fallback on a developer's machine or a v1 host).
+    let kobe_cpus: u64 = value_of("KOBE_CPUS")
+        .parse()
+        .expect("KOBE_CPUS is an integer");
+    assert!(kobe_cpus >= 1);
+    // Defaulted from KOBE_CPUS because nothing upstream of this test set them.
+    assert_eq!(value_of("CARGO_BUILD_JOBS"), kobe_cpus.to_string());
+    assert_eq!(value_of("RUST_TEST_THREADS"), kobe_cpus.to_string());
 }
 
 /// Output survives the command, and is still readable by offset afterwards.
