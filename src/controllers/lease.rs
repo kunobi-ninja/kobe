@@ -1245,9 +1245,25 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 Err(error) => return Err(error.into()),
             };
 
+            // Every pool shape gets a queue timeout, not just autoscaled ones
+            // (#233). A fixed-size pool's `size` is as hard a ceiling as an
+            // autoscaled pool's `max_clusters`, so a caller that vanished
+            // (cancelled CI job, closed laptop) can wedge a fixed pool's
+            // queue exactly like it would an autoscaled one; `scaling`
+            // being unset must not turn that off. Prefer
+            // `scaling.queue_timeout` when autoscaling is on (it already
+            // has its own default and is the value the pool's autoscaling
+            // is tuned against); otherwise fall back to the top-level
+            // `spec.queue_timeout`, which defaults identically.
             if let Some(profile) = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await
-                && let Some(scaling) = &profile.spec.scaling
-                && let Some(timeout) = parse_duration(&scaling.queue_timeout)
+                && let Some(timeout) = parse_duration(
+                    profile
+                        .spec
+                        .scaling
+                        .as_ref()
+                        .map(|scaling| scaling.queue_timeout.as_str())
+                        .unwrap_or(profile.spec.queue_timeout.as_str()),
+                )
             {
                 let age = chrono::Utc::now() - created_at;
                 if age > timeout {
@@ -7341,6 +7357,179 @@ mod tests {
         let action = reconcile_lease(lease, ctx).await.unwrap();
         // No ready cluster → requeue at 5s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile_lease: Pending — queue timeout expiry (#233)
+    //
+    // Both pool shapes are exercised against the SAME helper so a
+    // regression that special-cases one of them (e.g. re-adding the old
+    // `scaling.is_some()` guard) fails both tests identically instead of
+    // leaving the untested shape silently broken again.
+    // -----------------------------------------------------------------------
+
+    /// Drives a Pending lease, created `age` ago, through one reconcile
+    /// against `pool_spec_extra` merged into a minimal `ClusterPool` spec.
+    /// Returns the requeue `Action` and the pre/post `LEASE_QUEUE_WAIT_SECONDS{expired}`
+    /// sample counts so callers can assert the metric moved.
+    ///
+    /// `pool_name` must be unique per caller (not just per test file): the
+    /// metric is a real global `LazyLock` registry shared by every test
+    /// binary-wide, and `cargo test` runs tests concurrently, so two cases
+    /// sharing a pool name would race on the same before/after sample count.
+    async fn run_queue_timeout_case(
+        pool_name: &str,
+        age: chrono::Duration,
+        pool_spec_extra: serde_json::Value,
+    ) -> (Action, u64, u64) {
+        let (ctx, server) = test_lease_context().await;
+        let lease_name = format!("{pool_name}-lease");
+        let created_at = (chrono::Utc::now() - age).to_rfc3339();
+        let lease: Arc<ClusterLease> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": lease_name,
+                    "namespace": "test-ns",
+                    "uid": format!("{lease_name}-uid"),
+                    "resourceVersion": "10",
+                    "creationTimestamp": created_at,
+                },
+                "spec": {
+                    "poolRef": pool_name,
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": { "phase": "Pending", "queuePosition": 1 }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{lease_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.as_ref()))
+            .mount(&server)
+            .await;
+
+        let mut pool_spec = serde_json::json!({
+            "size": 3,
+            "ttl": "2h",
+            "backend": { "type": "k3s" },
+            "cluster": { "version": "v1.31.3+k3s1" }
+        });
+        for (key, value) in pool_spec_extra.as_object().unwrap() {
+            pool_spec[key] = value.clone();
+        }
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/{pool_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "metadata": { "name": pool_name, "namespace": "test-ns", "uid": format!("{pool_name}-uid"), "resourceVersion": "20" },
+                "spec": pool_spec
+            })))
+            .mount(&server)
+            .await;
+
+        // One route serves both status writes reconcile_lease issues for an
+        // expiring Pending lease: the queue-position write, then (once the
+        // timeout check trips) expire_lease_fenced's phase→Expired write.
+        // Routing on the patch body — rather than mount order — keeps this
+        // independent of wiremock's match-priority rules for two mocks on
+        // the same method+path.
+        let lease_name_for_patch = lease_name.clone();
+        let pool_name_owned = pool_name.to_string();
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{lease_name}/status"
+            )))
+            .respond_with(move |request: &wiremock::Request| {
+                let ops: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("status patch JSON");
+                let expiring = ops.as_array().unwrap().iter().any(|op| {
+                    op["path"] == "/status" && op["value"]["phase"] == "Expired"
+                });
+                let status = if expiring {
+                    serde_json::json!({ "phase": "Expired" })
+                } else {
+                    serde_json::json!({ "phase": "Pending", "queuePosition": 1 })
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterLease",
+                    "metadata": { "name": lease_name_for_patch, "namespace": "test-ns",
+                                  "uid": format!("{lease_name_for_patch}-uid"), "resourceVersion": "11" },
+                    "spec": { "poolRef": pool_name_owned, "ttl": "1h",
+                               "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
+                    "status": status
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let before = crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+            .with_label_values(&[pool_name, "expired"])
+            .get_sample_count();
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+
+        let after = crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+            .with_label_values(&[pool_name, "expired"])
+            .get_sample_count();
+
+        (action, before, after)
+    }
+
+    /// #233: a fixed-size pool (no `scaling` block) previously had no queue
+    /// timeout at all — a lease past `spec.queue_timeout` must still expire.
+    #[tokio::test]
+    async fn test_reconcile_pending_lease_expires_on_fixed_size_pool_queue_timeout() {
+        let (action, before, after) = run_queue_timeout_case(
+            "queue-timeout-fixed-pool",
+            chrono::Duration::minutes(2),
+            serde_json::json!({ "queueTimeout": "1m" }),
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            after,
+            before + 1,
+            "expired queue-wait metric should record for a fixed-size pool"
+        );
+    }
+
+    /// Same expiry path for an autoscaled pool, to prove the fix did not
+    /// regress the pre-existing `scaling.queue_timeout` behavior.
+    #[tokio::test]
+    async fn test_reconcile_pending_lease_expires_on_scaling_pool_queue_timeout() {
+        let (action, before, after) = run_queue_timeout_case(
+            "queue-timeout-scaling-pool",
+            chrono::Duration::minutes(2),
+            serde_json::json!({
+                "scaling": {
+                    "minReady": 1,
+                    "maxClusters": 8,
+                    "scaleDownAfter": "5m",
+                    "queueTimeout": "1m",
+                    "creatingTimeout": "10m"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            after,
+            before + 1,
+            "expired queue-wait metric should record for a scaling pool"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -745,7 +745,11 @@ fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
             max_clusters: None,
             scale_up_threshold: None,
             scale_down_after: None,
-            queue_timeout: None,
+            // Fixed-size pools queue-time-out too (#233): report
+            // `spec.queue_timeout` — the same field `reconcile_lease` reads
+            // for these pools — instead of the `None` this used to send
+            // back when only autoscaled pools had one.
+            queue_timeout: Some(profile.spec.queue_timeout.clone()),
         }
     }
 }
@@ -1497,8 +1501,9 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     }
 
     // #189 pre-flight: GET the target pool and refuse up-front when it cannot
-    // satisfy the lease, instead of creating a ClusterLease that hangs Pending
-    // forever (fixed-size pools have no queue_timeout). A `Failing` pool — or a
+    // satisfy the lease, instead of creating a ClusterLease that only gives up
+    // after the pool's queue_timeout (still minutes, even though #233 gave
+    // every pool one). A `Failing` pool — or a
     // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
     // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
     // empty warm pool keeps the 202 Pending below. Missing pools are rejected

@@ -2117,6 +2117,7 @@ fn synthetic_profile(config: &ResolvedInstanceConfig) -> ClusterPool {
             health_check: config.health_check.clone(),
             readiness_gates: config.readiness_gates.clone(),
             scaling: None,
+            queue_timeout: "5m".to_string(),
             upgrade_policy: None,
             diagnostics: None,
             snapshot: config.snapshot.clone(),
