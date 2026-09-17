@@ -247,12 +247,10 @@ impl ClusterBackend for MockBackend {
 /// moment.
 #[allow(dead_code)]
 pub fn mock_k8s_client(server: &wiremock::MockServer) -> kube::Client {
-    let config = kube::Config {
-        cluster_url: server.uri().parse().unwrap(),
-        default_namespace: "test-ns".into(),
-        root_cert: Some(Vec::new()),
-        ..kube::Config::new(server.uri().parse().unwrap())
-    };
+    // kube 4 made `Config` non-exhaustive, so build it and set the fields we need.
+    let mut config = kube::Config::new(server.uri().parse().unwrap());
+    config.default_namespace = "test-ns".into();
+    config.root_cert = Some(Vec::new());
     kube::Client::try_from(config).unwrap()
 }
 

@@ -38,12 +38,10 @@ pub const HOST_NS: &str = "pool-test";
 /// normal case here and is deliberately ignored.
 pub fn mock_client(server: &MockServer) -> Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = kube::Config {
-        cluster_url: server.uri().parse().unwrap(),
-        default_namespace: HOST_NS.into(),
-        root_cert: Some(Vec::new()),
-        ..kube::Config::new(server.uri().parse().unwrap())
-    };
+    // kube 4 made `Config` non-exhaustive, so build it and set the fields we need.
+    let mut config = kube::Config::new(server.uri().parse().unwrap());
+    config.default_namespace = HOST_NS.into();
+    config.root_cert = Some(Vec::new());
     Client::try_from(config).unwrap()
 }
 

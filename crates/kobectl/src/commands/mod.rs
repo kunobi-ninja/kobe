@@ -331,6 +331,11 @@ async fn discover_ssh_audience(config: &ResolvedConfig) -> anyhow::Result<String
     )
 }
 
+/// The SSH auth path has no OIDC issuer (status reports issuer=None for ssh, and SSH
+/// identities are stamped issuer="ssh"), so the endpoint is pinned under this sentinel
+/// in the issuer slot that `TofuStore` verifies and stores.
+const SSH_PINNED_ISSUER: &str = "ssh";
+
 /// Verify SSH trust off the async worker thread.
 ///
 /// The interactive path reads stdin synchronously. Running it in Tokio's
@@ -354,7 +359,11 @@ fn tofu_check_blocking(
     interaction: AuthInteraction,
 ) -> anyhow::Result<()> {
     let store = kunobi_auth::client::TofuStore::new()?;
-    apply_tofu_result(&store, store.verify(endpoint, audience)?, interaction)
+    apply_tofu_result(
+        &store,
+        store.verify(endpoint, SSH_PINNED_ISSUER, audience)?,
+        interaction,
+    )
 }
 
 fn apply_tofu_result(
@@ -362,10 +371,6 @@ fn apply_tofu_result(
     result: kunobi_auth::client::TofuResult,
     interaction: AuthInteraction,
 ) -> anyhow::Result<()> {
-    // The SSH auth path has no OIDC issuer (status reports issuer=None for ssh,
-    // and SSH identities are stamped issuer="ssh"), so pin the endpoint under
-    // the "ssh" sentinel for the issuer slot that TofuStore::trust requires.
-    let pinned_issuer = "ssh";
     match result {
         kunobi_auth::client::TofuResult::Trusted => Ok(()),
         kunobi_auth::client::TofuResult::FirstConnect { endpoint, audience }
@@ -384,7 +389,7 @@ fn apply_tofu_result(
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             if input.trim().eq_ignore_ascii_case("y") {
-                store.trust(&endpoint, pinned_issuer, &audience)?;
+                store.trust(&endpoint, SSH_PINNED_ISSUER, &audience)?;
                 Ok(())
             } else {
                 anyhow::bail!("Connection refused by user")
@@ -417,12 +422,28 @@ fn apply_tofu_result(
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             if input.trim().eq_ignore_ascii_case("y") {
-                store.trust(&endpoint, pinned_issuer, &current)?;
+                store.trust(&endpoint, SSH_PINNED_ISSUER, &current)?;
                 Ok(())
             } else {
                 anyhow::bail!("Connection refused by user")
             }
         }
+        // The SSH path always pins the "ssh" sentinel, so a different issuer means the
+        // endpoint was pinned by another auth path or by someone else. Refuse either
+        // way: unlike an audience change, there is no answer the user can give here
+        // that makes the new issuer trustworthy.
+        kunobi_auth::client::TofuResult::IssuerChanged {
+            endpoint,
+            previous,
+            current,
+        } => {
+            anyhow::bail!(
+                "SSH trust for {endpoint} is pinned to issuer {previous}, but the service now \
+                 presents {current}. Remove the pin for {endpoint} from the trust store only if \
+                 you know why it changed."
+            )
+        }
+        other => anyhow::bail!("Unhandled SSH trust result: {other:?}"),
     }
 }
 
