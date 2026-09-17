@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: SandboxPool
     plural: sandboxpools
     shortNames:
@@ -1069,7 +1068,7 @@ spec:
             type: object
         required:
         - spec
-        title: SandboxPoolValidated
+        title: SandboxPool
         type: object
         x-kubernetes-validations:
         - message: Ready=True requires a coherent observed-generation durable Certified receipt

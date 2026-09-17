@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: AccessPolicy
     plural: accesspolicies
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: accesspolicy
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for AccessPolicySpec via `CustomResource`
@@ -276,4 +274,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

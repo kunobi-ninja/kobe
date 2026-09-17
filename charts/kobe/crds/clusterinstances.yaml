@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: ClusterInstance
     plural: clusterinstances
     shortNames:
@@ -1793,7 +1792,7 @@ spec:
             type: object
         required:
         - spec
-        title: ClusterInstanceValidated
+        title: ClusterInstance
         type: object
         x-kubernetes-validations:
         - message: status.creationManifest is immutable once sealed
