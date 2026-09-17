@@ -13,16 +13,42 @@ a human in the loop.
 Nothing opens a window on your machine. A screenshot is written to a file and
 input events go straight to the server.
 
-## Start the desktop first
+## `kobe vnc open`
 
-A lease does not start a desktop. Nothing does until you ask:
+The one command to reach for. It starts the desktop if it is not running,
+forwards noVNC, and opens it in your browser:
 
 ```bash
-kobe exec dev --detach -- kobe-desktop-up
+kobe vnc open dev
+```
+
+```
+Starting the desktop in dev...
+Opened http://127.0.0.1:52341/vnc.html?autoconnect=1&resize=scale&path=websockify
+Ctrl-C closes the desktop in the browser; the sandbox keeps running.
+```
+
+The forward runs until you interrupt it. Interrupting closes the browser view,
+not the desktop: the sandbox keeps running and `kobe vnc open` reconnects to
+the same session.
+
+`--no-browser` prints the URL instead of opening one, which is what you want
+over SSH or in CI. `--local-port` pins the port when you would rather not have
+a new one each time. `--no-start` skips starting the desktop.
+
+## Starting the desktop by hand
+
+A lease does not start a desktop, and `kobe vnc open` is doing this for you:
+
+```bash
+kobe exec dev --detach -- kobe-desktop start
 ```
 
 It runs until the lease ends or you cancel the execution. Only one desktop runs
-in a Sandbox at a time.
+in a Sandbox at a time. `kobe-desktop status`, `stop`, `logs`, `terminal` and
+`browser` are also available; `kobe-desktop browser <url>` opens Firefox
+**inside** the desktop, which is different from `kobe vnc open` opening the
+desktop in the browser on your own machine.
 
 ## `kobe vnc screenshot`
 
@@ -92,8 +118,9 @@ short-lived loopback forward carried by the same authenticated stream as
 [`kobe port-forward`](/docs/kobe/commands/sandbox), so it inherits the same
 authorization and costs nothing against the execution budget.
 
-`kobe port-forward dev --port 6080` still works if you want noVNC in a browser
-instead. Both reach the same desktop.
+`kobe port-forward dev 6080:6080` still works if you would rather wire it up
+yourself. `kobe vnc open` is that plus starting the desktop and knowing the
+query string.
 
 ## Limits
 
