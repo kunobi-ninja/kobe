@@ -39,6 +39,12 @@ FROM debian:bookworm-slim
 # joins the container's own idle process and a dropped connection loses the
 # session — the exact failure an 8h agent lease must not have.
 #
+# `rsync` completes the file-transfer story the SSH path already tells. `scp`
+# and `sftp` work today and are proven at build time below, but rsync needs the
+# binary at BOTH ends: a caller has it on their machine and the sandbox did
+# not, so syncing a source tree incrementally — the workload in #259 that
+# started this — was the one transfer shape still unavailable.
+#
 # `openssh-server` is for `kobe ssh-proxy`: an SSH client on the caller's
 # machine reaches this sandbox through `kobe attach`, which runs `kobe-sshd`
 # (below) as the workload user in inetd mode. No port is opened.
@@ -73,6 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         procps \
         ripgrep \
+        rsync \
         tmux \
         unzip \
         websockify \
