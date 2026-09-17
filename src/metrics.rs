@@ -1381,21 +1381,28 @@ pub static SANDBOX_TEARDOWN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock:
     .unwrap()
 });
 
-/// Calls to a sandbox runner, by how each one ended.
+/// Sandbox runner transport calls, by how each one ended and why.
 ///
-/// `outcome` is `ok` or the failure's reason code (`runner_unreachable`,
-/// `runner_unreadable`, `runner_forgot_execution`, …), so the series counts
-/// every call exactly once and a failure rate is a ratio of its own labels.
+/// `outcome` is what the caller was told — `ok`, `runner_unreachable` or
+/// `runner_unreadable`. `cause` is why, and it is the label that makes this
+/// series worth having.
 ///
-/// This exists because a runner that stops answering is invisible otherwise:
-/// the caller gets a 502, the lease still reads Ready, and the only durable
-/// trace is an INFO log line. A rate here is alertable; grepping logs after a
-/// CI failure is not.
+/// `runner_unreachable` is one answer covering many faults, because a caller
+/// must not be able to tell a replaced Pod from an unreachable one by probing
+/// an execution. `cause` keeps the distinction on the operator's side, where
+/// [`SandboxAccessDenied::reason_code`](crate::api::sandbox_access::SandboxAccessDenied::reason_code)
+/// already argues it belongs: an `expired` lease, a `pool_unresolvable` one and
+/// a `backend_error` need different fixes, and `empty_reply` — the exec landed
+/// and the runner said nothing — is a different fault again from an exec that
+/// never landed at all.
+///
+/// Transport only. A reply that arrives and is then rejected while parsing does
+/// not pass through the counted path, so no `Refused` code appears here.
 pub static SANDBOX_RUNNER_CALL_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kobe_sandbox_runner_call_total",
-        "Calls to a sandbox runner by outcome",
-        &["outcome"]
+        "Sandbox runner transport calls by caller-facing outcome and underlying cause",
+        &["outcome", "cause"]
     )
     .unwrap()
 });
@@ -1532,12 +1539,13 @@ pub fn init() {
     LazyLock::force(&SANDBOX_RUNNER_CALL_TOTAL);
     // Forcing a *labelled* family only registers it; Prometheus emits no series
     // until some label combination is observed, so an alert on a label that has
-    // never occurred still reads "no data". These two are the ratio the runner
-    // alert needs — calls that worked, and calls where the runner went silent —
-    // so both are seeded at zero and the alert is live from startup.
-    for outcome in ["ok", "runner_unreachable"] {
+    // never occurred still reads "no data" during exactly the window it exists
+    // to cover. Seeding every pair the transport can produce makes each one
+    // alertable from startup, and a seeded series that never moves is honest:
+    // it says that fault has not happened.
+    for (outcome, cause) in crate::api::sandbox_runner::RUNNER_CALL_OUTCOMES {
         SANDBOX_RUNNER_CALL_TOTAL
-            .with_label_values(&[outcome])
+            .with_label_values(&[outcome, cause])
             .inc_by(0);
     }
     // Lease timing

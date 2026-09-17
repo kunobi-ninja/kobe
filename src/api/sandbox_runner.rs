@@ -660,10 +660,42 @@ async fn read_stream_to_cap(
 /// A truncated reply is `Unreadable` rather than an attempt at partial JSON,
 /// and a denial from the resolver is `Unreachable` — from Kobe's side those are
 /// the same fact: nobody can currently say what the command is doing.
-/// Every runner call goes through here, so this is where the outcome is
-/// counted. A runner that stops answering produces a 502 and an INFO log line
-/// and nothing else; `kobe_sandbox_runner_call_total` makes the rate visible
-/// without reading logs.
+/// Every `(outcome, cause)` pair the transport path below can record.
+///
+/// Lives next to the mapping that produces them so the two drift visibly rather
+/// than silently: `metrics::init` seeds exactly these at zero, and a pair that
+/// stops being reachable — or a new one that is added without being listed —
+/// shows up as a series that never moves, or an alert that reads "no data"
+/// during the window it exists to cover.
+pub(crate) const RUNNER_CALL_OUTCOMES: &[(&str, &str)] = &[
+    ("ok", "ok"),
+    // Everything `SandboxAccessDenied` can be, minus `not_declared`, which is
+    // the one denial the transport reports as unreadable rather than
+    // unreachable.
+    ("runner_unreachable", "not_found"),
+    ("runner_unreachable", "not_ready"),
+    ("runner_unreachable", "expired"),
+    ("runner_unreachable", "target_unresolved"),
+    ("runner_unreachable", "provenance_incomplete"),
+    ("runner_unreachable", "pool_unresolvable"),
+    ("runner_unreachable", "port_name_covers_range"),
+    ("runner_unreachable", "ambiguous_alias"),
+    ("runner_unreachable", "backend_error"),
+    // Not a denial: the exec landed and the runner said nothing.
+    ("runner_unreachable", "empty_reply"),
+    ("runner_unreadable", "not_declared"),
+    ("runner_unreadable", "truncated_reply"),
+];
+
+/// Every runner *transport* call goes through here, so this is where the
+/// outcome is counted. A runner that stops answering produces a 502 and an INFO
+/// log line and nothing else; `kobe_sandbox_runner_call_total` makes the rate
+/// visible without reading logs.
+///
+/// Only the transport. A reply that arrives and is then rejected by
+/// [`parse_reply`] — a protocol mismatch, or a `Refused` answer — never reaches
+/// this function, so `runner_forgot_execution` and friends are not among the
+/// outcomes it can record.
 async fn call(
     client: &kube::Client,
     target: &SandboxTarget,
@@ -674,15 +706,34 @@ async fn call(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<u8>, RunnerCallFailure> {
     let outcome = call_inner(client, target, container, argv, stdin, timeout, shutdown).await;
+    let (result, cause) = match outcome {
+        Ok(stdout) => (Ok(stdout), "ok"),
+        Err((failure, cause)) => (Err(failure), cause),
+    };
     crate::metrics::SANDBOX_RUNNER_CALL_TOTAL
-        .with_label_values(&[match &outcome {
-            Ok(_) => "ok",
-            Err(failure) => failure.reason_code(),
-        }])
+        .with_label_values(&[
+            match &result {
+                Ok(_) => "ok",
+                Err(failure) => failure.reason_code(),
+            },
+            cause,
+        ])
         .inc();
-    outcome
+    result
 }
 
+/// The transport call, paired with why it failed.
+///
+/// `RunnerCallFailure` is deliberately coarse — `Unreachable` absorbs every
+/// access denial but one, so a caller cannot tell a replaced Pod from an
+/// unreachable one by probing an execution. That opacity is for the caller.
+/// The operator needs the opposite, and
+/// [`SandboxAccessDenied::reason_code`](crate::api::sandbox_access::SandboxAccessDenied::reason_code)
+/// already says so: "the operator has to be able to tell `expired` from `never
+/// placed` when someone reports that access stopped working."
+///
+/// So the precise cause travels alongside the coarse failure and lands only on
+/// the metric. Nothing here changes what the caller is told.
 async fn call_inner(
     client: &kube::Client,
     target: &SandboxTarget,
@@ -691,7 +742,7 @@ async fn call_inner(
     stdin: Option<&[u8]>,
     timeout: std::time::Duration,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<u8>, RunnerCallFailure> {
+) -> Result<Vec<u8>, (RunnerCallFailure, &'static str)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let raw = exec_capped_until(
         client,
@@ -706,17 +757,20 @@ async fn call_inner(
     .await
     .map_err(|denied| match denied {
         // Kept as one failure on purpose: the caller must not be able to tell a
-        // replaced Pod from an unreachable one by probing an execution.
-        SandboxAccessDenied::NotDeclared { .. } => RunnerCallFailure::Unreadable,
-        _ => RunnerCallFailure::Unreachable,
+        // replaced Pod from an unreachable one by probing an execution. The
+        // denial's own reason code rides along for the metric, which the caller
+        // never sees.
+        SandboxAccessDenied::NotDeclared { .. } => (RunnerCallFailure::Unreadable, "not_declared"),
+        other => (RunnerCallFailure::Unreachable, other.reason_code()),
     })?;
     if raw.truncated {
-        return Err(RunnerCallFailure::Unreadable);
+        return Err((RunnerCallFailure::Unreadable, "truncated_reply"));
     }
     if raw.stdout.is_empty() {
         // The exec succeeded and the runner said nothing. That is not an
-        // outcome; it is the absence of one.
-        return Err(RunnerCallFailure::Unreachable);
+        // outcome; it is the absence of one — and it is a different fault from
+        // an exec that never landed, which is why it is not `backend_error`.
+        return Err((RunnerCallFailure::Unreachable, "empty_reply"));
     }
     Ok(raw.stdout)
 }
@@ -724,6 +778,53 @@ async fn call_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every access denial must be reachable as a seeded `(outcome, cause)`.
+    ///
+    /// The match below is exhaustive on purpose. Adding a variant to
+    /// `SandboxAccessDenied` stops this test compiling, which is the point:
+    /// a new denial that nobody seeds would produce a series that appears only
+    /// once the fault has already happened, and an alert that read "no data"
+    /// until then.
+    #[test]
+    fn every_denial_is_a_seeded_outcome_pair() {
+        use crate::api::sandbox_access::SandboxAccessDenied as Denied;
+
+        let denials = [
+            Denied::NotFound,
+            Denied::NotReady {
+                phase: "Pending".into(),
+            },
+            Denied::Expired,
+            Denied::TargetUnresolved,
+            Denied::ProvenanceIncomplete,
+            Denied::PoolUnresolvable,
+            Denied::NotDeclared { what: "port" },
+            Denied::PortNameCoversRange,
+            Denied::AmbiguousAlias,
+            Denied::Backend,
+        ];
+
+        for denied in &denials {
+            let outcome = match denied {
+                Denied::NotDeclared { .. } => "runner_unreadable",
+                Denied::NotFound
+                | Denied::NotReady { .. }
+                | Denied::Expired
+                | Denied::TargetUnresolved
+                | Denied::ProvenanceIncomplete
+                | Denied::PoolUnresolvable
+                | Denied::PortNameCoversRange
+                | Denied::AmbiguousAlias
+                | Denied::Backend => "runner_unreachable",
+            };
+            let pair = (outcome, denied.reason_code());
+            assert!(
+                RUNNER_CALL_OUTCOMES.contains(&pair),
+                "denial {denied} maps to {pair:?}, which RUNNER_CALL_OUTCOMES does not seed"
+            );
+        }
+    }
 
     fn report(state: RunnerState) -> ExecutionReport {
         ExecutionReport {
