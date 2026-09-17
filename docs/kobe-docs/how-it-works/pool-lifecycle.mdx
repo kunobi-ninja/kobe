@@ -78,6 +78,10 @@ curl https://.../v1/pools     # all pools
 curl https://.../v1/pools/x   # one pool
 ```
 
+## Queueing
+
+A lease that arrives with no `Ready` cluster free is queued (`status.phase: Pending`, `status.queuePosition` set) instead of rejected. Every pool — fixed `size` or `scaling` — has a queue timeout, so a lease whose caller is gone (cancelled CI job, closed laptop) does not hold its place forever and block leases behind it: `spec.queueTimeout` for a fixed-size pool, `spec.scaling.queueTimeout` for an autoscaled one. Both default to `5m`. A timed-out lease moves to `status.phase: Expired`.
+
 ## Health checks
 
 When `healthCheck` is configured on a pool, the operator periodically probes each `Ready` cluster. A cluster that fails the health check is moved directly to `Recycling` — it is destroyed and replaced without being offered for new claims.

@@ -27,8 +27,8 @@ Common causes: image pull on the inner k3s/k0s version, not enough CPU/memory on
 
 The API accepted the request; no Ready instance was free. `kobe_queue_depth` and `kobe_lease_oldest_pending_age_seconds` show whether the queue is moving.
 
-- Fixed `size` pool: raise `size`, or wait for a recycle.
-- Scaling pool: `maxClusters` may already be hit, or `queueTimeout` (default 5m) will expire the waiter.
+- Fixed `size` pool: raise `size`, wait for a recycle, or wait for `spec.queueTimeout` (default 5m) to expire the waiter.
+- Scaling pool: `maxClusters` may already be hit, or `spec.scaling.queueTimeout` (default 5m) will expire the waiter.
 - AccessPolicy `maxConcurrentLeases` returns `429`, not a long Pending.
 
 ## `Quarantined`

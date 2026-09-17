@@ -1039,6 +1039,7 @@ mod tests {
             health_check: None,
             readiness_gates: vec![],
             scaling: None,
+            queue_timeout: "5m".to_string(),
             upgrade_policy: None,
             diagnostics: None,
             snapshot: Some(snapshot.clone()),

@@ -238,6 +238,26 @@ pub struct ClusterPoolSpec {
     #[serde(default)]
     pub scaling: Option<ScalingConfig>,
 
+    /// Queue timeout for a lease waiting on this pool, used when `scaling`
+    /// is unset. Format: "5m", "30s".
+    ///
+    /// A fixed-size pool has a capacity ceiling (`size`) exactly like an
+    /// autoscaled pool has `max_clusters`, so it faces the same "the
+    /// caller may be gone" risk: a cancelled CI job or a closed laptop
+    /// leaves a queued lease at the head of the line forever, blocking
+    /// every request behind it (#233). `scaling.queue_timeout` already
+    /// covers that case for autoscaled pools; this field is its
+    /// fixed-size counterpart. It lives at the top level (not nested
+    /// under a fixed-size-only struct) because `ClusterPoolSpec` has no
+    /// such struct — `size` is a bare field, not a block — and adding one
+    /// only to hold a single timeout would be more ceremony than the
+    /// field warrants. Ignored once `scaling` is set; that block's own
+    /// `queue_timeout` takes over. See
+    /// [`crate::controllers::lease::reconcile_lease`] for where this is
+    /// read.
+    #[serde(default = "default_queue_timeout")]
+    pub queue_timeout: String,
+
     /// Rolling-upgrade policy for drift recycling. When unset, a
     /// conservative default applies: `maxRecycling=1, maxSurge=1`,
     /// floor on `ready_clean` is `min_ready` (or `spec.size` for fixed
