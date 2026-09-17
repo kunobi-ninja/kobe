@@ -89,6 +89,19 @@ group "push" {
   targets = ["operator-push", "kobe-sync-push", "runner-push", "agent-workspace-push"]
 }
 
+# What `hack/e2e.ts` actually loads into kind: operator + kobe-sync always,
+# plus the sandbox-e2e fixture when a leg runs with Sandbox conformance.
+# Deliberately NOT `default` — that also builds `agent-workspace`, a product
+# image (desktop, AI CLIs, rsync) that no test or harness file references, so
+# every conformance run paid to build the heaviest image in the repo for
+# nothing. `runner` is omitted here too: `sandbox-e2e` pulls it in via its
+# named `context`, and because it is then an implicit dependency rather than
+# a listed target, bake gives it `output=cacheonly` and skips loading it into
+# the local image store as well.
+group "e2e" {
+  targets = ["operator", "kobe-sync", "sandbox-e2e"]
+}
+
 # =============================================================================
 # Shared build stage (built once, reused via context)
 # =============================================================================
@@ -198,7 +211,8 @@ target "runner-push" {
 #
 # Deliberately absent from both `default` and `push`: this combines the static
 # runner with a tiny shell userspace solely for live conformance. The harness
-# names an ephemeral local registry explicitly and builds this target itself.
+# names an ephemeral local registry explicitly and builds this target itself
+# (see the `e2e` group above, the only group this target belongs to).
 # =============================================================================
 target "sandbox-e2e" {
   dockerfile = "docker/sandbox-e2e.Dockerfile"

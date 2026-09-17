@@ -811,7 +811,14 @@ async function removeSandboxRegistry(cluster: string): Promise<void> {
 
 async function buildImages(imageTag: string, sandboxFixture?: SandboxFixture): Promise<void> {
   step(`Building local images (tag=${imageTag}, platform=${nativePlatform()})`);
-  const targets = sandboxFixture ? ["default", "sandbox-e2e"] : [];
+  // Build exactly what this harness loads (see `saveImages`/`loadImagesIntoKind`
+  // below): kobe-operator + kobe-sync always, plus the sandbox-e2e fixture on a
+  // Sandbox-conformance leg. Never `default` — that also builds `agent-workspace`,
+  // a product image (desktop, AI CLIs, rsync) nothing in this file or the smoke
+  // tests references, making it the single heaviest, and entirely wasted, build
+  // in a conformance run (kunobi-ninja/kobe#235). The `e2e` Bake group mirrors
+  // this list so the two stay in sync.
+  const targets = sandboxFixture ? ["e2e"] : ["operator", "kobe-sync"];
   await runCommand(["docker", "buildx", "bake", "-f", "docker-bake.hcl", ...targets, "--load"], {
     env: {
       IMAGE_TAG: imageTag,
