@@ -1688,7 +1688,15 @@ pub async fn reconcile_lease(
         debug!(lease = %name, "Ready write lost a status race");
         return Ok(Action::await_change());
     }
-    info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
+    // Only the pass that actually moves the lease into Ready announces it, for
+    // the same reason the Service requirement above is written once: this
+    // writer is re-entered every 30s for as long as the lease lives. Announcing
+    // on every pass buried real events under thousands of copies a day, and the
+    // message names a transition — someone reading the log during an incident
+    // sees a TTL apparently restarting over and over.
+    if phase_before_ready != crate::crd::SandboxLeasePhase::Ready {
+        info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
+    }
 
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
 }
