@@ -74,6 +74,59 @@ struct Args {
     /// Run a single sweep tick and exit (test-only).
     #[arg(long, default_value_t = false)]
     one_shot: bool,
+
+    /// Port for the Prometheus `/metrics` endpoint. 0 disables the server.
+    ///
+    /// Bound on all interfaces because the scrape arrives from off-node. The
+    /// endpoint serves counters about the reaper's own work and exposes no
+    /// lease names, paths or cluster contents.
+    #[arg(long, default_value_t = 9109)]
+    metrics_port: u16,
+}
+
+/// Serve `/metrics` until the process exits.
+///
+/// Failing to bind is logged and otherwise ignored: a reaper that cannot
+/// publish metrics is degraded, but one that refuses to start over it would
+/// stop cleaning the node — which is the failure this whole component exists to
+/// prevent, and strictly worse than being unobservable.
+async fn serve_metrics(port: u16) {
+    use axum::{Router, routing::get};
+    let app = Router::new().route("/metrics", get(|| async { reaper::metrics::gather() }));
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            info!(%addr, "serving reaper metrics");
+            if let Err(e) = axum::serve(listener, app).await {
+                warn!(error = %e, "reaper metrics server stopped");
+            }
+        }
+        Err(e) => {
+            warn!(%addr, error = %e, "could not bind reaper metrics port; continuing without it")
+        }
+    }
+}
+
+/// Seconds since the epoch, or 0 if the clock is before it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Directory entries directly under `root`, or 0 if it cannot be read.
+///
+/// An unreadable root reports 0 rather than failing the tick: the count is a
+/// diagnostic, and losing it must not stop the cleaning.
+fn count_dirs(root: &std::path::Path) -> i64 {
+    match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count() as i64,
+        Err(_) => 0,
+    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -117,6 +170,13 @@ async fn main() -> anyhow::Result<()> {
         "kobe-host-reaper starting"
     );
 
+    // Register and seed every series before the first tick, so an alert on a
+    // skip reason that has not happened yet reads zero rather than "no data".
+    reaper::metrics::init();
+    if args.metrics_port != 0 {
+        tokio::spawn(serve_metrics(args.metrics_port));
+    }
+
     let unmounter = LibcUnmount;
 
     // KOBE_REAPER_SKIP_GET=1 lets the binary skip the synchronous apiserver
@@ -150,30 +210,63 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(n) => n,
+            Ok(n) => {
+                reaper::metrics::SWEEP_TICKS_TOTAL
+                    .with_label_values(&["lease_root", "ok"])
+                    .inc();
+                n
+            }
             Err(e) => {
                 warn!(error = %e, "lease-root sweep tick failed");
+                reaper::metrics::SWEEP_TICKS_TOTAL
+                    .with_label_values(&["lease_root", "error"])
+                    .inc();
                 0
             }
         };
         let cgroups_cleaned = match args.cgroup_root.as_deref() {
-            Some(root) => match reap_empty_container_cgroups(
-                root,
-                std::time::SystemTime::now(),
-                args.cgroup_mtime_skip,
-                args.dry_run,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(error = %e, "container cgroup sweep tick failed");
-                    0
-                }
-            },
+            Some(root) => {
+                let cleaned = match reap_empty_container_cgroups(
+                    root,
+                    std::time::SystemTime::now(),
+                    args.cgroup_mtime_skip,
+                    args.dry_run,
+                ) {
+                    Ok(n) => {
+                        reaper::metrics::SWEEP_TICKS_TOTAL
+                            .with_label_values(&["cgroups", "ok"])
+                            .inc();
+                        reaper::metrics::CGROUPS_REAPED_TOTAL
+                            .with_label_values(&["ok"])
+                            .inc_by(n as u64);
+                        n
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "container cgroup sweep tick failed");
+                        reaper::metrics::SWEEP_TICKS_TOTAL
+                            .with_label_values(&["cgroups", "error"])
+                            .inc();
+                        reaper::metrics::CGROUPS_REAPED_TOTAL
+                            .with_label_values(&["error"])
+                            .inc();
+                        0
+                    }
+                };
+                // The level, after the tick. `CGROUPS_REAPED_TOTAL` says the
+                // reaper is draining the leak; this says whether draining is
+                // keeping up with it.
+                reaper::metrics::CGROUPS_PRESENT.set(count_dirs(root));
+                cleaned
+            }
             None => 0,
         };
         if lease_cleaned > 0 || cgroups_cleaned > 0 {
             info!(lease_cleaned, cgroups_cleaned, "sweep tick done");
         }
+        // Stamped on every tick, including the ones that changed nothing: a
+        // quiet reaper and a dead one are otherwise identical, and that
+        // ambiguity is what let a broken one go unnoticed.
+        reaper::metrics::LAST_SWEEP_TIMESTAMP.set(unix_now());
         if args.one_shot {
             break;
         }

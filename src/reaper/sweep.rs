@@ -2,6 +2,7 @@
 //! classify → per-stale: synchronous GET → unmount mounts → rm -rf.
 
 use crate::reaper::classify::{FileKind, HostEntry, StaleEntry, classify_entries};
+use crate::reaper::metrics;
 use crate::reaper::mounts::collect_mounts_under;
 use crate::reaper::unmount::Unmount;
 use anyhow::{Context, Result};
@@ -60,30 +61,102 @@ pub async fn sweep_once(
     let stale = classify_entries(&live, entries, now, mtime_skip);
 
     let mut cleaned = 0;
+    let mut survivors: Vec<StaleEntry> = vec![];
     for s in stale {
         match process_stale(client, &s, mountinfo_path, dry_run, unmounter, skip_get).await {
-            Ok(SweepOutcome::Reaped) => cleaned += 1,
+            Ok(SweepOutcome::Reaped) => {
+                cleaned += 1;
+                metrics::ENTRIES_TOTAL
+                    .with_label_values(&["reaped", "reaped"])
+                    .inc();
+            }
             // Deliberate skips — apiserver unreachable, the CR still exists,
             // umount failed, rm -rf failed, or this is a dry run. None of
-            // them removed anything, so none of them may be counted.
-            Ok(SweepOutcome::Skipped) => {}
-            Err(e) => warn!(name = s.name, error = %e, "process_stale failed"),
+            // them removed anything, so none of them may be counted as
+            // cleaned; each is counted under its own reason instead.
+            Ok(SweepOutcome::Skipped(reason)) => {
+                metrics::ENTRIES_TOTAL
+                    .with_label_values(&["skipped", reason.as_str()])
+                    .inc();
+                survivors.push(s);
+            }
+            Err(e) => {
+                warn!(name = s.name, error = %e, "process_stale failed");
+                survivors.push(s);
+            }
         }
     }
+    // Measured after the tick, so it describes the backlog left behind rather
+    // than the work found. A reaper skipping everything keeps reporting ticks
+    // and a flat reaped count; this is the number that grows.
+    metrics::OLDEST_STALE_AGE_SECONDS.set(oldest_age_seconds(&survivors, now));
     Ok(cleaned)
 }
 
-/// Whether an entry's tree was actually removed.
+/// Age of the oldest surviving stale entry, in seconds; 0 when none survived.
+///
+/// Re-stats rather than carrying the mtime from classification: a tick can take
+/// a while, and the question being asked is how long the backlog has been on
+/// disk now. An entry that vanished under us contributes nothing.
+fn oldest_age_seconds(survivors: &[StaleEntry], now: SystemTime) -> i64 {
+    survivors
+        .iter()
+        .filter_map(|s| fs::symlink_metadata(&s.path).ok()?.modified().ok())
+        .filter_map(|mtime| now.duration_since(mtime).ok())
+        .map(|age| age.as_secs() as i64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether an entry's tree was actually removed, and if not, why.
 ///
 /// `process_stale` returns `Ok` for several outcomes that delete nothing —
 /// the safety skips are the whole point of the design. Collapsing them into
 /// `Ok(())` made the caller count them as cleaned, so the reaper reported
 /// `cleaned = N` while the apiserver was unreachable, while a mount was busy,
 /// and in dry-run mode.
+///
+/// The reason rides along because the skips are not interchangeable. A tick
+/// that skipped everything because the apiserver was unreachable is a node that
+/// has lost its control plane; one that skipped on `live_set_lag` is the safety
+/// net doing its job; one that skipped on `umount_failed` is a busy mount that
+/// will still be there next tick. Summed into one number they look alike, and
+/// the reaper looks equally healthy in all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOutcome {
     Reaped,
-    Skipped,
+    Skipped(SkipReason),
+}
+
+/// Why a stale entry survived a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The synchronous apiserver LIST failed, so nothing was proven absent.
+    ApiserverUnreachable,
+    /// The CR still exists but is missing from the live-set ConfigMap: the
+    /// ConfigMap is behind, and deleting would race a live instance.
+    LiveSetLag,
+    /// A mount under the entry would not unmount, so `rm -rf` was not attempted.
+    UmountFailed,
+    /// Unmounting succeeded and removing the tree did not.
+    RmFailed,
+    /// `--dry-run`.
+    DryRun,
+}
+
+impl SkipReason {
+    /// Stable metric label. Every value must appear in
+    /// [`crate::reaper::metrics::SKIP_REASONS`], which this module's tests
+    /// assert with an exhaustive match.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiserverUnreachable => "apiserver_unreachable",
+            Self::LiveSetLag => "live_set_lag",
+            Self::UmountFailed => "umount_failed",
+            Self::RmFailed => "rm_failed",
+            Self::DryRun => "dry_run",
+        }
+    }
 }
 
 fn read_live_set(path: &Path) -> Result<HashSet<String>> {
@@ -161,13 +234,12 @@ async fn process_stale(
                     found = list.items.len(),
                     "live_set_lag: CR exists but missing from live-set CM; skipping",
                 );
-                return Ok(SweepOutcome::Skipped);
+                return Ok(SweepOutcome::Skipped(SkipReason::LiveSetLag));
             }
             Ok(_) => {}
             Err(e) => {
                 warn!(error = %e, "apiserver LIST failed; skipping destructive action this tick");
-                metrics::REAPER_APISERVER_UNREACHABLE.inc();
-                return Ok(SweepOutcome::Skipped);
+                return Ok(SweepOutcome::Skipped(SkipReason::ApiserverUnreachable));
             }
         }
     }
@@ -183,7 +255,7 @@ async fn process_stale(
             mounts = mounts.len(),
             "DRY RUN: would unmount and rm -rf"
         );
-        return Ok(SweepOutcome::Skipped);
+        return Ok(SweepOutcome::Skipped(SkipReason::DryRun));
     }
 
     // Unmount deepest-first. Any failure aborts rm-rf for this entry.
@@ -197,7 +269,7 @@ async fn process_stale(
                     error = %e,
                     "umount2 failed; skipping rm -rf for this entry"
                 );
-                return Ok(SweepOutcome::Skipped);
+                return Ok(SweepOutcome::Skipped(SkipReason::UmountFailed));
             }
         }
     }
@@ -205,23 +277,10 @@ async fn process_stale(
     // Remove the directory tree.
     if let Err(e) = fs::remove_dir_all(&stale.path) {
         warn!(name = stale.name, path = ?stale.path, error = %e, "rm -rf failed");
-        return Ok(SweepOutcome::Skipped);
+        return Ok(SweepOutcome::Skipped(SkipReason::RmFailed));
     }
     info!(name = stale.name, path = ?stale.path, "reaped stale lease dir");
     Ok(SweepOutcome::Reaped)
-}
-
-mod metrics {
-    use prometheus::IntCounter;
-    use std::sync::LazyLock;
-    pub static REAPER_APISERVER_UNREACHABLE: LazyLock<IntCounter> = LazyLock::new(|| {
-        prometheus::register_int_counter!(
-            "kobe_reaper_skipped_apiserver_unreachable_total",
-            "Number of reaper sweep ticks where a synchronous GET against \
-             the apiserver failed and destructive action was skipped."
-        )
-        .expect("register kobe_reaper_skipped_apiserver_unreachable_total")
-    });
 }
 
 #[cfg(test)]
@@ -231,6 +290,75 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// Every skip reason must have a series seeded for it at startup.
+    ///
+    /// The match is exhaustive on purpose: adding a `SkipReason` variant stops
+    /// this compiling. Without it a new reason would be counted under a label
+    /// no alert covers, and — because Prometheus emits nothing for an
+    /// unobserved label combination — that alert would read "no data" until the
+    /// fault had already happened.
+    #[test]
+    fn every_skip_reason_is_seeded() {
+        use crate::reaper::metrics::SKIP_REASONS;
+
+        for reason in [
+            SkipReason::ApiserverUnreachable,
+            SkipReason::LiveSetLag,
+            SkipReason::UmountFailed,
+            SkipReason::RmFailed,
+            SkipReason::DryRun,
+        ] {
+            // Exhaustive: a new variant breaks the build here.
+            let label = match reason {
+                SkipReason::ApiserverUnreachable
+                | SkipReason::LiveSetLag
+                | SkipReason::UmountFailed
+                | SkipReason::RmFailed
+                | SkipReason::DryRun => reason.as_str(),
+            };
+            assert!(
+                SKIP_REASONS.contains(&label),
+                "skip reason {label:?} is not seeded in metrics::SKIP_REASONS"
+            );
+        }
+        assert_eq!(
+            SKIP_REASONS.len(),
+            5,
+            "SKIP_REASONS carries a label with no SkipReason behind it"
+        );
+    }
+
+    /// The backlog gauge reports the oldest survivor, not the newest.
+    ///
+    /// It is the number that grows while every entry is being skipped — the
+    /// state the reaper used to report as perfectly healthy.
+    #[test]
+    fn oldest_age_reports_the_oldest_survivor() {
+        let tmp = TempDir::new().unwrap();
+        let mut survivors = vec![];
+        for name in ["a", "b"] {
+            let path = tmp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            survivors.push(StaleEntry {
+                name: name.to_string(),
+                path,
+            });
+        }
+
+        let now = SystemTime::now() + Duration::from_secs(600);
+        let age = oldest_age_seconds(&survivors, now);
+        assert!(
+            (595..=605).contains(&age),
+            "expected roughly 600s, got {age}"
+        );
+
+        assert_eq!(
+            oldest_age_seconds(&[], now),
+            0,
+            "nothing left behind must read zero, not stale"
+        );
+    }
 
     fn make_dir(root: &Path, name: &str) -> PathBuf {
         let p = root.join(name);
@@ -363,8 +491,8 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            SweepOutcome::Skipped,
-            "a skipped entry must not be reported as cleaned"
+            SweepOutcome::Skipped(SkipReason::UmountFailed),
+            "a skipped entry must not be reported as cleaned, and must say why"
         );
     }
 
@@ -408,7 +536,7 @@ mod tests {
         .unwrap();
 
         assert!(stale_path.exists(), "dry run must not remove anything");
-        assert_eq!(outcome, SweepOutcome::Skipped);
+        assert_eq!(outcome, SweepOutcome::Skipped(SkipReason::DryRun));
     }
 
     /// The accounting fix lives in `sweep_once`, not in `process_stale`, and

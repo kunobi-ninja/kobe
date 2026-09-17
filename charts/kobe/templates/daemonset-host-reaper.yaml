@@ -18,6 +18,16 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/managed-by: {{ .Release.Service }}
         app.kubernetes.io/part-of: {{ include "kobe.name" . }}
+      {{- if and .Values.signoz.scrape .Values.hostReaper.metricsPort }}
+      annotations:
+        # Same mechanism as the operator Deployment. Without these the reaper's
+        # counters exist in its own process and nowhere else — the state this
+        # component shipped in for its whole life, where a reaper that had
+        # stopped working looked exactly like one with nothing to do.
+        signoz.io/scrape: "true"
+        signoz.io/port: {{ .Values.hostReaper.metricsPort | quote }}
+        signoz.io/path: {{ .Values.signoz.path | quote }}
+      {{- end }}
     spec:
       serviceAccountName: kobe-host-reaper
       hostPID: true
@@ -44,6 +54,13 @@ spec:
             {{- if .Values.hostReaper.dryRun }}
             - --dry-run
             {{- end }}
+            - --metrics-port={{ .Values.hostReaper.metricsPort | default 0 }}
+          {{- if .Values.hostReaper.metricsPort }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.hostReaper.metricsPort }}
+              protocol: TCP
+          {{- end }}
           env:
             {{- if .Values.hostReaper.disable }}
             - name: KOBE_REAPER_DISABLE

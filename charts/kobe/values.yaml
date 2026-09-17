@@ -419,6 +419,14 @@ hostReaper:
   image:
     repository: ""  # falls back to .Values.image.repository
     tag: ""        # falls back to .Values.image.tag
+  # Port for the reaper's Prometheus /metrics endpoint. 0 disables the server
+  # and the scrape annotations with it.
+  #
+  # The reaper deletes things as root on every node, and without this its
+  # counters never leave the process — a wedged reaper and an idle one produce
+  # the same empty log. `kobe_reaper_last_sweep_timestamp_seconds` is the one to
+  # alert on, by its age rather than its value.
+  metricsPort: 9109
   leaseRoot: /var/lib/kobe/leases
   reconcileInterval: 30s
   mtimeSkip: 120s

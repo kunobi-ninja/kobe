@@ -6,6 +6,7 @@
 
 pub mod cgroups;
 pub mod classify;
+pub mod metrics;
 pub mod mounts;
 pub mod sweep;
 pub mod unmount;
