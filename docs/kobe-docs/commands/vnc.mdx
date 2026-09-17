@@ -1,0 +1,105 @@
+---
+title: Desktop commands
+description: See and drive a Sandbox desktop from the CLI, without a browser.
+---
+
+# Desktop commands
+
+The workspace image ships a desktop: Xvfb, a window manager, Firefox and a VNC
+server. `kobe vnc` reads its framebuffer and sends it input, so an agent can
+look at the screen and act on what it sees without a browser, an open port, or
+a human in the loop.
+
+Nothing opens a window on your machine. A screenshot is written to a file and
+input events go straight to the server.
+
+## Start the desktop first
+
+A lease does not start a desktop. Nothing does until you ask:
+
+```bash
+kobe exec dev --detach -- kobe-desktop-up
+```
+
+It runs until the lease ends or you cancel the execution. Only one desktop runs
+in a Sandbox at a time.
+
+## `kobe vnc screenshot`
+
+Write the desktop to a PNG file on your machine.
+
+```bash
+kobe vnc screenshot dev -f desktop.png
+```
+
+```
+Wrote desktop.png (1440x900)
+```
+
+The image is read over the connection and written locally. It never passes
+through the execution API, which matters: `kobe exec` converts its output to
+text, so capturing to a file inside the Sandbox and printing it back would
+corrupt it.
+
+## `kobe vnc click`
+
+```bash
+kobe vnc click dev --at 400,300
+kobe vnc click dev --at 400,300 --button right
+```
+
+Coordinates are pixels from the top-left corner. A point outside the desktop is
+refused rather than sent and silently ignored.
+
+Use `kobe vnc move` to move the pointer without pressing anything, which is how
+you trigger a hover.
+
+## `kobe vnc type` and `kobe vnc key`
+
+```bash
+kobe vnc type dev --text 'echo hello > /tmp/note'
+kobe vnc key dev --key return
+```
+
+`type` sends printable ASCII, holding Shift where the character needs it. `key`
+presses one named key: `return`, `tab`, `escape`, `backspace`, `delete`, `home`,
+`end`, `pageup`, `pagedown`, `space`, and the four arrows.
+
+A character outside printable ASCII is refused by name rather than typed as
+something else. Accents and international layouts need a layout-aware keysym
+table that does not exist yet, and a silently wrong character is worse than an
+error that says so.
+
+## The loop
+
+Screenshot, decide, act, screenshot again:
+
+```bash
+kobe vnc screenshot dev -f before.png
+kobe vnc click dev --at 400,300
+kobe vnc type dev --text 'make test'
+kobe vnc key dev --key return
+kobe vnc screenshot dev -f after.png
+```
+
+Input alone is not enough, because something has to decide where to click. That
+is why both halves ship together.
+
+## What it does not need
+
+No port has to be open and no browser has to be running. The connection is one
+short-lived loopback forward carried by the same authenticated stream as
+[`kobe port-forward`](/docs/kobe/commands/sandbox), so it inherits the same
+authorization and costs nothing against the execution budget.
+
+`kobe port-forward dev --port 6080` still works if you want noVNC in a browser
+instead. Both reach the same desktop.
+
+## Limits
+
+- The VNC server must be the one the workspace image starts, listening on
+  loopback inside the Sandbox. A server asking for a VNC password is refused:
+  kobe reaches the desktop over an already-authenticated stream and holds no
+  VNC credentials.
+- Colour-map servers are refused rather than rendered with the wrong colours.
+- A framebuffer larger than 64 megapixels is refused rather than allocated.
