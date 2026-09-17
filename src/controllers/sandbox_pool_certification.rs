@@ -788,6 +788,11 @@ fn container_matches(expected: &Container, actual: &Container) -> bool {
         && expected.ports == actual.ports
         && expected.resources == actual.resources
         && expected.security_context == actual.security_context
+        // A drifted path or policy re-opens #219: the kubelet would copy a
+        // workload-written termination-log file into persisted Pod status
+        // under a value certification never reviewed.
+        && expected.termination_message_path == actual.termination_message_path
+        && expected.termination_message_policy == actual.termination_message_policy
         && empty(&actual.env)
         && empty(&actual.env_from)
         && empty(&actual.volume_mounts)
@@ -2973,6 +2978,43 @@ mod tests {
         let error = validate_certification_claim(&pool, &desired, &mutated).unwrap_err();
         assert!(
             error.contains("certification Claim spec drifted"),
+            "{error}"
+        );
+    }
+
+    /// Regression guard for #219: a scheduled Pod carrying a different
+    /// termination-message path or policy must fail certification, not just
+    /// a Pod with a different name/image/command/resources. Passing this
+    /// through would let a workload's container run with kubelet's `File`
+    /// default (or an unreviewed path) even though the pool template pins
+    /// `FallbackToLogsOnError` at `/dev/termination-log`.
+    #[test]
+    fn pod_spec_certification_rejects_termination_message_drift() {
+        let pool = pool(0);
+        let expected = expected_pod_spec(&pool, "kobe-system").unwrap();
+
+        let mut scheduled = expected.clone();
+        scheduled.node_name = Some("node-1".into());
+        // Baseline: an exact copy, only scheduled to a node, certifies clean.
+        validate_pod_spec(&expected, &scheduled).unwrap();
+
+        let mut policy_drifted = scheduled.clone();
+        policy_drifted.containers[0].termination_message_policy = Some("File".into());
+        assert!(!container_matches(
+            &expected.containers[0],
+            &policy_drifted.containers[0]
+        ));
+        let error = validate_pod_spec(&expected, &policy_drifted).unwrap_err();
+        assert!(
+            error.contains("drifted from the closed pool template"),
+            "{error}"
+        );
+
+        let mut path_drifted = scheduled;
+        path_drifted.containers[0].termination_message_path = Some("/tmp/termination-log".into());
+        let error = validate_pod_spec(&expected, &path_drifted).unwrap_err();
+        assert!(
+            error.contains("drifted from the closed pool template"),
             "{error}"
         );
     }

@@ -53,6 +53,10 @@ pub const SANDBOX_LEASE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-cleanup";
 const KOBE_API_VERSION: &str = "kobe.kunobi.ninja/v1alpha1";
 const SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
 const CORE_API_VERSION: &str = "v1";
+/// See the `Container` literal in `build_sandbox_template` for why both of
+/// these are pinned explicitly instead of left to the kubelet's defaults.
+const SANDBOX_TERMINATION_MESSAGE_PATH: &str = "/dev/termination-log";
+const SANDBOX_TERMINATION_MESSAGE_POLICY: &str = "FallbackToLogsOnError";
 
 /// Require the durable, current-generation readiness certificate used by both
 /// HTTP admission and the final pre-Claim placement check.
@@ -260,6 +264,29 @@ pub fn build_sandbox_template(
                 args: (!container.args.is_empty()).then(|| container.args.clone()),
                 ports: (!ports.is_empty()).then_some(ports),
                 resources: Some(to_k8s_resources(&container.resources)),
+                // Leaving these `None` does not mean "no termination
+                // message" — it means the kubelet's own defaults apply
+                // (`/dev/termination-log`, policy `File`), and on exit the
+                // kubelet copies whatever the workload wrote there into
+                // `Pod.status.containerStatuses[].state.terminated.message`:
+                // etcd-persisted, backed up, and readable by anyone with
+                // `get` on this Pod. That file is mode 0666 by kubelet
+                // design, so the container's non-root UID never blocks a
+                // write. Pinning both fields turns an unreviewed, drift-
+                // prone kubelet default into a certified one (see
+                // `container_matches`), which is the actual gap this closes.
+                // It is not a content filter: kubelet copies a non-empty
+                // file into status under either policy, and the mount is
+                // visible to the workload via its own `/proc/self/mountinfo`
+                // no matter which path is configured, so relocating the
+                // path buys no secrecy against code already running inside.
+                // `FallbackToLogsOnError` earns its place on the operator
+                // side of that tradeoff: when the workload never touches the
+                // file and exits in error, it surfaces real log output
+                // instead of an empty message, at no extra exposure over the
+                // kubelet's own default.
+                termination_message_path: Some(SANDBOX_TERMINATION_MESSAGE_PATH.to_string()),
+                termination_message_policy: Some(SANDBOX_TERMINATION_MESSAGE_POLICY.to_string()),
                 security_context: Some(SecurityContext {
                     allow_privilege_escalation: Some(false),
                     capabilities: Some(Capabilities {
@@ -2060,6 +2087,24 @@ mod tests {
             value["spec"]["podTemplate"]["spec"]
                 .get("volumes")
                 .is_none()
+        );
+    }
+
+    /// Regression guard for #219: an unset termination-message path/policy
+    /// silently inherits the kubelet's own defaults, so this must assert the
+    /// exact values Kobe pins rather than merely that *some* value is set.
+    #[test]
+    fn template_container_pins_termination_message_fields() {
+        let object = build_sandbox_template("agents", "targets", &pool(), Some(&owner())).unwrap();
+        let value = serde_json::to_value(object).unwrap();
+
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["terminationMessagePath"],
+            SANDBOX_TERMINATION_MESSAGE_PATH
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["terminationMessagePolicy"],
+            SANDBOX_TERMINATION_MESSAGE_POLICY
         );
     }
 
