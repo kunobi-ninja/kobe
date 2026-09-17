@@ -27,6 +27,12 @@ anyhow = "1"
 # dependency set is kept slim for.
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+# `kobe vnc screenshot` writes the framebuffer it read. Chosen over `image`,
+# which reads and writes a dozen formats this needs none of, and over emitting
+# deflate by hand, where a wrong CRC yields a file only some viewers reject.
+# Pure Rust through miniz_oxide, so it adds no platform surface to the Windows
+# cross-build this dependency set is kept slim for.
+png = "0.17"
 clap_complete = "4"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

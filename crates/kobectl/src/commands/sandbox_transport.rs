@@ -932,7 +932,7 @@ pub async fn port_forward(
     }
 }
 
-async fn forward_connection(
+pub(crate) async fn forward_connection(
     local: &mut tokio::net::TcpStream,
     config: &ResolvedConfig,
     lease: &str,
@@ -1047,7 +1047,11 @@ struct LeaseTransportView {
     transport: Option<String>,
 }
 
-async fn lease_uses_iroh(config: &ResolvedConfig, lease: &str, output: OutputFormat) -> bool {
+pub(crate) async fn lease_uses_iroh(
+    config: &ResolvedConfig,
+    lease: &str,
+    output: OutputFormat,
+) -> bool {
     let path = format!("/v1/sandbox-leases/{lease}");
     let token = match get_auth_header_for_output(config, "GET", &path, b"", output).await {
         Ok(token) => token,
