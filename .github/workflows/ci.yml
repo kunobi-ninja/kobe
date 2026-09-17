@@ -180,10 +180,18 @@ jobs:
           echo "::error::bun could not be installed after 3 attempts"
           exit 1
 
+      # `mise exec bun`, not a bare `mise exec`: the bare form resolves the
+      # whole mise.toml, so a step that lints TypeScript was also fetching
+      # helm, kind and kubectl. On 2026-09-17 helm's download timed out after
+      # 30s and took this required Rust check down with it, on a run whose
+      # code had already passed the same check on its PR. Naming the tool
+      # keeps the other three off the critical path of a job that never runs
+      # them — the step above already installs bun explicitly, and this is the
+      # only `mise exec` in the job.
       - name: Lint and test E2E harness
         run: |
-          mise exec -- bunx @biomejs/biome@2.3.11 lint --only=correctness/noUndeclaredVariables hack/*.ts
-          mise exec -- bun test ./hack/e2e.test.ts
+          mise exec bun -- bunx @biomejs/biome@2.3.11 lint --only=correctness/noUndeclaredVariables hack/*.ts
+          mise exec bun -- bun test ./hack/e2e.test.ts
 
       - name: Add Rust components
         run: rustup component add rustfmt clippy
