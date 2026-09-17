@@ -444,6 +444,81 @@ fn starter_lock_is_held(_path: &Path) -> bool {
     true
 }
 
+/// Read a spool document, refusing anything that is not a regular file.
+///
+/// `std::fs::read`'s `open` blocks forever on a FIFO with no writer on the
+/// other end — and a FIFO is exactly what the workload UID can put at
+/// `state.json`'s path (see "Trust boundary" above): `mkfifo` over its own
+/// spool document, then never open it for writing. Every caller here holds
+/// nothing while blocked in `open`, except `write_report`, which holds the
+/// state lock — so that variant also wedges every concurrent `status`.
+///
+/// `O_NONBLOCK` makes the `open` itself return immediately no matter what is
+/// on the other end, turning the FIFO case into an ordinary `fstat` result
+/// instead of a hang. `O_NOFOLLOW` closes the sibling attack, where the
+/// workload symlinks `state.json` elsewhere instead of changing its type
+/// directly: without it, `open` would transparently chase the link and
+/// `fstat` would report the *target's* type, never seeing the tampering at
+/// this path at all. It is gated to Linux — the only place this binary is
+/// deployed — because this crate also has to keep compiling and testing on
+/// macOS for local development, and `O_NONBLOCK` alone already closes the
+/// hang, which is the reachable half of the bug there.
+///
+/// A path that resolves to anything but a regular file is corruption, full
+/// stop: nothing legitimate ever puts a FIFO, socket, device, or directory
+/// where a spool document belongs, so there is no reading it "safely" to fall
+/// back to. `SpoolError::Corrupt` is the same answer this function already
+/// gives for bytes that fail to parse — an observation about tampering, not
+/// proof about the workload process making it.
+#[cfg(unix)]
+fn read_existing(path: &Path) -> Result<Vec<u8>, SpoolError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    #[cfg(not(target_os = "linux"))]
+    options.custom_flags(libc::O_NONBLOCK);
+
+    let mut file = options.open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => SpoolError::NotFound,
+        // ELOOP is O_NOFOLLOW refusing a symlink; ENXIO is `open` refusing a
+        // UNIX-domain socket outright (POSIX carves this out specifically for
+        // sockets, since they cannot be usefully opened at all). Both are the
+        // tampering itself, not an I/O failure to pass through as one.
+        _ if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENXIO)) => {
+            SpoolError::Corrupt
+        }
+        _ => SpoolError::Io(error),
+    })?;
+
+    // fstat on the descriptor already open, never a second lookup by path.
+    // Re-resolving the name here would be its own TOCTOU: the workload could
+    // swap a regular file back in between the check and the read.
+    if !file.metadata()?.file_type().is_file() {
+        return Err(SpoolError::Corrupt);
+    }
+
+    // O_NONBLOCK cannot make a regular file's `read` return less than
+    // `read_to_end` expects — it only ever mattered to the `open` above — but
+    // this descriptor is about to be handed to `Read`, so leave nothing on it
+    // that the next person to touch this function has to remember is inert.
+    let raw_fd = file.as_raw_fd();
+    // SAFETY: `raw_fd` names this owned, still-open descriptor for both calls.
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1
+    {
+        return Err(SpoolError::Io(std::io::Error::last_os_error()));
+    }
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
 fn read_existing(path: &Path) -> Result<Vec<u8>, SpoolError> {
     std::fs::read(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => SpoolError::NotFound,
@@ -715,6 +790,100 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".state.json.tmp")),
             "no writer may leave a shared or partial temporary report"
+        );
+    }
+
+    /// A workload that swaps its own `state.json` for a FIFO must not be able
+    /// to hang the runner (#220). `open(2)` on a FIFO with `O_RDONLY` blocks
+    /// until a writer appears on the other end, and the workload never has to
+    /// provide one — `std::fs::read`'s plain `open` had no defense against
+    /// that at all.
+    ///
+    /// The read runs on another thread with a bounded `recv_timeout`: the
+    /// entire point of #220 is that a regression here is a *hang*, and an
+    /// assertion that blocks in this thread would just wedge the test runner
+    /// instead of failing it — exactly the CI failure mode this test exists
+    /// to turn into a reported failure.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_fifo_in_place_of_a_spool_document_errors_instead_of_hanging() {
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+        spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
+
+        let state_path = root.path().join("sbxe-1").join(STATE_FILE);
+        std::fs::remove_file(&state_path).unwrap();
+        let c_path = std::ffi::CString::new(state_path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid, NUL-terminated path that outlives this
+        // call. No writer ever opens the other end — that absence is the
+        // whole point of the test.
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let root_path = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let spool = Spool::new(root_path);
+            // Ignored send error: only reachable if the receiver already gave
+            // up after timing out, i.e. the failure this test reports below.
+            let _ = sender.send(spool.read_report("sbxe-1"));
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert!(
+                matches!(result, Err(SpoolError::Corrupt)),
+                "a FIFO standing in for state.json must be refused, not read: {result:?}"
+            ),
+            Err(_) => panic!(
+                "read_report hung on a FIFO with no writer — #220 has regressed \
+                 (open(2) on a FIFO with O_RDONLY blocks until a writer appears; \
+                 read_existing must open with O_NONBLOCK and reject non-regular files)"
+            ),
+        }
+    }
+
+    /// The symlink variant of the same trick: the workload points
+    /// `state.json` at some other path instead of changing its type in
+    /// place. `O_NOFOLLOW` makes `open` refuse the link outright, so this
+    /// never gets far enough to read whatever the link resolves to.
+    ///
+    /// Linux-only because `read_existing` only sets `O_NOFOLLOW` there (see
+    /// its doc comment) — this crate also has to build and test on macOS for
+    /// local development, and the FIFO hang above is already closed there by
+    /// `O_NONBLOCK` alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_a_symlinked_spool_document_is_refused() {
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+        spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
+
+        // The link target is a real, readable, well-formed report — proving
+        // the rejection is about the symlink itself, not about whatever it
+        // points to.
+        let elsewhere = root.path().join("elsewhere-state.json");
+        std::fs::write(
+            &elsewhere,
+            serde_json::to_vec(&ExecutionReport {
+                id: "sbxe-1".into(),
+                state: RunnerState::Running,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state_path = root.path().join("sbxe-1").join(STATE_FILE);
+        std::fs::remove_file(&state_path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &state_path).unwrap();
+
+        assert!(
+            matches!(spool.read_report("sbxe-1"), Err(SpoolError::Corrupt)),
+            "a symlinked state.json must be refused even when it resolves to a well-formed report"
         );
     }
 
