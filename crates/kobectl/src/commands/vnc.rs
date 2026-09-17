@@ -569,6 +569,151 @@ fn write_png(path: &std::path::Path, width: u16, height: u16, rgb: &[u8]) -> Res
     Ok(())
 }
 
+/// The noVNC query string that turns a blank page into a connected desktop.
+///
+/// Without `autoconnect` the browser shows a connect dialogue asking for a
+/// host nobody can name, since the real one is on the far side of the
+/// forward. `resize=scale` fits a 1440x900 desktop into whatever window the
+/// laptop has, and `path=websockify` is where the image's websockify serves.
+const NOVNC_QUERY: &str = "autoconnect=1&resize=scale&path=websockify";
+
+/// Ask the sandbox to start its desktop, if it is not already up.
+///
+/// `kobe-desktop start` is idempotent, so this is safe to run every time and
+/// saves the caller remembering that a lease starts no desktop by itself.
+async fn ensure_desktop(
+    config: &super::config::ResolvedConfig,
+    lease: &str,
+    output: OutputFormat,
+) -> Result<()> {
+    let argv = vec!["kobe-desktop".to_string(), "start".to_string()];
+    let result = super::sandbox::exec_once(
+        config,
+        lease,
+        &argv,
+        None,
+        Some("120s"),
+        None,
+        &super::sandbox::new_idempotency_key(),
+        false,
+        output,
+    )
+    .await
+    .context("could not start the desktop")?;
+    if result.exit_code != Some(0) {
+        bail!(
+            "kobe-desktop start failed in {lease}: {}",
+            result.stderr.clone().unwrap_or_default().trim()
+        );
+    }
+    Ok(())
+}
+
+/// Hand a URL to whatever the operating system opens URLs with.
+///
+/// Best effort on purpose: a machine with no browser, or a session with no
+/// display, still gets the URL printed and the forward left running.
+fn open_in_browser(url: &str) -> bool {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Start the desktop, forward noVNC, and open it in the local browser.
+///
+/// One command for what was four steps and a query string nobody remembers:
+/// start the desktop, forward the port, work out the URL, open it. The
+/// forward runs until interrupted, because closing it closes the desktop in
+/// the browser.
+pub(crate) struct OpenDesktop<'a> {
+    pub lease: &'a str,
+    /// noVNC's port inside the Sandbox.
+    pub port: u16,
+    /// Local port to serve on; 0 picks a free one.
+    pub local_port: u16,
+    pub launch_browser: bool,
+    pub start_desktop: bool,
+    pub target_override: Option<&'a str>,
+    pub endpoint_override: Option<&'a str>,
+    pub output: OutputFormat,
+}
+
+pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
+    let OpenDesktop {
+        lease,
+        port,
+        local_port,
+        launch_browser,
+        start_desktop,
+        target_override,
+        endpoint_override,
+        output,
+    } = options;
+    let config = CliConfig::load()?;
+    let config = config.resolve(target_override, endpoint_override)?;
+
+    if start_desktop {
+        if output == OutputFormat::Text {
+            println!("Starting the desktop in {lease}...");
+        }
+        ensure_desktop(&config, lease, output).await?;
+    }
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+        .await
+        .context("could not bind a local port for the desktop")?;
+    let bound = listener.local_addr()?;
+    let url = format!("http://{bound}/vnc.html?{NOVNC_QUERY}");
+
+    let opened = launch_browser && open_in_browser(&url);
+    match output {
+        OutputFormat::Json => print_json(&serde_json::json!({
+            "apiVersion": super::sandbox::SANDBOX_CLI_API_VERSION,
+            "lease": lease,
+            "url": url,
+            "browserOpened": opened,
+        }))?,
+        OutputFormat::Text => {
+            if opened {
+                println!("Opened {url}");
+            } else {
+                println!("Open {url}");
+            }
+            println!("Ctrl-C closes the desktop in the browser; the sandbox keeps running.");
+        }
+    }
+
+    let remote = port.to_string();
+    let path = format!("/v1/sandbox-leases/{lease}/port-forward?port={remote}");
+    let iroh = super::sandbox_transport::lease_uses_iroh(&config, lease, output).await;
+
+    // A browser opens several connections for the page, its assets and the
+    // WebSocket, so this serves them concurrently rather than one at a time.
+    loop {
+        let (mut local, _) = listener.accept().await.context("accept failed")?;
+        let config = config.clone();
+        let lease = lease.to_owned();
+        let remote = remote.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            let _ = super::sandbox_transport::forward_connection(
+                &mut local, &config, &lease, &remote, &path, iroh, output,
+            )
+            .await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

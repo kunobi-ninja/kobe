@@ -482,6 +482,27 @@ enum VncCommand {
         #[arg(long, default_value_t = 5900)]
         port: u16,
     },
+    /// Start the desktop and open it in your browser
+    ///
+    /// One command for what was four steps: start the desktop if it is not
+    /// running, forward noVNC, work out the URL, and open it. The forward
+    /// runs until you interrupt it.
+    Open {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Local port to serve on; 0 picks a free one
+        #[arg(long, default_value_t = 0)]
+        local_port: u16,
+        /// noVNC port inside the Sandbox
+        #[arg(long, default_value_t = 6080)]
+        port: u16,
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Assume the desktop is already running
+        #[arg(long)]
+        no_start: bool,
+    },
     /// Click at a pixel
     Click {
         /// Lease id, name, or pool
@@ -880,6 +901,37 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--at takes X,Y such as 640,480"))?;
                 Ok((x.trim().parse()?, y.trim().parse()?))
             }
+            if let VncCommand::Open {
+                lease,
+                local_port,
+                port,
+                no_browser,
+                no_start,
+            } = action
+            {
+                let lease = commands::require_lease_capability(
+                    &lease,
+                    "port-forward",
+                    target,
+                    endpoint,
+                    output,
+                )
+                .await
+                .unwrap_or_else(|error| exit_resource_error(error, output));
+                let code = commands::vnc::open(commands::vnc::OpenDesktop {
+                    lease: &lease,
+                    port,
+                    local_port,
+                    launch_browser: !no_browser,
+                    start_desktop: !no_start,
+                    target_override: target,
+                    endpoint_override: endpoint,
+                    output,
+                })
+                .await
+                .unwrap_or_else(|error| exit_resource_error(error, output));
+                std::process::exit(code);
+            }
             let (lease, port, todo) = match action {
                 VncCommand::Screenshot { lease, out, port } => (
                     lease,
@@ -914,6 +966,7 @@ async fn main() -> anyhow::Result<()> {
                 VncCommand::Key { lease, key, port } => {
                     (lease, port, commands::vnc::VncAction::Key { name: key })
                 }
+                VncCommand::Open { .. } => unreachable!("handled above"),
             };
             let lease = commands::require_lease_capability(
                 &lease,
