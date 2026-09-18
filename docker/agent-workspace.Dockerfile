@@ -64,7 +64,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-noto-core \
         gh \
         git \
+# `iputils-ping` for first-hop network diagnostics: without it, "is it DNS
+# or is it the network" is unanswerable from inside the sandbox.
         iproute2 \
+        iputils-ping \
         jq \
         less \
         libayatana-appindicator3-dev \
@@ -315,7 +318,7 @@ RUN kobe-sshd --check \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes \
-        nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server' \
+        nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server && command -v ping' \
     && session_ssh='-o IdentityFile=/tmp/proof-client -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes' \
     && session_proxy='ProxyCommand=/usr/local/bin/kobe-sshd --session proof' \
     && ssh -q ${session_ssh} -o "${session_proxy}" nonroot@kobe-proof 'echo passed-through' \
