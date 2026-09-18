@@ -66,10 +66,6 @@ pub struct SandboxContext {
     pub reservation_namespace: String,
     /// Stops bounded runner cancellation during operator shutdown.
     shutdown: CancellationToken,
-    /// Watches on child clusters, so a child placement advances on their events
-    /// instead of polling them. `None` in tests and wherever the controller runs
-    /// without the registry: placements then fall back to their backstop timers.
-    child_watches: Option<Arc<crate::controllers::sandbox_child_watch::ChildWatchRegistry>>,
     /// Whether the protected distributed access ledger is available.
     /// Production lifecycle controllers always enable it; focused controller
     /// unit tests may disable it and exercise the barrier through its own
@@ -5446,31 +5442,6 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
     }
 }
 
-/// Start watching this lease's child cluster, if the registry is present.
-///
-/// Called from the one place that proves the child client works and the child
-/// namespace belongs to this lease, so a watch never outlives that proof.
-fn watch_child_cluster(ctx: &SandboxContext, lease: &SandboxLease, cluster: &str, child: &Client) {
-    let Some(registry) = ctx.child_watches.as_ref() else {
-        return;
-    };
-    let Some(namespace) = lease.namespace() else {
-        return;
-    };
-    registry.ensure(
-        cluster,
-        child,
-        CHILD_SANDBOX_NAMESPACE,
-        kube::runtime::reflector::ObjectRef::new(&lease.name_any()).within(&namespace),
-        // What the certification ladder and the tenant Claim actually wait on.
-        vec![
-            upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
-            sandbox_resource(),
-            core_resource("Pod", "pods"),
-        ],
-    );
-}
-
 enum RecordedChildAccess {
     Reachable(Client),
     /// Management-cluster or child API state may recover without destruction.
@@ -5559,7 +5530,6 @@ async fn recorded_child_access(
         Ok(namespace)
             if child_namespace_matches_lease(&namespace, &lease.name_any(), &lease_uid) =>
         {
-            watch_child_cluster(ctx, lease, &instance.name, &child);
             RecordedChildAccess::Reachable(child)
         }
         Ok(_) => RecordedChildAccess::Quarantine(QuarantineReason::ChildNamespaceIdentityChanged),
@@ -6929,19 +6899,6 @@ async fn finish_child_release_after_proof(
     reason: ReleaseReason,
 ) -> Result<Action, SandboxPlacementError> {
     let name = lease.name_any();
-    // The cluster goes back to the pool here, so its watch has nothing left to
-    // report and its slot belongs to the next lease.
-    if let (Some(registry), Some(cluster)) = (
-        ctx.child_watches.as_ref(),
-        lease
-            .status
-            .as_ref()
-            .and_then(|status| status.target.as_ref())
-            .and_then(|target| target.child_cluster_instance.as_ref())
-            .map(|instance| instance.name.clone()),
-    ) {
-        registry.stop(&cluster);
-    }
     let status = lease.status.clone().unwrap_or_default();
     debug_assert!(footprint_absence_proven(&status));
 
@@ -9850,11 +9807,6 @@ pub async fn run_sandbox_controller(
     shutdown: CancellationToken,
 ) {
     let placement_enabled = runtime_mode.enabled();
-    // Child placements wait on objects in another apiserver. The registry turns
-    // those clusters' events into reconcile requests; without it they would only
-    // be found on the backstop timers.
-    let (child_watches, child_requests) =
-        crate::controllers::sandbox_child_watch::ChildWatchRegistry::new(shutdown.clone());
     let managed_runtime_identity =
         (runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed).then(|| {
             crate::sandbox_runtime::ManagedRuntimeIdentity::from_env()
@@ -9865,7 +9817,6 @@ pub async fn run_sandbox_controller(
         namespace: namespace.to_string(),
         reservation_namespace: reservation_namespace.to_string(),
         shutdown: shutdown.clone(),
-        child_watches: Some(child_watches),
         access_ledger_enabled: true,
         placement_enabled,
         runtime_mode,
@@ -9907,10 +9858,6 @@ pub async fn run_sandbox_controller(
             // A child placement waits for its internal ClusterLease to bind.
             // Without this the controller only finds out on a timer, which is
             // most of the wait: the bind itself takes a second or two.
-            .reconcile_on(futures::stream::unfold(
-                child_requests,
-                |mut requests| async move { requests.recv().await.map(|lease| (lease, requests)) },
-            ))
             .watches(
                 internal_cluster_leases,
                 Config::default(),
@@ -10252,7 +10199,6 @@ pub(crate) mod tests {
             namespace: NS.to_string(),
             reservation_namespace: NS.to_string(),
             shutdown: CancellationToken::new(),
-            child_watches: None,
             access_ledger_enabled: false,
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::Managed,
@@ -11326,7 +11272,6 @@ pub(crate) mod tests {
             namespace: NS.into(),
             reservation_namespace: NS.into(),
             shutdown: CancellationToken::new(),
-            child_watches: None,
             access_ledger_enabled: false,
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
@@ -19305,7 +19250,6 @@ current-context: child
             namespace: NS.into(),
             reservation_namespace: NS.into(),
             shutdown: CancellationToken::new(),
-            child_watches: None,
             access_ledger_enabled: false,
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,

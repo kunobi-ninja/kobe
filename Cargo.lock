@@ -3461,7 +3461,6 @@ dependencies = [
  "kobe-runner",
  "kobe-state-machine",
  "kube",
- "kube-runtime",
  "kunobi-auth",
  "kunobi-ha",
  "kunobi-reload",

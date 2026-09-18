@@ -53,16 +53,6 @@ path = "src/host_reaper_bin.rs"
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
 kube = { version = "4.0", features = ["runtime", "derive", "client", "ws"] }
-# Direct dependency purely to turn on one unstable kube-runtime feature. The
-# `kube` umbrella only exposes the whole `unstable-runtime` set, and features are
-# additive, so naming `kube-runtime` here enables exactly `reconcile_on` and
-# nothing else. It is the only way to feed a controller reconcile requests from a
-# stream it did not build: child-cluster watches live in another apiserver and
-# are discovered per lease. The stable alternative, `reconcile_all_on`, would
-# wake every SandboxLease on every child event.
-kube-runtime = { version = "4.0", default-features = false, features = [
-    "unstable-runtime-reconcile-on",
-] }
 k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
 
 # Web framework
