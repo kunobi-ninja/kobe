@@ -81,6 +81,11 @@ Authenticates with the configured endpoint:
 
 On success, kobe stores a session token locally.
 
+kobe pins each endpoint's auth issuer and audience on first contact and refuses
+a later change. When the change is expected, for example after the server moved
+from SSH keys to OIDC, run `kobe login --retrust` once: it shows the old and new
+values and pins the ones the server advertises now.
+
 ---
 
 ## `kobe logout`

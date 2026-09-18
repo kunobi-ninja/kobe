@@ -245,7 +245,15 @@ impl JwtAuthenticator {
 
             // Capture discovery data before oidc's fields move into the builder.
             let client_id = oidc.client_id.clone();
-            let discovery_audience = oidc.audience.first().cloned();
+            // The CLI forwards the advertised audience to the IdP as the
+            // `audience`/`resource` authorize parameters. An ID token's `aud` is
+            // already the client id, so when the policy accepts the client id
+            // there is nothing to request, and IdPs that gate custom audiences
+            // (Clerk) reject the request outright.
+            let discovery_audience = match &client_id {
+                Some(cid) if oidc.audience.contains(cid) => None,
+                _ => oidc.audience.first().cloned(),
+            };
             let issuer = oidc.issuer.clone();
 
             builder = builder.jwt(
@@ -1624,6 +1632,48 @@ mod tests {
         .unwrap();
         auth.update_policies(vec![machine], HashMap::new()).await;
         assert!(auth.discovery_metadata().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_metadata_omits_audience_equal_to_client_id() {
+        // Clerk rejects an authorize/device request whose `audience` is not a
+        // whitelisted custom audience, even when it is the client id itself.
+        // The ID token's `aud` is the client id anyway, so advertise nothing.
+        let auth = JwtAuthenticator::new("test".to_string());
+        let human: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "clerk" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://clerk.example",
+                "audience": ["kobe-cli"], "algorithms": ["RS256"],
+                "clientId": "kobe-cli"
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![human], HashMap::new()).await;
+
+        let doc = auth
+            .discovery_metadata()
+            .await
+            .expect("the interactive provider must be advertised");
+        assert_eq!(doc.client_id, "kobe-cli");
+        assert_eq!(doc.audience, None);
+
+        // Same when the client id is not the first audience: the ID token
+        // still satisfies the list, so there is nothing to request.
+        let mixed: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "clerk" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://clerk.example",
+                "audience": ["kobe-api", "kobe-cli"], "algorithms": ["RS256"],
+                "clientId": "kobe-cli"
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![mixed], HashMap::new()).await;
+        let doc = auth.discovery_metadata().await.unwrap();
+        assert_eq!(doc.audience, None);
     }
 
     #[tokio::test]

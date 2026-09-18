@@ -359,7 +359,13 @@ async fn ensure_session(
                 .context("SSH authorization failed")?;
         }
         AuthMode::Oidc if interactive => {
-            login::login(config.target.as_deref(), Some(&config.endpoint), false).await?;
+            login::login(
+                config.target.as_deref(),
+                Some(&config.endpoint),
+                false,
+                false,
+            )
+            .await?;
         }
         AuthMode::Ssh => anyhow::bail!(
             "SSH authorization needs a one-time trust answer; run `kobe init` in a terminal, or `kobe status`"

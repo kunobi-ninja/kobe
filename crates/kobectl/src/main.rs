@@ -148,6 +148,11 @@ enum Commands {
         /// Sign in on another device (RFC 8628 device authorization)
         #[arg(long)]
         device: bool,
+        /// Accept and re-pin the server's current auth issuer and audience
+        /// when they no longer match the trusted pin, e.g. after the server
+        /// moved from SSH keys to OIDC. Without it a changed pin is refused.
+        #[arg(long)]
+        retrust: bool,
     },
     /// Lease a sandbox, run one command in it, and release it
     Run {
@@ -792,7 +797,9 @@ async fn main() -> anyhow::Result<()> {
     let result = match cli.command {
         Commands::Status { all } => commands::status(target, endpoint, output, all).await,
         Commands::Version => commands::version(target, endpoint, output).await,
-        Commands::Login { device } => commands::login(target, endpoint, device).await,
+        Commands::Login { device, retrust } => {
+            commands::login(target, endpoint, device, retrust).await
+        }
         Commands::Logout => commands::logout(target, endpoint).await,
         Commands::Lease {
             pool,
