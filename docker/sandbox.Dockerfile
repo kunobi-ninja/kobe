@@ -50,8 +50,10 @@ FROM debian:bookworm-slim
 # (below) as the workload user in inetd mode. No port is opened.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         autocutsel \
+        bc \
         build-essential \
         ca-certificates \
+        clang \
         curl \
         dbus \
         file \
