@@ -8,4 +8,5 @@ pub mod profile;
 pub mod sandbox;
 pub mod sandbox_canary;
 pub mod sandbox_child;
+pub mod sandbox_child_watch;
 pub mod sandbox_pool_certification;
