@@ -25,4 +25,4 @@ RUN printf '%s\n' '{"protocol":1,"id":"sbxe-image-smoke","argv":["/bin/true"],"t
        done \
     && rm -rf /var/run/kobe/executions/sbxe-image-smoke
 
-CMD ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"]
+CMD ["/bin/sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"]

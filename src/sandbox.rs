@@ -33,6 +33,9 @@ pub const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
 pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
 pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
 pub const KOBE_MANAGED_BY: &str = "kobe-operator";
+/// Grace period for Sandbox Pods. Release waits for the Pod to be gone before
+/// capacity is returned, so this bounds how long a TERM-ignoring workload holds it.
+pub const SANDBOX_TERMINATION_GRACE_SECONDS: i64 = 5;
 pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 /// Namespace inside an exclusive child cluster that holds Sandbox objects.
 ///
@@ -308,6 +311,10 @@ pub fn build_sandbox_template(
         enable_service_links: Some(false),
         restart_policy: Some("Never".to_string()),
         runtime_class_name: pool.isolation.runtime_class_name().map(ToString::to_string),
+        // A released workspace is disposable. Its capacity is not returned
+        // until the Pod is gone, so a workload that ignores TERM must not hold
+        // the slot for the 30s default.
+        termination_grace_period_seconds: Some(SANDBOX_TERMINATION_GRACE_SECONDS),
         security_context: Some(PodSecurityContext {
             run_as_group: Some(65_532),
             run_as_non_root: Some(true),
@@ -2045,6 +2052,10 @@ mod tests {
         assert_eq!(
             value["spec"]["podTemplate"]["spec"]["enableServiceLinks"],
             false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["terminationGracePeriodSeconds"],
+            SANDBOX_TERMINATION_GRACE_SECONDS
         );
         assert_eq!(
             value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsUser"],

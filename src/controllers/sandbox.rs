@@ -139,8 +139,10 @@ pub(crate) const SANDBOX_CLAIM_TOMBSTONE_PRIOR_UID_LABEL: &str =
 pub(crate) const SANDBOX_CLAIM_TOMBSTONE_LABEL: &str = "kobe.kunobi.ninja/sandbox-claim-tombstone";
 
 /// The final authorization read and the Claim POST share this deadline. A
-/// release fence only has to drain this bounded interval before absence can be
-/// considered stable; a timed-out POST is always recovered by exact GET.
+/// release fence of a child or unplaced lease only has to drain this bounded
+/// interval before absence can be considered stable; management placement
+/// relies on Claim-name occupancy instead (see `allocation_fence_needs_drain`).
+/// A timed-out POST is always recovered by exact GET.
 pub(crate) const SANDBOX_CLAIM_CREATE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
@@ -210,6 +212,55 @@ enum ExecutionCleanupAdvance {
 /// checkpoint when no unrelated parent update happens to wake it.
 fn execution_cleanup_checkpoint_action() -> Action {
     Action::requeue(std::time::Duration::from_secs(1))
+}
+
+/// How often release re-checks a management footprint that is still present.
+/// The Pod exits within its short grace period and nothing watches it for us,
+/// so a long poll here would be most of the release.
+const FOOTPRINT_ABSENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Upper bounds on retiring execution records within one reconcile pass.
+const EXECUTION_DRAIN_MAX_STEPS: usize = 64;
+const EXECUTION_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Retire a released lease's execution records once its target is proven
+/// absent, running cleanup until it stops making progress, within bounds.
+///
+/// Each cleanup call makes at most one durable mutation and re-reads the
+/// manifest and records before the next, so repeating it here keeps that
+/// invariant. Returning after each step instead cost a requeue per record,
+/// which held a released lease's quota for minutes when it had many failed
+/// or lost executions.
+async fn drain_executions_after_target_absence<F, Fut>(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    mut step: F,
+) -> crate::api::sandbox_executions::ExecutionCleanupOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::api::sandbox_executions::ExecutionCleanupOutcome>,
+{
+    use crate::api::sandbox_executions::ExecutionCleanupOutcome;
+
+    let deadline = tokio::time::Instant::now() + EXECUTION_DRAIN_BUDGET;
+    let mut steps = 0usize;
+    let outcome = loop {
+        let outcome = step().await;
+        if !matches!(outcome, ExecutionCleanupOutcome::Checkpointed) {
+            break outcome;
+        }
+        steps += 1;
+        if steps >= EXECUTION_DRAIN_MAX_STEPS
+            || tokio::time::Instant::now() >= deadline
+            || ctx.shutdown.is_cancelled()
+        {
+            break outcome;
+        }
+    };
+    if steps > 0 {
+        info!(lease = %lease.name_any(), steps, "retired Sandbox execution records after target absence");
+    }
+    outcome
 }
 
 fn execution_cleanup_advance(
@@ -1941,8 +1992,9 @@ fn admitted_pending_is_allocation_free(
 /// nothing was ever *named*. `target` is written in the same fenced patch that
 /// records a child handle, and `sandbox_lease_authorizes_allocation` refuses
 /// every create once a release reason or an allocation fence is present, so an
-/// unnamed target plus a drained fence is the durable statement that no POST
-/// was issued and none can be.
+/// unnamed target plus a closed fence (drained, or name-occupied for
+/// Management placement) is the durable statement that no POST was issued and
+/// none can be.
 ///
 /// A recorded `ChildCluster` placement is excluded: it is only ever written
 /// together with the handle reference, so it means a `ClusterLease` was
@@ -2579,6 +2631,34 @@ fn allocation_fence_matches(
             == Some(format!("{SANDBOX_ALLOCATION_FENCE_HOLDER_PREFIX}{lease_uid}").as_str())
 }
 
+/// Whether release must wait out in-flight creates before proving absence.
+///
+/// Management placement does not. Its only create is the SandboxClaim POST,
+/// under a name derived from the lease, and release never frees that name: it
+/// converts the Claim into an expired `Retain` tombstone in place, or creates
+/// the tombstone under the same name when no Claim exists, and absence is
+/// proven only once that tombstone is Ready. A stale POST that lands after the
+/// tombstone gets a 409, however late; one that lands first makes the tombstone
+/// CREATE 409 instead, and the next pass converts that live Claim in place.
+/// Either way the stale reconcile's status write is rejected by the
+/// resourceVersion fence, and `ensure_management_claim_fenced` refuses a
+/// tombstone-shaped Claim. The fence still closes the gate for new creates;
+/// only the wait is skipped, which was 35s of every release.
+///
+/// A recorded Management placement also rules out the child handle: it is
+/// written before any create and never retargeted, and the child create path
+/// records `ChildCluster` placement, so no internal ClusterLease POST can be in
+/// flight for this lease.
+///
+/// Child placement, or a lease whose placement is not yet recorded, keeps the
+/// wait: its internal ClusterLease create has no name-occupancy guard.
+fn allocation_fence_needs_drain(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    !matches!(
+        status.placement,
+        Some(crate::crd::ResolvedSandboxPlacement::Management {})
+    )
+}
+
 async fn ensure_allocation_fence(
     lease: &SandboxLease,
     ctx: &SandboxContext,
@@ -2721,6 +2801,9 @@ async fn ensure_allocation_fence(
             QuarantineReason::AllocationFenceTimestampMissing,
         ));
     };
+    if !allocation_fence_needs_drain(&status) {
+        return Ok(AllocationFence::Ready);
+    }
     let drain = SANDBOX_CLAIM_CREATE_TIMEOUT + SANDBOX_ALLOCATION_DRAIN_MARGIN;
     let elapsed = (chrono::Utc::now() - created_at)
         .to_std()
@@ -4467,10 +4550,12 @@ async fn admission_only_management_footprint_absent(
 /// landed, and until a `target` names one, neither can be ruled out by shape
 /// alone.
 ///
-/// The 404s are only meaningful because the caller waited. The allocation
-/// fence has drained by the time this runs, and `sandbox_lease_authorizes_allocation`
-/// refuses every create once that fence exists, so nothing can appear behind
-/// the check. Without the drain these would be the "a 404 cannot distinguish
+/// The 404s are only meaningful because nothing can appear behind the check.
+/// `sandbox_lease_authorizes_allocation` refuses every create once the
+/// allocation fence exists. A create already in flight is covered by the
+/// fence drain, or, for a recorded Management placement, by the reasons in
+/// `allocation_fence_needs_drain`: the Claim name stays occupied, and no child
+/// handle POST was ever authorized. Without the drain these would be the "a 404 cannot distinguish
 /// never-created from GC'd-before-checkpoint" mistake this whole protocol
 /// exists to avoid.
 async fn pre_create_footprint_absent(
@@ -4571,8 +4656,9 @@ async fn pre_create_footprint_absent(
 /// `AdmissionOnlyV1` is written with Releasing from an exact fresh Pending
 /// shape, so no producer POST was authorised; the tombstone plus empty scans
 /// prove that footprint stayed empty. `FinalizerV1` instead precedes create and
-/// makes every active Claim non-GC-dependent. After allocation drain, observing
-/// only the inert tombstone proves that active POST never committed. Leases
+/// makes every active Claim non-GC-dependent. Once allocation is closed (drained,
+/// or name-occupied for Management placement), observing only the inert
+/// tombstone proves that active POST never committed. Leases
 /// with neither checkpoint remain fail-closed.
 async fn checkpoint_never_started_management_claim(
     lease: &SandboxLease,
@@ -4749,7 +4835,8 @@ async fn drive_release(
     // Close allocation before inspecting teardown. Every create path performs
     // its final outer/pool/fence reads and POST inside one bounded future; once
     // this durable fence has existed for that whole bound, no stale create can
-    // still arrive after an absence proof.
+    // still arrive after an absence proof. Management placement skips the wait:
+    // see `allocation_fence_needs_drain`.
     match ensure_allocation_fence(lease, ctx).await? {
         AllocationFence::Ready => {}
         AllocationFence::Checkpointed => return Ok(Action::await_change()),
@@ -4854,13 +4941,15 @@ async fn drive_release(
             return Box::pin(finish_child_release_after_proof(lease, ctx, reason)).await;
         }
         if ctx.access_ledger_enabled {
-            match crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
-                &ctx.client,
-                &ctx.namespace,
-                &ctx.reservation_namespace,
-                lease,
-                &ctx.shutdown,
-            )
+            match drain_executions_after_target_absence(lease, ctx, || {
+                crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.shutdown,
+                )
+            })
             .await
             {
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
@@ -5159,7 +5248,7 @@ async fn drive_release(
         TargetFootprintCheck::Verified => {}
         TargetFootprintCheck::Retry(check) => {
             debug!(lease = %name, check, "recorded management footprint is not absent yet");
-            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+            return Ok(Action::requeue(FOOTPRINT_ABSENCE_POLL));
         }
         TargetFootprintCheck::Quarantine(check) => {
             return quarantine_lease(lease, ctx, check).await;
@@ -13793,6 +13882,76 @@ pub(crate) mod tests {
         assert_eq!(entries, serde_json::json!({}));
     }
 
+    /// Only management placement may skip the fence drain. An unrecorded
+    /// placement could still be a child composition whose internal
+    /// ClusterLease create has no name-occupancy guard.
+    #[test]
+    fn only_management_placement_skips_allocation_drain() {
+        let mut status = crate::crd::SandboxLeaseStatus::default();
+        assert!(allocation_fence_needs_drain(&status));
+        status.placement = Some(crate::crd::ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: None,
+                name: "child".into(),
+                uid: "child-uid".into(),
+                generation: None,
+            },
+        });
+        assert!(allocation_fence_needs_drain(&status));
+        status.placement = Some(crate::crd::ResolvedSandboxPlacement::Management {});
+        assert!(!allocation_fence_needs_drain(&status));
+    }
+
+    /// Post-proof execution retirement keeps going within one pass while it
+    /// makes progress, instead of paying a requeue per record.
+    #[tokio::test]
+    async fn post_proof_execution_retirement_drains_in_one_pass() {
+        use crate::api::sandbox_executions::ExecutionCleanupOutcome;
+
+        let (ctx, _server) = test_context().await;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if call < 5 {
+                    ExecutionCleanupOutcome::Checkpointed
+                } else {
+                    ExecutionCleanupOutcome::Clean
+                }
+            }
+        })
+        .await;
+        assert!(matches!(outcome, ExecutionCleanupOutcome::Clean));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+
+        // A step that never stops checkpointing is bounded, and the caller
+        // requeues rather than treating the lease as clean.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { ExecutionCleanupOutcome::Checkpointed }
+        })
+        .await;
+        assert!(matches!(outcome, ExecutionCleanupOutcome::Checkpointed));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            EXECUTION_DRAIN_MAX_STEPS
+        );
+
+        // Retry and quarantine end the pass immediately.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { ExecutionCleanupOutcome::Retry }
+        })
+        .await;
+        assert!(matches!(outcome, ExecutionCleanupOutcome::Retry));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// Run the destructive half only after the durable Releasing checkpoint
     /// has been observed at a new Kubernetes resourceVersion.
     async fn reconcile_release_after_checkpoint(
@@ -14070,7 +14229,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(action, Action::requeue(FOOTPRINT_ABSENCE_POLL));
         assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
         assert_eq!(requests_to(&server, "GET", POD_PATH).await, 1);
         assert_eq!(
@@ -14144,7 +14303,7 @@ pub(crate) mod tests {
                 assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
                 assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
             } else {
-                assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+                assert_eq!(action, Action::requeue(FOOTPRINT_ABSENCE_POLL));
                 assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
             }
             assert_eq!(
@@ -14820,7 +14979,7 @@ pub(crate) mod tests {
         target.service = None;
 
         let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(action, Action::requeue(FOOTPRINT_ABSENCE_POLL));
         assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
         assert_eq!(requests_to(&server, "GET", SERVICES_PATH).await, 1);
         assert_eq!(

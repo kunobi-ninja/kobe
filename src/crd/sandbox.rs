@@ -1200,11 +1200,13 @@ pub enum SandboxClaimCleanupFence {
     /// cancels immediately after it lands had, until this variant existed,
     /// nothing to prove absence with and was quarantined for it.
     ///
-    /// The obligation is correspondingly stronger. Verification waits for the
-    /// allocation fence to drain, then requires BOTH the inert Claim tombstone
-    /// with empty descendant scans AND a verified 404 on the deterministic
-    /// child handle name. The drain is what makes those 404s mean "nothing was
-    /// created and nothing can be" rather than "I did not find it".
+    /// The obligation is correspondingly stronger. Verification closes
+    /// allocation first, then requires BOTH the inert Claim tombstone with
+    /// empty descendant scans AND a verified 404 on the deterministic child
+    /// handle name. Closing allocation (a drained fence, or for a recorded
+    /// Management placement an occupied Claim name and no authorized child
+    /// POST) is what makes those 404s mean "nothing was created and nothing
+    /// can be" rather than "I did not find it".
     PreCreateV1,
     /// A management Claim cleanup finalizer was durable before the first POST,
     /// or an exact non-deleting legacy Claim was atomically migrated to that
