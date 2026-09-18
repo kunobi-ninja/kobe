@@ -124,7 +124,7 @@ pub struct HostSpec {
     pub alias: String,
     /// The name after the pool, when the host carries one.
     ///
-    /// `kobe-agent-workspace-dev`, with an `agent-workspace` pool, parses to
+    /// `kobe-sandbox-dev`, with a `sandbox` pool, parses to
     /// `Some("dev")`. That is what `kobe lease --name` and `kobe attach` call
     /// the lease, so it is the second thing to try when nothing is aliased to
     /// the whole host. Without it a lease the caller can see in `kobe status`
@@ -367,7 +367,7 @@ async fn authorize_key(config: &ResolvedConfig, lease_id: &str, public_key: &str
     if result.exit_code == Some(EXIT_NO_SSHD) {
         anyhow::bail!(
             "{lease_id} runs an image without {REMOTE_SSHD}; the pool needs \
-             zondax/kobe-agent-workspace v0.45.0 or newer (release this sandbox with \
+             zondax/kobe-sandbox v0.45.0 or newer (release this sandbox with \
              `kobe release {lease_id}` once the pool image is updated)"
         );
     }
@@ -519,13 +519,9 @@ mod tests {
     /// call the lease, and the SSH path needs it to reach one they created.
     #[test]
     fn host_carries_the_name_after_the_pool() {
-        let spec = parse_host(
-            "kobe-agent-workspace-kache-mutants-m2",
-            &pools(&["agent-workspace"]),
-        )
-        .unwrap();
-        assert_eq!(spec.pool.as_deref(), Some("agent-workspace"));
-        assert_eq!(spec.alias, "kobe-agent-workspace-kache-mutants-m2");
+        let spec = parse_host("kobe-sandbox-kache-mutants-m2", &pools(&["sandbox"])).unwrap();
+        assert_eq!(spec.pool.as_deref(), Some("sandbox"));
+        assert_eq!(spec.alias, "kobe-sandbox-kache-mutants-m2");
         assert_eq!(
             spec.name.as_deref(),
             Some("kache-mutants-m2"),
@@ -537,8 +533,8 @@ mod tests {
     /// invent one by stripping the pool off itself.
     #[test]
     fn host_that_is_only_a_pool_carries_no_name() {
-        let spec = parse_host("kobe-agent-workspace", &pools(&["agent-workspace"])).unwrap();
-        assert_eq!(spec.pool.as_deref(), Some("agent-workspace"));
+        let spec = parse_host("kobe-sandbox", &pools(&["sandbox"])).unwrap();
+        assert_eq!(spec.pool.as_deref(), Some("sandbox"));
         assert_eq!(spec.name, None);
     }
 

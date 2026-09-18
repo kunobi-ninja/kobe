@@ -98,9 +98,9 @@ The command comes from the pool, never the caller. Declaring it also changes
 which subresource attach calls, from `pods/attach` to `pods/exec`, so the grant
 it needs is the `exec` verb either way.
 
-## Agent workspace images
+## Sandbox images
 
-`zondax/kobe-agent-workspace` includes `kobe-runner`, `mise`, `tmux`, Git,
+`zondax/kobe-sandbox` includes `kobe-runner`, `mise`, `tmux`, Git,
 GitHub CLI (`gh`), OpenSSH, JSON/search/network diagnostics, OpenSSL headers,
 and a C toolchain. It also ships `kobe-sshd`, so an SSH client can reach the
 sandbox through [`kobe ssh-proxy`](/docs/commands/ssh) without any port being
@@ -132,7 +132,7 @@ template:
   attachCommand: ["tmux", "new-session", "-A", "-s", "agent"]
   containers:
     - name: workspace
-      image: zondax/kobe-agent-workspace:v0.47.0
+      image: zondax/kobe-sandbox:v0.47.0
   exposedPorts:
     - name: desktop
       container: workspace
@@ -181,5 +181,5 @@ cancelling its runner execution or releasing the lease stops the desktop.
 When started in tmux, use `Ctrl-c` in that pane to stop it. Only one desktop
 can run in a Sandbox.
 
-Build locally with `docker buildx bake agent-workspace --load` (set
+Build locally with `docker buildx bake sandbox --load` (set
 `PLATFORM=linux/arm64` on an ARM host).

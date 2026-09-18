@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # =============================================================================
-# kobe-agent-workspace — a general-purpose Sandbox image for agent sessions.
+# kobe-sandbox — a general-purpose Sandbox image for agent sessions.
 #
 # Unlike `sandbox-e2e` (a conformance fixture) this image is meant to be run by
 # real callers: an agent leases a Sandbox, clones a project into it, installs
@@ -64,7 +64,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-noto-core \
         gh \
         git \
+# `iputils-ping` for first-hop network diagnostics: without it, "is it DNS
+# or is it the network" is unanswerable from inside the sandbox.
         iproute2 \
+        iputils-ping \
         jq \
         less \
         libayatana-appindicator3-dev \
@@ -194,12 +197,14 @@ RUN echo "cli refresh: ${CLI_REFRESH}" \
     && npm install --global --prefix "$node_dir" --no-audit --no-fund \
         "@openai/codex@latest" \
         "@anthropic-ai/claude-code@latest" \
+        "opencode-ai@latest" \
     && codex --version \
     && claude --version \
-    && printf 'node %s\ncodex %s\nclaude-code %s\n' \
-        "$(node --version)" "$(codex --version)" "$(claude --version)" \
-        > /etc/kobe-workspace-versions \
-    && chmod 0644 /etc/kobe-workspace-versions \
+    && opencode --version \
+    && printf 'node %s\ncodex %s\nclaude-code %s\nopencode %s\n' \
+        "$(node --version)" "$(codex --version)" "$(claude --version)" "$(opencode --version)" \
+        > /etc/kobe-sandbox-versions \
+    && chmod 0644 /etc/kobe-sandbox-versions \
     && npm cache clean --force \
     && rm -rf /root/.npm \
     && ln -sfn "$node_dir" /opt/kobe/node
@@ -214,20 +219,28 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/node/bin:$PATH' \
       > /etc/profile.d/kobe-node-tools.sh \
     && chmod 0644 /etc/profile.d/kobe-node-tools.sh
 
-# `nproc` inside this container reports the HOST's CPU count, not the cgroup
-# quota Kubernetes actually enforces on it — commonly a fraction of the host's
-# (#272). `kobe-runner` (below) computes the real number at runtime from
-# `/sys/fs/cgroup/cpu.max` and sets it, plus sane `CARGO_BUILD_JOBS` /
-# `RUST_TEST_THREADS` defaults, on every process it spawns — see its `cpu`
-# module for why that has to happen in the runner itself rather than here: a
-# shell-less `kobe exec` never sources this file, so this script cannot be
-# the source of the value, only an announcement of it. All it does is print
-# the runner's own `KOBE_CPUS` on an interactive login shell as a single line
-# (#319): the env-var detail and the `nproc` caveat live in the runner's `cpu`
-# module, not in front of every prompt.
+# Login banner: one branded line on an interactive shell (a tty), silent for
+# `kobe exec` and friends (#319). Background: `nproc` inside this container
+# reports the HOST's CPU count, not the cgroup quota Kubernetes actually
+# enforces on it — commonly a fraction of the host's (#272). `kobe-runner`
+# (below) computes the real number at runtime from `/sys/fs/cgroup/cpu.max`
+# and exports it as
+# `KOBE_CPUS` on every process it spawns — see its `cpu` module for why that
+# has to happen in the runner itself rather than here: a shell-less `kobe
+# exec` never sources this file, so this script cannot be the source of the
+# value, only an announcement of it. Colors stay off under `NO_COLOR` or on a
+# `dumb` terminal. The `nproc` caveat and the `CARGO_BUILD_JOBS` /
+# `RUST_TEST_THREADS` detail live in the runner's docs, not in front of every
+# prompt.
 RUN printf '%s\n' \
       'if [ -n "$KOBE_CPUS" ] && [ -t 1 ]; then' \
-      '  echo "kobe: $KOBE_CPUS CPUs (cgroup quota); nproc reports the host count." >&2' \
+      '  if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then' \
+      '    _kobe_b=$(printf "\033[1;36m"); _kobe_r=$(printf "\033[0m")' \
+      '  else' \
+      "    _kobe_b=''; _kobe_r=''" \
+      '  fi' \
+      '  printf "%b\n" "${_kobe_b}kobe${_kobe_r} · sandbox · ${KOBE_CPUS} CPUs (cgroup quota)" >&2' \
+      '  unset _kobe_b _kobe_r' \
       'fi' \
       > /etc/profile.d/kobe-cpu-quota.sh \
     && chmod 0644 /etc/profile.d/kobe-cpu-quota.sh
@@ -281,15 +294,15 @@ WORKDIR /home/agent/work
 # leased Sandbox: the runner spool must be usable under the workload UID, and
 # a mise-installed tool must resolve through the shims with no shell involved.
 # An image that fails either is not worth publishing.
-RUN printf '%s\n' '{"protocol":1,"id":"agentws-image-smoke","argv":["/bin/true"],"timeoutSeconds":30,"maxOutputBytes":1024}' \
+RUN printf '%s\n' '{"protocol":1,"id":"sandbox-image-smoke","argv":["/bin/true"],"timeoutSeconds":30,"maxOutputBytes":1024}' \
       | /kobe-runner start \
     && attempts=0 \
-    && until /kobe-runner status --id agentws-image-smoke | grep -q '"state":"succeeded"'; do \
+    && until /kobe-runner status --id sandbox-image-smoke | grep -q '"state":"succeeded"'; do \
          attempts=$((attempts + 1)); \
          test "$attempts" -lt 100; \
          sleep 0.05; \
        done \
-    && rm -rf /var/run/kobe/executions/agentws-image-smoke
+    && rm -rf /var/run/kobe/executions/sandbox-image-smoke
 
 # The SSH path is proven end to end as the workload user: `kobe-sshd --check`
 # generates the host key and validates the configuration, then a real `ssh`
@@ -307,7 +320,7 @@ RUN kobe-sshd --check \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes \
-        nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server' \
+        nonroot@kobe-proof 'test "$(id -u)" = 65532 && test -x /usr/lib/openssh/sftp-server && command -v ping' \
     && session_ssh='-o IdentityFile=/tmp/proof-client -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes' \
     && session_proxy='ProxyCommand=/usr/local/bin/kobe-sshd --session proof' \
     && ssh -q ${session_ssh} -o "${session_proxy}" nonroot@kobe-proof 'echo passed-through' \
@@ -325,7 +338,8 @@ RUN kobe-sshd --check \
 # only thing a runner execution inherits: a profile.d line would not survive
 # this, and in v0.48.0 that is exactly how the CLIs shipped unreachable.
 RUN env -i PATH="$PATH" claude --version >/dev/null \
-    && env -i PATH="$PATH" codex --version >/dev/null
+    && env -i PATH="$PATH" codex --version >/dev/null \
+    && env -i PATH="$PATH" opencode --version >/dev/null
 
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.
@@ -342,7 +356,7 @@ ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
-LABEL org.opencontainers.image.title="kobe-agent-workspace"
+LABEL org.opencontainers.image.title="kobe-sandbox"
 LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, kobe-runner, and an opt-in loopback-only desktop"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
