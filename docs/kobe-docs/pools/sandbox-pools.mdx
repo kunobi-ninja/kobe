@@ -5,12 +5,16 @@ description: Administrator-owned Agent Sandbox templates, placement, and isolati
 
 # Sandbox pools
 
-<Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Set
-  `agentSandbox.mode=managed` for Kobe-owned management and child runtimes, or
-  `external` after installing Agent Sandbox v1.0.0 yourself. Kobe validates
-  consumed APIs before mounting the Sandbox HTTP API; `disabled` mounts no
-  Sandbox endpoints.
+Sandboxes run on [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+v1.0.0, on the `trusted-runc` isolation tier. That tier is in production use.
+
+<Callout type="info">
+  `SandboxPool` and `SandboxLease` are served at `v1alpha1`, so the object shape
+  can still change between releases; the runtime underneath them is Agent
+  Sandbox v1.0.0. Set `agentSandbox.mode=managed` for Kobe-owned management and
+  child runtimes, or `external` after installing Agent Sandbox v1.0.0 yourself.
+  Kobe validates consumed APIs before mounting the Sandbox HTTP API; `disabled`
+  mounts no Sandbox endpoints.
 </Callout>
 
 Administrators author `SandboxPool` objects. API callers only choose an allowed

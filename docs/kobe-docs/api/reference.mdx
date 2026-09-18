@@ -302,8 +302,9 @@ Lists leases currently associated with one pool. This is useful for operational 
 
 ## Sandbox leases
 
-<Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Sandbox HTTP endpoints are
+<Callout type="info">
+  `SandboxPool` and `SandboxLease` are served at `v1alpha1`, so the object shape
+  can still change between releases. Sandbox HTTP endpoints are
   mounted when `agentSandbox.mode=external` or `managed` and Agent Sandbox
   v1.0.0 passes the mode's compatibility and ownership checks. Managed child
   composition also completes an exact create/delete canary before creating the
