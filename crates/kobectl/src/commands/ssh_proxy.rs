@@ -23,9 +23,17 @@
 //! # Host names
 //!
 //! `kobe-<pool>-<name>` selects the pool by name; `kobe-<name>` uses the
-//! target's `default_pool`. The whole host name, lowercased, is the lease
-//! alias, so `kobe-small-1` and `kobe-small-2` are two sandboxes and another
-//! user's `kobe-small-1` is a third: aliases are scoped to the caller.
+//! target's `default_pool`. A sandbox created here is aliased to the whole
+//! host name, lowercased, so `kobe-small-1` and `kobe-small-2` are two
+//! sandboxes and another user's `kobe-small-1` is a third: aliases are scoped
+//! to the caller.
+//!
+//! Connecting tries that whole-host alias first and then `<name>` on its own
+//! within the named pool, because `kobe lease --name dev` aliases its lease
+//! `dev` — which is also what `kobe attach dev` answers to. Without the second
+//! attempt a lease visible in `kobe status` had no host that reached it, and
+//! since a miss creates, the failure surfaced as a concurrency error about a
+//! sandbox nobody asked for.
 //!
 //! A dot adds a persistent session: `kobe-dev.main` is sandbox `kobe-dev`,
 //! with interactive logins landing in `kobe-runner` session `main`, whose
@@ -114,6 +122,15 @@ pub struct HostSpec {
     pub pool: Option<String>,
     /// The lease alias: the host name up to its first dot, lowercased.
     pub alias: String,
+    /// The name after the pool, when the host carries one.
+    ///
+    /// `kobe-agent-workspace-dev`, with an `agent-workspace` pool, parses to
+    /// `Some("dev")`. That is what `kobe lease --name` and `kobe attach` call
+    /// the lease, so it is the second thing to try when nothing is aliased to
+    /// the whole host. Without it a lease the caller can see in `kobe status`
+    /// has no SSH host that reaches it, and the miss silently becomes a
+    /// create.
+    pub name: Option<String>,
     /// The persistent session named after the dot, when there is one.
     pub session: Option<String>,
 }
@@ -171,9 +188,17 @@ pub fn parse_host(host: &str, known_pools: &[String]) -> Result<HostSpec> {
             pool = Some(candidate);
         }
     }
+    // Whatever follows the matched pool, minus the separating '-'. A host that
+    // is only a pool name carries no name, so there is nothing to look up.
+    let name = match pool {
+        Some(matched) if rest.len() > matched.len() => Some(rest[matched.len() + 1..].to_string()),
+        Some(_) => None,
+        None => Some(rest.to_string()),
+    };
     Ok(HostSpec {
         pool: pool.cloned(),
         alias,
+        name,
         session,
     })
 }
@@ -212,13 +237,31 @@ pub async fn ssh_proxy(command: SshProxyCommand<'_>) -> Result<i32> {
         None => DEFAULT_READY_TIMEOUT,
     };
 
-    let existing = leases::fetch_all_leases_with_output(&config, quiet)
-        .await?
-        .into_iter()
-        .find(|lease| {
-            lease.alias.as_deref() == Some(spec.alias.as_str())
-                && !leases::is_terminal_phase(&lease.phase)
-        });
+    // Two ways to name the same sandbox. `ssh kobe-<pool>-<name>` aliases the
+    // lease to the whole host, while `kobe lease --name <name>` aliases it to
+    // the name alone — and `kobe attach <name>` accepts that one. Trying only
+    // the first left a lease the caller can see in `kobe status` with no host
+    // that reaches it, and because a miss creates, the failure arrived as a
+    // concurrency error about a sandbox nobody asked for.
+    //
+    // The whole host still wins, so a sandbox created through SSH keeps its
+    // own alias even if some other lease answers to the bare name.
+    let all_leases = leases::fetch_all_leases_with_output(&config, quiet).await?;
+    let live = |lease: &leases::LeaseSummary| !leases::is_terminal_phase(&lease.phase);
+    let existing = all_leases
+        .iter()
+        .find(|lease| live(lease) && lease.alias.as_deref() == Some(spec.alias.as_str()))
+        .or_else(|| {
+            let name = spec.name.as_deref()?;
+            all_leases.iter().find(|lease| {
+                live(lease)
+                    && lease.alias.as_deref() == Some(name)
+                    // Only within the pool the host named. Without this, two
+                    // pools holding a `dev` each would answer the same host.
+                    && spec.pool.as_deref().is_none_or(|pool| lease.profile == pool)
+            })
+        })
+        .cloned();
 
     let lease_id = match existing {
         Some(lease) if !lease.is_sandbox() => anyhow::bail!(
@@ -470,6 +513,51 @@ mod tests {
     fn longest_pool_name_wins() {
         let spec = parse_host("kobe-ci-gpu-2", &pools(&["ci", "ci-gpu"])).unwrap();
         assert_eq!(spec.pool.as_deref(), Some("ci-gpu"));
+    }
+
+    /// The name after the pool is what `kobe lease --name` and `kobe attach`
+    /// call the lease, and the SSH path needs it to reach one they created.
+    #[test]
+    fn host_carries_the_name_after_the_pool() {
+        let spec = parse_host(
+            "kobe-agent-workspace-kache-mutants-m2",
+            &pools(&["agent-workspace"]),
+        )
+        .unwrap();
+        assert_eq!(spec.pool.as_deref(), Some("agent-workspace"));
+        assert_eq!(spec.alias, "kobe-agent-workspace-kache-mutants-m2");
+        assert_eq!(
+            spec.name.as_deref(),
+            Some("kache-mutants-m2"),
+            "the name must survive hyphens, or a lease called kache-mutants-m2 stays unreachable"
+        );
+    }
+
+    /// A host that is only a pool name has no name to look up, and must not
+    /// invent one by stripping the pool off itself.
+    #[test]
+    fn host_that_is_only_a_pool_carries_no_name() {
+        let spec = parse_host("kobe-agent-workspace", &pools(&["agent-workspace"])).unwrap();
+        assert_eq!(spec.pool.as_deref(), Some("agent-workspace"));
+        assert_eq!(spec.name, None);
+    }
+
+    /// With no pool in the host, everything after the prefix is the name, so
+    /// `kobe-dev` can still find a lease aliased `dev` in the default pool.
+    #[test]
+    fn host_without_a_known_pool_is_all_name() {
+        let spec = parse_host("kobe-dev", &pools(&["small"])).unwrap();
+        assert_eq!(spec.pool, None);
+        assert_eq!(spec.name.as_deref(), Some("dev"));
+    }
+
+    /// The session suffix belongs to the session, never to the name.
+    #[test]
+    fn a_session_suffix_does_not_leak_into_the_name() {
+        let spec = parse_host("kobe-small-dev.main", &pools(&["small"])).unwrap();
+        assert_eq!(spec.name.as_deref(), Some("dev"));
+        assert_eq!(spec.session.as_deref(), Some("main"));
+        assert_eq!(spec.alias, "kobe-small-dev");
     }
 
     #[test]
