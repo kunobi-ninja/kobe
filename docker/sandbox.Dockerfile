@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # =============================================================================
-# kobe-agent-workspace — a general-purpose Sandbox image for agent sessions.
+# kobe-sandbox — a general-purpose Sandbox image for agent sessions.
 #
 # Unlike `sandbox-e2e` (a conformance fixture) this image is meant to be run by
 # real callers: an agent leases a Sandbox, clones a project into it, installs
@@ -203,8 +203,8 @@ RUN echo "cli refresh: ${CLI_REFRESH}" \
     && opencode --version \
     && printf 'node %s\ncodex %s\nclaude-code %s\nopencode %s\n' \
         "$(node --version)" "$(codex --version)" "$(claude --version)" "$(opencode --version)" \
-        > /etc/kobe-workspace-versions \
-    && chmod 0644 /etc/kobe-workspace-versions \
+        > /etc/kobe-sandbox-versions \
+    && chmod 0644 /etc/kobe-sandbox-versions \
     && npm cache clean --force \
     && rm -rf /root/.npm \
     && ln -sfn "$node_dir" /opt/kobe/node
@@ -239,7 +239,7 @@ RUN printf '%s\n' \
       '  else' \
       "    _kobe_b=''; _kobe_r=''" \
       '  fi' \
-      '  printf "%b\n" "${_kobe_b}kobe${_kobe_r} · agent-workspace · ${KOBE_CPUS} CPUs (cgroup quota)" >&2' \
+      '  printf "%b\n" "${_kobe_b}kobe${_kobe_r} · sandbox · ${KOBE_CPUS} CPUs (cgroup quota)" >&2' \
       '  unset _kobe_b _kobe_r' \
       'fi' \
       > /etc/profile.d/kobe-cpu-quota.sh \
@@ -294,15 +294,15 @@ WORKDIR /home/agent/work
 # leased Sandbox: the runner spool must be usable under the workload UID, and
 # a mise-installed tool must resolve through the shims with no shell involved.
 # An image that fails either is not worth publishing.
-RUN printf '%s\n' '{"protocol":1,"id":"agentws-image-smoke","argv":["/bin/true"],"timeoutSeconds":30,"maxOutputBytes":1024}' \
+RUN printf '%s\n' '{"protocol":1,"id":"sandbox-image-smoke","argv":["/bin/true"],"timeoutSeconds":30,"maxOutputBytes":1024}' \
       | /kobe-runner start \
     && attempts=0 \
-    && until /kobe-runner status --id agentws-image-smoke | grep -q '"state":"succeeded"'; do \
+    && until /kobe-runner status --id sandbox-image-smoke | grep -q '"state":"succeeded"'; do \
          attempts=$((attempts + 1)); \
          test "$attempts" -lt 100; \
          sleep 0.05; \
        done \
-    && rm -rf /var/run/kobe/executions/agentws-image-smoke
+    && rm -rf /var/run/kobe/executions/sandbox-image-smoke
 
 # The SSH path is proven end to end as the workload user: `kobe-sshd --check`
 # generates the host key and validates the configuration, then a real `ssh`
@@ -356,7 +356,7 @@ ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
-LABEL org.opencontainers.image.title="kobe-agent-workspace"
+LABEL org.opencontainers.image.title="kobe-sandbox"
 LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, kobe-runner, and an opt-in loopback-only desktop"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 

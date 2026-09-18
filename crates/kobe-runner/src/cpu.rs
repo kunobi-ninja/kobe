@@ -29,7 +29,7 @@
 //! # Why this lives in Rust, not a container-start shell script
 //!
 //! Kobe's runner executes a tenant's argv directly with NO shell in between —
-//! see `main.rs`'s module docs and the `agent-workspace.Dockerfile` comments
+//! see `main.rs`'s module docs and the `sandbox.Dockerfile` comments
 //! next to its `ENV PATH` line for the exact trap this avoids. A value a
 //! container-start script `export`s, or drops into `/etc/profile.d`, is
 //! invisible to that exec: `kubectl exec`-style transports (Kobe's own exec

@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn pool_picker_row_shows_availability_policy_and_capabilities() {
         let pool: pools::PoolSummary = serde_json::from_value(serde_json::json!({
-            "name": "agent-workspace",
+            "name": "sandbox",
             "resourceKind": "Sandbox",
             "capabilities": ["exec", "logs", "attach", "port-forward"],
             "phase": "Ready",
@@ -600,7 +600,7 @@ mod tests {
         }))
         .unwrap();
         let item = pool_picker_item(&pool);
-        assert_eq!(item.primary, "agent-workspace");
+        assert_eq!(item.primary, "sandbox");
         assert_eq!(
             item.secondary,
             "Ready  ready 2  leased 1   ttl 30m  warm 2 fixed   exec, logs, attach, port-forward"
