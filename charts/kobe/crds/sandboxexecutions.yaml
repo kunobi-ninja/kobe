@@ -142,6 +142,21 @@ spec:
           status:
             nullable: true
             properties:
+              deadline:
+                description: |-
+                  When the runner stops the command, fixed when it starts.
+
+                  Extending the lease afterwards does not move it.
+                format: date-time
+                nullable: true
+                type: string
+              deadlineSource:
+                description: What set an execution's deadline.
+                enum:
+                - timeout
+                - lease
+                nullable: true
+                type: string
               exitCode:
                 description: |-
                   The remote process's exact exit code. Absent unless the command actually

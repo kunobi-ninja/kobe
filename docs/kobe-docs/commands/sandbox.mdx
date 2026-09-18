@@ -146,24 +146,28 @@ By default `kobe exec` waits for the command and exits with its exit code.
 it:
 
 ```bash
-kobe exec dev --detach --timeout 1h -- make release
+kobe exec dev --detach -- make release
 ```
 
 ```text
 Started execution sbxe-91c4 (running)
+  stops at 21:30 (7h 58m left) when the lease expires; kobe extend does not move it
   kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4 --follow
   kobe cancel sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
 ```
 
 The exit code is `0` when the execution started. It says nothing about how the
 command will end; read that from `kobe logs --execution`. With `--output json`,
-the envelope carries the execution id and its current `state`, with no
-`exitCode` yet.
+the envelope carries the execution id, its current `state`, and its `deadline`
+and `deadlineSource` (`timeout` or `lease`), with no `exitCode` yet.
 
 A detached command is still bound by `--timeout`, which defaults to the time
 left on the lease. No execution outlives its lease: `kobe extend` gives the
 lease more time, but a command already running keeps the deadline it started
-with. For work that should follow the lease across extensions, run it in a
+with. `kobe extend` lists any running execution that still stops before the
+new expiry, and a command stopped by its deadline says whether the lease or
+`--timeout` ended it. For work that should follow the lease across extensions,
+run it in a
 [persistent session](#sessions-that-survive-a-disconnect)
 (`kobe attach dev --session build`). `kobe run` never detaches, because it releases the sandbox when the command
 returns.

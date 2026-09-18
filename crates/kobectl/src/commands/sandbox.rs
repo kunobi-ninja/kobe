@@ -81,6 +81,13 @@ pub struct ExecOutput {
     /// Whether output was cut off at the server's cap.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// When the runner stops the command, fixed at start. Absent from servers
+    /// that predate it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+    /// What set `deadline`: `timeout` or `lease`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_source: Option<String>,
     /// Release outcome for `run`. Reported separately from the command's own
     /// result so an unconfirmed release is never hidden behind a successful
     /// command, and a working command is never failed by a cleanup problem.
@@ -140,6 +147,38 @@ pub struct ExecutionResponse {
     pub truncated: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub deadline_source: Option<String>,
+}
+
+/// A deadline as local wall-clock time plus time left, e.g. `21:30 (7h 58m left)`.
+pub(crate) fn describe_deadline(deadline: &str) -> String {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(deadline) else {
+        return deadline.to_string();
+    };
+    let local = at.with_timezone(&chrono::Local);
+    let clock = if local.date_naive() == chrono::Local::now().date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%Y-%m-%d %H:%M").to_string()
+    };
+    format!(
+        "{clock} ({})",
+        super::leases::format_relative_time(deadline)
+    )
+}
+
+/// Why a command will stop, or did, in words.
+///
+/// The lease case names `kobe extend` because that is the surprise: extending
+/// the lease gives a running command no more time.
+fn deadline_cause(source: &str) -> &'static str {
+    match source {
+        "lease" => "when the lease expires; kobe extend does not move it",
+        _ => "when --timeout elapses",
+    }
 }
 
 /// The process exit code for one execution result.
@@ -295,6 +334,16 @@ pub async fn exec(
                     result.id,
                     result.state.to_ascii_lowercase()
                 );
+                if let (Some(deadline), Some(source)) = (
+                    result.deadline.as_deref(),
+                    result.deadline_source.as_deref(),
+                ) {
+                    println!(
+                        "  stops at {} {}",
+                        describe_deadline(deadline),
+                        deadline_cause(source)
+                    );
+                }
                 println!("  kobe logs {lease} --execution {} --follow", result.id);
                 println!("  kobe cancel {lease} --execution {}", result.id);
             }
@@ -440,6 +489,8 @@ fn emit(
             stdout: result.stdout.clone().unwrap_or_default(),
             stderr: result.stderr.clone().unwrap_or_default(),
             truncated: result.truncated,
+            deadline: result.deadline.clone(),
+            deadline_source: result.deadline_source.clone(),
             cleanup,
         }),
         OutputFormat::Text => {
@@ -456,7 +507,23 @@ fn emit(
             }
             // A state that is not a completed command needs saying: a caller
             // seeing empty output and exit 125 should not have to guess why.
-            if result.exit_code.is_none() {
+            if result.state == "TimedOut"
+                && let (Some(deadline), Some(source)) = (
+                    result.deadline.as_deref(),
+                    result.deadline_source.as_deref(),
+                )
+            {
+                let at = chrono::DateTime::parse_from_rfc3339(deadline)
+                    .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                    .unwrap_or_else(|_| deadline.to_string());
+                match source {
+                    "lease" => eprintln!(
+                        "kobe: stopped at {at} because the lease expired. \
+                         kobe extend does not move a running command's deadline."
+                    ),
+                    _ => eprintln!("kobe: stopped at {at} because --timeout elapsed"),
+                }
+            } else if result.exit_code.is_none() {
                 eprintln!(
                     "kobe: execution ended in state {}{}",
                     result.state,
@@ -2202,6 +2269,8 @@ mod tests {
             stderr: Some("err".into()),
             truncated: false,
             reason: None,
+            deadline: None,
+            deadline_source: None,
         }
     }
 
@@ -2614,6 +2683,58 @@ mod tests {
         assert!(validate_log_window("stdout", 10, &window).is_ok());
     }
 
+    /// The lease case names `kobe extend`, because extending is what a user
+    /// tries when a long command is about to run out of time.
+    #[test]
+    fn a_lease_deadline_says_extend_does_not_move_it() {
+        assert!(deadline_cause("lease").contains("kobe extend does not move it"));
+        assert_eq!(deadline_cause("timeout"), "when --timeout elapses");
+    }
+
+    /// Agents read the deadline from JSON; it is omitted, not null, when the
+    /// server predates it.
+    #[test]
+    fn machine_output_carries_the_deadline_when_the_server_sent_one() {
+        let result: ExecutionResponse = serde_json::from_value(serde_json::json!({
+            "id": "sbxe-1",
+            "state": "Running",
+            "deadline": "2026-09-18T21:30:00+00:00",
+            "deadlineSource": "lease"
+        }))
+        .unwrap();
+        assert_eq!(
+            result.deadline.as_deref(),
+            Some("2026-09-18T21:30:00+00:00")
+        );
+        assert_eq!(result.deadline_source.as_deref(), Some("lease"));
+
+        let output = ExecOutput {
+            api_version: SANDBOX_CLI_API_VERSION,
+            lease: "sbx-1".into(),
+            execution: result.id,
+            state: result.state,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+            deadline: result.deadline,
+            deadline_source: result.deadline_source,
+            cleanup: None,
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["deadline"], "2026-09-18T21:30:00+00:00");
+        assert_eq!(json["deadlineSource"], "lease");
+
+        let older = ExecOutput {
+            deadline: None,
+            deadline_source: None,
+            ..output
+        };
+        let json = serde_json::to_value(&older).unwrap();
+        assert!(json.get("deadline").is_none());
+        assert!(json.get("deadlineSource").is_none());
+    }
+
     /// Machine output is versioned and keeps the streams apart.
     ///
     /// An agent parses this. A field that changed meaning without a version
@@ -2630,6 +2751,8 @@ mod tests {
             stdout: "the output".into(),
             stderr: "the diagnostics".into(),
             truncated: false,
+            deadline: None,
+            deadline_source: None,
             cleanup: None,
         };
         let json: serde_json::Value = serde_json::to_value(&output).unwrap();
@@ -2671,6 +2794,8 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             truncated: false,
+            deadline: None,
+            deadline_source: None,
             // ...and release was not confirmed. Both facts survive.
             cleanup: Some(CleanupOutcome {
                 released: false,

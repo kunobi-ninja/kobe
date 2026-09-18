@@ -285,13 +285,32 @@ pub fn effective_timeout(
         return Err(ExecutionRequestError::Denied(SandboxAccessDenied::Expired));
     }
 
-    let requested_seconds = requested
+    Ok(std::time::Duration::from_secs(
+        requested_seconds(requested).min(remaining_seconds),
+    ))
+}
+
+/// A requested timeout in whole runner seconds, rounded up and at least one.
+fn requested_seconds(requested: std::time::Duration) -> u64 {
+    requested
         .as_secs()
         .saturating_add(u64::from(requested.subsec_nanos() > 0))
-        .max(1);
-    Ok(std::time::Duration::from_secs(
-        requested_seconds.min(remaining_seconds),
-    ))
+        .max(1)
+}
+
+/// Whether the caller's timeout or the lease set an execution's deadline.
+///
+/// `effective` is what [`effective_timeout`] returned for `requested`. It is
+/// shorter only when the lease cut it.
+pub fn deadline_source(
+    requested: std::time::Duration,
+    effective: std::time::Duration,
+) -> crate::crd::ExecutionDeadlineSource {
+    if effective.as_secs() < requested_seconds(requested) {
+        crate::crd::ExecutionDeadlineSource::Lease
+    } else {
+        crate::crd::ExecutionDeadlineSource::Timeout
+    }
 }
 
 /// Validate a request before anything is reserved.
@@ -815,9 +834,13 @@ pub async fn mark_running(
     client: &kube::Client,
     namespace: &str,
     execution: &SandboxExecution,
-    _timeout: std::time::Duration,
+    timeout: std::time::Duration,
+    source: crate::crd::ExecutionDeadlineSource,
 ) -> Result<(), ExecutionRequestError> {
     let started = chrono::Utc::now();
+    let deadline = chrono::Duration::from_std(timeout)
+        .ok()
+        .and_then(|timeout| started.checked_add_signed(timeout));
     mutate_status(client, namespace, execution, |status| {
         crate::crd::transition_execution(status.state, ExecutionState::Running, None)
             .map_err(|_| ExecutionRequestError::Backend)?;
@@ -826,6 +849,10 @@ pub async fn mark_running(
         // A wall clock cannot prove that the runner stopped. Legacy records may
         // carry this field, but current writers never use it as a terminal CAS.
         status.verdict_deadline = None;
+        // Recorded so a caller can see when the command will stop and why,
+        // before it does. The runner, not this field, enforces it.
+        status.deadline = deadline.map(|deadline| deadline.to_rfc3339());
+        status.deadline_source = Some(source);
         Ok(())
     })
     .await
@@ -3180,6 +3207,26 @@ mod tests {
             effective_timeout(std::time::Duration::from_secs(1), &lease, now),
             Err(ExecutionRequestError::Denied(SandboxAccessDenied::Expired))
         ));
+    }
+
+    /// A deadline names what set it, so a caller can tell a lease that ran
+    /// out from a timeout they chose.
+    #[test]
+    fn a_deadline_names_the_lease_only_when_the_lease_cut_it() {
+        use crate::crd::ExecutionDeadlineSource::{Lease, Timeout};
+        let secs = std::time::Duration::from_secs;
+
+        assert_eq!(deadline_source(secs(60), secs(60)), Timeout);
+        assert_eq!(deadline_source(secs(7_200), secs(1_800)), Lease);
+        assert_eq!(
+            deadline_source(std::time::Duration::from_millis(1_500), secs(2)),
+            Timeout,
+            "rounding the caller's timeout up is not the lease cutting it"
+        );
+        assert_eq!(
+            deadline_source(requested_timeout(LEASE_TIMEOUT).unwrap(), secs(17)),
+            Lease
+        );
     }
 
     /// Status writes are conditional on both immutable identity and the exact

@@ -146,6 +146,8 @@ kobe extend <lease-id-or-pool> --ttl 1h
 
 Adds `--ttl` (default `30m`) to the current expiry, subject to `maxExtensions` and the policy ceiling. With no selector, uses your only active lease or opens a picker (JSON mode lists candidates and exits).
 
+A running `kobe exec` keeps the deadline it started with. For a Sandbox lease, `kobe extend` names each running execution that still stops before the new expiry.
+
 ---
 
 ## `kobe release`
