@@ -82,16 +82,16 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator", "kobe-sync", "runner", "agent-workspace"]
+  targets = ["operator", "kobe-sync", "runner", "sandbox"]
 }
 
 group "push" {
-  targets = ["operator-push", "kobe-sync-push", "runner-push", "agent-workspace-push"]
+  targets = ["operator-push", "kobe-sync-push", "runner-push", "sandbox-push"]
 }
 
 # What `hack/e2e.ts` actually loads into kind: operator + kobe-sync always,
 # plus the sandbox-e2e fixture when a leg runs with Sandbox conformance.
-# Deliberately NOT `default` — that also builds `agent-workspace`, a product
+# Deliberately NOT `default` — that also builds `sandbox`, a product
 # image (desktop, AI CLIs, rsync) that no test or harness file references, so
 # every conformance run paid to build the heaviest image in the repo for
 # nothing. `runner` is omitted here too: `sandbox-e2e` pulls it in via its
@@ -227,7 +227,7 @@ target "sandbox-e2e" {
 }
 
 # =============================================================================
-# Agent workspace image
+# Sandbox image
 #
 # Consumes `runner` as a named context for the same reason `sandbox-e2e` does:
 # the binary that ships inside a Sandbox image must be the exact statically
@@ -236,16 +236,16 @@ target "sandbox-e2e" {
 # Unlike `sandbox-e2e` this target IS in `default` and `push` — it is a product
 # image that SandboxPools reference by tag, not a test fixture.
 # =============================================================================
-target "agent-workspace" {
-  dockerfile = "docker/agent-workspace.Dockerfile"
+target "sandbox" {
+  dockerfile = "docker/sandbox.Dockerfile"
   context    = "."
   contexts = {
     runner = "target:runner"
   }
   platforms  = [PLATFORM]
-  tags       = tags("kobe-agent-workspace")
-  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/agent-workspace"]
-  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/agent-workspace,mode=max"]
+  tags       = tags("kobe-sandbox")
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/sandbox"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/sandbox,mode=max"]
   args = {
     BUILD_VERSION = BUILD_VERSION
     BUILD_COMMIT  = BUILD_COMMIT
@@ -267,8 +267,8 @@ target "agent-workspace" {
 # The `default` group has no `runner-push`, so `runner` builds once there and
 # `docker-dry-run` stayed green — the break only ever appeared on a publish.
 # Pointing at `runner-push` keeps exactly one runner target in this group.
-target "agent-workspace-push" {
-  inherits = ["agent-workspace"]
+target "sandbox-push" {
+  inherits = ["sandbox"]
   contexts = {
     runner = "target:runner-push"
   }

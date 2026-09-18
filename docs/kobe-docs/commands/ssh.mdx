@@ -163,9 +163,9 @@ against a `kobe-*` host with no extra setup, because they read the same
 `ssh_config` block `kobe init` wrote.
 
 ```bash
-scp ./overlay.tar kobe-agent-workspace-dev:/tmp/
-scp kobe-agent-workspace-dev:/tmp/results.json .
-rsync -az ./src/ kobe-agent-workspace-dev:/home/agent/work/src/
+scp ./overlay.tar kobe-sandbox-dev:/tmp/
+scp kobe-sandbox-dev:/tmp/results.json .
+rsync -az ./src/ kobe-sandbox-dev:/home/agent/work/src/
 ```
 
 The sandbox is created on the first connection, so these work from cold.
@@ -188,7 +188,7 @@ one operation each.
 
 ## What the pool needs
 
-The `zondax/kobe-agent-workspace` images ship `kobe-sshd`, which serves one
+The `zondax/kobe-sandbox` images ship `kobe-sshd`, which serves one
 session over the attach stream as the workload user. No port is opened, so
 `exposedPorts` is not involved. A custom image needs `openssh-server`, a
 `kobe-sshd` launcher, and an account that sshd will let in; see the image's

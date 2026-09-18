@@ -120,7 +120,7 @@ The remote stdin is closed once the bytes are delivered, which is what lets a
 tool that reads until EOF finish instead of hanging until its timeout. Without
 `--stdin` the command reads `/dev/null`, exactly as it always has.
 
-Agent workspace images include `gh`. To give one an authenticated HTTPS Git
+Sandbox images include `gh`. To give one an authenticated HTTPS Git
 credential, forward the host token over stdin, then configure Git without ever
 putting the token in command arguments:
 
