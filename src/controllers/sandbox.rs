@@ -33,6 +33,7 @@ use kube::api::{
     Preconditions, PropagationPolicy,
 };
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher::Config;
 use kube::{Client, Resource, ResourceExt};
 use tokio_util::sync::CancellationToken;
@@ -9041,11 +9042,14 @@ async fn compose_child_target(
     .await
     {
         Ok(binding) => binding,
-        // Still queuing for capacity. Normal, and not an error.
+        // Still queuing for capacity. Normal, and not an error. The binding
+        // arrives as a watch event (see `internal_cluster_lease_trigger`), so
+        // this timer is only the backstop for a dropped or missed event, not
+        // how the controller normally learns the cluster is bound.
         Err(error) => {
             debug!(lease = %name, error = %error, "child cluster not bound yet");
             return Ok(ChildTarget::Pending(Action::requeue(
-                std::time::Duration::from_secs(15),
+                CHILD_BINDING_BACKSTOP,
             )));
         }
     };
@@ -9759,6 +9763,37 @@ where
     }
 }
 
+/// Backstop poll while a child placement waits for its internal `ClusterLease`
+/// to bind.
+///
+/// The `ClusterLease` watch is what normally wakes the reconciler, within a
+/// second of the bind. This interval only covers a dropped watch event, so it
+/// is long on purpose: a shorter one would poll the apiserver for every
+/// queued child lease and buy nothing when the watch is healthy.
+const CHILD_BINDING_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Map an internal `ClusterLease` back to the `SandboxLease` that composed it.
+///
+/// `build_internal_cluster_lease` stamps the outer lease's name and UID onto
+/// every handle it creates, so the mapping needs no API call. Anything without
+/// both stamps belongs to a direct cluster lease and triggers nothing here.
+fn internal_cluster_lease_trigger(
+    cluster_lease: &crate::crd::ClusterLease,
+) -> Option<ObjectRef<SandboxLease>> {
+    let annotations = cluster_lease.metadata.annotations.as_ref()?;
+    let outer_name = annotations
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION)
+        .filter(|name| !name.is_empty())?;
+    cluster_lease
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(crate::sandbox::SANDBOX_LEASE_UID_LABEL))
+        .filter(|uid| !uid.is_empty())?;
+    let namespace = cluster_lease.metadata.namespace.as_ref()?;
+    Some(ObjectRef::new(outer_name).within(namespace))
+}
+
 /// Run Sandbox lifecycle until shutdown.
 ///
 /// Pool placement is started only when `placement_enabled`. The lease loop is
@@ -9789,6 +9824,8 @@ pub async fn run_sandbox_controller(
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
+    let internal_cluster_leases: Api<crate::crd::ClusterLease> =
+        Api::namespaced(client.clone(), namespace);
     let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
 
     if placement_enabled {
@@ -9818,6 +9855,16 @@ pub async fn run_sandbox_controller(
     let lease_shutdown = shutdown.clone();
     let lease_loop = async move {
         Controller::new(leases, Config::default())
+            // A child placement waits for its internal ClusterLease to bind.
+            // Without this the controller only finds out on a timer, which is
+            // most of the wait: the bind itself takes a second or two.
+            .watches(
+                internal_cluster_leases,
+                Config::default(),
+                |cluster_lease: crate::crd::ClusterLease| {
+                    internal_cluster_lease_trigger(&cluster_lease).into_iter()
+                },
+            )
             .graceful_shutdown_on(async move { lease_shutdown.cancelled().await })
             .run(reconcile_lease, lease_error_policy, ctx)
             .for_each(|result| async move {
@@ -12204,10 +12251,62 @@ pub(crate) mod tests {
         assert_eq!(status["releaseCause"], "ProvisioningDeadline");
     }
 
+    /// The watch is only as good as this mapping: if a handle stops resolving to
+    /// its outer lease, nothing fails loudly — child placements just go back to
+    /// waiting out the backstop timer.
+    #[test]
+    fn an_internal_handle_maps_back_to_the_lease_that_composed_it() {
+        let lease = admitted_lease();
+        let handle = crate::controllers::sandbox_child::build_internal_cluster_lease(
+            &lease,
+            "child-pool",
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("the fixture carries a UID");
+
+        let trigger = internal_cluster_lease_trigger(&handle).expect("handle maps to its lease");
+        assert_eq!(trigger.name, lease.name_any());
+        assert_eq!(trigger.namespace, lease.namespace());
+    }
+
+    #[test]
+    fn a_cluster_lease_that_is_not_a_child_handle_triggers_nothing() {
+        let lease = admitted_lease();
+        let handle = crate::controllers::sandbox_child::build_internal_cluster_lease(
+            &lease,
+            "child-pool",
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("the fixture carries a UID");
+
+        // A lease a tenant took directly carries neither stamp.
+        let mut direct = handle.clone();
+        direct.metadata.labels = None;
+        direct.metadata.annotations = None;
+        assert!(internal_cluster_lease_trigger(&direct).is_none());
+
+        // The name alone is not enough: without the UID stamp this is not a
+        // handle this controller composed.
+        let mut name_only = handle.clone();
+        name_only.metadata.labels = None;
+        assert!(internal_cluster_lease_trigger(&name_only).is_none());
+
+        // And a stamp that was blanked out must not resolve to an empty name.
+        let mut blank = handle;
+        if let Some(annotations) = blank.metadata.annotations.as_mut() {
+            annotations.insert(
+                crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.to_string(),
+                String::new(),
+            );
+        }
+        assert!(internal_cluster_lease_trigger(&blank).is_none());
+    }
+
     /// Child allocation persists the exact handle before binding can block.
     /// The handle itself has no ownerRef, so the outer finalizer—not GC—owns
     /// the receipt lifecycle.
     #[tokio::test]
+
     async fn child_handle_identity_is_checkpointed_before_binding() {
         const CHILD_POOL_PATH: &str =
             "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool";
