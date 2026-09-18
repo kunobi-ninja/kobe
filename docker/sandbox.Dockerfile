@@ -50,8 +50,10 @@ FROM debian:bookworm-slim
 # (below) as the workload user in inetd mode. No port is opened.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         autocutsel \
+        bc \
         build-essential \
         ca-certificates \
+        clang \
         curl \
         dbus \
         file \
@@ -75,6 +77,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         librsvg2-dev \
         libssl-dev \
         libwebkit2gtk-4.1-dev \
+# X11 keyboard and XCB libraries that GPUI-based apps (gpui-kit) link against.
+# `xkbcommon-x11.pc` requires `xcb-xkb`, so pkg-config needs both -dev packages;
+# the pkg-config check after the install fails the build if either goes missing.
+        libx11-xcb-dev \
+        libxcb-xkb-dev \
+        libxcb-xkb1 \
+        libxkbcommon-x11-0 \
+        libxkbcommon-x11-dev \
         novnc \
         openbox \
         openssh-client \
@@ -95,6 +105,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xterm \
         xvfb \
         xz-utils \
+    && pkg-config --exists xkbcommon-x11 x11-xcb xcb-xkb \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Workload identity ------------------------------------------------------
