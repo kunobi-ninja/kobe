@@ -170,6 +170,25 @@ pub struct SandboxExecutionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     pub verdict_deadline: Option<String>,
+    /// When the runner stops the command, fixed when it starts.
+    ///
+    /// Extending the lease afterwards does not move it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub deadline: Option<String>,
+    /// What set `deadline`: the caller's timeout, or the lease's expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_source: Option<ExecutionDeadlineSource>,
+}
+
+/// What set an execution's deadline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionDeadlineSource {
+    /// The caller's timeout ends before the lease does.
+    Timeout,
+    /// The lease expires first, so it ends the command.
+    Lease,
 }
 
 /// Where an execution is.

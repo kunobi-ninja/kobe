@@ -467,6 +467,11 @@ The response reports the new expiry and the remaining budget:
 { "expiresAt": "2026-08-10T01:32:00Z", "extensionsCount": 1, "maxExtensions": 2 }
 ```
 
+When the lease has running executions that still stop before the new expiry,
+the response lists them in `runningExecutions` (`id`, `deadline`). An
+execution's deadline is fixed when it starts, so extending the lease does not
+give it more time.
+
 Authorized by the `lease` verb rather than one of its own: an extension can
 never move expiry past `maxTtl` measured from readiness, which is the same
 ceiling the caller could have requested at creation. Set `maxExtensions: 0` on
@@ -553,6 +558,8 @@ Wait mode (`detach: false`) returns `200 OK` after the supervised command ends:
   "exitCode": 0,
   "startedAt": "2026-08-20T12:01:00Z",
   "finishedAt": "2026-08-20T12:01:12Z",
+  "deadline": "2026-08-20T13:01:00Z",
+  "deadlineSource": "timeout",
   "stdout": "analysis complete\n",
   "stderr": "",
   "truncated": false
@@ -565,7 +572,9 @@ starting another process.
 
 Execution states are `Queued`, `Running`, `Succeeded`, `Failed`, `Cancelled`,
 `TimedOut`, and `Unknown`. `exitCode` is present only when the remote process
-reported one. `Unknown` means Kobe could not establish the outcome and must not
+reported one. `deadline` is when the runner stops the command, fixed at start;
+`deadlineSource` is `timeout` when the caller's timeout set it and `lease` when
+the lease expiry cut it. `Unknown` means Kobe could not establish the outcome and must not
 be treated as permission to rerun effects automatically.
 
 Common failures are `400` for an invalid command, timeout, cwd, stdin, or

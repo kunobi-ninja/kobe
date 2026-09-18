@@ -193,6 +193,12 @@ struct ExecutionResponse {
     finished_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// When the runner stops the command. Fixed at start; extending the lease
+    /// does not move it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_source: Option<crate::crd::ExecutionDeadlineSource>,
     /// Present only in wait mode, and kept distinct — a caller that cannot
     /// separate a tool's diagnostics from its output cannot parse either.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,6 +221,8 @@ fn execution_response(
         started_at: status.started_at,
         finished_at: status.finished_at,
         reason: status.reason,
+        deadline: status.deadline,
+        deadline_source: status.deadline_source,
         stdout: output.as_ref().map(|output| output.stdout.clone()),
         stderr: output.as_ref().map(|output| output.stderr.clone()),
         truncated: output.is_some_and(|output| output.truncated),
@@ -587,7 +595,8 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // spawn authority permanently: a retry may observe the runner, but never
     // call `start` again. The workload shares the runner UID and can remove or
     // replace its spool, so target-side NotFound is not a no-spawn proof.
-    if executions::mark_running(&state.client, &state.namespace, &reserved, timeout)
+    let source = executions::deadline_source(requested_timeout, timeout);
+    if executions::mark_running(&state.client, &state.namespace, &reserved, timeout, source)
         .await
         .is_err()
     {
@@ -4910,6 +4919,57 @@ struct ExtendSandboxLeaseResponse {
     expires_at: String,
     extensions_count: u32,
     max_extensions: u32,
+    /// Running executions whose deadline stays before the new expiry. An
+    /// execution's deadline is fixed when it starts, so extending the lease
+    /// does not give it more time.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    running_executions: Vec<RunningExecutionDeadline>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningExecutionDeadline {
+    id: String,
+    deadline: String,
+}
+
+/// Running executions of one lease that end before `expiry`.
+///
+/// Best effort: the extension has already landed, so a failed list only drops
+/// the warning. It never fails the request.
+async fn executions_ending_before(
+    client: &kube::Client,
+    namespace: &str,
+    lease_uid: &str,
+    expiry: chrono::DateTime<chrono::Utc>,
+) -> Vec<RunningExecutionDeadline> {
+    let executions: Api<crate::crd::SandboxExecution> = Api::namespaced(client.clone(), namespace);
+    let params = kube::api::ListParams::default()
+        .labels(&format!("kobe.kunobi.ninja/sandbox-lease-uid={lease_uid}"));
+    let list = match executions.list(&params).await {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::debug!(error = %err, "could not list executions for the extend response");
+            return Vec::new();
+        }
+    };
+    let mut ending: Vec<RunningExecutionDeadline> = list
+        .items
+        .into_iter()
+        .filter_map(|execution| {
+            let status = execution.status.as_ref()?;
+            if status.state != crate::crd::ExecutionState::Running {
+                return None;
+            }
+            let deadline = status.deadline.clone()?;
+            (parse_lease_timestamp(&deadline)? < expiry).then(|| RunningExecutionDeadline {
+                id: execution.name_any(),
+                deadline,
+            })
+        })
+        .collect();
+    ending.sort_by(|a, b| a.deadline.cmp(&b.deadline));
+    ending
 }
 
 /// Extend the runtime TTL of a Ready Sandbox lease.
@@ -5189,12 +5249,15 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
         extension_number = next_count,
         "Sandbox lease TTL extended"
     );
+    let running_executions =
+        executions_ending_before(&state.client, &state.namespace, &uid, derived_expiry).await;
     (
         StatusCode::OK,
         Json(ExtendSandboxLeaseResponse {
             expires_at: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             extensions_count: next_count,
             max_extensions: grant.max_extensions,
+            running_executions,
         }),
     )
         .into_response()
@@ -10053,6 +10116,61 @@ mod tests {
 
     /// The durable effect is what matters: expiry moves and the budget is
     /// spent in the same write, so a crash cannot grant a free extension.
+    /// Extending a lease does not move a running command's deadline, so the
+    /// response names every running execution that still stops first.
+    #[tokio::test]
+    async fn extending_names_running_executions_the_extension_does_not_reach() {
+        let server = MockServer::start().await;
+        mount_extendable(&server, extendable_lease_json("sandbox-extend", 0)).await;
+        let soon = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        let later = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc3339();
+        let execution = |name: &str, state: &str, deadline: &str| {
+            let mut execution = execution_json(true);
+            execution["metadata"]["name"] = serde_json::json!(name);
+            execution["status"] = serde_json::json!({
+                "state": state, "deadline": deadline, "deadlineSource": "lease"
+            });
+            execution
+        };
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "SandboxExecutionList",
+                "metadata": {},
+                "items": [
+                    execution("sbxe-cut", "Running", &soon),
+                    execution("sbxe-past-expiry", "Running", &later),
+                    execution("sbxe-done", "Succeeded", &soon),
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let response = extend(&server, "sandbox-extend", "30m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["runningExecutions"],
+            serde_json::json!([{ "id": "sbxe-cut", "deadline": soon }])
+        );
+    }
+
+    /// The warning is best effort: a failed execution list still returns the
+    /// extension that already landed.
+    #[tokio::test]
+    async fn extending_succeeds_without_the_warning_when_executions_cannot_be_listed() {
+        let server = MockServer::start().await;
+        mount_extendable(&server, extendable_lease_json("sandbox-extend", 0)).await;
+
+        let response = extend(&server, "sandbox-extend", "30m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(body.get("runningExecutions").is_none());
+    }
+
     #[tokio::test]
     async fn extending_a_ready_lease_moves_expiry_and_spends_one_extension() {
         let server = MockServer::start().await;
@@ -15318,6 +15436,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             reason: Some("completed".into()),
+            deadline: Some("2026-09-18T21:30:00+00:00".into()),
+            deadline_source: Some(crate::crd::ExecutionDeadlineSource::Lease),
             stdout: Some("out".into()),
             stderr: Some("err".into()),
             truncated: false,
@@ -15325,6 +15445,8 @@ mod tests {
         .unwrap();
         assert_eq!(response["exitCode"], 42);
         assert!(response.get("exit_code").is_none());
+        assert_eq!(response["deadline"], "2026-09-18T21:30:00+00:00");
+        assert_eq!(response["deadlineSource"], "lease");
     }
 
     fn pool_json_with_runner() -> serde_json::Value {
