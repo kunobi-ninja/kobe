@@ -34,7 +34,7 @@ clap = { version = "4", features = ["derive"] }
 # cross-build this dependency set is kept slim for.
 png = "0.17"
 clap_complete = "4"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
