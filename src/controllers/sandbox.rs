@@ -3016,10 +3016,15 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
         let receipt_verified = receipt_token.is_some();
         let receipt_evidence_is_authoritative = match status.teardown_receipt.as_ref() {
             Some(receipt) if crate::receipt_authority::is_separate() => {
-                authoritative_child_receipt_matches(client, namespace, &handle, receipt)
-                    .await
-                    .ok()
-                    .flatten()
+                // A read-only "is this authoritative yet" probe. Unpublished
+                // and mismatched are both "not yet authoritative" here, and
+                // neither withholds anything, so the distinction that matters
+                // at the teardown decision does not matter at this one.
+                match authoritative_child_receipt_matches(client, namespace, &handle, receipt).await
+                {
+                    Ok(ChildReceiptAuthority::Verified(evidence)) => Some(*evidence),
+                    _ => None,
+                }
             }
             _ => None,
         };
@@ -6319,14 +6324,38 @@ async fn release_child_composition(
                 ))
                 .await
                 {
-                    Ok(Some(evidence)) => evidence,
-                    Ok(None) => {
+                    Ok(ChildReceiptAuthority::Verified(evidence)) => *evidence,
+                    Ok(ChildReceiptAuthority::Mismatched) => {
                         return quarantine_lease(
                             lease,
                             ctx,
                             QuarantineReason::ChildReceiptAuthorityUnverified,
                         )
                         .await;
+                    }
+                    // Nothing published yet. Withholding capacity here would
+                    // punish a lease for being looked at too early — which is
+                    // exactly what happens once a watch drives this path
+                    // instead of a timer. Wait, but not forever: an authority
+                    // that has genuinely stopped still has to reach a verdict.
+                    Ok(ChildReceiptAuthority::NotPublished) => {
+                        if child_evidence_patience_exhausted(&status) {
+                            warn!(
+                                lease = %name,
+                                "child published no teardown evidence within the patience window"
+                            );
+                            return quarantine_lease(
+                                lease,
+                                ctx,
+                                QuarantineReason::ChildReceiptAuthorityUnverified,
+                            )
+                            .await;
+                        }
+                        debug!(
+                            lease = %name,
+                            "child teardown evidence not published yet; waiting"
+                        );
+                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
                     }
                     Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
                         return quarantine_lease(
@@ -6888,20 +6917,27 @@ async fn authoritative_child_receipt_matches(
     namespace: &str,
     lease: &crate::crd::ClusterLease,
     receipt: &crate::crd::TeardownReceipt,
-) -> Result<Option<crate::crd::TeardownEvidenceReference>, kube::Error> {
+) -> Result<ChildReceiptAuthority, kube::Error> {
+    // Absent status, absent reference and an unset UID all say the child has
+    // not got there yet — not that it disagrees. They are reachable in the
+    // window between the receipt being observed and the evidence being
+    // persisted: a few hundred milliseconds, unreachable while a 5s requeue
+    // paced this path and routine once a watch drives it.
     let Some(status) = lease.status.as_ref() else {
-        return Ok(None);
+        return Ok(ChildReceiptAuthority::NotPublished);
     };
     let Some(reference) = status.teardown_evidence.as_ref() else {
-        return Ok(None);
+        return Ok(ChildReceiptAuthority::NotPublished);
     };
     let Some(lease_uid) = lease.uid().filter(|uid| !uid.trim().is_empty()) else {
-        return Ok(None);
+        return Ok(ChildReceiptAuthority::NotPublished);
     };
+    // Past here the child has published a reference, so every remaining answer
+    // is a judgement about what it published, and no retry changes it.
     let expected_name =
         crate::crd::verified_teardown_evidence_name(&lease_uid, &receipt.attempt_id);
     if reference.name != expected_name || reference.generation < 1 {
-        return Ok(None);
+        return Ok(ChildReceiptAuthority::Mismatched);
     }
     let evidence_api: Api<crate::crd::VerifiedTeardownEvidence> =
         Api::namespaced(client.clone(), namespace);
@@ -6912,7 +6948,50 @@ async fn authoritative_child_receipt_matches(
         && evidence.spec.lease.uid.as_deref() == Some(lease_uid.as_str())
         && evidence.spec.attempt_id == receipt.attempt_id
         && evidence.spec.receipt == *receipt;
-    Ok((identity_matches && content_matches).then(|| reference.clone()))
+    if identity_matches && content_matches {
+        Ok(ChildReceiptAuthority::Verified(Box::new(reference.clone())))
+    } else {
+        Ok(ChildReceiptAuthority::Mismatched)
+    }
+}
+
+/// What the authoritative-evidence lookup established.
+///
+/// These are not the same fact, and collapsing them into one `Option` is what
+/// let a teardown quarantine on a race. `Mismatched` is durable uncertainty
+/// and must withhold capacity. `NotPublished` only says the child has not
+/// written its evidence reference *yet*, which a later reconcile can change
+/// and which says nothing about whether the footprint is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildReceiptAuthority {
+    Verified(Box<crate::crd::TeardownEvidenceReference>),
+    Mismatched,
+    NotPublished,
+}
+
+/// How long a teardown may wait for the child to publish its evidence before
+/// the silence is treated as durable uncertainty.
+///
+/// Bounded, because "not yet" must not become "never" without a verdict: an
+/// authority that has genuinely stopped writing still has to quarantine, just
+/// later than a mismatch does. Sized well above the few hundred milliseconds
+/// the write actually takes, and well below the teardown windows the duration
+/// histogram is bucketed for, so a real stall is still caught inside one.
+const CHILD_EVIDENCE_PATIENCE: chrono::Duration = chrono::Duration::seconds(90);
+
+/// Whether teardown has been waiting longer than [`CHILD_EVIDENCE_PATIENCE`].
+///
+/// A lease with no `releasingAt` — one that entered Releasing under an older
+/// operator — is treated as out of patience rather than waiting forever on a
+/// start that will never appear.
+fn child_evidence_patience_exhausted(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    let Some(started) = status.releasing_at.as_deref() else {
+        return true;
+    };
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(started) else {
+        return true;
+    };
+    chrono::Utc::now() - started.with_timezone(&chrono::Utc) > CHILD_EVIDENCE_PATIENCE
 }
 
 /// ACK and retire the receipt-bearing internal lease after evidence is durable.
@@ -7103,8 +7182,13 @@ async fn finish_child_release_after_proof(
         )
         .await
         {
-            Ok(Some(evidence)) => evidence,
-            Ok(None) => {
+            Ok(ChildReceiptAuthority::Verified(evidence)) => *evidence,
+            // Post-proof re-read: this evidence validated once already. Both
+            // "gone" and "disagrees" mean it stopped validating, which is the
+            // same alarming fact, so they keep sharing an outcome. The
+            // not-yet-written case cannot occur here — it was written before
+            // this path was reachable.
+            Ok(ChildReceiptAuthority::Mismatched | ChildReceiptAuthority::NotPublished) => {
                 return record_post_proof_cleanup_failure(
                     lease,
                     ctx,
@@ -9602,12 +9686,16 @@ async fn reconcile_receipt_ack_authority(
         status.child_teardown_evidence.as_ref(),
         child_status.teardown_receipt.as_ref(),
     ) {
-        let Some(authoritative) =
+        // Already retryable before the three-state split: this path withholds
+        // nothing, so an unpublished reference and a mismatched one both just
+        // come back later.
+        let ChildReceiptAuthority::Verified(authoritative) =
             authoritative_child_receipt_matches(&ctx.client, &ctx.namespace, &child, receipt)
                 .await?
         else {
             return Ok(Action::requeue(std::time::Duration::from_secs(30)));
         };
+        let authoritative = *authoritative;
         let Some(recorded_pool) = recorded_child_pool(&status, &ctx.namespace) else {
             return Ok(Action::requeue(std::time::Duration::from_secs(60)));
         };
@@ -13095,6 +13183,46 @@ pub(crate) mod tests {
 
     /// Teardown holds the caller's quota slot until absence is proven, so the
     /// time it takes is time the caller cannot lease again. Nothing measured
+    /// Waiting for evidence is bounded, and the bound is measured from the
+    /// teardown's own start.
+    ///
+    /// The whole point of separating `NotPublished` from `Mismatched` is that
+    /// the first one waits. If it waited forever, a child authority that
+    /// stopped writing would hold a lease in Releasing indefinitely and never
+    /// reach a verdict — trading a wrong quarantine for a missing one, which
+    /// is worse: a quarantine is visible and an operator can act on it.
+    #[test]
+    fn evidence_patience_is_bounded_and_measured_from_releasing_at() {
+        let fresh = crate::crd::SandboxLeaseStatus {
+            releasing_at: Some((chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()),
+            ..Default::default()
+        };
+        assert!(
+            !child_evidence_patience_exhausted(&fresh),
+            "a teardown that just started must still wait for the child's evidence"
+        );
+
+        let stalled = crate::crd::SandboxLeaseStatus {
+            releasing_at: Some(
+                (chrono::Utc::now() - CHILD_EVIDENCE_PATIENCE - chrono::Duration::seconds(1))
+                    .to_rfc3339(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            child_evidence_patience_exhausted(&stalled),
+            "past the window, silence has to become a verdict"
+        );
+
+        // A lease that entered Releasing under an older operator carries no
+        // start. Waiting on a timestamp that will never arrive would be the
+        // unbounded case by another route.
+        assert!(
+            child_evidence_patience_exhausted(&crate::crd::SandboxLeaseStatus::default()),
+            "no releasingAt must not mean infinite patience"
+        );
+    }
+
     /// it before, which made a slow teardown and a stuck one look identical.
     #[test]
     fn teardown_duration_is_recorded_per_outcome() {
