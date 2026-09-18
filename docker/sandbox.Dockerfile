@@ -361,5 +361,8 @@ LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox worksp
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
 # Idle until the lease drives it. TERM is trapped so a released lease tears the
-# container down promptly instead of waiting out the grace period.
-CMD ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"]
+# container down promptly instead of waiting out the grace period. The shell
+# runs a trap only once its foreground child returns, so `sleep` must run in the
+# background: `wait` returns on the signal, while a foreground `sleep 3600`
+# held TERM until the kubelet's SIGKILL.
+CMD ["/bin/sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"]
