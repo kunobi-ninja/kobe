@@ -519,11 +519,7 @@ mod tests {
     /// call the lease, and the SSH path needs it to reach one they created.
     #[test]
     fn host_carries_the_name_after_the_pool() {
-        let spec = parse_host(
-            "kobe-sandbox-kache-mutants-m2",
-            &pools(&["sandbox"]),
-        )
-        .unwrap();
+        let spec = parse_host("kobe-sandbox-kache-mutants-m2", &pools(&["sandbox"])).unwrap();
         assert_eq!(spec.pool.as_deref(), Some("sandbox"));
         assert_eq!(spec.alias, "kobe-sandbox-kache-mutants-m2");
         assert_eq!(
