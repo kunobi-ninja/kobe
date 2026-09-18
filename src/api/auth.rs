@@ -1658,6 +1658,22 @@ mod tests {
             .expect("the interactive provider must be advertised");
         assert_eq!(doc.client_id, "kobe-cli");
         assert_eq!(doc.audience, None);
+
+        // Same when the client id is not the first audience: the ID token
+        // still satisfies the list, so there is nothing to request.
+        let mixed: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "clerk" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://clerk.example",
+                "audience": ["kobe-api", "kobe-cli"], "algorithms": ["RS256"],
+                "clientId": "kobe-cli"
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![mixed], HashMap::new()).await;
+        let doc = auth.discovery_metadata().await.unwrap();
+        assert_eq!(doc.audience, None);
     }
 
     #[tokio::test]

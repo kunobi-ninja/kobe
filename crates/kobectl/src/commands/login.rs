@@ -146,7 +146,8 @@ fn retrust_pin(store: &TofuStore, service_config: &ServiceConfig) -> Result<Opti
         TofuResult::IssuerChanged {
             previous, current, ..
         } => Some(format!(
-            "Re-pinned the auth issuer for {endpoint}: {previous:?} -> {current:?}"
+            "Re-pinned the auth issuer for {endpoint}: {previous:?} -> {current:?} \
+             (audience now {audience:?})"
         )),
         TofuResult::AudienceChanged {
             previous, current, ..
