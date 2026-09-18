@@ -147,7 +147,7 @@ kobe exec gui -- kobe-desktop status
 ```
 
 `kobe-desktop start` is idempotent and runs the desktop supervisor in a dedicated
-tmux server, so it outlives the one-hour runner-execution limit. Use
+tmux server, so it outlives the `kobe exec` that started it. Use
 `kobe-desktop logs`, `kobe-desktop terminal`, or `kobe-desktop browser` to
 inspect the session. `kobe-desktop stop` stops only that managed desktop.
 

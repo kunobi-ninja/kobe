@@ -238,12 +238,25 @@ pub const MAX_EXECUTION_STDIN_BYTES: usize = kobe_runner::protocol::MAX_STDIN_BY
 /// correlate a record with a caller's own logs.
 pub const MAX_IDEMPOTENCY_KEY: usize = 253;
 
-/// Longest a command may be allowed to run.
+/// The timeout recorded when the caller names none.
 ///
-/// The caller picks the timeout; this is the ceiling. An execution outliving
-/// its own lease would be cancelled mid-flight by teardown, which is a worse
-/// outcome than refusing the request.
-pub const MAX_EXECUTION_TIMEOUT: chrono::Duration = chrono::Duration::hours(1);
+/// The command may run until its lease expires. The lease is the only ceiling:
+/// [`effective_timeout`] clamps every execution to the time the lease still
+/// owns, so a fixed global maximum could only cut off work the lease allows.
+pub const LEASE_TIMEOUT: &str = "lease";
+
+/// Parse a request's timeout: a positive duration, or [`LEASE_TIMEOUT`].
+///
+/// [`LEASE_TIMEOUT`] parses to [`std::time::Duration::MAX`], which
+/// [`effective_timeout`] then clamps to the lease's remaining time.
+pub fn requested_timeout(timeout: &str) -> Option<std::time::Duration> {
+    if timeout == LEASE_TIMEOUT {
+        return Some(std::time::Duration::MAX);
+    }
+    crate::pool::parse_duration(timeout)
+        .filter(|timeout| *timeout > chrono::Duration::zero())
+        .and_then(|timeout| timeout.to_std().ok())
+}
 
 /// Clamp one execution to the time its exact lease still owns.
 ///
@@ -319,11 +332,9 @@ pub fn validate_request(request: &ExecutionRequest) -> Result<(), ExecutionReque
         // reservation so an oversized request cannot spend an idempotency key.
         return Err(ExecutionRequestError::Invalid { what: "stdin" });
     }
-    match crate::pool::parse_duration(&request.timeout) {
-        Some(timeout) if timeout > chrono::Duration::zero() && timeout <= MAX_EXECUTION_TIMEOUT => {
-            Ok(())
-        }
-        _ => Err(ExecutionRequestError::Invalid { what: "timeout" }),
+    match requested_timeout(&request.timeout) {
+        Some(_) => Ok(()),
+        None => Err(ExecutionRequestError::Invalid { what: "timeout" }),
     }
 }
 
@@ -2962,22 +2973,26 @@ mod tests {
         }
     }
 
-    /// A command may not be allowed to outlive its own lease.
+    /// The lease is the only ceiling on a timeout.
     ///
-    /// One that did would be cancelled mid-flight by teardown, which is a
-    /// worse outcome — and a less legible one — than refusing the request.
+    /// Anything positive is accepted here, including hours past the old
+    /// one-hour limit; [`effective_timeout`] clamps it to the lease at start.
     #[test]
-    fn a_timeout_is_bounded_at_both_ends() {
+    fn a_timeout_is_positive_and_otherwise_bounded_only_by_the_lease() {
         let with_timeout = |timeout: &str| {
             let mut request = request();
             request.timeout = timeout.to_string();
             validate_request(&request)
         };
 
-        assert!(with_timeout("1s").is_ok());
-        assert!(with_timeout("1h").is_ok());
+        for good in ["1s", "1h", "2h", "24h", LEASE_TIMEOUT] {
+            assert!(
+                with_timeout(good).is_ok(),
+                "timeout {good:?} must be accepted"
+            );
+        }
 
-        for bad in ["", "0s", "-1m", "2h", "24h", "forever", "60"] {
+        for bad in ["", "0s", "-1m", "forever", "60", "Lease"] {
             assert!(
                 with_timeout(bad).is_err(),
                 "timeout {bad:?} must be refused"
@@ -3127,7 +3142,7 @@ mod tests {
     }
 
     /// An execution's wall-clock bound is never longer than the lease that
-    /// authorises it, even when the caller asks for the global maximum.
+    /// authorises it, whatever the caller asks for.
     #[test]
     fn an_execution_timeout_never_outlives_its_lease() {
         let now = chrono::Utc::now();
@@ -3141,6 +3156,11 @@ mod tests {
             effective_timeout(std::time::Duration::from_secs(3_600), &lease, now).unwrap(),
             std::time::Duration::from_secs(17),
             "lease time is rounded down, never granted past expiresAt"
+        );
+        assert_eq!(
+            effective_timeout(requested_timeout(LEASE_TIMEOUT).unwrap(), &lease, now).unwrap(),
+            std::time::Duration::from_secs(17),
+            "an omitted timeout runs until the lease expires"
         );
         assert_eq!(
             effective_timeout(std::time::Duration::from_millis(1_500), &lease, now).unwrap(),

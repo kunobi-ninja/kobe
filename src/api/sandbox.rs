@@ -342,7 +342,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         cwd: request.cwd,
         timeout: request
             .timeout
-            .unwrap_or_else(|| DEFAULT_EXECUTION_TIMEOUT.to_string()),
+            .unwrap_or_else(|| executions::LEASE_TIMEOUT.to_string()),
         idempotency_key: request.idempotency_key,
         detached: request.detach,
         stdin,
@@ -366,8 +366,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     if let Err(error) = executions::validate_request(&requested) {
         return execution_denied(&identity, &id, &error);
     }
-    let requested_timeout = crate::pool::parse_duration(&requested.timeout)
-        .and_then(|timeout| timeout.to_std().ok())
+    let requested_timeout = executions::requested_timeout(&requested.timeout)
         .expect("validated execution timeout must parse");
     let initial_timeout =
         match executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now()) {
@@ -611,9 +610,6 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     )
     .await
 }
-
-/// Default bound when a caller does not choose one.
-const DEFAULT_EXECUTION_TIMEOUT: &str = "60s";
 
 /// Hand one reserved execution to the runner, then either return its durable
 /// handle or wait for the same supervised process.

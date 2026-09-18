@@ -164,7 +164,8 @@ enum Commands {
         /// Working directory for the command
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Stop the command after this long, e.g. 30s or 5m
+        /// Stop the command after this long, e.g. 30s or 2h. Defaults to when the
+        /// lease expires; a longer value is cut to the lease.
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         /// The command to run, after `--`
@@ -178,7 +179,8 @@ enum Commands {
         /// Working directory for the command
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
-        /// Stop the command after this long, e.g. 30s or 5m
+        /// Stop the command after this long, e.g. 30s or 2h. Defaults to when the
+        /// lease expires; a longer value is cut to the lease.
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         /// Send this process's stdin to the command, then close it
@@ -194,7 +196,7 @@ enum Commands {
         ///
         /// Prints the execution id. `kobe logs --execution` and `kobe cancel
         /// --execution` reach it afterwards. The command still stops at
-        /// --timeout, and no execution runs longer than one hour. Without
+        /// --timeout, and never outlives the lease. Without
         /// this, a process backgrounded inside the command dies with the
         /// execution that started it.
         #[arg(long)]
@@ -578,7 +580,7 @@ enum SandboxAction {
         ///
         /// Prints the execution id. `kobe logs --execution` and `kobe cancel
         /// --execution` reach it afterwards. The command still stops at
-        /// --timeout, and no execution runs longer than one hour. Without
+        /// --timeout, and never outlives the lease. Without
         /// this, a process backgrounded inside the command dies with the
         /// execution that started it.
         #[arg(long)]

@@ -39,13 +39,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// path. Kobe's ids are `sbxe-<hex>` and fit comfortably.
 pub const MAX_ID_LEN: usize = 64;
 
-/// Longest a supervised command may be allowed to run.
-///
-/// Matches Kobe's own ceiling. Enforced on both sides because they fail
-/// differently: Kobe's bound protects the lease, and the runner's protects a
-/// container from a supervisor that outlives whatever asked for it.
-pub const MAX_TIMEOUT_SECONDS: u64 = 3600;
-
 /// Most output the runner retains, per stream.
 ///
 /// The spool is on the ephemeral disk the whole Pod shares, and the caller

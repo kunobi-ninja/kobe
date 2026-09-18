@@ -160,11 +160,12 @@ command will end; read that from `kobe logs --execution`. With `--output json`,
 the envelope carries the execution id and its current `state`, with no
 `exitCode` yet.
 
-A detached command is still bound by `--timeout`, and no execution runs longer
-than one hour. For longer work, run it in a
+A detached command is still bound by `--timeout`, which defaults to the time
+left on the lease. No execution outlives its lease: `kobe extend` gives the
+lease more time, but a command already running keeps the deadline it started
+with. For work that should follow the lease across extensions, run it in a
 [persistent session](#sessions-that-survive-a-disconnect)
-(`kobe attach dev --session build`), which the execution limit does not apply
-to. `kobe run` never detaches, because it releases the sandbox when the command
+(`kobe attach dev --session build`). `kobe run` never detaches, because it releases the sandbox when the command
 returns.
 
 ## `kobe logs`

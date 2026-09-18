@@ -129,7 +129,7 @@ spec:
                 - runnerPath
                 type: object
               timeout:
-                description: Wall-clock bound the runner enforces.
+                description: 'Wall-clock bound the runner enforces: a duration, or `lease` to run until the lease expires.'
                 minLength: 1
                 type: string
             required:
