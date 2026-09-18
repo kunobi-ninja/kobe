@@ -1,5 +1,5 @@
 use anyhow::Result;
-use kunobi_auth::client::{AuthClient, ServiceConfig};
+use kunobi_auth::client::{AuthClient, ServiceConfig, TofuResult, TofuStore};
 
 use super::config::{AuthMode, CliConfig};
 
@@ -20,10 +20,15 @@ const DEVICE_GRANT_SCOPE: &str = "openid profile email offline_access";
 /// Without `device`, falls back to the standard browser-redirect flow
 /// — opens the system browser, listens on a localhost callback URL,
 /// completes the OAuth dance.
+///
+/// `retrust` re-pins the endpoint's advertised issuer and audience when they
+/// no longer match the trusted pin (see [`retrust_pin`]). Without it the
+/// pinned discovery refuses a change, as every other command does.
 pub async fn login(
     context_override: Option<&str>,
     endpoint_override: Option<&str>,
     device: bool,
+    retrust: bool,
 ) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(context_override, endpoint_override)?;
@@ -37,7 +42,25 @@ pub async fn login(
     }
 
     println!("Discovering auth configuration from {endpoint}...");
-    let service_config = ServiceConfig::discover(endpoint).await?;
+    let service_config = if retrust {
+        let service_config = kunobi_auth::client::discover_unpinned(endpoint).await?;
+        if let Some(change) = retrust_pin(&TofuStore::new()?, &service_config)? {
+            eprintln!("{change}");
+        }
+        service_config
+    } else {
+        ServiceConfig::discover(endpoint).await.map_err(|error| {
+            if error.to_string().contains("TOFU:") {
+                error.context(
+                    "the server's auth configuration no longer matches the trusted pin; \
+                     if the change is expected (e.g. the server moved from SSH keys to OIDC), \
+                     run `kobe login --retrust`",
+                )
+            } else {
+                error
+            }
+        })?
+    };
     let client = AuthClient::new(service_config)?;
 
     if device {
@@ -103,4 +126,109 @@ pub async fn logout(context_override: Option<&str>, endpoint_override: Option<&s
 
     println!("Logged out (token revoked at IdP).");
     Ok(())
+}
+
+/// Pin `service_config`'s issuer and audience for its endpoint, which the
+/// user asked for explicitly with `kobe login --retrust`.
+///
+/// The pinned discovery used everywhere else refuses any change, so an
+/// endpoint that moved from SSH auth (pinned under the `ssh` issuer sentinel)
+/// to OIDC, or whose advertised audience changed, stays unusable until trust
+/// is re-established. Returns a description of the change when the pin moved,
+/// so the caller can show the user what they accepted.
+fn retrust_pin(store: &TofuStore, service_config: &ServiceConfig) -> Result<Option<String>> {
+    let endpoint = &service_config.endpoint;
+    let issuer = &service_config.issuer;
+    let audience = service_config.audience.as_deref().unwrap_or("");
+    let change = match store.verify(endpoint, issuer, audience)? {
+        TofuResult::Trusted => return Ok(None),
+        TofuResult::FirstConnect { .. } => None,
+        TofuResult::IssuerChanged {
+            previous, current, ..
+        } => Some(format!(
+            "Re-pinned the auth issuer for {endpoint}: {previous:?} -> {current:?}"
+        )),
+        TofuResult::AudienceChanged {
+            previous, current, ..
+        } => Some(format!(
+            "Re-pinned the auth audience for {endpoint}: {previous:?} -> {current:?}"
+        )),
+        other => anyhow::bail!("unexpected TOFU result for {endpoint}: {other:?}"),
+    };
+    store.trust(endpoint, issuer, audience)?;
+    Ok(change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oidc_config(audience: Option<&str>) -> ServiceConfig {
+        let mut config = ServiceConfig::new("https://kobe.example", "https://idp.example", "cli");
+        config.audience = audience.map(str::to_string);
+        config
+    }
+
+    fn store(directory: &tempfile::TempDir) -> TofuStore {
+        TofuStore::with_path(directory.path().join("known.json"))
+    }
+
+    #[test]
+    fn retrust_moves_an_ssh_pin_to_the_oidc_issuer() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        store
+            .trust("https://kobe.example", "ssh", "kobe-system")
+            .unwrap();
+        let config = oidc_config(None);
+
+        // Without --retrust the pinned discovery refuses the new issuer.
+        assert!(
+            store
+                .check_and_pin("https://kobe.example", "https://idp.example", "")
+                .is_err()
+        );
+
+        let change = retrust_pin(&store, &config).unwrap().unwrap();
+        assert!(
+            change.contains("\"ssh\" -> \"https://idp.example\""),
+            "{change}"
+        );
+        // Once re-pinned, every later pinned discovery accepts it.
+        store
+            .check_and_pin("https://kobe.example", "https://idp.example", "")
+            .unwrap();
+    }
+
+    #[test]
+    fn retrust_moves_a_changed_audience() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        store
+            .trust("https://kobe.example", "https://idp.example", "cli")
+            .unwrap();
+
+        let change = retrust_pin(&store, &oidc_config(None)).unwrap().unwrap();
+        assert!(change.contains("audience"), "{change}");
+        store
+            .check_and_pin("https://kobe.example", "https://idp.example", "")
+            .unwrap();
+    }
+
+    #[test]
+    fn retrust_is_silent_when_the_pin_already_matches_or_is_new() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        assert_eq!(
+            retrust_pin(&store, &oidc_config(Some("kobe"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            retrust_pin(&store, &oidc_config(Some("kobe"))).unwrap(),
+            None
+        );
+        store
+            .check_and_pin("https://kobe.example", "https://idp.example", "kobe")
+            .unwrap();
+    }
 }
