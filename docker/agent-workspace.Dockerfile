@@ -197,10 +197,12 @@ RUN echo "cli refresh: ${CLI_REFRESH}" \
     && npm install --global --prefix "$node_dir" --no-audit --no-fund \
         "@openai/codex@latest" \
         "@anthropic-ai/claude-code@latest" \
+        "opencode-ai@latest" \
     && codex --version \
     && claude --version \
-    && printf 'node %s\ncodex %s\nclaude-code %s\n' \
-        "$(node --version)" "$(codex --version)" "$(claude --version)" \
+    && opencode --version \
+    && printf 'node %s\ncodex %s\nclaude-code %s\nopencode %s\n' \
+        "$(node --version)" "$(codex --version)" "$(claude --version)" "$(opencode --version)" \
         > /etc/kobe-workspace-versions \
     && chmod 0644 /etc/kobe-workspace-versions \
     && npm cache clean --force \
@@ -336,7 +338,8 @@ RUN kobe-sshd --check \
 # only thing a runner execution inherits: a profile.d line would not survive
 # this, and in v0.48.0 that is exactly how the CLIs shipped unreachable.
 RUN env -i PATH="$PATH" claude --version >/dev/null \
-    && env -i PATH="$PATH" codex --version >/dev/null
+    && env -i PATH="$PATH" codex --version >/dev/null \
+    && env -i PATH="$PATH" opencode --version >/dev/null
 
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.
