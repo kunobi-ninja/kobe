@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: ClusterLease
     plural: clusterleases
     shortNames:
@@ -1092,7 +1091,7 @@ spec:
             type: object
         required:
         - spec
-        title: ClusterLeaseValidated
+        title: ClusterLease
         type: object
         x-kubernetes-validations:
         - message: spec.cleanupMode is immutable, including implicit Standard

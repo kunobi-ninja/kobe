@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: VerifiedTeardownEvidence
     plural: verifiedteardownevidence
     shortNames:
@@ -251,7 +250,7 @@ spec:
             type: object
         required:
         - spec
-        title: VerifiedTeardownEvidenceValidated
+        title: VerifiedTeardownEvidence
         type: object
         x-kubernetes-validations:
         - message: verified teardown evidence is immutable
@@ -262,4 +261,3 @@ spec:
           rule: self.spec.receipt.outcome == 'verified' && self.spec.receipt.cleanupMode == 'VerifiedDestroy'
     served: true
     storage: true
-    subresources: {}

@@ -89,6 +89,8 @@ mod tests {
         // Build a minimal kubeconfig for constructing dummy clients.
         let kubeconfig = kube::config::Kubeconfig {
             clusters: vec![kube::config::NamedCluster {
+                // kube 4 keeps unknown kubeconfig keys; we add none.
+                other: Default::default(),
                 name: "dummy".to_string(),
                 cluster: Some(kube::config::Cluster {
                     server: Some("https://127.0.0.1:6443".to_string()),
@@ -96,6 +98,8 @@ mod tests {
                 }),
             }],
             auth_infos: vec![kube::config::NamedAuthInfo {
+                // kube 4 keeps unknown kubeconfig keys; we add none.
+                other: Default::default(),
                 name: "dummy".to_string(),
                 auth_info: Some(kube::config::AuthInfo {
                     token: Some("fake-token".into()),
@@ -103,6 +107,8 @@ mod tests {
                 }),
             }],
             contexts: vec![kube::config::NamedContext {
+                // kube 4 keeps unknown kubeconfig keys; we add none.
+                other: Default::default(),
                 name: "dummy".to_string(),
                 context: Some(kube::config::Context {
                     cluster: "dummy".to_string(),

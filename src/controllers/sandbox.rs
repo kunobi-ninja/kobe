@@ -13528,7 +13528,9 @@ pub(crate) mod tests {
                     request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
                 })
                 .count();
-            let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            // Boxed: since kube 4 this future no longer fits on a test thread's
+            // 2 MiB stack when awaited directly.
+            let action = Box::pin(reconcile_lease(Arc::new(lease.clone()), ctx.clone()))
                 .await
                 .expect("release checkpoint");
             if action == Action::requeue(std::time::Duration::from_secs(5)) {

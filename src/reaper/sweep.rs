@@ -421,6 +421,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let kubeconfig = kube::config::Kubeconfig {
             clusters: vec![kube::config::NamedCluster {
+                // kube 4 keeps unknown kubeconfig keys; we add none.
+                other: Default::default(),
                 name: "offline".to_string(),
                 cluster: Some(kube::config::Cluster {
                     server: Some("https://127.0.0.1:1".to_string()),
@@ -428,6 +430,8 @@ mod tests {
                 }),
             }],
             contexts: vec![kube::config::NamedContext {
+                // kube 4 keeps unknown kubeconfig keys; we add none.
+                other: Default::default(),
                 name: "offline".to_string(),
                 context: Some(kube::config::Context {
                     cluster: "offline".to_string(),

@@ -5,7 +5,6 @@ metadata:
 spec:
   group: kobe.kunobi.ninja
   names:
-    categories: []
     kind: BootstrapConfig
     plural: bootstrapconfigs
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: bootstrapconfig
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for BootstrapConfigSpec via `CustomResource`
@@ -78,4 +76,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}
