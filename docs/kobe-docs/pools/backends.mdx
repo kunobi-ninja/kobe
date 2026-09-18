@@ -24,7 +24,7 @@ spec:
 
 ### Shared PostgreSQL datastore
 
-For golden image workflows, k3s can use a shared PostgreSQL datastore instead of embedded SQLite. This enables `CREATE DATABASE ... TEMPLATE` to clone a pre-seeded database into new cluster pods, reducing addon setup time.
+For golden image workflows, k3s can use a shared PostgreSQL datastore instead of embedded SQLite. The datastore itself works; the [golden image path](/docs/operate/golden-images) that motivated it is not validated. This enables `CREATE DATABASE ... TEMPLATE` to clone a pre-seeded database into new cluster pods, reducing addon setup time.
 
 ```yaml
 spec:
@@ -164,6 +164,6 @@ spec:
 | Isolation | Full | Full | Full | Namespace | Namespace |
 | Overhead per cluster | Low | Low | Provider-dependent | Very low | Very low |
 | Provision time | ~30s | ~30s | ~60s+ | ~15s | ~5s |
-| Golden images (Velero) | Yes | Yes | Varies | No | No |
+| Golden images (Velero) | Not validated | Not validated | Varies | No | No |
 | Shared etcd | Via PostgreSQL | Via PostgreSQL | No | No | Yes (required) |
 | Custom addons | Yes | Yes | Yes | Yes | Yes |

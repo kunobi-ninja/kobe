@@ -5,6 +5,13 @@ description: Pre-build a cluster with Velero and restore pool members from the b
 
 # Golden images
 
+<Callout type="warn">
+  **Not validated.** The snapshot path is implemented and unit-tested, but it is
+  not covered by the conformance suite and we have not seen it work end to end.
+  Do not plan a pool around it. This page documents the intended contract so the
+  code can be read against it; treat every claim below as untested.
+</Callout>
+
 When `spec.snapshot` is enabled on a `ClusterPool`, the operator builds a temporary cluster from that pool's spec, waits for addons and readiness gates, takes a Velero backup, then tears the temporary cluster down. New pool members restore from the backup instead of installing addons from scratch.
 
 This is the slow-addon path. Provision time drops because addon install is skipped, not because Kubernetes itself gets faster. Exact numbers depend on cluster size, addon complexity, and the storage backend.

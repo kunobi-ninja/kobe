@@ -84,7 +84,7 @@ spec:
     storage: s3://my-diagnostics-bucket/kobe/diag
     retentionDays: 7
 
-  # Velero golden image snapshot. See /docs/operate/golden-images.
+  # Velero golden image snapshot. Not validated; see /docs/operate/golden-images.
   snapshot:
     enabled: true
     veleroNamespace: velero
@@ -132,4 +132,4 @@ diagnostics:
 
 The operator uses the standard AWS credential chain (environment variables, IAM role, instance profile) to authenticate with S3.
 
-Rolling recycle during operator or spec upgrades is `spec.upgradePolicy`. See [Upgrades](/docs/operate/upgrades). Golden-image restores are [Velero snapshots](/docs/operate/golden-images).
+Rolling recycle during operator or spec upgrades is `spec.upgradePolicy`. See [Upgrades](/docs/operate/upgrades). Golden-image restores are [Velero snapshots](/docs/operate/golden-images), which are not validated yet.
