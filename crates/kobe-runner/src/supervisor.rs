@@ -224,7 +224,9 @@ pub fn supervise(spool: &Spool, id: &str, stdin_bytes: Option<usize>, source: im
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
+    // A timeout too large for `Instant` has no reachable deadline; the lease's
+    // teardown bounds the command instead.
+    let deadline = Instant::now().checked_add(Duration::from_secs(request.timeout_seconds));
     let mut ended_by: Option<&'static str> = None;
     let status = loop {
         match child.try_wait() {
@@ -248,7 +250,7 @@ pub fn supervise(spool: &Spool, id: &str, stdin_bytes: Option<usize>, source: im
         if ended_by.is_none() {
             if spool.cancel_requested(id) {
                 ended_by = Some(reason::CANCELLED);
-            } else if Instant::now() >= deadline {
+            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 ended_by = Some(reason::TIMED_OUT);
             }
             if ended_by.is_some() {

@@ -17,7 +17,7 @@ kobe exec gui -- kobe-desktop start
 kobe exec gui -- kobe-desktop status
 ```
 
-`kobe-desktop start` is idempotent. It runs the supervisor in a dedicated tmux server so the desktop outlives the one-hour runner-execution limit.
+`kobe-desktop start` is idempotent. It runs the supervisor in a dedicated tmux server so the desktop outlives the `kobe exec` that started it.
 
 ```sh
 kobe exec gui -- kobe-desktop logs

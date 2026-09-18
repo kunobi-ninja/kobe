@@ -96,7 +96,7 @@ pub struct SandboxExecutionSpec {
     #[schemars(length(min = 64, max = 64))]
     pub request_digest: String,
 
-    /// Wall-clock bound the runner enforces.
+    /// Wall-clock bound the runner enforces: a duration, or `lease` to run until the lease expires.
     #[schemars(length(min = 1))]
     pub timeout: String,
 

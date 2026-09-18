@@ -37,8 +37,8 @@ use clap::{Parser, Subcommand};
 
 use kobe_runner::protocol::{
     Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES,
-    MAX_RETENTION_BYTES, MAX_TIMEOUT_SECONDS, PROTOCOL_VERSION, Reply, RunnerErrorCode,
-    RunnerState, StartRequest, TEST_EXECUTION_CRASH_EXIT_CODE, is_valid_id, reason,
+    MAX_RETENTION_BYTES, PROTOCOL_VERSION, Reply, RunnerErrorCode, RunnerState, StartRequest,
+    TEST_EXECUTION_CRASH_EXIT_CODE, is_valid_id, reason,
 };
 use kobe_runner::spool::{self, Reservation, Spool, SpoolError};
 #[cfg(unix)]
@@ -344,7 +344,10 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
             return Err(RunnerErrorCode::InvalidRequest);
         }
     }
-    if request.timeout_seconds == 0 || request.timeout_seconds > MAX_TIMEOUT_SECONDS {
+    // No upper bound here: Kobe clamps every timeout to the lease that
+    // authorises it, and the lease's teardown deletes this container. A fixed
+    // ceiling in the runner could only cut off work the lease allows.
+    if request.timeout_seconds == 0 {
         return Err(RunnerErrorCode::InvalidRequest);
     }
     if request.max_output_bytes == 0 || request.max_output_bytes > MAX_RETENTION_BYTES {
@@ -772,8 +775,9 @@ mod tests {
 
     /// Neither bound may be absent, and neither may be unbounded.
     ///
-    /// A zero timeout is a command that can never finish successfully; an
-    /// unbounded one holds a lease's CPU until teardown. An unbounded retention
+    /// A zero timeout is a command that can never finish successfully. A long
+    /// one is the lease's business: Kobe clamps it to the lease, so the runner
+    /// accepts anything positive. An unbounded retention
     /// cap fills the ephemeral disk the whole Pod shares — from inside a
     /// container that exists because its occupant is not trusted.
     #[test]
@@ -786,11 +790,10 @@ mod tests {
         };
 
         assert!(with(1, 1).is_ok());
-        assert!(with(MAX_TIMEOUT_SECONDS, MAX_RETENTION_BYTES).is_ok());
+        assert!(with(8 * 3600, MAX_RETENTION_BYTES).is_ok());
+        assert!(with(u64::MAX, 1024).is_ok());
 
         assert!(with(0, 1024).is_err());
-        assert!(with(MAX_TIMEOUT_SECONDS + 1, 1024).is_err());
-        assert!(with(u64::MAX, 1024).is_err());
         assert!(with(60, 0).is_err());
         assert!(with(60, MAX_RETENTION_BYTES + 1).is_err());
         assert!(with(60, u64::MAX).is_err());

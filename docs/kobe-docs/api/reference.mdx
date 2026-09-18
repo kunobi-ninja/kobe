@@ -515,8 +515,8 @@ intent returns `409 Conflict`.
 ```
 
 `command` is an argv array and is never interpreted by a shell. `cwd` and
-`container` are optional. `timeout` defaults to 60 seconds, is capped at one
-hour, and can never extend past the lease expiry.
+`container` are optional. `timeout` defaults to the time left on the lease. A
+longer value is cut to the lease expiry.
 
 `stdin` is optional, base64-encoded, and written to the command's standard
 input before it is closed. **It is how you pass a secret to a Sandbox.** The
