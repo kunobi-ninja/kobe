@@ -214,20 +214,28 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/node/bin:$PATH' \
       > /etc/profile.d/kobe-node-tools.sh \
     && chmod 0644 /etc/profile.d/kobe-node-tools.sh
 
-# `nproc` inside this container reports the HOST's CPU count, not the cgroup
-# quota Kubernetes actually enforces on it — commonly a fraction of the host's
-# (#272). `kobe-runner` (below) computes the real number at runtime from
-# `/sys/fs/cgroup/cpu.max` and sets it, plus sane `CARGO_BUILD_JOBS` /
-# `RUST_TEST_THREADS` defaults, on every process it spawns — see its `cpu`
-# module for why that has to happen in the runner itself rather than here: a
-# shell-less `kobe exec` never sources this file, so this script cannot be
-# the source of the value, only an announcement of it. All it does is print
-# the runner's own `KOBE_CPUS` on an interactive login shell as a single line
-# (#319): the env-var detail and the `nproc` caveat live in the runner's `cpu`
-# module, not in front of every prompt.
+# Login banner: one branded line on an interactive shell (a tty), silent for
+# `kobe exec` and friends (#319). Background: `nproc` inside this container
+# reports the HOST's CPU count, not the cgroup quota Kubernetes actually
+# enforces on it — commonly a fraction of the host's (#272). `kobe-runner`
+# (below) computes the real number at runtime from `/sys/fs/cgroup/cpu.max`
+# and exports it as
+# `KOBE_CPUS` on every process it spawns — see its `cpu` module for why that
+# has to happen in the runner itself rather than here: a shell-less `kobe
+# exec` never sources this file, so this script cannot be the source of the
+# value, only an announcement of it. Colors stay off under `NO_COLOR` or on a
+# `dumb` terminal. The `nproc` caveat and the `CARGO_BUILD_JOBS` /
+# `RUST_TEST_THREADS` detail live in the runner's docs, not in front of every
+# prompt.
 RUN printf '%s\n' \
       'if [ -n "$KOBE_CPUS" ] && [ -t 1 ]; then' \
-      '  echo "kobe: $KOBE_CPUS CPUs (cgroup quota); nproc reports the host count." >&2' \
+      '  if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then' \
+      '    _kobe_b=$(printf "\033[1;36m"); _kobe_r=$(printf "\033[0m")' \
+      '  else' \
+      "    _kobe_b=''; _kobe_r=''" \
+      '  fi' \
+      '  printf "%b\n" "${_kobe_b}kobe${_kobe_r} · agent-workspace · ${KOBE_CPUS} CPUs (cgroup quota)" >&2' \
+      '  unset _kobe_b _kobe_r' \
       'fi' \
       > /etc/profile.d/kobe-cpu-quota.sh \
     && chmod 0644 /etc/profile.d/kobe-cpu-quota.sh
