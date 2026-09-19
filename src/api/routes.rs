@@ -4542,8 +4542,17 @@ mod tests {
         assert!(response_text(resp).await.contains("kubernetes"));
     }
 
+    /// Held by every test that scrapes `/metrics`.
+    ///
+    /// The handler writes process-wide gauges such as `kobe_ipam_pool_allocated`
+    /// from what it just listed, then renders them. Two scrapes running in
+    /// parallel overwrite each other's values between write and render, so one
+    /// test reads the other's number.
+    static METRICS_SCRAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_metrics_returns_200() {
+        let _scrape = METRICS_SCRAPE.lock().await;
         let (app, server) = test_app().await;
 
         use wiremock::matchers::{method, path_regex};
@@ -4594,6 +4603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_exports_live_ages_and_ipam_occupancy() {
+        let _scrape = METRICS_SCRAPE.lock().await;
         let (app, server) = test_app().await;
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, ResponseTemplate};
