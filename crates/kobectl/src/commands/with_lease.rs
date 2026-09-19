@@ -63,8 +63,15 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
         eprintln!("Leasing '{}' for the wrapped command...", pool.name);
     }
     let metadata = parse_metadata_json(command.metadata_json)?;
-    let accepted =
-        create_lease_request(&config, &pool.name, command.ttl, None, metadata.as_ref()).await?;
+    let accepted = create_lease_request(
+        &config,
+        &pool.name,
+        command.ttl,
+        None,
+        metadata.as_ref(),
+        None,
+    )
+    .await?;
     let lease_id = accepted.id.clone();
 
     // Everything past creation must release the lease, even on error or signal.
