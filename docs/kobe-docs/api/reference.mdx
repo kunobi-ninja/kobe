@@ -734,10 +734,9 @@ waiting for its timeout. Omitting `stdin` leaves the process reading
 `/dev/null`, exactly as before; an empty string gives it a pipe that is
 immediately closed.
 
-This is a channel for secrets and small inputs, not a file transfer: at most
-16 KiB once decoded. More than that is refused with `400`, never truncated —
-half a token is still a secret, and a command that received half of one would
-fail somewhere a long way from the cause.
+There is no input byte ceiling by default. An operator can set
+`KOBE_SANDBOX_STDIN_MAX_BYTES`; larger decoded inputs are refused with `400`
+before reserving an execution. Stdin is never truncated.
 
 Wait mode (`detach: false`) returns `200 OK` after the supervised command ends:
 

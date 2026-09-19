@@ -36,9 +36,9 @@ use std::io::BufRead;
 use clap::{Parser, Subcommand};
 
 use kobe_runner::protocol::{
-    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES,
-    MAX_RETENTION_BYTES, PROTOCOL_VERSION, Reply, RunnerErrorCode, RunnerState, StartRequest,
-    TEST_EXECUTION_CRASH_EXIT_CODE, is_valid_id, reason,
+    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, PROTOCOL_VERSION, Reply,
+    RunnerErrorCode, RunnerState, StartRequest, TEST_EXECUTION_CRASH_EXIT_CODE, is_valid_id,
+    reason,
 };
 use kobe_runner::spool::{self, Reservation, Spool, SpoolError};
 #[cfg(unix)]
@@ -138,6 +138,8 @@ enum SessionAction {
     },
     /// Print the live sessions as JSON.
     List,
+    /// Print current session usage and the optional ceiling as Prometheus metrics.
+    Metrics,
 }
 
 #[cfg(unix)]
@@ -155,6 +157,16 @@ fn session(dir: &std::path::Path, action: &SessionAction) -> i32 {
             Ok(code) => code,
             Err(error) => {
                 eprintln!("kobe-runner: session {name}: {error}");
+                1
+            }
+        },
+        SessionAction::Metrics => match session::metrics(dir) {
+            Ok(metrics) => {
+                print!("{metrics}");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
                 1
             }
         },
@@ -305,10 +317,9 @@ fn start(
 
 fn read_start_request(reader: impl std::io::Read) -> Result<StartRequest, RunnerErrorCode> {
     let mut raw = Vec::new();
-    if std::io::BufReader::new(reader.take((MAX_REQUEST_BYTES + 1) as u64))
+    if std::io::BufReader::new(reader)
         .read_until(b'\n', &mut raw)
         .is_err()
-        || raw.len() > MAX_REQUEST_BYTES
         || !raw.ends_with(b"\n")
     {
         return Err(RunnerErrorCode::InvalidRequest);
@@ -348,11 +359,6 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
     // authorises it, and the lease's teardown deletes this container. A fixed
     // ceiling in the runner could only cut off work the lease allows.
     if request.timeout_seconds == 0 {
-        return Err(RunnerErrorCode::InvalidRequest);
-    }
-    if request.max_output_bytes == 0 || request.max_output_bytes > MAX_RETENTION_BYTES {
-        // Unbounded retention inside a tenant's container is a way to fill the
-        // ephemeral disk the whole Pod shares.
         return Err(RunnerErrorCode::InvalidRequest);
     }
     if request.stdin_bytes().is_err() {
@@ -702,131 +708,54 @@ mod tests {
         assert!(with(&|r| r.cwd = None).is_ok());
     }
 
-    /// Stdin that cannot be delivered whole reserves nothing.
-    ///
-    /// Refusing before the reservation is what keeps an oversized or malformed
-    /// secret from spending an idempotency key on a command that could never
-    /// have been given its input. Truncating to fit is the one response that is
-    /// never correct: half a token is still a secret, and the command would
-    /// fail somewhere a long way from the cause.
+    /// Input size is validated by the operator; encoding is validated here.
     #[test]
-    fn stdin_that_cannot_be_delivered_whole_reserves_nothing() {
+    fn large_stdin_is_valid_but_malformed_base64_is_refused() {
         use base64::Engine;
-        use kobe_runner::protocol::MAX_STDIN_BYTES;
-
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        let with = |encoded: Option<String>| {
-            let mut request = request();
-            request.stdin_base64 = encoded;
-            validate(&request)
-        };
-
-        assert!(with(None).is_ok(), "no stdin at all stays valid");
-        assert!(
-            with(Some(String::new())).is_ok(),
-            "an empty stdin is a request"
-        );
-        assert!(with(Some(encode(b"ghp_token"))).is_ok());
-        assert!(with(Some(encode(&vec![b'x'; MAX_STDIN_BYTES]))).is_ok());
-
-        assert_eq!(
-            with(Some(encode(&vec![b'x'; MAX_STDIN_BYTES + 1]))),
-            Err(RunnerErrorCode::InvalidRequest),
-            "one byte past the bound is refused, not trimmed"
-        );
-        assert_eq!(
-            with(Some("not base64!!".into())),
-            Err(RunnerErrorCode::InvalidRequest)
-        );
-    }
-
-    /// A request carrying stdin still has to fit the encoded-request bound.
-    ///
-    /// [`MAX_STDIN_BYTES`] and [`MAX_REQUEST_BYTES`] are two different ceilings
-    /// and both apply. Neither is allowed to become a silent truncation of the
-    /// other.
-    #[test]
-    fn stdin_is_bounded_inside_the_encoded_request_bound() {
-        use base64::Engine;
-        use kobe_runner::protocol::MAX_STDIN_BYTES;
-
         let mut request = request();
         request.stdin_base64 =
-            Some(base64::engine::general_purpose::STANDARD.encode(vec![b'x'; MAX_STDIN_BYTES]));
-        let mut encoded = serde_json::to_vec(&request).unwrap();
-        encoded.push(b'\n');
-        assert!(
-            encoded.len() < MAX_REQUEST_BYTES,
-            "a maximal stdin must still leave room for a command: {} bytes",
-            encoded.len()
-        );
-        assert_eq!(read_start_request(encoded.as_slice()).unwrap(), request);
-
-        // Padding the argv past the whole-request bound is refused by the
-        // reader, before the stdin ceiling is ever consulted.
-        request.argv.push("y".repeat(MAX_REQUEST_BYTES));
-        let mut oversized = serde_json::to_vec(&request).unwrap();
-        oversized.push(b'\n');
-        assert_eq!(
-            read_start_request(oversized.as_slice()).unwrap_err(),
-            RunnerErrorCode::InvalidRequest
-        );
+            Some(base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 2 * 1024 * 1024]));
+        assert!(validate(&request).is_ok());
+        request.stdin_base64 = Some("!invalid!".into());
+        assert_eq!(validate(&request), Err(RunnerErrorCode::InvalidRequest));
     }
 
-    /// Neither bound may be absent, and neither may be unbounded.
-    ///
-    /// A zero timeout is a command that can never finish successfully. A long
-    /// one is the lease's business: Kobe clamps it to the lease, so the runner
-    /// accepts anything positive. An unbounded retention
-    /// cap fills the ephemeral disk the whole Pod shares — from inside a
-    /// container that exists because its occupant is not trusted.
+    /// No hidden request-size cap may truncate forwarded stdin.
     #[test]
-    fn a_command_is_bounded_in_time_and_in_output() {
-        let with = |timeout: u64, output: u64| {
-            let mut request = request();
-            request.timeout_seconds = timeout;
-            request.max_output_bytes = output;
-            validate(&request)
-        };
-
-        assert!(with(1, 1).is_ok());
-        assert!(with(8 * 3600, MAX_RETENTION_BYTES).is_ok());
-        assert!(with(u64::MAX, 1024).is_ok());
-
-        assert!(with(0, 1024).is_err());
-        assert!(with(60, 0).is_err());
-        assert!(with(60, MAX_RETENTION_BYTES + 1).is_err());
-        assert!(with(60, u64::MAX).is_err());
-    }
-
-    /// The runner reads exactly the same encoded boundary Kobe validates.
-    #[test]
-    fn encoded_request_bound_is_exact_and_requires_a_complete_line() {
+    fn large_stdin_survives_the_complete_start_request() {
+        use base64::Engine;
         let mut request = request();
-        request.argv = vec![String::new()];
+        request.stdin_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 2 * 1024 * 1024]));
         let mut encoded = serde_json::to_vec(&request).unwrap();
         encoded.push(b'\n');
-        let fill = MAX_REQUEST_BYTES - encoded.len();
-        request.argv[0] = "x".repeat(fill);
-        let mut exact = serde_json::to_vec(&request).unwrap();
-        exact.push(b'\n');
-        assert_eq!(exact.len(), MAX_REQUEST_BYTES);
-        assert_eq!(read_start_request(exact.as_slice()).unwrap(), request);
+        assert_eq!(read_start_request(encoded.as_slice()).unwrap(), request);
+    }
 
-        let mut oversized = request.clone();
-        oversized.argv[0].push('x');
-        let mut oversized = serde_json::to_vec(&oversized).unwrap();
-        oversized.push(b'\n');
-        assert_eq!(oversized.len(), MAX_REQUEST_BYTES + 1);
+    /// Zero means unlimited output. Execution time remains lease-scoped.
+    #[test]
+    fn output_retention_is_unlimited_with_zero_and_accepts_explicit_caps() {
+        for output in [0, 1, 8 * 1024 * 1024 + 1, u64::MAX] {
+            let mut request = request();
+            request.max_output_bytes = output;
+            assert!(validate(&request).is_ok());
+        }
+        let mut request = request();
+        request.timeout_seconds = 0;
+        assert!(validate(&request).is_err());
+    }
+
+    /// A complete request line is required, regardless of its size.
+    #[test]
+    fn start_request_requires_a_complete_line_without_a_size_ceiling() {
+        let mut request = request();
+        request.argv.push("x".repeat(128 * 1024));
+        let mut encoded = serde_json::to_vec(&request).unwrap();
         assert_eq!(
-            read_start_request(oversized.as_slice()).unwrap_err(),
+            read_start_request(encoded.as_slice()).unwrap_err(),
             RunnerErrorCode::InvalidRequest
         );
-
-        assert_eq!(
-            read_start_request(&exact[..exact.len() - 1]).unwrap_err(),
-            RunnerErrorCode::InvalidRequest,
-            "EOF without the line receipt is incomplete"
-        );
+        encoded.push(b'\n');
+        assert_eq!(read_start_request(encoded.as_slice()).unwrap(), request);
     }
 }

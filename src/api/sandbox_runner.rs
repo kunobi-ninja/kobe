@@ -44,8 +44,8 @@
 //! forwarded and hashed; they are never persisted, on either side.
 
 use kobe_runner::protocol::{
-    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
-    Reply, RunnerErrorCode, RunnerState, StartRequest, TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
+    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, PROTOCOL_VERSION, Reply,
+    RunnerErrorCode, RunnerState, StartRequest, TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
     TEST_EXIT_BEFORE_SPAWN_FLAG,
 };
 
@@ -308,7 +308,7 @@ pub fn start_request(
         // Rounded up, never down: a request for one and a half seconds that
         // became one would kill a command before its own bound elapsed.
         timeout_seconds: (timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0)).max(1),
-        max_output_bytes: crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES,
+        max_output_bytes: crate::sandbox_limits::get().output_bytes,
         // Base64 so exact bytes survive the JSON: a credential is not required
         // to be UTF-8, and a lossy conversion here would corrupt it in a way
         // that surfaces as an authentication failure far from the cause.
@@ -320,9 +320,6 @@ pub fn start_request(
 pub fn start_line(request: &StartRequest) -> Result<Vec<u8>, RunnerCallFailure> {
     let mut line = serde_json::to_vec(request).map_err(|_| RunnerCallFailure::Unreadable)?;
     line.push(b'\n');
-    if line.len() > MAX_REQUEST_BYTES {
-        return Err(RunnerCallFailure::Refused(RunnerErrorCode::InvalidRequest));
-    }
     Ok(line)
 }
 
@@ -565,6 +562,12 @@ fn validate_log_chunk(
     {
         return Err(RunnerCallFailure::Unreadable);
     }
+    crate::sandbox_limits::observe("output_bytes", chunk.next_offset);
+    if chunk.truncated {
+        crate::metrics::SANDBOX_USAGE_REJECTED
+            .with_label_values(&["output_bytes"])
+            .inc();
+    }
     Ok(RunnerLogChunk {
         offset: chunk.offset,
         next_offset: chunk.next_offset,
@@ -574,12 +577,12 @@ fn validate_log_chunk(
     })
 }
 
-/// Read both retained streams to the API response cap.
+/// Read both output streams, applying an optional operator retention ceiling.
 ///
 /// Streams are fetched concurrently and by monotonically advancing offsets.
 /// A broken runner that repeats an offset is refused rather than allowed to
-/// spin forever, and output beyond Kobe's response cap is reported as
-/// truncated even if the runner retained more on disk.
+/// spin forever. An explicitly configured cap reports truncation; zero leaves
+/// the response unbounded.
 pub async fn read_wait_output(
     client: &kube::Client,
     target: &SandboxTarget,
@@ -641,12 +644,14 @@ async fn read_stream_to_cap(
         )
         .await?;
 
-        let remaining =
-            crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len());
+        let remaining = crate::sandbox_limits::capacity(crate::sandbox_limits::get().output_bytes)
+            .saturating_sub(output.len());
         let kept = chunk.bytes.len().min(remaining);
         output.extend_from_slice(&chunk.bytes[..kept]);
         truncated |= chunk.truncated || kept < chunk.bytes.len();
-        if output.len() == crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES {
+        if output.len()
+            == crate::sandbox_limits::capacity(crate::sandbox_limits::get().output_bytes)
+        {
             truncated |= chunk.more;
             break;
         }
@@ -658,6 +663,7 @@ async fn read_stream_to_cap(
         }
         offset = chunk.next_offset;
     }
+    crate::sandbox_limits::observe("output_bytes", output.len() as u64);
     Ok((output, truncated))
 }
 
@@ -1117,24 +1123,21 @@ mod tests {
         assert_ne!(empty, without);
     }
 
-    /// Kobe and the runner share the exact encoded request ceiling.
+    /// Stdin crosses the former encoded request ceiling intact.
     #[test]
-    fn start_request_bound_includes_the_newline() {
-        let mut request = start_request(
+    fn large_start_requests_are_encoded_without_truncation() {
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        let request = start_request(
             "sbxe-1",
-            &[String::new()],
+            &["cat".into()],
             None,
             std::time::Duration::from_secs(1),
-            None,
+            Some(&payload),
         );
-        let base = start_line(&request).unwrap().len();
-        request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
-        assert_eq!(start_line(&request).unwrap().len(), MAX_REQUEST_BYTES);
-        request.argv[0].push('x');
-        assert_eq!(
-            start_line(&request).unwrap_err(),
-            RunnerCallFailure::Refused(RunnerErrorCode::InvalidRequest)
-        );
+        let line = start_line(&request).unwrap();
+        assert_eq!(line.last(), Some(&b'\n'));
+        let decoded: StartRequest = serde_json::from_slice(&line).unwrap();
+        assert_eq!(decoded.stdin_bytes().unwrap(), Some(payload));
     }
 
     /// A refusal is a refusal, not an outcome.
@@ -1540,14 +1543,9 @@ mod tests {
         assert_eq!(seconds(std::time::Duration::ZERO), 1);
     }
 
-    /// The retention the runner is asked for is Kobe's decision, not the
-    /// caller's.
-    ///
-    /// The spool sits on the ephemeral disk the whole Pod shares. A cap a
-    /// caller could choose is a way to fill it from inside a sandbox that
-    /// exists precisely because its occupant is not trusted.
+    /// The operator requests unlimited retention by default.
     #[test]
-    fn retention_is_bounded_by_kobe_rather_than_by_the_caller() {
+    fn retention_is_unlimited_by_default() {
         let request = start_request(
             "sbxe-1",
             &["/agent".into()],
@@ -1555,10 +1553,6 @@ mod tests {
             std::time::Duration::from_secs(60),
             None,
         );
-        assert_eq!(
-            request.max_output_bytes,
-            crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES
-        );
-        assert!(request.max_output_bytes <= kobe_runner::protocol::MAX_RETENTION_BYTES);
+        assert_eq!(request.max_output_bytes, 0);
     }
 }

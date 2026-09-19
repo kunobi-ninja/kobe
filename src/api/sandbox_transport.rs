@@ -1,8 +1,8 @@
-//! Bounded interactive transport for Sandbox operations (#83).
+//! Interactive transport with optional usage limits for Sandbox operations.
 //!
 //! Two things a caller can want that a request/response API cannot give them:
 //! a terminal, and a TCP connection to a declared port. Both need a stream, and
-//! a stream needs limits, a framing, and a way to be closed by somebody other
+//! a stream needs framing and a way to be closed by somebody other
 //! than the caller.
 //!
 //! # Not a Kubernetes proxy
@@ -31,16 +31,14 @@
 //! it means a client that believes it sent a resize, or a signal, and was
 //! silently disregarded.
 //!
-//! # Limits are not optional
+//! # Stream limits
 //!
-//! Every one of these exists because the caller controls the workload:
+//! Operators may configure usage ceilings:
 //!
-//! * **idle timeout** — an abandoned terminal holds a connection to the target
-//!   cluster indefinitely, and nobody notices because nothing is wrong.
-//! * **maximum duration** — an *active* stream would otherwise outlive any
-//!   sensible bound simply by staying busy.
-//! * **byte ceiling** — `yes` is a one-word denial-of-service.
-//! * **concurrency** — enforced before upgrade, from #83's registry.
+//! * **idle timeout** and **maximum duration** — optional operator settings;
+//!   neither closes a stream by default.
+//! * **byte ceiling** — optional, configured by the operator; absent by default.
+//! * **concurrency** — optional ceilings enforced before upgrade.
 //!
 //! A stream is also cancelled the moment its lease stops permitting access.
 //! Kubernetes authenticates an upgraded connection once; nothing but an
@@ -61,28 +59,6 @@ pub const CHANNEL_STDOUT: u8 = 1;
 pub const CHANNEL_STDERR: u8 = 2;
 pub const CHANNEL_ERROR: u8 = 3;
 pub const CHANNEL_RESIZE: u8 = 4;
-
-/// Closed after this long with nothing in either direction.
-///
-/// An abandoned terminal is the common case — somebody closes a laptop — and it
-/// holds a connection to the target cluster with nothing to signal that
-/// anything is wrong.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-/// Closed after this long regardless of activity.
-///
-/// The idle timeout does not bound an *active* stream: a session that stays
-/// busy would otherwise live as long as the lease, which defeats having a
-/// separate transport bound at all.
-pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
-
-/// Most bytes carried across both directions before the stream is closed.
-///
-/// `yes > /dev/null` is a one-word way to make the operator relay unbounded
-/// traffic from inside a sandbox whose occupant is, by construction, not
-/// trusted. Counting both directions also prevents a caller from receiving the
-/// full bound and then sending another full bound back.
-pub const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Longest an upgraded operation may spend opening its exact target stream.
 ///
@@ -229,19 +205,25 @@ pub fn server_frame(channel: u8, payload: &[u8]) -> Message {
 /// Tracks the limits that end a stream.
 ///
 /// Separated from the copying so the rules are testable without a socket, and
-/// because these bounds are the reason the transport is safe to expose at all.
+/// because time bounds and optional byte ceilings apply to every transport.
 #[derive(Debug)]
 pub struct StreamLimits {
     started: tokio::time::Instant,
     last_activity: tokio::time::Instant,
     bytes: u64,
-    idle_timeout: Duration,
-    max_duration: Duration,
-    max_bytes: u64,
+    max_idle: Duration,
+    idle_timeout: Option<Duration>,
+    max_duration: Option<Duration>,
+    max_bytes: Option<u64>,
 }
 
 impl StreamLimits {
-    pub fn new(idle_timeout: Duration, max_duration: Duration, max_bytes: u64) -> Self {
+    /// Create stream bounds; each `None` disables that ceiling.
+    pub fn new(
+        idle_timeout: Option<Duration>,
+        max_duration: Option<Duration>,
+        max_bytes: Option<u64>,
+    ) -> Self {
         Self::starting_at(
             tokio::time::Instant::now(),
             idle_timeout,
@@ -256,14 +238,15 @@ impl StreamLimits {
     /// hidden until production.
     pub fn starting_at(
         now: tokio::time::Instant,
-        idle_timeout: Duration,
-        max_duration: Duration,
-        max_bytes: u64,
+        idle_timeout: Option<Duration>,
+        max_duration: Option<Duration>,
+        max_bytes: Option<u64>,
     ) -> Self {
         Self {
             started: now,
             last_activity: now,
             bytes: 0,
+            max_idle: Duration::ZERO,
             idle_timeout,
             max_duration,
             max_bytes,
@@ -272,9 +255,14 @@ impl StreamLimits {
 
     /// Record traffic in either direction and re-check every bound.
     pub fn record(&mut self, bytes: usize, now: tokio::time::Instant) -> Result<(), StreamEnd> {
+        self.max_idle = self.max_idle.max(now.duration_since(self.last_activity));
         self.last_activity = now;
         self.bytes = self.bytes.saturating_add(bytes as u64);
-        if self.bytes > self.max_bytes {
+        crate::metrics::SANDBOX_STREAM_BYTES.inc_by(bytes as u64);
+        if self.max_bytes.is_some_and(|max| self.bytes > max) {
+            crate::metrics::SANDBOX_USAGE_REJECTED
+                .with_label_values(&["stream_bytes"])
+                .inc();
             return Err(StreamEnd::ByteLimitExceeded);
         }
         self.check(now)
@@ -282,10 +270,22 @@ impl StreamLimits {
 
     /// Re-check the time-based bounds without any traffic.
     pub fn check(&self, now: tokio::time::Instant) -> Result<(), StreamEnd> {
-        if now.duration_since(self.started) >= self.max_duration {
+        if self
+            .max_duration
+            .is_some_and(|max| now.duration_since(self.started) >= max)
+        {
+            crate::metrics::SANDBOX_USAGE_REJECTED
+                .with_label_values(&["stream_duration_seconds"])
+                .inc();
             return Err(StreamEnd::DurationExceeded);
         }
-        if now.duration_since(self.last_activity) >= self.idle_timeout {
+        if self
+            .idle_timeout
+            .is_some_and(|max| now.duration_since(self.last_activity) >= max)
+        {
+            crate::metrics::SANDBOX_USAGE_REJECTED
+                .with_label_values(&["stream_idle_seconds"])
+                .inc();
             return Err(StreamEnd::IdleTimeout);
         }
         Ok(())
@@ -293,14 +293,40 @@ impl StreamLimits {
 
     /// How long until the next bound would fire, so the loop can wake exactly
     /// then rather than polling.
-    pub fn next_deadline(&self, now: tokio::time::Instant) -> Duration {
-        let until_idle = self
+    pub fn next_deadline(&self, now: tokio::time::Instant) -> Option<Duration> {
+        let idle = self
             .idle_timeout
-            .saturating_sub(now.duration_since(self.last_activity));
-        let until_max = self
+            .map(|max| max.saturating_sub(now.duration_since(self.last_activity)));
+        let total = self
             .max_duration
-            .saturating_sub(now.duration_since(self.started));
-        until_idle.min(until_max)
+            .map(|max| max.saturating_sub(now.duration_since(self.started)));
+        match (idle, total) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// With no time ceiling, wait only for I/O or lease revocation. Never construct
+/// an overflowing Instant or periodically wake an otherwise idle stream.
+async fn wait_deadline(deadline: Option<Duration>) {
+    match deadline {
+        Some(duration) => match tokio::time::Instant::now().checked_add(duration) {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        },
+        None => std::future::pending::<()>().await,
+    }
+}
+
+impl Drop for StreamLimits {
+    fn drop(&mut self) {
+        crate::sandbox_limits::observe(
+            "stream_idle_seconds",
+            self.max_idle.max(self.last_activity.elapsed()).as_secs(),
+        );
+        crate::sandbox_limits::observe("stream_bytes", self.bytes);
+        crate::sandbox_limits::observe("stream_duration_seconds", self.started.elapsed().as_secs());
     }
 }
 
@@ -325,7 +351,7 @@ where
     tokio::select! {
         biased;
         _ = revoked.cancelled() => Err(StreamEnd::Revoked),
-        _ = tokio::time::sleep(deadline) => {
+        _ = wait_deadline(deadline) => {
             Err(limits
                 .check(tokio::time::Instant::now())
                 .err()
@@ -363,7 +389,7 @@ where
 
         tokio::select! {
             _ = revoked.cancelled() => return StreamEnd::Revoked,
-            _ = tokio::time::sleep(deadline) => {
+            _ = wait_deadline(deadline) => {
                 // A bound came due. `check` decides which, so the reported
                 // reason always matches the rule that actually fired.
                 return limits
@@ -495,7 +521,7 @@ pub async fn pump_attached(
 
         tokio::select! {
             _ = revoked.cancelled() => return StreamEnd::Revoked,
-            _ = tokio::time::sleep(deadline) => {
+            _ = wait_deadline(deadline) => {
                 return limits
                     .check(tokio::time::Instant::now())
                     .err()
@@ -687,7 +713,7 @@ pub async fn pump_attached_iroh(
 
         tokio::select! {
             _ = revoked.cancelled() => return StreamEnd::Revoked,
-            _ = tokio::time::sleep(deadline) => {
+            _ = wait_deadline(deadline) => {
                 return limits
                     .check(tokio::time::Instant::now())
                     .err()
@@ -816,7 +842,7 @@ where
 
         tokio::select! {
             _ = revoked.cancelled() => return StreamEnd::Revoked,
-            _ = tokio::time::sleep(deadline) => {
+            _ = wait_deadline(deadline) => {
                 return limits
                     .check(tokio::time::Instant::now())
                     .err()
@@ -971,6 +997,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_stream_has_no_byte_or_time_ceiling() {
+        let start = tokio::time::Instant::now();
+        let mut limits = StreamLimits::starting_at(start, None, None, None);
+        for _ in 0..4 {
+            assert!(limits.record(512 * 1024 * 1024, start).is_ok());
+        }
+        assert!(limits.check(start + Duration::from_secs(7 * 86400)).is_ok());
+        assert_eq!(limits.next_deadline(start), None);
+    }
+
     /// Every bound actually binds, and reports the rule that fired.
     ///
     /// Reporting matters: a client that cannot tell "you were idle" from "your
@@ -980,8 +1017,12 @@ mod tests {
         let start = tokio::time::Instant::now();
 
         // Bytes.
-        let mut limits =
-            StreamLimits::starting_at(start, Duration::from_secs(60), Duration::from_secs(600), 10);
+        let mut limits = StreamLimits::starting_at(
+            start,
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(600)),
+            Some(10),
+        );
         assert!(limits.record(10, start).is_ok());
         assert_eq!(
             limits.record(1, start).unwrap_err(),
@@ -991,9 +1032,9 @@ mod tests {
         // Idle: quiet for long enough, even though the total duration is fine.
         let limits = StreamLimits::starting_at(
             start,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            1024,
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(600)),
+            Some(1024),
         );
         assert!(limits.check(start + Duration::from_secs(59)).is_ok());
         assert_eq!(
@@ -1005,9 +1046,9 @@ mod tests {
         // timeout cannot supply.
         let mut limits = StreamLimits::starting_at(
             start,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            1_000_000,
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(600)),
+            Some(1_000_000),
         );
         for second in 1..600 {
             assert!(
@@ -1035,36 +1076,53 @@ mod tests {
         let start = tokio::time::Instant::now();
         let limits = StreamLimits::starting_at(
             start,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            1024,
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(600)),
+            Some(1024),
         );
 
-        assert_eq!(limits.next_deadline(start), Duration::from_secs(60));
+        assert_eq!(limits.next_deadline(start), Some(Duration::from_secs(60)));
         assert_eq!(
             limits.next_deadline(start + Duration::from_secs(30)),
-            Duration::from_secs(30)
+            Some(Duration::from_secs(30))
         );
 
         // Late in a long-running stream the total duration is nearer than the
         // idle window, and the deadline has to follow whichever is closer.
         let limits = StreamLimits::starting_at(
             start,
-            Duration::from_secs(600),
-            Duration::from_secs(60),
-            1024,
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(60)),
+            Some(1024),
         );
-        assert_eq!(limits.next_deadline(start), Duration::from_secs(60));
+        assert_eq!(limits.next_deadline(start), Some(Duration::from_secs(60)));
 
         // Never negative: a bound already passed wakes immediately.
         assert_eq!(
             limits.next_deadline(start + Duration::from_secs(9999)),
-            Duration::ZERO
+            Some(Duration::ZERO)
         );
     }
 
     /// Target negotiation is part of a live operation and cannot ignore a
     /// release merely because the Kubernetes request has not answered yet.
+    #[tokio::test]
+    async fn unlimited_streams_still_obey_lease_revocation() {
+        let limits = StreamLimits::new(None, None, None);
+        let revoked = CancellationToken::new();
+        revoked.cancel();
+        assert_eq!(
+            bounded_io(
+                std::future::pending::<Result<(), ()>>(),
+                &limits,
+                &revoked,
+                StreamEnd::TargetError
+            )
+            .await,
+            Err(StreamEnd::Revoked)
+        );
+    }
+
     #[tokio::test]
     async fn a_blocked_setup_is_preempted_by_revocation() {
         let revoked = CancellationToken::new();
@@ -1083,7 +1141,12 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_io_cannot_outlive_the_stream_deadline() {
         let now = tokio::time::Instant::now();
-        let limits = StreamLimits::starting_at(now, Duration::from_secs(60), Duration::ZERO, 1024);
+        let limits = StreamLimits::starting_at(
+            now,
+            Some(Duration::from_secs(60)),
+            Some(Duration::ZERO),
+            Some(1024),
+        );
         let revoked = CancellationToken::new();
 
         assert_eq!(

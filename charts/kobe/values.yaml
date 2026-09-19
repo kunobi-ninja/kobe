@@ -138,6 +138,29 @@ agentSandbox:
   #             refused at admission, never silently served over WebSocket.
   #   <urls>    Comma-separated relay URLs for a self-hosted relay map.
   irohRelay: public
+  # Usage ceilings are opt-in. Zero disables enforcement; telemetry stays on.
+  # Bytes per connection, both directions.
+  streamMaxBytes: 0
+  # Seconds without stream traffic.
+  streamIdleSeconds: 0
+  # Seconds per connection.
+  streamDurationSeconds: 0
+  # Durable executions over one lease lifetime.
+  maxExecutionsPerLease: 0
+  # Concurrent streams per lease.
+  maxStreamsPerLease: 0
+  # Concurrent streams per identity.
+  maxStreamsPerPrincipal: 0
+  # Retained bytes per execution output stream.
+  outputMaxBytes: 0
+  # Input bytes per execution.
+  stdinMaxBytes: 0
+  # Lines returned by sandbox logs.
+  logMaxLines: 0
+  # Seconds for the legacy exec endpoint; zero uses the lease.
+  legacyExecSeconds: 0
+  # Admission burst per identity and replica; refills in 20 seconds.
+  admissionBurst: 0
   # Aggregate object ceiling across every caller. This namespace contains only
   # admission tokens plus distributed operation gates/principal ledgers, so
   # the quota cannot starve unrelated leader elections. Each live Sandbox can

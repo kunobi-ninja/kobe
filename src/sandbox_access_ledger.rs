@@ -5,8 +5,10 @@
 //! replica has drained before workload cleanup. This module adds two
 //! API-server CAS records in the protected Sandbox ledger namespace:
 //!
-//! - one gate per `SandboxLease` UID, containing at most eight operations;
-//! - one ledger per authenticated principal, containing at most 32 operations.
+//! - one gate per `SandboxLease` UID;
+//! - one ledger per authenticated principal.
+//!
+//! Both track every operation. Count ceilings are optional operator settings.
 //!
 //! Admission creates the lease gate before reserving capacity or publishing an
 //! admitted `SandboxLease`. Handlers enter that existing gate first and the
@@ -170,6 +172,7 @@ pub enum ExecutionCapacity {
     Conflict,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reserve_execution_entry(
     entries: &mut BTreeMap<String, ExecutionEntry>,
     execution_name: &str,
@@ -177,6 +180,7 @@ fn reserve_execution_entry(
     pod_uid: &str,
     reserved_at: &str,
     writer: Option<&ServingReplica>,
+    max_executions: u64,
 ) -> ExecutionCapacity {
     if let Some(existing) = entries.get(execution_name) {
         if existing.request_digest != request_digest || existing.pod_uid != pod_uid {
@@ -192,10 +196,11 @@ fn reserve_execution_entry(
             }
         };
     }
-    let active = entries.values().filter(|entry| entry.active).count();
-    if entries.len() >= crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE
-        || active >= crate::api::sandbox_executions::MAX_ACTIVE_EXECUTIONS_PER_LEASE
-    {
+    if crate::sandbox_limits::exceeds(
+        "executions_per_lease",
+        entries.len() as u64 + 1,
+        max_executions,
+    ) {
         return ExecutionCapacity::LimitReached;
     }
     entries.insert(
@@ -859,6 +864,7 @@ async fn add_gate_entry(
     api: &Api<Lease>,
     registration: &mut ReleaseRegistration,
     pending_write: &mut Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
+    limits: &crate::sandbox_limits::SandboxLimits,
 ) -> Result<Option<Lease>, AccessLedgerError> {
     let ledger_namespace = api
         .namespace()
@@ -887,7 +893,11 @@ async fn add_gate_entry(
             .cloned()
             .ok_or(AccessLedgerError::Invalid("entries annotation"))?;
         let mut entries: BTreeMap<String, GateEntry> = serde_json::from_str(&previous)?;
-        if entries.len() >= crate::api::sandbox_streams::MAX_STREAMS_PER_LEASE {
+        if crate::sandbox_limits::exceeds(
+            "streams_per_lease",
+            entries.len() as u64 + 1,
+            limits.streams_per_lease,
+        ) {
             return Ok(None);
         }
         entries.insert(
@@ -912,6 +922,7 @@ async fn add_principal_entry(
     gate: &Lease,
     registration: &mut ReleaseRegistration,
     pending_write: &mut Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
+    limits: &crate::sandbox_limits::SandboxLimits,
 ) -> Result<Option<Lease>, AccessLedgerError> {
     let name = registration.principal_name.clone();
     for _ in 0..MAX_CAS_ATTEMPTS {
@@ -940,7 +951,11 @@ async fn add_principal_entry(
             .cloned()
             .ok_or(AccessLedgerError::Invalid("entries annotation"))?;
         let mut entries: BTreeMap<String, PrincipalEntry> = serde_json::from_str(&previous)?;
-        if entries.len() >= crate::api::sandbox_streams::MAX_STREAMS_PER_PRINCIPAL {
+        if crate::sandbox_limits::exceeds(
+            "streams_per_principal",
+            entries.len() as u64 + 1,
+            limits.streams_per_principal,
+        ) {
             return Ok(None);
         }
         entries.insert(
@@ -967,6 +982,25 @@ pub async fn acquire(
     lease: &SandboxLease,
     principal_hash: &str,
     replica: &ServingReplica,
+) -> Result<AccessAcquire, AccessLedgerError> {
+    acquire_with_limits(
+        client,
+        ledger_namespace,
+        lease,
+        principal_hash,
+        replica,
+        crate::sandbox_limits::get(),
+    )
+    .await
+}
+
+async fn acquire_with_limits(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    principal_hash: &str,
+    replica: &ServingReplica,
+    limits: &crate::sandbox_limits::SandboxLimits,
 ) -> Result<AccessAcquire, AccessLedgerError> {
     replica.validate()?;
     let sandbox_name = lease.name_any();
@@ -1005,6 +1039,7 @@ pub async fn acquire(
         &api,
         &mut guard_mut.registration,
         &mut guard_mut.pending_write,
+        limits,
     )
     .await?
     else {
@@ -1026,6 +1061,7 @@ pub async fn acquire(
         &gate,
         &mut guard_mut.registration,
         &mut guard_mut.pending_write,
+        limits,
     )
     .await?;
     let Some(_principal) = principal else {
@@ -1113,6 +1149,7 @@ pub async fn reserve_execution_capacity(
             pod_uid,
             &chrono::Utc::now().to_rfc3339(),
             writer,
+            crate::sandbox_limits::get().executions_per_lease,
         );
         if outcome != ExecutionCapacity::Reserved {
             return Ok(outcome);
@@ -2633,6 +2670,39 @@ mod tests {
     /// map, so racing replicas cannot each observe a spare slot. Exact retries
     /// reuse their entry; changed content under the same derived name cannot.
     #[test]
+    fn default_execution_budget_exceeds_256_and_preserves_idempotency() {
+        let mut entries = BTreeMap::new();
+        for index in 0..512 {
+            assert_eq!(
+                reserve_execution_entry(
+                    &mut entries,
+                    &format!("execution-{index}"),
+                    "digest",
+                    "pod",
+                    "2026-09-19T00:00:00Z",
+                    None,
+                    0
+                ),
+                ExecutionCapacity::Reserved
+            );
+        }
+        assert_eq!(entries.len(), 512);
+        assert!(matches!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-0",
+                "digest",
+                "pod",
+                "2026-09-19T00:00:00Z",
+                None,
+                0
+            ),
+            ExecutionCapacity::ExistingActive { .. }
+        ));
+        assert_eq!(entries.len(), 512);
+    }
+
+    #[test]
     fn execution_capacity_is_bounded_by_history_and_active_processes() {
         let digest = "d".repeat(64);
         let mut entries = BTreeMap::new();
@@ -2644,6 +2714,7 @@ mod tests {
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
                 None,
+                256
             ),
             ExecutionCapacity::Reserved
         );
@@ -2655,6 +2726,7 @@ mod tests {
                 "pod-uid",
                 "2026-08-20T00:01:00Z",
                 None,
+                256
             ),
             ExecutionCapacity::ExistingActive {
                 execution_uid: None
@@ -2669,6 +2741,7 @@ mod tests {
                 "pod-uid",
                 "2026-08-20T00:01:00Z",
                 None,
+                256
             ),
             ExecutionCapacity::Conflict
         );
@@ -2682,6 +2755,7 @@ mod tests {
                     "pod-uid",
                     "2026-08-20T00:00:00Z",
                     None,
+                    256
                 ),
                 ExecutionCapacity::Reserved
             );
@@ -2702,6 +2776,7 @@ mod tests {
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
                 None,
+                256
             ),
             ExecutionCapacity::LimitReached
         );
@@ -2721,6 +2796,7 @@ mod tests {
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
                 None,
+                256
             ),
             ExecutionCapacity::LimitReached,
             "freeing concurrency cannot bypass the lifetime history bound"
@@ -4097,9 +4173,17 @@ mod tests {
         let mut gate_registration = test_registration(&replica);
         let mut pending_write = None;
         assert!(
-            add_gate_entry(&gate_api, &mut gate_registration, &mut pending_write)
-                .await
-                .is_err()
+            add_gate_entry(
+                &gate_api,
+                &mut gate_registration,
+                &mut pending_write,
+                &crate::sandbox_limits::SandboxLimits {
+                    streams_per_lease: 8,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
         );
         assert_eq!(gate_registration.gate_uid.as_deref(), Some("gate-uid"));
 
@@ -4142,6 +4226,10 @@ mod tests {
                 &gate_object,
                 &mut principal_registration,
                 &mut pending_write,
+                &crate::sandbox_limits::SandboxLimits {
+                    streams_per_principal: 32,
+                    ..Default::default()
+                }
             )
             .await
             .is_err()
@@ -4399,10 +4487,18 @@ mod tests {
         gate_registration.principal_hash = "principal-new".into();
         let mut pending_write = None;
         assert!(
-            add_gate_entry(&gate_api, &mut gate_registration, &mut pending_write)
-                .await
-                .unwrap()
-                .is_none()
+            add_gate_entry(
+                &gate_api,
+                &mut gate_registration,
+                &mut pending_write,
+                &crate::sandbox_limits::SandboxLimits {
+                    streams_per_lease: 8,
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(
             gate_server
@@ -4474,6 +4570,10 @@ mod tests {
                 &gate_object,
                 &mut principal_registration,
                 &mut pending_write,
+                &crate::sandbox_limits::SandboxLimits {
+                    streams_per_principal: 32,
+                    ..Default::default()
+                }
             )
             .await
             .unwrap()

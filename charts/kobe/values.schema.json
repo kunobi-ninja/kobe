@@ -94,10 +94,76 @@
           "minimum": 4,
           "maximum": 1000000
         },
+        "streamMaxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Bytes per connection, both directions. Zero disables enforcement."
+        },
         "irohRelay": {
           "type": "string",
           "minLength": 1,
           "description": "Iroh relay selection: public, disabled, or comma-separated relay URLs."
+        },
+        "streamIdleSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Seconds without stream traffic. Zero disables enforcement."
+        },
+        "streamDurationSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Seconds per connection. Zero disables enforcement."
+        },
+        "maxExecutionsPerLease": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Durable executions over one lease lifetime. Zero disables enforcement."
+        },
+        "maxStreamsPerLease": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Concurrent streams per lease. Zero disables enforcement."
+        },
+        "maxStreamsPerPrincipal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Concurrent streams per identity. Zero disables enforcement."
+        },
+        "outputMaxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Retained bytes per execution output stream. Zero disables enforcement."
+        },
+        "stdinMaxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Input bytes per execution. Zero disables enforcement."
+        },
+        "logMaxLines": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Lines returned by sandbox logs. Zero disables enforcement."
+        },
+        "legacyExecSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Seconds for the legacy exec endpoint; zero uses the lease. Zero disables enforcement."
+        },
+        "admissionBurst": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Admission burst per identity and replica; refills in 20 seconds. Zero disables enforcement."
         }
       },
       "required": [

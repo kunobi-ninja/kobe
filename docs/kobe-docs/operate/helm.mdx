@@ -62,6 +62,33 @@ When Sandbox mode is enabled, the chart creates a ledger namespace `<release>-sa
 
 `agentSandbox.irohRelay` is `public` (n0 relays), `disabled`, or a comma-separated list of self-hosted relay URLs. Pools that request iroh transport are refused if relays are disabled.
 
+Sandbox usage ceilings default to `0` (disabled). Measurements remain enabled.
+To enforce a ceiling, set a positive value on the operator:
+
+| Helm value under `agentSandbox` | Operator environment variable | Unit |
+|---|---|---|
+| `streamMaxBytes` | `KOBE_SANDBOX_STREAM_MAX_BYTES` | Bytes per connection, both directions |
+| `streamIdleSeconds` | `KOBE_SANDBOX_STREAM_IDLE_SECONDS` | Seconds without stream traffic |
+| `streamDurationSeconds` | `KOBE_SANDBOX_STREAM_DURATION_SECONDS` | Seconds per connection |
+| `maxExecutionsPerLease` | `KOBE_SANDBOX_MAX_EXECUTIONS_PER_LEASE` | Durable executions over one lease lifetime |
+| `maxStreamsPerLease` | `KOBE_SANDBOX_MAX_STREAMS_PER_LEASE` | Concurrent streams per lease |
+| `maxStreamsPerPrincipal` | `KOBE_SANDBOX_MAX_STREAMS_PER_PRINCIPAL` | Concurrent streams per identity |
+| `outputMaxBytes` | `KOBE_SANDBOX_OUTPUT_MAX_BYTES` | Retained bytes per execution output stream |
+| `stdinMaxBytes` | `KOBE_SANDBOX_STDIN_MAX_BYTES` | Input bytes per execution |
+| `logMaxLines` | `KOBE_SANDBOX_LOG_MAX_LINES` | Lines returned by sandbox logs |
+| `legacyExecSeconds` | `KOBE_SANDBOX_LEGACY_EXEC_SECONDS` | Seconds for the legacy exec endpoint; zero uses the lease |
+| `admissionBurst` | `KOBE_SANDBOX_ADMISSION_BURST` | Admission burst per identity and replica; refills in 20 seconds |
+
+For example, `--set agentSandbox.streamDurationSeconds=14400` enables a four-hour connection ceiling. These settings apply to WebSocket and iroh. Lease expiry and access-policy settings still govern authorization. Invalid configuration prevents startup.
+
+`admissionBurst` configures both Sandbox and cluster admission. Each has its own per-identity bucket on each operator replica.
+
+Persistent terminal sessions also default to unlimited. Set `KOBE_SESSION_MAX_SESSIONS` in the SandboxPool container environment to enforce a session count. `kobe-runner session metrics` prints current session count and configuration for an exec-based Prometheus collector.
+
+The operator exports `kobe_sandbox_usage_limit` (zero means disabled), `kobe_sandbox_usage_observed` (resource names specify units), and `kobe_sandbox_usage_limit_exceeded_total`. Live transfer volume is exported as `kobe_sandbox_stream_bytes_total`; stream activity/duration metrics remain available. Admission requests are counted by `kobe_sandbox_admission_attempts_total`. These metrics contain no lease IDs, identities, command text or output.
+
+Unlimited output and larger stdin require the updated `kobe-runner` image. Existing sandboxes keep their image until replaced. Stdin and non-follow output responses are buffered in memory; removing usage ceilings does not remove available-memory, disk or Kubernetes object-size constraints.
+
 ### Teardown authority
 
 On Kubernetes 1.30+, `teardownAuthority.separate=true` runs teardown proof under a dedicated ServiceAccount. Helm installs two fail-closed ValidatingAdmissionPolicy boundaries: ordinary lifecycle code cannot forge or erase protected evidence, and it cannot replace the authority namespace or cluster-scoped RBAC. The default is single-process mode for older API servers.
