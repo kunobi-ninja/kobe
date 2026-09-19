@@ -212,8 +212,7 @@ async fn get_auth_header_with_interaction(
             }
         },
         AuthMode::Oidc => {
-            let service_config =
-                kunobi_auth::client::ServiceConfig::discover(&config.endpoint).await?;
+            let service_config = login::discover_pinned(&config.endpoint).await?;
             let token = match interaction {
                 AuthInteraction::Interactive => {
                     kunobi_auth::client::AuthClient::new(service_config)?

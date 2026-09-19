@@ -49,17 +49,7 @@ pub async fn login(
         }
         service_config
     } else {
-        ServiceConfig::discover(endpoint).await.map_err(|error| {
-            if error.to_string().contains("TOFU:") {
-                error.context(
-                    "the server's auth configuration no longer matches the trusted pin; \
-                     if the change is expected (e.g. the server moved from SSH keys to OIDC), \
-                     run `kobe login --retrust`",
-                )
-            } else {
-                error
-            }
-        })?
+        discover_pinned(endpoint).await?
     };
     let client = AuthClient::new(service_config)?;
 
@@ -120,7 +110,7 @@ pub async fn logout(context_override: Option<&str>, endpoint_override: Option<&s
         return Ok(());
     }
 
-    let service_config = ServiceConfig::discover(endpoint).await?;
+    let service_config = discover_pinned(endpoint).await?;
     let client = AuthClient::new(service_config)?;
     client.logout_async().await?;
 
@@ -160,8 +150,73 @@ fn retrust_pin(store: &TofuStore, service_config: &ServiceConfig) -> Result<Opti
     Ok(change)
 }
 
+/// Discover `endpoint`'s auth configuration, checked against the trusted pin.
+///
+/// Every OIDC command goes through here, so a pin mismatch reads the same from
+/// `kobe status` as from `kobe login`.
+pub(crate) async fn discover_pinned(endpoint: &str) -> Result<ServiceConfig> {
+    ServiceConfig::discover(endpoint)
+        .await
+        .map_err(retrust_hint)
+}
+
+/// Replace kunobi-auth's pin-mismatch hint with the command that fixes it.
+///
+/// The library ends its TOFU errors by pointing at its own `trust()` function,
+/// which a CLI user cannot call. Keep what changed, drop that hint, and name
+/// `kobe login --retrust`. Any other error passes through unchanged.
+fn retrust_hint(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    let Some(detail) = message.strip_prefix("TOFU: ") else {
+        return error;
+    };
+    let detail = [
+        ". If this change is expected",
+        "; call trust()",
+        "; re-run trust()",
+    ]
+    .iter()
+    .find_map(|hint| detail.split_once(hint).map(|(kept, _)| kept))
+    .unwrap_or(detail);
+    anyhow::anyhow!(
+        "{detail}. If the server's auth changed on purpose, for example from SSH keys to OIDC, \
+         run `kobe login --retrust`"
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every kunobi-auth TOFU message loses its `trust()` hint and names the
+    /// command a user can run.
+    #[test]
+    fn a_pin_mismatch_names_kobe_login_retrust_instead_of_trust() {
+        for (library, kept) in [
+            (
+                "TOFU: audience changed for https://kobe.example (possible MITM): pinned \"kobe-system\", presented \"\". If this change is expected, re-establish trust explicitly with trust()",
+                "audience changed for https://kobe.example (possible MITM): pinned \"kobe-system\", presented \"\"",
+            ),
+            (
+                "TOFU: issuer changed for https://kobe.example (possible MITM): pinned \"ssh\", presented \"https://clerk.example\". If this change is expected, re-establish trust explicitly with trust()",
+                "issuer changed for https://kobe.example (possible MITM): pinned \"ssh\", presented \"https://clerk.example\"",
+            ),
+            (
+                "TOFU: refusing to trust unpinned service https://kobe.example; call trust() to establish first-use trust",
+                "refusing to trust unpinned service https://kobe.example",
+            ),
+        ] {
+            let message = super::retrust_hint(anyhow::anyhow!(library)).to_string();
+            assert!(message.starts_with(kept), "{message}");
+            assert!(message.ends_with("run `kobe login --retrust`"), "{message}");
+            assert!(!message.contains("trust()"), "{message}");
+        }
+    }
+
+    #[test]
+    fn other_errors_pass_through_unchanged() {
+        let message = super::retrust_hint(anyhow::anyhow!("connection refused")).to_string();
+        assert_eq!(message, "connection refused");
+    }
+
     use super::*;
 
     fn oidc_config(audience: Option<&str>) -> ServiceConfig {
