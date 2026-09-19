@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::StreamExt;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, PodSpec, PodTemplateSpec, SecretVolumeSource, Volume, VolumeMount,
@@ -21,8 +22,9 @@ use kube::{Client, Resource, ResourceExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::backend::k3s::INSTANCE_UID_LABEL;
 use crate::backend::{
-    BackendCreationFootprint, BackendFactory, BootstrapJobPlan, ClusterBackend,
+    BackendCreationFootprint, BackendFactory, BootstrapJobPlan, ClusterBackend, CreateProgress,
     resolve_bootstrap_addons, resolve_bootstrap_jobs,
 };
 use crate::crd::{
@@ -45,6 +47,19 @@ use crate::velero::VeleroCoordinator;
 /// immediately and `K3sBackend::delete()` / `K0sBackend::delete()`
 /// never runs — leaking the entire backend resource set (see #95).
 const INSTANCE_FINALIZER: &str = "kobe.kunobi.ninja/instance-cleanup";
+
+/// Set on a `ClusterInstance` once its backend reported
+/// [`CreateProgress::Complete`]: the control plane was ready and every
+/// post-ready step (agents, addons) ran.
+///
+/// Backends that defer readiness (k3s) return from `create` as soon as their
+/// objects are applied. The instance controller then calls `advance_create`
+/// on each `Creating` reconcile until it completes, and this annotation keeps
+/// it from repeating the post-ready steps afterwards. It is written only after
+/// those steps succeeded, so a crash before the write just repeats them, and
+/// they are idempotent. It lives on the instance, so a replacement instance
+/// (new UID) never inherits it.
+const CREATE_COMPLETE_ANNOTATION: &str = "kobe.kunobi.ninja/create-complete";
 
 fn receipt_authority_is_separate() -> bool {
     crate::receipt_authority::is_separate()
@@ -194,6 +209,7 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
     let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
     let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
     let claims: Api<CIDRClaim> = Api::namespaced(client.clone(), namespace);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
     // Each extra watch backs off on error (`watches_with` and `owns_with` do
     // not). Bootstrap Jobs and CIDRClaims carry this controller's owner
     // reference, so their progress wakes the instance instead of a poll.
@@ -215,6 +231,16 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
             Config::default(),
             "CIDRClaim",
             |claim: &CIDRClaim| owning_instance(&claim.metadata),
+        ))
+        // A backend that defers readiness (k3s) becomes ready when its server
+        // StatefulSet does. Waking on its status saves most of the 5s polls
+        // a booting instance would otherwise need; the requeue stays as the
+        // backstop for the kubeconfig Secret, which is not watched.
+        .reconcile_on(instance_triggers(
+            statefulsets,
+            Config::default().labels(INSTANCE_UID_LABEL),
+            "backend StatefulSet",
+            |sts: &StatefulSet| owning_instance(&sts.metadata),
         ))
         .run(reconcile_instance, error_policy, ctx)
         .for_each(|result| async move { observe_instance_result(result) });
@@ -785,32 +811,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             let owner_ref = instance.controller_owner_ref(&());
             match provision_instance(&ctx, &config, &name, &ns, owner_ref.as_ref()).await {
                 Ok(()) => {
-                    // Seal the exact footprint while every created object, bound
-                    // PV, StorageClass and datastore OID is still observable.
-                    // Failure is honest ineligibility for VerifiedDestroy, not a
-                    // reason to break ordinary Standard-mode pools; a later
-                    // Creating/Ready reconcile retries the capture.
-                    if !receipt_authority_is_separate() {
-                        match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
-                            Ok(Some(manifest)) => {
-                                if let Err(error) = persist_creation_manifest_once(
-                                    &instances_api,
-                                    &instance,
-                                    &manifest,
-                                )
-                                .await
-                                {
-                                    warn!(instance = %name, error = %error, "could not persist creation manifest; will retry");
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => warn!(
-                                instance = %name,
-                                error = %format!("{error:#}"),
-                                "creation footprint is not fully observable; verified teardown remains ineligible"
-                            ),
-                        }
-                    }
+                    // The creation manifest is sealed by the next pass, once
+                    // `advance_create` reports the backend complete: a backend
+                    // that defers readiness has not created its agents yet.
                     patch_instance_status(
                         &instances_api,
                         &instance,
@@ -832,37 +835,86 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     Ok(Action::requeue(std::time::Duration::from_secs(5)))
                 }
                 Err(e) => {
-                    let failure = format!("{e:#}");
-                    warn!(instance = %name, error = %failure, "Provisioning failed");
-                    observe_instance_create(
-                        &instance,
-                        &config.backend.backend_type,
-                        crate::metrics::InstanceCreateOutcome::Failed,
-                    );
-                    patch_instance_status(
+                    fail_provisioning(
                         &instances_api,
                         &instance,
-                        ClusterInstanceStatus {
-                            phase: ClusterInstancePhase::Failed,
-                            provisioned: false,
-                            bootstrapped: false,
-                            lease_ref: status.lease_ref,
-                            active_bootstrap: None,
-                            idle_since: None,
-                            state_since: Some(chrono::Utc::now().to_rfc3339()),
-                            health_failures: status.health_failures,
-                            spec_hash: status.spec_hash.clone(),
-                            message: Some(format!("provisioning failed: {failure}")),
-                            ..Default::default()
-                        },
+                        &config,
+                        &status,
+                        &format!("{e:#}"),
                     )
-                    .await?;
-                    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+                    .await
                 }
             }
         }
         ClusterInstancePhase::Creating if status.provisioned => {
-            if !receipt_authority_is_separate()
+            // Finish a create the backend deferred (k3s): one readiness check
+            // per reconcile, then the post-ready steps. Nothing below may run
+            // before this completes: the manifest would miss the agents and
+            // readiness gates would probe a cluster that is still booting.
+            let mut backend_pending = false;
+            if !create_marked_complete(&instance) {
+                let mut config = config.clone();
+                config.cluster.allocated_network = status.network.clone();
+                let owner_ref = instance.controller_owner_ref(&());
+                match advance_instance_create(&ctx, &config, &name, &ns, owner_ref.as_ref()).await {
+                    Ok(CreateProgress::NotDeferred) => {}
+                    Ok(CreateProgress::Complete) => {
+                        info!(instance = %name, owner = %owner, "Backend create complete");
+                        let marked = mark_create_complete(&instances_api, &instance).await?;
+                        // Restart the stuck-Creating timer here, where a
+                        // blocking `create` used to return: readiness gates
+                        // and bootstraps get the same fresh window they had.
+                        patch_instance_status(
+                            &instances_api,
+                            &marked,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Creating,
+                                provisioned: true,
+                                bootstrapped: false,
+                                lease_ref: status.lease_ref,
+                                active_bootstrap: None,
+                                idle_since: status.idle_since,
+                                state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                health_failures: status.health_failures,
+                                spec_hash: status.spec_hash.clone(),
+                                message: Some(
+                                    "control plane ready; checking readiness gates".into(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        return Ok(Action::requeue(std::time::Duration::from_secs(0)));
+                    }
+                    Ok(CreateProgress::Pending) => {
+                        if let Some(elapsed) = create_budget_exceeded(&ctx, &config, &status) {
+                            let failure =
+                                format!("cluster {name} not ready after {}s", elapsed.as_secs());
+                            return fail_provisioning(
+                                &instances_api,
+                                &instance,
+                                &config,
+                                &status,
+                                &failure,
+                            )
+                            .await;
+                        }
+                        backend_pending = true;
+                    }
+                    Err(e) => {
+                        return fail_provisioning(
+                            &instances_api,
+                            &instance,
+                            &config,
+                            &status,
+                            &format!("{e:#}"),
+                        )
+                        .await;
+                    }
+                }
+            }
+            if !backend_pending
+                && !receipt_authority_is_separate()
                 && status.creation_manifest.is_none()
                 && let Ok(Some(manifest)) =
                     capture_creation_manifest(&ctx, &config, &instance, &ns).await
@@ -872,7 +924,8 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             {
                 return Ok(Action::requeue(std::time::Duration::from_secs(0)));
             }
-            let ready = evaluate_instance_readiness(&ctx, &config, &name, &ns).await?;
+            let ready =
+                !backend_pending && evaluate_instance_readiness(&ctx, &config, &name, &ns).await?;
             if ready {
                 match reconcile_instance_bootstraps(&ctx, &config, &instance, &name, &ns).await {
                     Ok(Some(active_bootstrap)) => {
@@ -2469,6 +2522,168 @@ fn failed_job_message(job: &Job) -> Option<String> {
         })
 }
 
+/// Mark an instance `Failed` because its backend could not be created.
+///
+/// `provisioned` is kept as observed: a deferred create that fails after its
+/// objects were applied still owns them, and teardown must see that.
+async fn fail_provisioning(
+    instances_api: &Api<ClusterInstance>,
+    instance: &ClusterInstance,
+    config: &ResolvedInstanceConfig,
+    status: &ClusterInstanceStatus,
+    failure: &str,
+) -> Result<Action, InstanceError> {
+    warn!(instance = %instance.name_any(), error = %failure, "Provisioning failed");
+    observe_instance_create(
+        instance,
+        &config.backend.backend_type,
+        crate::metrics::InstanceCreateOutcome::Failed,
+    );
+    patch_instance_status(
+        instances_api,
+        instance,
+        ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Failed,
+            provisioned: status.provisioned,
+            bootstrapped: false,
+            lease_ref: status.lease_ref.clone(),
+            active_bootstrap: None,
+            idle_since: None,
+            state_since: Some(chrono::Utc::now().to_rfc3339()),
+            health_failures: status.health_failures,
+            spec_hash: status.spec_hash.clone(),
+            message: Some(format!("provisioning failed: {failure}")),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+}
+
+/// Whether the backend already reported this instance's create complete.
+fn create_marked_complete(instance: &ClusterInstance) -> bool {
+    instance
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.contains_key(CREATE_COMPLETE_ANNOTATION))
+}
+
+/// Record [`CREATE_COMPLETE_ANNOTATION`], fenced to the observed UID so a
+/// stale reconcile cannot mark a same-named replacement. Returns the updated
+/// object so the caller's next status write passes its resourceVersion test.
+async fn mark_create_complete(
+    instances_api: &Api<ClusterInstance>,
+    instance: &ClusterInstance,
+) -> Result<ClusterInstance, InstanceError> {
+    let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
+    })?;
+    let mut operations =
+        vec![serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid })];
+    if instance.metadata.annotations.is_none() {
+        operations
+            .push(serde_json::json!({ "op": "add", "path": "/metadata/annotations", "value": {} }));
+    }
+    operations.push(serde_json::json!({
+        "op": "add",
+        // `/` in the key is escaped as `~1` in a JSON Pointer.
+        "path": format!("/metadata/annotations/{}", CREATE_COMPLETE_ANNOTATION.replace('/', "~1")),
+        "value": chrono::Utc::now().to_rfc3339(),
+    }));
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
+    Ok(instances_api
+        .patch(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
+}
+
+/// How long a deferred create has been pending, when that exceeds the
+/// backend's readiness budget.
+///
+/// Measured from `status.stateSince`, which the provisioning pass stamped when
+/// `create` applied the objects: the same start a blocking `create` measured
+/// its own wait from. An instance held for scheduling backpressure is exempt;
+/// the pool manager owns its retry, and its timer restarts once it schedules.
+fn create_budget_exceeded<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    status: &ClusterInstanceStatus,
+) -> Option<std::time::Duration> {
+    let budget = if ctx.factory.is_some() {
+        backend_dispatch_for_config(ctx, config)
+            .ok()?
+            .create_readiness_budget(&config.cluster)
+    } else {
+        ctx.backend.create_readiness_budget(&config.cluster)
+    }?;
+    create_budget_elapsed(status, budget, chrono::Utc::now())
+}
+
+fn create_budget_elapsed(
+    status: &ClusterInstanceStatus,
+    budget: std::time::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    if status
+        .message
+        .as_deref()
+        .is_some_and(|m| m.starts_with(crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX))
+    {
+        return None;
+    }
+    let since = chrono::DateTime::parse_from_rfc3339(status.state_since.as_deref()?).ok()?;
+    let elapsed = (now - since.with_timezone(&chrono::Utc)).to_std().ok()?;
+    (elapsed > budget).then_some(elapsed)
+}
+
+async fn instance_addons<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    namespace: &str,
+) -> Result<Vec<Addon>, anyhow::Error> {
+    let mut addons = config.addons.clone();
+    addons.extend(resolve_bootstrap_addons(&ctx.client, namespace, &config.bootstraps).await?);
+    Ok(addons)
+}
+
+async fn advance_instance_create<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    name: &str,
+    namespace: &str,
+    owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+) -> Result<CreateProgress, anyhow::Error> {
+    if ctx.factory.is_some() {
+        let backend = backend_dispatch_for_config(ctx, config)?;
+        advance_backend_create(ctx, &backend, config, name, namespace, owner_ref).await
+    } else {
+        advance_backend_create(ctx, &ctx.backend, config, name, namespace, owner_ref).await
+    }
+}
+
+async fn advance_backend_create<B: ClusterBackend + Clone, C: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    backend: &C,
+    config: &ResolvedInstanceConfig,
+    name: &str,
+    namespace: &str,
+    owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+) -> Result<CreateProgress, anyhow::Error> {
+    // A backend without a readiness budget finished everything in `create`.
+    // Skip it before resolving addons, which costs ConfigMap reads.
+    if backend.create_readiness_budget(&config.cluster).is_none() {
+        return Ok(CreateProgress::NotDeferred);
+    }
+    let addons = instance_addons(ctx, config, namespace).await?;
+    backend
+        .advance_create(name, namespace, &config.cluster, &addons, owner_ref)
+        .await
+}
+
 async fn create_instance_backend<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
@@ -2476,8 +2691,7 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
     namespace: &str,
     owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
 ) -> Result<(), anyhow::Error> {
-    let mut addons = config.addons.clone();
-    addons.extend(resolve_bootstrap_addons(&ctx.client, namespace, &config.bootstraps).await?);
+    let addons = instance_addons(ctx, config, namespace).await?;
 
     if ctx.factory.is_some() {
         let backend = backend_dispatch_for_config(ctx, config)?;
@@ -4387,7 +4601,7 @@ fn error_policy<B: ClusterBackend>(
 mod tests {
     use super::*;
     use crate::testutil::MockBackend;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Find a derived condition by type. Panics if absent (tests assert
@@ -5660,6 +5874,168 @@ mod tests {
         let calls = backend.call_count();
         assert_eq!(calls.create, 0);
         assert_eq!(calls.check_health, 1);
+    }
+
+    /// A provisioned instance whose deferred create has not completed.
+    fn deferred_instance(
+        name: &str,
+        state_since: Option<&str>,
+        marked: bool,
+    ) -> Arc<ClusterInstance> {
+        let mut instance =
+            (*standalone_instance(name, ClusterInstancePhase::Creating, true, 0)).clone();
+        if let Some(since) = state_since {
+            instance.status.as_mut().unwrap().state_since = Some(since.to_string());
+        }
+        if marked {
+            instance.metadata.annotations = Some(BTreeMap::from([(
+                CREATE_COMPLETE_ANNOTATION.to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+            )]));
+        }
+        Arc::new(instance)
+    }
+
+    #[tokio::test]
+    async fn deferred_create_pending_skips_readiness_and_requeues() {
+        let (ctx, server, backend) = test_instance_context().await;
+        backend.set_create_progress(
+            CreateProgress::Pending,
+            Some(std::time::Duration::from_secs(600)),
+        );
+        let since = chrono::Utc::now().to_rfc3339();
+        let instance = deferred_instance("deferred-1", Some(&since), false);
+        // Still booting and inside the budget: no status write at all.
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        let calls = backend.call_count();
+        assert_eq!(calls.advance_create, 1);
+        assert_eq!(calls.create, 0);
+        assert_eq!(
+            calls.check_health, 0,
+            "readiness is not probed while the backend is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_create_complete_marks_instance_and_restarts_the_timer() {
+        let (ctx, server, backend) = test_instance_context().await;
+        backend.set_create_progress(
+            CreateProgress::Complete,
+            Some(std::time::Duration::from_secs(600)),
+        );
+        let instance = deferred_instance("deferred-2", Some("2026-01-01T00:00:00Z"), false);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deferred-2",
+            ))
+            .and(body_string_contains("kobe.kunobi.ninja~1create-complete"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(instance_api_response("deferred-2")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The status write is fenced to the resourceVersion the marker patch
+        // returned, and moves stateSince off the stale start.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deferred-2/status",
+            ))
+            .and(body_string_contains(r#""value":"11""#))
+            .and(body_string_contains("control plane ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("deferred-2")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(0)));
+        let calls = backend.call_count();
+        assert_eq!(calls.advance_create, 1);
+        assert_eq!(calls.check_health, 0);
+    }
+
+    #[tokio::test]
+    async fn marked_instance_never_repeats_post_ready_steps() {
+        let (ctx, server, backend) = test_instance_context().await;
+        backend.set_create_progress(
+            CreateProgress::Complete,
+            Some(std::time::Duration::from_secs(600)),
+        );
+        let instance = deferred_instance("deferred-3", None, true);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deferred-3/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("deferred-3")))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+        let calls = backend.call_count();
+        assert_eq!(calls.advance_create, 0);
+        assert_eq!(calls.check_health, 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_create_past_its_budget_fails_the_instance() {
+        let (ctx, server, backend) = test_instance_context().await;
+        backend.set_create_progress(
+            CreateProgress::Pending,
+            Some(std::time::Duration::from_secs(600)),
+        );
+        let since = (chrono::Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
+        let instance = deferred_instance("deferred-4", Some(&since), false);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deferred-4/status",
+            ))
+            .and(body_string_contains(r#""phase":"Failed""#))
+            .and(body_string_contains("not ready after"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("deferred-4")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+        assert_eq!(backend.call_count().check_health, 0);
+    }
+
+    #[test]
+    fn create_budget_is_measured_from_state_since_and_spares_backpressure() {
+        let now = chrono::Utc::now();
+        let budget = std::time::Duration::from_secs(600);
+        let mut status = ClusterInstanceStatus {
+            state_since: Some((now - chrono::Duration::seconds(599)).to_rfc3339()),
+            ..Default::default()
+        };
+        assert_eq!(create_budget_elapsed(&status, budget, now), None);
+
+        status.state_since = Some((now - chrono::Duration::seconds(601)).to_rfc3339());
+        assert!(create_budget_elapsed(&status, budget, now).is_some());
+
+        status.message = Some(format!(
+            "{} server pod Unschedulable: 0/3 nodes",
+            crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX
+        ));
+        assert_eq!(create_budget_elapsed(&status, budget, now), None);
+
+        status.message = None;
+        status.state_since = None;
+        assert_eq!(create_budget_elapsed(&status, budget, now), None);
     }
 
     #[tokio::test]

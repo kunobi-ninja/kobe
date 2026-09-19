@@ -328,6 +328,79 @@ pub(crate) fn data_volume_claim_template(
     }
 }
 
+/// Where a cluster stands after [`ClusterBackend::create`] returned.
+///
+/// Reported by [`ClusterBackend::advance_create`], which the instance
+/// controller calls on every `Creating` reconcile until the backend says the
+/// cluster is fully created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateProgress {
+    /// `create` already waited for readiness and ran every step that follows
+    /// it. Nothing is deferred to the controller.
+    NotDeferred,
+    /// The backend objects exist but the control plane is not ready yet.
+    Pending,
+    /// The control plane is ready and every post-ready step has run.
+    Complete,
+}
+
+/// Create a cluster and wait in-process until the backend reports it fully
+/// created.
+///
+/// For callers that own a dedicated task and have no controller to drive
+/// [`ClusterBackend::advance_create`] across reconciles, such as the golden
+/// snapshot builder. Never call this from a reconcile: it holds the caller
+/// for up to the backend's readiness budget.
+pub async fn create_and_wait<B: ClusterBackend>(
+    backend: &B,
+    name: &str,
+    namespace: &str,
+    config: &ClusterConfig,
+    addons: &[Addon],
+    owner_ref: Option<&OwnerReference>,
+) -> Result<()> {
+    create_and_wait_polling(
+        backend,
+        name,
+        namespace,
+        config,
+        addons,
+        owner_ref,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+async fn create_and_wait_polling<B: ClusterBackend>(
+    backend: &B,
+    name: &str,
+    namespace: &str,
+    config: &ClusterConfig,
+    addons: &[Addon],
+    owner_ref: Option<&OwnerReference>,
+    poll: std::time::Duration,
+) -> Result<()> {
+    backend
+        .create(name, namespace, config, addons, owner_ref)
+        .await?;
+    let budget = backend
+        .create_readiness_budget(config)
+        .unwrap_or(std::time::Duration::from_secs(600));
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match backend
+            .advance_create(name, namespace, config, addons, owner_ref)
+            .await?
+        {
+            CreateProgress::NotDeferred | CreateProgress::Complete => return Ok(()),
+            CreateProgress::Pending if tokio::time::Instant::now() >= deadline => {
+                anyhow::bail!("cluster {name} not ready after {}s", budget.as_secs())
+            }
+            CreateProgress::Pending => tokio::time::sleep(poll).await,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BackendDispatch — enum dispatch for ClusterBackend implementations
 // ---------------------------------------------------------------------------
@@ -360,6 +433,48 @@ impl ClusterBackend for BackendDispatch {
             Self::Capi(b) => b.create(name, namespace, config, addons, owner_ref).await,
             Self::Vkobe(b) => b.create(name, namespace, config, addons, owner_ref).await,
             Self::Vcluster(b) => b.create(name, namespace, config, addons, owner_ref).await,
+        }
+    }
+
+    async fn advance_create(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+        addons: &[Addon],
+        owner_ref: Option<&OwnerReference>,
+    ) -> Result<CreateProgress> {
+        match self {
+            Self::K3s(b) => {
+                b.advance_create(name, namespace, config, addons, owner_ref)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.advance_create(name, namespace, config, addons, owner_ref)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.advance_create(name, namespace, config, addons, owner_ref)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.advance_create(name, namespace, config, addons, owner_ref)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.advance_create(name, namespace, config, addons, owner_ref)
+                    .await
+            }
+        }
+    }
+
+    fn create_readiness_budget(&self, config: &ClusterConfig) -> Option<std::time::Duration> {
+        match self {
+            Self::K3s(b) => b.create_readiness_budget(config),
+            Self::K0s(b) => b.create_readiness_budget(config),
+            Self::Capi(b) => b.create_readiness_budget(config),
+            Self::Vkobe(b) => b.create_readiness_budget(config),
+            Self::Vcluster(b) => b.create_readiness_budget(config),
         }
     }
 
@@ -876,6 +991,14 @@ pub struct VerifiedDestroyUnsupported;
 pub trait ClusterBackend: Send + Sync {
     /// Create a virtual cluster with the given name and config.
     ///
+    /// A backend either waits here until the cluster is ready (the default,
+    /// still used by k0s, vkobe, capi and vcluster), or applies its objects
+    /// and returns at once, deferring readiness and every step that needs a
+    /// ready control plane to [`Self::advance_create`]. k3s defers, so a
+    /// reconcile worker is never parked on a booting cluster.
+    ///
+    /// Must be safe to call again after a partial failure or restart.
+    ///
     /// `owner_ref` should be the parent `ClusterInstance`'s
     /// [`OwnerReference`]. When supplied, backends MUST stamp it on
     /// every namespaced child resource they create so that k8s
@@ -897,6 +1020,44 @@ pub trait ClusterBackend: Send + Sync {
         addons: &[Addon],
         owner_ref: Option<&OwnerReference>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Advance a cluster whose objects [`Self::create`] already applied.
+    ///
+    /// Called by the instance controller on each `Creating` reconcile until
+    /// it returns [`CreateProgress::Complete`] or
+    /// [`CreateProgress::NotDeferred`]. One call does one readiness check and
+    /// never waits. Once the control plane is ready it runs the post-ready
+    /// steps (for k3s: kubeconfig authentication, agent Deployment, addons).
+    ///
+    /// Those steps can run more than once: the controller records completion
+    /// only after this returns, so a crash or a failed status write repeats
+    /// them. Implementations must keep every post-ready step idempotent.
+    ///
+    /// The default reports [`CreateProgress::NotDeferred`] for backends whose
+    /// `create` still waits for readiness itself.
+    fn advance_create(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+        addons: &[Addon],
+        owner_ref: Option<&OwnerReference>,
+    ) -> impl std::future::Future<Output = Result<CreateProgress>> + Send {
+        let _ = (name, namespace, config, addons, owner_ref);
+        async { Ok(CreateProgress::NotDeferred) }
+    }
+
+    /// How long a deferred create may stay [`CreateProgress::Pending`] before
+    /// the instance is failed, measured from when `create` applied the
+    /// objects.
+    ///
+    /// `None` means the backend does not defer readiness, and the controller
+    /// then skips [`Self::advance_create`] entirely. A backend that overrides
+    /// `advance_create` must return `Some` here.
+    fn create_readiness_budget(&self, config: &ClusterConfig) -> Option<std::time::Duration> {
+        let _ = config;
+        None
+    }
 
     /// Delete a virtual cluster.
     fn delete(
@@ -1999,6 +2160,48 @@ mod tests {
     use base64::Engine;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn create_and_wait_returns_once_a_blocking_create_is_done() {
+        let backend = crate::testutil::MockBackend::new();
+        let config = ClusterConfig::default();
+        create_and_wait_polling(
+            &backend,
+            "golden",
+            "ns",
+            &config,
+            &[],
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        let calls = backend.call_count();
+        assert_eq!((calls.create, calls.advance_create), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn create_and_wait_fails_when_readiness_outlasts_the_budget() {
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_create_progress(
+            CreateProgress::Pending,
+            Some(std::time::Duration::from_millis(20)),
+        );
+        let config = ClusterConfig::default();
+        let error = create_and_wait_polling(
+            &backend,
+            "golden",
+            "ns",
+            &config,
+            &[],
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not ready"), "{error:#}");
+        assert!(backend.call_count().advance_create > 1);
+    }
 
     /// Fields at their no-op values ask for nothing, so even a backend that
     /// reads none of `spec.cluster` accepts them.
