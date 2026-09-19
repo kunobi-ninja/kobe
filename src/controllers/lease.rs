@@ -595,8 +595,10 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     let controller = controller
         .reconcile_on(instance_lease_triggers(
             instances,
-            instance_writer,
-            Some(lease_store),
+            Some(PendingWakes {
+                instances: instance_writer,
+                leases: lease_store,
+            }),
         ))
         .reconcile_on(connect_token_lease_triggers(secrets))
         .reconcile_on(lease_deletion_evictions(leases, ctx.clone()))
@@ -605,28 +607,51 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
             |mut requests| async move { requests.recv().await.map(|lease| (lease, requests)) },
         ))
         .run(reconcile_lease_tracked, error_policy, ctx)
-        .for_each(|result| async move {
-            match result {
-                Ok((obj, _action)) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["lease", "ok"])
-                        .inc();
-                    debug!(lease = %obj.name, "Lease reconciled");
-                }
-                Err(e) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["lease", "error"])
-                        .inc();
-                    error!("Lease reconciliation error: {e:?}");
-                }
-            }
-        });
+        .for_each(|result| async move { observe_lease_result(result) });
 
     tokio::select! {
         _ = controller => {},
         _ = shutdown.cancelled() => {
             info!("Lease controller shutting down");
         },
+    }
+}
+
+type LeaseRunResult = Result<
+    (ObjectRef<ClusterLease>, Action),
+    kube::runtime::controller::Error<LeaseError, kube::runtime::watcher::Error>,
+>;
+
+/// Whether a controller-stream error only says a trigger woke an object that
+/// is already gone.
+///
+/// Every teardown produces these: an instance's last patches wake the lease it
+/// named after that lease was deleted, and deleting an instance wakes it
+/// through its garbage-collected Jobs and CIDRClaims. kube-runtime reports
+/// each as `ObjectNotFound`; none is a failed reconcile.
+pub(crate) fn woke_deleted_object<R, Q>(error: &kube::runtime::controller::Error<R, Q>) -> bool {
+    matches!(error, kube::runtime::controller::Error::ObjectNotFound(_))
+}
+
+/// Count and log one lease controller result. A wake for a deleted lease is
+/// neither success nor failure (see [`woke_deleted_object`]).
+fn observe_lease_result(result: LeaseRunResult) {
+    match result {
+        Ok((obj, _action)) => {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["lease", "ok"])
+                .inc();
+            debug!(lease = %obj.name, "Lease reconciled");
+        }
+        Err(error) if woke_deleted_object(&error) => {
+            debug!(%error, "Lease trigger woke a deleted lease");
+        }
+        Err(e) => {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["lease", "error"])
+                .inc();
+            error!("Lease reconciliation error: {e:?}");
+        }
     }
 }
 
@@ -642,8 +667,12 @@ const RECYCLING_READ_RETRY: std::time::Duration = std::time::Duration::from_secs
 /// instance reference to go. The Secret and instance watches deliver both.
 const NEVER_BOUND_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
 /// Retry after an optimistic-concurrency conflict. The object changed under
-/// us; re-reading it right away is the whole fix.
+/// us; re-reading it right away is usually the whole fix.
 const CONFLICT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Consecutive failures that still retry after [`CONFLICT_RETRY`] when they
+/// are conflicts. Past this, a lagging store is the likelier cause, and
+/// conflicts join the exponential backoff.
+const FAST_CONFLICT_RETRIES: u32 = 3;
 /// First retry after a failed reconcile. Doubles per consecutive failure.
 const ERROR_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Longest retry after repeated failed reconciles.
@@ -666,13 +695,17 @@ impl<B: ClusterBackend> LeaseContext<B> {
         let Some(removed_at) = remove_from_queue(&self.queues, pool, lease_name).await else {
             return;
         };
-        let window = self.bind_window(pool);
-        if removed_at >= window {
-            return;
+        if removed_at < self.bind_window(pool) {
+            self.wake_window(pool).await;
         }
+    }
+
+    /// Wake the leases currently inside `pool`'s bind window.
+    async fn wake_window(&self, pool: &str) {
         let Some(wakes) = self.queue_wakes.as_ref() else {
             return;
         };
+        let window = self.bind_window(pool);
         let names = {
             let queues = self.queues.read().await;
             queues
@@ -699,7 +732,8 @@ impl<B: ClusterBackend> LeaseContext<B> {
 /// loser clears its own intent and waits. Leases outside the window still
 /// wait, so when capacity is scarcer than demand, priority order decides who
 /// binds. With a single free instance the window is the head alone, and an
-/// unsatisfiable head still blocks its pool until the queue timeout.
+/// unsatisfiable head still blocks its pool until the queue timeout. See
+/// [`candidates_for_slot`] for which instance each slot may take.
 fn bind_window(free_instances: usize) -> usize {
     free_instances.max(1)
 }
@@ -836,24 +870,39 @@ fn pending_leases_to_wake(
         .collect()
 }
 
+/// Where an instance watch finds the queues it may wake.
+struct PendingWakes {
+    /// Reflects the instance watch; its store sizes the bind window.
+    instances: kube::runtime::reflector::store::Writer<ClusterInstance>,
+    /// The lease controller's store, to find a pool's Pending leases.
+    leases: Store<ClusterLease>,
+}
+
 /// Reconcile requests for the leases an instance event concerns.
 ///
-/// The instance watch is reflected into `writer`, whose store sizes the bind
-/// window. With `pending` set, an instance that became free capacity also
-/// wakes the front of its pool's queue; the release authority passes `None`
-/// because it never binds.
+/// With `pending` set, the watch is reflected into a store that sizes the
+/// bind window, and an instance that became free capacity also wakes the
+/// front of its pool's queue. The release authority passes `None`: it never
+/// binds, so it keeps no instance store.
 fn instance_lease_triggers(
     instances: Api<ClusterInstance>,
-    writer: kube::runtime::reflector::store::Writer<ClusterInstance>,
-    pending: Option<Store<ClusterLease>>,
+    pending: Option<PendingWakes>,
 ) -> impl futures::Stream<Item = ObjectRef<ClusterLease>> + Send + 'static {
     use kube::runtime::{WatchStreamExt, watcher};
 
-    let instance_store = writer.as_reader();
+    let events = watcher(instances, Config::default()).default_backoff();
+    let (events, pending) = match pending {
+        Some(PendingWakes { instances, leases }) => {
+            let instance_store = instances.as_reader();
+            (
+                events.reflect(instances).boxed(),
+                Some((instance_store, leases)),
+            )
+        }
+        None => (events.boxed(), None),
+    };
     let mut index = InstanceLeaseIndex::default();
-    watcher(instances, Config::default())
-        .default_backoff()
-        .reflect(writer)
+    events
         .filter_map(|event| async move {
             event
                 .inspect_err(
@@ -865,7 +914,8 @@ fn instance_lease_triggers(
             let (instance, names) = match &event {
                 watcher::Event::Apply(instance) | watcher::Event::InitApply(instance) => {
                     let mut names = index.applied(instance);
-                    if let (Some(leases), Some(pool)) = (pending.as_ref(), instance_pool(instance))
+                    if let (Some((instance_store, leases)), Some(pool)) =
+                        (pending.as_ref(), instance_pool(instance))
                     {
                         let window =
                             bind_window(free_instances_in_pool(&instance_store.state(), pool));
@@ -945,15 +995,24 @@ fn lease_deletion_evictions<B: ClusterBackend + 'static>(
             let ctx = ctx.clone();
             async move {
                 match event {
-                    Ok(watcher::Event::Delete(lease)) => {
-                        ctx.dequeue(&lease.spec.pool_ref, &lease.name_any()).await;
-                    }
+                    Ok(watcher::Event::Delete(lease)) => forget_deleted_lease(&ctx, &lease).await,
                     Ok(_) => {}
                     Err(error) => warn!(error = %error, "ClusterLease deletion watch failed"),
                 }
                 None
             }
         })
+}
+
+/// Drop what the controller keeps in memory for a deleted lease: its queue
+/// entry, and its failure count, which a later lease reusing the name must
+/// not inherit.
+async fn forget_deleted_lease<B: ClusterBackend>(ctx: &LeaseContext<B>, lease: &ClusterLease) {
+    let name = lease.name_any();
+    if let Ok(mut failures) = ctx.failures.lock() {
+        failures.remove(&name);
+    }
+    ctx.dequeue(&lease.spec.pool_ref, &name).await;
 }
 
 /// Reconcile, then forget the lease's failure count on success so the next
@@ -1000,9 +1059,8 @@ pub async fn run_release_authority_controller(
     info!("Starting isolated release-attempt authority");
     // NeverBound proof waits on instance references and the connect-token
     // Secret, so both wake the lease they concern.
-    let (_instance_store, instance_writer) = kube::runtime::reflector::store();
     let controller = Controller::new(leases, Config::default())
-        .reconcile_on(instance_lease_triggers(instances, instance_writer, None))
+        .reconcile_on(instance_lease_triggers(instances, None))
         .reconcile_on(connect_token_lease_triggers(secrets))
         .run(
             reconcile_release_authority,
@@ -1010,8 +1068,12 @@ pub async fn run_release_authority_controller(
             context,
         )
         .for_each(|result| async move {
-            if let Err(error) = result {
-                debug!(?error, "release authority reconciliation error");
+            match result {
+                Err(error) if woke_deleted_object(&error) => {
+                    debug!(%error, "release authority woke a deleted lease");
+                }
+                Err(error) => debug!(?error, "release authority reconciliation error"),
+                Ok(_) => {}
             }
         });
     tokio::select! {
@@ -1689,8 +1751,8 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 return Ok(Action::requeue(pending_requeue));
             }
 
-            // Leases inside the window start from different Ready instances so
-            // concurrent reservations rarely collide (see `bind_window`).
+            // Each window slot has its own instance, so concurrent
+            // reservations do not collide (see `candidates_for_slot`).
             let reserved_binding = reserve_ready_instance(
                 &ctx.client,
                 &ns,
@@ -2105,35 +2167,20 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     // A reservation intent that never reached Bound, whose
                     // exact instance is gone, holds nothing: retire it. Before
                     // this arm such leases re-reconciled every 30s forever.
+                    // Boxed to keep its awaits off this future's frame.
                     if token_delete_result.is_ok()
-                        && let Some(binding) = orphaned_standard_intent(
+                        && let Some(action) = Box::pin(retire_orphaned_standard_intent(
+                            &ctx.client,
+                            &ns,
+                            &leases_api,
                             &terminal_lease,
                             &terminal_status,
                             verified_cleanup,
-                        )
-                        && exact_bound_instance_is_gone(&ctx.client, &ns, binding).await?
+                            err.reason_code(),
+                        ))
+                        .await?
                     {
-                        info!(
-                            lease = %name,
-                            phase = %phase,
-                            instance = %binding.instance.name,
-                            reason = err.reason_code(),
-                            "Retiring terminal lease: its unbound reservation intent names an instance that no longer exists"
-                        );
-                        crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
-                            .with_label_values(&[
-                                terminal_lease.spec.pool_ref.as_str(),
-                                phase.to_string().as_str(),
-                            ])
-                            .inc();
-                        let terminal_lease =
-                            remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
-                                .await?;
-                        return Ok(if delete_lease_crd(&leases_api, &terminal_lease).await {
-                            Action::await_change()
-                        } else {
-                            Action::requeue(std::time::Duration::from_secs(15))
-                        });
+                        return Ok(action);
                     }
                     mark_binding_unverified(&leases_api, &terminal_lease, err.reason_code())
                         .await?;
@@ -2341,6 +2388,44 @@ fn orphaned_standard_intent<'a>(
         && !sandbox_composition_requires_outer_retirement(lease)
         && !teardown_receipt_unconsumed(lease, status))
     .then_some(binding)
+}
+
+/// Retire a terminal lease matching [`orphaned_standard_intent`] whose exact
+/// instance is gone. `None` leaves the lease to the caller.
+async fn retire_orphaned_standard_intent(
+    client: &Client,
+    namespace: &str,
+    leases_api: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    verified_cleanup: bool,
+    reason: &str,
+) -> Result<Option<Action>, LeaseError> {
+    let Some(binding) = orphaned_standard_intent(lease, status, verified_cleanup) else {
+        return Ok(None);
+    };
+    if !exact_bound_instance_is_gone(client, namespace, binding).await? {
+        return Ok(None);
+    }
+    info!(
+        lease = %lease.name_any(),
+        phase = %status.phase,
+        instance = %binding.instance.name,
+        reason,
+        "Retiring terminal lease: its unbound reservation intent names an instance that no longer exists"
+    );
+    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+        .with_label_values(&[
+            lease.spec.pool_ref.as_str(),
+            status.phase.to_string().as_str(),
+        ])
+        .inc();
+    let lease = remove_receipt_retention_finalizer(client, namespace, lease).await?;
+    Ok(Some(if delete_lease_crd(leases_api, &lease).await {
+        Action::await_change()
+    } else {
+        Action::requeue(std::time::Duration::from_secs(15))
+    }))
 }
 
 /// Whether the exact instance a binding names no longer exists: 404, or the
@@ -3841,15 +3926,14 @@ async fn persist_reserved_connect_token(
 /// Reserve a free Ready instance of the lease's pool, or resume the lease's
 /// existing reservation intent.
 ///
-/// `start` rotates the candidate order: the lease at bind-window slot `start`
-/// tries the `start`-th Ready instance first, so leases reserving at the same
-/// time spread across instances instead of all racing for the first one.
+/// `slot` is the lease's bind-window position (0 for the head) and limits
+/// which free instances it may try (see [`candidates_for_slot`]).
 async fn reserve_ready_instance(
     client: &Client,
     namespace: &str,
     lease: &ClusterLease,
     factory: Option<&BackendFactory>,
-    start: usize,
+    slot: usize,
 ) -> Result<Option<LeaseBinding>, LeaseError> {
     // A resumed intent is already authority-bearing. Revalidate it before the
     // idempotent receipt-fence metadata upgrade so a replaced outer pool can
@@ -3911,7 +3995,7 @@ async fn reserve_ready_instance(
         .filter(instance_is_free_capacity)
         .collect();
     ready.sort_by_key(|instance| instance.name_any());
-    rotate_candidates(&mut ready, start);
+    let ready = candidates_for_slot(ready, slot);
 
     if ready.is_empty() {
         return Ok(None);
@@ -4015,12 +4099,25 @@ async fn reserve_ready_instance(
     Ok(None)
 }
 
-/// Rotate `candidates` left by `start` (modulo its length).
-fn rotate_candidates<T>(candidates: &mut [T], start: usize) {
-    if !candidates.is_empty() {
-        let len = candidates.len();
-        candidates.rotate_left(start % len);
+/// The free instances the lease at bind-window `slot` may try, from the
+/// name-sorted free list.
+///
+/// The head (slot 0) tries every instance. Any other slot tries only the
+/// instance at its own index, and none if the list is shorter than its slot
+/// (the window was sized from a store that has since moved on). Concurrent
+/// leases stay off each other's instance, and a lower-priority lease never
+/// takes the instance the head tries first.
+///
+/// This does not fully preserve priority. If the head cannot accept instance
+/// 0 (its cleanup mode or provenance does not match) but could accept the
+/// instance slot 1 just took, the head waits for the next free instance or
+/// its queue timeout. Ruling that out would mean checking every
+/// higher-priority lease's eligibility before each reservation.
+fn candidates_for_slot<T>(candidates: Vec<T>, slot: usize) -> Vec<T> {
+    if slot == 0 {
+        return candidates;
     }
+    candidates.into_iter().nth(slot).into_iter().collect()
 }
 
 fn lease_uid_for(lease: &ClusterLease) -> Result<&str, LeaseError> {
@@ -4739,15 +4836,21 @@ async fn run_reaper<B: ClusterBackend>(
                 .map(|l| l.name_any())
                 .collect();
 
-            let evicted = {
+            let (evicted, pools) = {
                 let mut queues = ctx.queues.write().await;
-                prune_queues_against_live(&mut queues, &live_pending)
+                let evicted = prune_queues_against_live(&mut queues, &live_pending);
+                (evicted, queues.keys().cloned().collect::<Vec<_>>())
             };
             if !evicted.is_empty() {
                 warn!(
                     leases = ?evicted,
                     "Reaper: evicted queue entries with no live Pending lease (would otherwise head-block the pool)"
                 );
+                // Evictions shift the window; wake it rather than leave the
+                // new front to its backstop.
+                for pool in pools {
+                    ctx.wake_window(&pool).await;
+                }
             }
         }
 
@@ -5066,26 +5169,33 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
 
 /// Retry a failed reconcile.
 ///
-/// An optimistic-concurrency conflict retries after [`CONFLICT_RETRY`]: the
-/// lease changed under the reconcile and the next read settles it. Any other
-/// error backs off exponentially per lease (see [`error_backoff`]); a success
-/// resets the count (see [`reconcile_lease_tracked`]).
+/// Every failure counts per lease; a success resets the count (see
+/// [`reconcile_lease_tracked`]) and so does the lease's deletion (see
+/// [`forget_deleted_lease`]). An optimistic-concurrency conflict retries after
+/// [`CONFLICT_RETRY`] for the first [`FAST_CONFLICT_RETRIES`] failures: the
+/// lease changed under the reconcile and the next read settles it. Conflicts
+/// that keep coming, and every other error, back off exponentially (see
+/// [`error_backoff`]).
 fn error_policy<B: ClusterBackend>(
     lease: Arc<ClusterLease>,
     error: &LeaseError,
     ctx: Arc<LeaseContext<B>>,
 ) -> Action {
-    if let LeaseError::Kube(kube_error) = error
-        && optimistic_conflict(kube_error)
-    {
-        debug!(lease = %lease.name_any(), "Lease reconcile lost an optimistic race; retrying");
-        return Action::requeue(CONFLICT_RETRY);
-    }
     let failures = ctx.failures.lock().map_or(1, |mut failures| {
         let count = failures.entry(lease.name_any()).or_insert(0);
         *count = count.saturating_add(1);
         *count
     });
+    let conflict = matches!(error, LeaseError::Kube(kube_error) if optimistic_conflict(kube_error));
+    if conflict && failures <= FAST_CONFLICT_RETRIES {
+        debug!(lease = %lease.name_any(), failures, "Lease reconcile lost an optimistic race; retrying");
+        return Action::requeue(CONFLICT_RETRY);
+    }
+    let failures = if conflict {
+        failures - FAST_CONFLICT_RETRIES
+    } else {
+        failures
+    };
     let delay = error_backoff(failures);
     error!(lease = %lease.name_any(), failures, retry_in = ?delay, "Lease reconciliation error: {error}");
     Action::requeue(delay)
@@ -7619,19 +7729,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_policy_retries_optimistic_conflicts_immediately() {
+    async fn error_policy_retries_a_few_conflicts_fast_then_backs_off() {
         let (ctx, _server) = test_lease_context().await;
         let lease = make_test_lease("conflict-lease", "Pending");
         let conflict = LeaseError::Kube(api_error(409, "Conflict", vec![]));
-        for _ in 0..3 {
+        for _ in 0..FAST_CONFLICT_RETRIES {
             assert_eq!(
                 error_policy(lease.clone(), &conflict, ctx.clone()),
                 Action::requeue(CONFLICT_RETRY)
             );
         }
-        assert!(
-            ctx.failures.lock().unwrap().is_empty(),
-            "a lost race is not a failure and must not grow the backoff"
+        // Conflicts that keep coming point at a lagging store; they must not
+        // retry every second until the watch recovers.
+        assert_eq!(
+            error_policy(lease.clone(), &conflict, ctx.clone()),
+            Action::requeue(ERROR_BACKOFF_BASE)
+        );
+        assert_eq!(
+            error_policy(lease, &conflict, ctx),
+            Action::requeue(ERROR_BACKOFF_BASE * 2)
         );
     }
 
@@ -9851,16 +9967,64 @@ mod tests {
     }
 
     #[test]
-    fn rotate_candidates_spreads_window_slots_across_instances() {
-        let mut candidates = vec!["a", "b", "c"];
-        rotate_candidates(&mut candidates, 1);
-        assert_eq!(candidates, ["b", "c", "a"]);
-        let mut candidates = vec!["a", "b", "c"];
-        rotate_candidates(&mut candidates, 4);
-        assert_eq!(candidates, ["b", "c", "a"], "slots past the end wrap");
-        let mut empty: Vec<&str> = Vec::new();
-        rotate_candidates(&mut empty, 2);
-        assert!(empty.is_empty());
+    fn the_head_tries_every_instance_and_other_slots_only_their_own() {
+        let free = || vec!["a", "b", "c"];
+        assert_eq!(candidates_for_slot(free(), 0), ["a", "b", "c"]);
+        assert_eq!(candidates_for_slot(free(), 1), ["b"]);
+        assert_eq!(candidates_for_slot(free(), 2), ["c"]);
+        assert!(
+            candidates_for_slot(free(), 3).is_empty(),
+            "a slot past the free list must not wrap onto the head's instance"
+        );
+    }
+
+    #[test]
+    fn a_wake_for_a_deleted_object_is_not_a_reconcile_error() {
+        let gone: kube::runtime::controller::Error<LeaseError, kube::runtime::watcher::Error> =
+            kube::runtime::controller::Error::ObjectNotFound(Box::new(
+                ObjectRef::<ClusterLease>::new("gone")
+                    .within("test-ns")
+                    .erase(),
+            ));
+        assert!(woke_deleted_object(&gone));
+        let failed: kube::runtime::controller::Error<LeaseError, kube::runtime::watcher::Error> =
+            kube::runtime::controller::Error::ReconcilerFailed(
+                LeaseError::Lifecycle(anyhow::anyhow!("boom")),
+                Box::new(ObjectRef::<ClusterLease>::new("x").erase()),
+            );
+        assert!(!woke_deleted_object(&failed));
+
+        let errors = || {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["lease", "error"])
+                .get()
+        };
+        let before = errors();
+        observe_lease_result(Err(gone));
+        assert_eq!(errors(), before, "a deleted lease's wake is not an error");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_lease_forgets_its_failures_and_queue_entry() {
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("doomed", "Pending");
+        ctx.queues
+            .write()
+            .await
+            .insert("test-profile".into(), vec![pending("doomed")]);
+        let error = LeaseError::Lifecycle(anyhow::anyhow!("boom"));
+        error_policy(lease.clone(), &error, ctx.clone());
+        error_policy(lease.clone(), &error, ctx.clone());
+
+        forget_deleted_lease(&ctx, &lease).await;
+
+        assert!(ctx.failures.lock().unwrap().is_empty());
+        assert!(ctx.queues.read().await["test-profile"].is_empty());
+        assert_eq!(
+            error_policy(lease, &error, ctx),
+            Action::requeue(ERROR_BACKOFF_BASE),
+            "a lease reusing the name starts its backoff over"
+        );
     }
 
     #[test]

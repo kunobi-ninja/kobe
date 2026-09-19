@@ -217,29 +217,7 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
             |claim: &CIDRClaim| owning_instance(&claim.metadata),
         ))
         .run(reconcile_instance, error_policy, ctx)
-        .for_each(|result| async move {
-            match result {
-                Ok((obj, _action)) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["instance", "ok"])
-                        .inc();
-                    debug!(instance = %obj.name, "Instance reconciled");
-                }
-                Err(e) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["instance", "error"])
-                        .inc();
-                    // `error_policy` already reported this at ERROR, with the
-                    // instance named and the error in its Display form. Logging
-                    // it again here as Debug meant every reconcile failure
-                    // appeared twice in two different shapes, which doubled the
-                    // volume and made counting incidents by eye unreliable
-                    // (#153). Kept at debug for the runtime-level detail the
-                    // Debug form carries; the metric above is the durable count.
-                    debug!("Instance reconciliation error (runtime detail): {e:?}");
-                }
-            }
-        });
+        .for_each(|result| async move { observe_instance_result(result) });
 
     tokio::select! {
         _ = controller => {},
@@ -286,13 +264,53 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
             ctx,
         )
         .for_each(|result| async move {
-            if let Err(error) = result {
-                debug!(?error, "receipt authority reconciliation error");
+            match result {
+                Err(error) if crate::controllers::lease::woke_deleted_object(&error) => {
+                    debug!(%error, "receipt authority woke a deleted instance");
+                }
+                Err(error) => debug!(?error, "receipt authority reconciliation error"),
+                Ok(_) => {}
             }
         });
     tokio::select! {
         _ = controller => {},
         _ = shutdown.cancelled() => info!("Teardown receipt authority shutting down"),
+    }
+}
+
+type InstanceRunResult = Result<
+    (ObjectRef<ClusterInstance>, Action),
+    kube::runtime::controller::Error<InstanceError, kube::runtime::watcher::Error>,
+>;
+
+/// Count and log one instance controller result. Deleting an instance wakes
+/// it again through its garbage-collected Jobs and CIDRClaims and its lease;
+/// kube-runtime reports those wakes as `ObjectNotFound`, which is not a failed
+/// reconcile (see [`crate::controllers::lease::woke_deleted_object`]).
+fn observe_instance_result(result: InstanceRunResult) {
+    match result {
+        Ok((obj, _action)) => {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["instance", "ok"])
+                .inc();
+            debug!(instance = %obj.name, "Instance reconciled");
+        }
+        Err(error) if crate::controllers::lease::woke_deleted_object(&error) => {
+            debug!(%error, "Instance trigger woke a deleted instance");
+        }
+        Err(e) => {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["instance", "error"])
+                .inc();
+            // `error_policy` already reported this at ERROR, with the
+            // instance named and the error in its Display form. Logging it
+            // again here as Debug meant every reconcile failure appeared twice
+            // in two different shapes, which doubled the volume and made
+            // counting incidents by eye unreliable (#153). Kept at debug for
+            // the runtime-level detail the Debug form carries; the metric
+            // above is the durable count.
+            debug!("Instance reconciliation error (runtime detail): {e:?}");
+        }
     }
 }
 
@@ -6494,5 +6512,23 @@ mod tests {
             owning_instance(&job.metadata).map(|reference| reference.name),
             Some("pool-test-1".to_string())
         );
+    }
+
+    #[test]
+    fn a_wake_for_a_deleted_instance_is_not_a_reconcile_error() {
+        let errors = || {
+            crate::metrics::RECONCILIATIONS_TOTAL
+                .with_label_values(&["instance", "error"])
+                .get()
+        };
+        let before = errors();
+        observe_instance_result(Err(kube::runtime::controller::Error::ObjectNotFound(
+            Box::new(
+                ObjectRef::<ClusterInstance>::new("gone")
+                    .within("test-ns")
+                    .erase(),
+            ),
+        )));
+        assert_eq!(errors(), before);
     }
 }
