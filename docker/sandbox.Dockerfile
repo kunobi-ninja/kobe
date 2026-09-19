@@ -23,7 +23,11 @@
 #
 #   2. `mise` itself, and `tmux` for `attachCommand`.
 #
-#   3. `kobe-runner`, so the pool can offer detached execution.
+#   3. A `/nix` the workload owns, with Nix in it. Creating `/nix` takes root,
+#      so a project cannot do it; with it in place, a project fetches its own
+#      system libraries instead of asking for them to be added to (1).
+#
+#   4. `kobe-runner`, so the pool can offer detached execution.
 # =============================================================================
 FROM debian:bookworm-slim
 
@@ -256,6 +260,32 @@ RUN printf '%s\n' \
       > /etc/profile.d/kobe-cpu-quota.sh \
     && chmod 0644 /etc/profile.d/kobe-cpu-quota.sh
 
+# --- Nix store ---------------------------------------------------------------
+#
+# `/nix` is the one part of Nix a project cannot provide for itself: creating it
+# takes root, and there is none at runtime. Owning it by the workload UID makes
+# this a single-user install, with no daemon, no setuid helper and no build
+# users, so Nix adds no privilege the lease did not already have. What it adds
+# is reach: a project pulls the system libraries it needs with `nix shell` or
+# its own flake instead of waiting for them to land in the apt list above.
+#
+# `sandbox = false` because Kobe's Sandbox containers cannot create user
+# namespaces, which is what the Nix build sandbox is made of. Builds are
+# therefore not isolated from one another inside a lease; the lease itself is
+# the isolation boundary. The store lives in the container's writable layer and
+# counts against the pool's ephemeral-storage limit.
+RUN install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0755 /nix \
+    && install -d -m 0755 /etc/nix \
+    && printf '%s\n' \
+        'sandbox = false' \
+        'build-users-group =' \
+        'experimental-features = nix-command flakes' \
+        > /etc/nix/nix.conf \
+    && chmod 0644 /etc/nix/nix.conf \
+    && printf '%s\n' 'export PATH=$PATH:/home/agent/.nix-profile/bin' \
+        > /etc/profile.d/kobe-nix.sh \
+    && chmod 0644 /etc/profile.d/kobe-nix.sh
+
 COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner \
@@ -276,7 +306,9 @@ ENV HOME=/home/agent
 # shell: `kobe exec -- claude ...` never reads /etc/profile.d, so a profile
 # line alone left the CLIs installed and unreachable, which is exactly what
 # shipped in v0.48.0. The symlink keeps this stable across Node patch bumps.
-ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/opt/kobe/node/bin:$PATH
+# The Nix profile comes LAST: a tool a project pins through mise, and anything
+# the image ships, wins over whatever a lease later adds with `nix profile`.
+ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/opt/kobe/node/bin:$PATH:/home/agent/.nix-profile/bin
 
 # mise refuses to read a config file it has not been told to trust, which in a
 # freshly cloned repo means `mise install` stops and waits for a human that a
@@ -303,6 +335,22 @@ ENV DISPLAY=:99 \
     WEBKIT_DISABLE_DMABUF_RENDERER=1
 
 WORKDIR /home/agent/work
+
+# --- Nix ---------------------------------------------------------------------
+#
+# Installed as the workload user into the `/nix` prepared above. Pinned for the
+# same reason mise is; the versioned installer carries the SHA-256 of the
+# tarball it fetches, so the pin covers the binaries and not just the script.
+# Fetched to a file, not piped, for the reason recorded at the mise install.
+# `--no-modify-profile` because PATH is already handled: ENV above for a
+# shell-less `kobe exec`, /etc/profile.d for a login shell.
+ARG NIX_VERSION=2.35.2
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" -o /tmp/nix-install.sh \
+    && test -s /tmp/nix-install.sh \
+    && USER=nonroot sh /tmp/nix-install.sh --no-daemon --no-modify-profile --no-channel-add \
+    && rm -f /tmp/nix-install.sh \
+    && env -i HOME="$HOME" PATH="$PATH" nix --version | grep -q "${NIX_VERSION}"
 
 # --- Build-time proof -------------------------------------------------------
 #
@@ -357,6 +405,16 @@ RUN env -i PATH="$PATH" claude --version >/dev/null \
     && env -i PATH="$PATH" codex --version >/dev/null \
     && env -i PATH="$PATH" opencode --version >/dev/null
 
+# Nix must BUILD, not just start, under the constraints a lease has: no root,
+# no user namespaces, no shell. A trivial derivation proves the store is
+# writable and the unsandboxed builder runs; the result is collected again so
+# the proof leaves nothing in the published store.
+RUN out="$(env -i HOME="$HOME" PATH="$PATH" nix build --impure --no-link --print-out-paths --expr \
+        'derivation { name = "kobe-nix-proof"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo ok > $out" ]; }')" \
+    && grep -qx ok "$out" \
+    && nix store delete "$out" \
+    && rm -rf /home/agent/.cache/nix
+
 # `jq` is small, has no runtime deps, and stands in for "any mise-managed tool".
 # Resolving it by bare name proves the shim PATH works for a non-shell exec.
 RUN mise use --global jq@1.7.1 \
@@ -373,7 +431,7 @@ LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.title="kobe-sandbox"
-LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, a C toolchain, kobe-runner, and an opt-in loopback-only desktop"
+LABEL org.opencontainers.image.description="Project-agnostic Kobe Sandbox workspace: mise, Nix, a C toolchain, kobe-runner, and an opt-in loopback-only desktop"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
 # Idle until the lease drives it. TERM is trapped so a released lease tears the
