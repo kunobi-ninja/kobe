@@ -114,11 +114,15 @@ The image also ships Node 24 with the Codex and Claude Code CLIs, on `PATH` for
 signs in its own user. The CLIs track their latest release at image build time.
 
 Nix is installed for the workload user, with `nix-command` and `flakes`
-enabled. Use it for system libraries and tools the image does not carry:
+enabled. Run tools the image does not carry with `nix shell`:
 
 ```bash
-kobe exec <lease> -- nix shell nixpkgs#libxkbcommon -c cargo build
+kobe exec <lease> -- nix shell nixpkgs#hello -c hello
 ```
+
+For builds that need headers and libraries, define them in your project's
+`flake.nix` development shell and use `nix develop`. `nix shell` adds executables
+to `PATH`; it does not configure compiler or linker search paths.
 
 There is no Nix daemon and no root. The Nix build sandbox is off, because a
 Sandbox container cannot create user namespaces, so builds inside one lease are
