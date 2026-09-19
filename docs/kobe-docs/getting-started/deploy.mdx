@@ -17,12 +17,11 @@ Pick a namespace for the release and for the CRs the operator watches. They can 
 kubectl create namespace kobe-system
 
 helm install kobe oci://registry-1.docker.io/zondax/kobe \
-  --version 0.47.0 \
   --namespace kobe-system \
   --set operatorNamespace=kobe-system
 ```
 
-Chart version, GitHub release tag, and operator image tag stay in lockstep: chart `0.47.0` pulls `zondax/kobe-operator:v0.47.0`. Pin `--version` to a [released tag](https://github.com/kunobi-ninja/kobe/releases).
+Helm installs the latest release. Chart version, GitHub release tag, and operator image tag stay in lockstep: chart `X.Y.Z` runs `zondax/kobe-operator:vX.Y.Z`. To install a specific [release](https://github.com/kunobi-ninja/kobe/releases), add `--version X.Y.Z`.
 
 Confirm the operator is up:
 
@@ -36,13 +35,12 @@ curl http://localhost:8080/healthz
 
 ### CRDs on upgrade
 
-Helm applies objects from a chart's `crds/` directory on first install only. Before upgrading to a version that adds or changes CRDs, apply the new manifests, then upgrade the operator:
+Helm applies objects from a chart's `crds/` directory on first install only. Before upgrading to a version that adds or changes CRDs, apply the new manifests, then upgrade the operator from the same pulled chart:
 
 ```sh
-helm pull oci://registry-1.docker.io/zondax/kobe --version 0.47.0 --untar
+helm pull oci://registry-1.docker.io/zondax/kobe --untar
 kubectl apply -f kobe/crds/
-helm upgrade kobe oci://registry-1.docker.io/zondax/kobe \
-  --version 0.47.0 \
+helm upgrade kobe ./kobe \
   --namespace kobe-system \
   --set operatorNamespace=kobe-system
 ```
