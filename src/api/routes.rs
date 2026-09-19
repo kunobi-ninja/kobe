@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
+use crate::api::cluster_admission;
 use crate::api::connect::{
     BackendAccess, backend_access_from_kubeconfig, build_backend_tls_config,
     build_connect_kubeconfig, ensure_lease_connect_token, validate_lease_connect_token,
@@ -440,7 +441,9 @@ pub(crate) struct CreateLeaseRequest {
     /// Sandbox pools.
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
-    /// Sandbox create idempotency key. Ignored for Cluster pools.
+    /// Create idempotency key. A repeated create with the same key and the
+    /// same request returns the lease the first one created instead of a new
+    /// one; the same key with a different request is a 409.
     #[serde(default, rename = "idempotencyKey", alias = "idempotency_key")]
     pub(crate) idempotency_key: Option<String>,
 }
@@ -701,6 +704,9 @@ enum ErrorReason {
     TeardownQuarantined,
     /// The pool name exists as the other resource kind (Cluster vs Sandbox).
     WrongResourceKind,
+    /// Another create for the same caller held the admission lock for the
+    /// whole wait budget. Nothing was created; retry after `Retry-After`.
+    AdmissionBusy,
 }
 
 impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
@@ -1444,61 +1450,20 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     let was_clamped = effective_ttl < requested_ttl;
     let ttl_formatted = format_duration(&effective_ttl);
 
-    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    let active_count = match count_active_leases(&leases_api, &identity.identity).await {
-        Ok(count) => count,
-        Err(e) => {
-            return infra_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Unable to verify lease quota",
-                e,
-            );
+    let create_key = match cluster_create_key(&req, &profile) {
+        Ok(key) => key,
+        Err(detail) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid lease create idempotency key".to_string(),
+                    detail: Some(detail.to_string()),
+                    reason: None,
+                }),
+            )
+                .into_response();
         }
     };
-    if active_count >= policy.max_concurrent_leases {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse {
-                error: format!(
-                    "Concurrent lease limit ({}) reached",
-                    policy.max_concurrent_leases
-                ),
-                detail: Some(format!("You have {} active leases", active_count)),
-                reason: None,
-            }),
-        )
-            .into_response();
-    }
-
-    // #107 P2: an alias names exactly one of the requester's active leases.
-    // Fast-fail if it's already taken (the post-create check below closes the
-    // concurrent-create race).
-    if let Some(alias) = req.alias.as_deref() {
-        match active_alias_holders_sorted(&leases_api, &identity.identity, alias).await {
-            Ok(holders) if !holders.is_empty() => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: format!("Alias '{alias}' is already in use by an active lease"),
-                        detail: Some(format!(
-                            "Lease '{}' already holds this alias; release it or extend that lease instead",
-                            holders[0]
-                        )),
-                        reason: None,
-                    }),
-                )
-                    .into_response();
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return infra_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Unable to verify lease alias",
-                    e,
-                );
-            }
-        }
-    }
 
     // #189 pre-flight: GET the target pool and refuse up-front when it cannot
     // satisfy the lease, instead of creating a ClusterLease that only gives up
@@ -1507,7 +1472,8 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
     // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
     // empty warm pool keeps the 202 Pending below. Missing pools are rejected
-    // above in `resolve_create_pool_kind`.
+    // above in `resolve_create_pool_kind`. Runs before the admission lock so a
+    // slow pool read never lengthens the critical section.
     {
         let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
         match pools_api.get(&profile).await {
@@ -1531,7 +1497,7 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
     );
 
-    let lease = build_lease_crd(
+    let mut lease = build_lease_crd(
         &lease_id,
         &state.namespace,
         &profile,
@@ -1541,76 +1507,68 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         req.alias.as_deref(),
         req.metadata.clone(),
     );
-
-    if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
-        return infra_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to create lease",
-            e,
+    if let Some(key) = create_key.as_ref() {
+        let annotations = lease
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default);
+        annotations.insert(CREATE_KEY_ANNOTATION.to_string(), key.key_digest.clone());
+        annotations.insert(
+            CREATE_INTENT_ANNOTATION.to_string(),
+            key.intent_digest.clone(),
         );
     }
 
-    // The pre-create count check is advisory: N concurrent requests for one
-    // identity can each observe the same sub-limit count and all create,
-    // overshooting max_concurrent_leases. Re-list the identity's active leases in
-    // a deterministic order and self-delete this one if it ranks beyond the cap,
-    // so concurrent creates converge to exactly the cap instead of overshooting.
-    // (Bounded mitigation; the lease reconciler remains the authoritative quota
-    // enforcer for the residual list-cache race.)
-    if let Ok(active) = active_lease_names_sorted(&leases_api, &identity.identity).await
-        && lease_exceeds_quota(&active, &lease_id, policy.max_concurrent_leases)
-    {
-        let _ = leases_api.delete(&lease_id, &Default::default()).await;
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse {
-                error: format!(
-                    "Concurrent lease limit ({}) reached",
-                    policy.max_concurrent_leases
-                ),
-                detail: Some("A concurrent request won the quota race; please retry".to_string()),
-                reason: None,
-            }),
-        )
-            .into_response();
-    }
+    // Quota, alias uniqueness and idempotent replay are decided under a
+    // per-principal lock, so concurrent creates for one caller (on any API
+    // replica) run count -> check -> create one at a time. See
+    // `cluster_admission` for why a post-create re-rank cannot do this.
+    let locks: Api<k8s_openapi::api::coordination::v1::Lease> =
+        Api::namespaced(state.client.clone(), &state.namespace);
+    let lock_name = cluster_admission::lock_name(&cluster_principal_hash(&identity));
+    let guard =
+        match cluster_admission::acquire(&locks, &lock_name, cluster_admission::LOCK_WAIT_BUDGET)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(cluster_admission::AdmissionLockError::Busy) => {
+                return admission_busy_response();
+            }
+            Err(e) => {
+                return infra_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to acquire lease admission lock",
+                    e,
+                );
+            }
+        };
 
-    // #107 P2: alias-uniqueness concurrent-create race. Like the quota check
-    // above, the pre-check is advisory — two requests with the same alias can
-    // both pass it. Re-list the alias holders deterministically; if this lease
-    // isn't the oldest, it lost the race, so self-delete and 409.
-    if let Some(alias) = req.alias.as_deref()
-        && let Ok(holders) =
-            active_alias_holders_sorted(&leases_api, &identity.identity, alias).await
-        && holders.first().map(|n| n.as_str()) != Some(lease_id.as_str())
-    {
-        // This lease lost the race; remove it so it can't linger as a second
-        // active holder of the alias. There is NO alias reconciler backstop, so a
-        // swallowed delete error would leave an orphaned duplicate (breaking the
-        // uniqueness the CLI's `--ensure`/alias-select rely on). Surface a failed
-        // cleanup as a retryable error rather than a clean-looking 409.
-        if let Err(e) = leases_api.delete(&lease_id, &Default::default()).await {
-            error!(
-                lease_id = %lease_id,
-                alias = %alias,
-                error = %e,
-                "Failed to delete alias-race-loser lease; it may linger as a duplicate alias holder until its TTL expires"
-            );
-            return infra_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Lost the alias race and failed to clean up the duplicate; please retry",
-                e,
-            );
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let admitted = admit_cluster_lease(
+        &leases_api,
+        &guard,
+        &identity,
+        &policy,
+        &lease,
+        req.alias.as_deref(),
+        create_key.as_ref(),
+    )
+    .await;
+    if let Err(e) = guard.release(&locks).await {
+        // The lease outcome is already decided. An unreleased lock expires on
+        // its own; until then this principal's next create waits or gets 503.
+        error!(
+            lock = %lock_name,
+            error = %e,
+            "Failed to release Cluster admission lock"
+        );
+    }
+    match admitted {
+        Ok(ClusterAdmission::Created) => {}
+        Ok(ClusterAdmission::Replay(existing)) => {
+            return cluster_create_replay(&existing, &policy);
         }
-        return (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: format!("Alias '{alias}' is already in use by an active lease"),
-                detail: Some("A concurrent request won the alias race; please retry".to_string()),
-                reason: None,
-            }),
-        )
-            .into_response();
+        Err(response) => return *response,
     }
 
     metrics::CLAIMS_TOTAL
@@ -1666,7 +1624,7 @@ async fn list_leases<B: ClusterBackend>(
             let policy = policy_for(&identity);
             let mut my_claims: Vec<LeaseSummary> = claims
                 .iter()
-                .filter(|c| c.spec.requester.identity == identity.identity)
+                .filter(|c| owns_cluster_lease(&c.spec.requester, &identity))
                 // #107 P2: optional ?alias= filter (exact match on the alias label).
                 .filter(|c| match &params.alias {
                     Some(alias) => lease_alias(c).as_deref() == Some(alias.as_str()),
@@ -1758,7 +1716,7 @@ async fn get_lease<B: ClusterBackend>(
 
     match leases_api.get(&id).await {
         Ok(lease) => {
-            if lease.spec.requester.identity != identity.identity {
+            if !owns_cluster_lease(&lease.spec.requester, &identity) {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
@@ -2570,7 +2528,7 @@ async fn release_lease<B: ClusterBackend>(
         }
     };
 
-    if lease.spec.requester.identity != identity.identity {
+    if !owns_cluster_lease(&lease.spec.requester, &identity) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -2684,7 +2642,7 @@ async fn extend_lease<B: ClusterBackend>(
     // extend cannot land on a same-named lease created after this check.
     let authorized_uid = match leases_api.get(&id).await {
         Ok(lease) => {
-            if lease.spec.requester.identity != identity.identity {
+            if !owns_cluster_lease(&lease.spec.requester, &identity) {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
@@ -2773,7 +2731,7 @@ async fn get_diagnostics<B: ClusterBackend>(
 
     match leases_api.get(&id).await {
         Ok(lease) => {
-            if lease.spec.requester.identity != identity.identity {
+            if !owns_cluster_lease(&lease.spec.requester, &identity) {
                 return StatusCode::NOT_FOUND.into_response();
             }
 
@@ -3000,7 +2958,7 @@ async fn list_pool_leases<B: ClusterBackend>(
                     let status = c.status.clone().unwrap_or_default();
                     matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
                 })
-                .map(|c| pool_lease_summary(c, &identity.identity))
+                .map(|c| pool_lease_summary(c, &identity))
                 .collect();
 
             (StatusCode::OK, Json(summaries)).into_response()
@@ -3016,9 +2974,9 @@ async fn list_pool_leases<B: ClusterBackend>(
 /// Summarize one active pool lease without crossing tenant boundaries.
 /// Utilization fields are shared, while requester-controlled identity, alias,
 /// and metadata are disclosed only when the caller owns the lease.
-fn pool_lease_summary(lease: &ClusterLease, caller_identity: &str) -> LeaseSummary {
+fn pool_lease_summary(lease: &ClusterLease, caller: &AuthIdentity) -> LeaseSummary {
     let status = lease.status.clone().unwrap_or_default();
-    let own = lease.spec.requester.identity == caller_identity;
+    let own = owns_cluster_lease(&lease.spec.requester, caller);
     LeaseSummary {
         id: lease.name_any(),
         phase: status.phase.to_string(),
@@ -3402,101 +3360,321 @@ async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) ->
 
 // --- Helpers ---
 
-async fn count_active_leases(
+/// Whether `identity` owns a Cluster lease with this stored requester.
+///
+/// Leases created by this version carry the authenticating provider and
+/// issuer, and ownership then requires the full principal to match: the same
+/// identity string minted by a different provider or issuer is a different
+/// caller. Leases created before those fields existed store only the identity
+/// string and keep identity-only ownership until they expire.
+pub(crate) fn owns_cluster_lease(requester: &Requester, identity: &AuthIdentity) -> bool {
+    requester.identity == identity.identity
+        && requester
+            .provider
+            .as_ref()
+            .is_none_or(|provider| *provider == identity.provider)
+        && requester
+            .issuer
+            .as_ref()
+            .is_none_or(|issuer| *issuer == identity.issuer)
+}
+
+/// Digest of the full authenticated principal (provider, issuer, identity).
+/// Same digest the Sandbox admission ledger uses, so one principal maps to
+/// one admission key across resource kinds.
+fn cluster_principal_hash(identity: &AuthIdentity) -> String {
+    crate::api::sandbox::principal_hash_for(&crate::crd::SandboxPrincipal {
+        provider: identity.provider.clone(),
+        requester_type: identity.requester_type.clone(),
+        issuer: identity.issuer.clone(),
+        identity: identity.identity.clone(),
+    })
+}
+
+fn lease_is_active(lease: &ClusterLease) -> bool {
+    matches!(
+        lease.status.as_ref().map(|status| &status.phase),
+        None | Some(LeasePhase::Pending) | Some(LeasePhase::Bound)
+    )
+}
+
+/// Every Cluster lease `identity` owns, in any phase.
+///
+/// The label selector narrows by identity string only (the label predates
+/// provider/issuer); [`owns_cluster_lease`] then applies the full ownership
+/// rule. The LIST carries no resourceVersion, so it is a consistent read and
+/// sees every create that finished before it started.
+async fn list_owned_leases(
     leases_api: &Api<ClusterLease>,
-    identity: &str,
-) -> Result<u32, kube::Error> {
-    let label_hash = hash_identity(identity);
+    identity: &AuthIdentity,
+) -> Result<Vec<ClusterLease>, kube::Error> {
+    let label_hash = hash_identity(&identity.identity);
     let lp =
         ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
-    let claims = leases_api.list(&lp).await?;
-    Ok(claims
-        .iter()
-        .filter(|c| c.spec.requester.identity == identity)
-        .filter(|c| {
-            let status = c.status.clone().unwrap_or_default();
-            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
-        })
-        .count() as u32)
+    Ok(leases_api
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter(|lease| owns_cluster_lease(&lease.spec.requester, identity))
+        .collect())
 }
 
-/// Names of an identity's active (Pending|Bound) leases, in a deterministic
-/// order (oldest first, then by name). The order is stable across concurrent
-/// requests so they agree on which leases are "excess" over the quota.
-async fn active_lease_names_sorted(
-    leases_api: &Api<ClusterLease>,
-    identity: &str,
-) -> Result<Vec<String>, kube::Error> {
-    let label_hash = hash_identity(identity);
-    let lp =
-        ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
-    let leases = leases_api.list(&lp).await?;
-    let mut active: Vec<(String, String)> = leases
+/// Annotation holding the SHA-256 of a Cluster create idempotency key.
+const CREATE_KEY_ANNOTATION: &str = "kobe.kunobi.ninja/create-key-sha256";
+/// Annotation holding the SHA-256 of the request a keyed create was made with.
+const CREATE_INTENT_ANNOTATION: &str = "kobe.kunobi.ninja/create-intent-sha256";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterCreateKey {
+    key_digest: String,
+    intent_digest: String,
+}
+
+/// Digest a Cluster create's idempotency key and the request it names.
+///
+/// A repeated POST with the same key replays the original lease only if the
+/// pool, TTL, alias and metadata also match; reusing a key for a different
+/// request is a conflict. Keys are bounded the same way Sandbox bounds them.
+fn cluster_create_key(
+    req: &CreateLeaseRequest,
+    profile: &str,
+) -> Result<Option<ClusterCreateKey>, &'static str> {
+    let Some(key) = req.idempotency_key.as_deref() else {
+        return Ok(None);
+    };
+    if key.is_empty() || key.len() > 253 {
+        return Err("idempotencyKey must contain between 1 and 253 bytes");
+    }
+    let metadata = req
+        .metadata
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    Ok(Some(ClusterCreateKey {
+        key_digest: sha256_components([key.as_bytes()]),
+        intent_digest: sha256_components([
+            profile.as_bytes(),
+            req.ttl.as_deref().unwrap_or_default().as_bytes(),
+            req.alias.as_deref().unwrap_or_default().as_bytes(),
+            metadata.as_bytes(),
+            &[
+                u8::from(req.ttl.is_some()),
+                u8::from(req.alias.is_some()),
+                u8::from(req.metadata.is_some()),
+            ],
+        ]),
+    }))
+}
+
+/// Length-prefixed SHA-256, hex encoded, so component boundaries are part of
+/// the digest.
+fn sha256_components<'a>(components: impl IntoIterator<Item = &'a [u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for component in components {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    hasher
+        .finalize()
         .iter()
-        .filter(|c| c.spec.requester.identity == identity)
-        .filter(|c| {
-            let status = c.status.clone().unwrap_or_default();
-            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
-        })
-        .map(|c| {
-            let ts = c
-                .metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.to_string())
-                .unwrap_or_default();
-            (ts, c.name_any())
-        })
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What admission decided from the caller's current leases.
+#[derive(Debug)]
+enum AdmissionDecision {
+    Admit,
+    /// A lease created earlier with the same idempotency key and request.
+    Replay(Box<ClusterLease>),
+    /// The idempotency key was already used for a different request.
+    KeyReused,
+    QuotaExceeded(u32),
+    AliasTaken(String),
+}
+
+/// Decide a Cluster create against the caller's leases.
+///
+/// Only correct while the caller holds the principal's admission lock: the
+/// lock is what guarantees no other create for this principal lands between
+/// the LIST that produced `owned` and this request's CREATE.
+fn admission_decision(
+    owned: &[ClusterLease],
+    alias: Option<&str>,
+    create_key: Option<&ClusterCreateKey>,
+    max_concurrent_leases: u32,
+) -> AdmissionDecision {
+    if let Some(key) = create_key
+        && let Some(existing) = owned
+            .iter()
+            .find(|lease| lease.annotations().get(CREATE_KEY_ANNOTATION) == Some(&key.key_digest))
+    {
+        return if existing.annotations().get(CREATE_INTENT_ANNOTATION) == Some(&key.intent_digest) {
+            AdmissionDecision::Replay(Box::new(existing.clone()))
+        } else {
+            AdmissionDecision::KeyReused
+        };
+    }
+
+    let active: Vec<&ClusterLease> = owned
+        .iter()
+        .filter(|lease| lease_is_active(lease))
         .collect();
-    // RFC3339 timestamps sort chronologically as strings; the name (random lease
-    // id) breaks same-second ties consistently.
-    active.sort();
-    Ok(active.into_iter().map(|(_, name)| name).collect())
+    if active.len() as u32 >= max_concurrent_leases {
+        return AdmissionDecision::QuotaExceeded(active.len() as u32);
+    }
+    if let Some(alias) = alias
+        && let Some(holder) = active
+            .iter()
+            .find(|lease| lease_alias(lease).as_deref() == Some(alias))
+    {
+        return AdmissionDecision::AliasTaken(holder.name_any());
+    }
+    AdmissionDecision::Admit
 }
 
-/// Names of an identity's ACTIVE (Pending|Bound) leases carrying `alias`, in the
-/// same deterministic order as [`active_lease_names_sorted`] (oldest first, then
-/// by name). Used for alias-uniqueness enforcement (#107 P2): the first holder
-/// keeps the alias; any later concurrent claimant self-deletes. Filters by the
-/// alias label server-side, then by exact identity (two identities may reuse an
-/// alias) and active phase in-process.
-async fn active_alias_holders_sorted(
+#[derive(Debug)]
+enum ClusterAdmission {
+    Created,
+    Replay(Box<ClusterLease>),
+}
+
+/// Count, check and create one Cluster lease while holding `guard`.
+///
+/// Every failure is returned as the response to send. Nothing here deletes a
+/// lease after the fact: the lock makes the pre-create checks authoritative.
+async fn admit_cluster_lease(
     leases_api: &Api<ClusterLease>,
-    identity: &str,
-    alias: &str,
-) -> Result<Vec<String>, kube::Error> {
-    let lp = ListParams::default().labels(&format!("{ALIAS_LABEL}={alias}"));
-    let leases = leases_api.list(&lp).await?;
-    let mut active: Vec<(String, String)> = leases
-        .iter()
-        .filter(|c| c.spec.requester.identity == identity)
-        .filter(|c| {
-            let status = c.status.clone().unwrap_or_default();
-            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
-        })
-        .map(|c| {
-            let ts = c
-                .metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.to_string())
-                .unwrap_or_default();
-            (ts, c.name_any())
-        })
-        .collect();
-    active.sort();
-    Ok(active.into_iter().map(|(_, name)| name).collect())
+    guard: &cluster_admission::AdmissionLockGuard,
+    identity: &AuthIdentity,
+    policy: &policy::Policy,
+    lease: &ClusterLease,
+    alias: Option<&str>,
+    create_key: Option<&ClusterCreateKey>,
+) -> Result<ClusterAdmission, Box<Response>> {
+    let owned = list_owned_leases(leases_api, identity).await.map_err(|e| {
+        Box::new(infra_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Unable to verify lease quota",
+            e,
+        ))
+    })?;
+
+    match admission_decision(&owned, alias, create_key, policy.max_concurrent_leases) {
+        AdmissionDecision::Admit => {}
+        AdmissionDecision::Replay(existing) => return Ok(ClusterAdmission::Replay(existing)),
+        AdmissionDecision::KeyReused => {
+            return Err(Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error:
+                            "Lease create idempotency key is already bound to a different request"
+                                .to_string(),
+                        detail: None,
+                        reason: None,
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+        AdmissionDecision::QuotaExceeded(active) => {
+            return Err(Box::new(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Concurrent lease limit ({}) reached",
+                            policy.max_concurrent_leases
+                        ),
+                        detail: Some(format!("You have {active} active leases")),
+                        reason: None,
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+        AdmissionDecision::AliasTaken(holder) => {
+            let alias = alias.unwrap_or_default();
+            return Err(Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!("Alias '{alias}' is already in use by an active lease"),
+                        detail: Some(format!(
+                            "Lease '{holder}' already holds this alias; release it or extend that lease instead"
+                        )),
+                        reason: None,
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+    }
+
+    // The lock is never renewed. If the LIST was slow enough that the lock
+    // could expire before the CREATE lands, another request could take it over
+    // and admit against a count that misses this lease. Refuse instead.
+    if !guard.still_safe() {
+        warn!("Cluster admission ran past the lock's safe window; refusing the create");
+        return Err(Box::new(admission_busy_response()));
+    }
+
+    leases_api
+        .create(&PostParams::default(), lease)
+        .await
+        .map_err(|e| {
+            Box::new(infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create lease",
+                e,
+            ))
+        })?;
+    Ok(ClusterAdmission::Created)
 }
 
-/// Whether `lease_id` ranks beyond the cap among the identity's deterministically
-/// ordered active leases — i.e. it lost a concurrent-create race and should
-/// self-delete. Unknown lease (not in the list) => not excess.
-fn lease_exceeds_quota(active_sorted: &[String], lease_id: &str, cap: u32) -> bool {
-    active_sorted
-        .iter()
-        .position(|n| n == lease_id)
-        .map(|rank| rank >= cap as usize)
-        .unwrap_or(false)
+/// 503 for a create that could not get (or keep) the principal's admission
+/// lock in time. Safe to retry: nothing was created.
+fn admission_busy_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "Another lease request for this identity is being admitted".to_string(),
+            detail: Some("No lease was created; retry shortly".to_string()),
+            reason: Some(ErrorReason::AdmissionBusy),
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("retry-after"),
+        HeaderValue::from_static("1"),
+    );
+    response
+}
+
+/// Answer a repeated keyed create with the lease the first request created.
+fn cluster_create_replay(lease: &ClusterLease, policy: &policy::Policy) -> Response {
+    let status = lease.status.clone().unwrap_or_default();
+    let response = LeaseResponse {
+        id: lease.name_any(),
+        resource_kind: "Cluster",
+        capabilities: cluster_lease_capabilities(policy),
+        kubeconfig: None,
+        cluster_name: status.cluster_name,
+        expires_at: status.expires_at,
+        phase: status.phase.to_string(),
+        profile: lease.spec.pool_ref.clone(),
+        queue_position: status.queue_position,
+        diagnostics_url: status.diagnostics_url,
+        effective_ttl: None,
+        alias: lease_alias(lease),
+        metadata: lease.spec.metadata.as_deref().cloned(),
+        message: status.message,
+        conditions: status.conditions,
+    };
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Label key carrying the caller-supplied lease alias (#107 P2). A label (not a
@@ -3543,6 +3721,8 @@ fn build_lease_crd(
             requester: Requester {
                 requester_type: identity.requester_type.clone(),
                 identity: identity.identity.clone(),
+                provider: Some(identity.provider.clone()),
+                issuer: Some(identity.issuer.clone()),
             },
             metadata: metadata.map(Box::new),
             priority,
@@ -3750,21 +3930,164 @@ mod tests {
         assert_eq!(cache.0.lock().unwrap().len(), 1);
     }
 
+    fn owned_lease(name: &str, phase: &str, alias: Option<&str>) -> ClusterLease {
+        let mut lease = build_lease_crd(
+            name,
+            "ns",
+            "e2e-basic",
+            "1h",
+            &test_identity(),
+            50,
+            alias,
+            None,
+        );
+        lease.status = Some(serde_json::from_value(serde_json::json!({ "phase": phase })).unwrap());
+        lease
+    }
+
     #[test]
-    fn test_lease_exceeds_quota() {
-        let active = vec![
-            "lease-a".to_string(),
-            "lease-b".to_string(),
-            "lease-c".to_string(),
+    fn admission_decision_counts_only_active_leases() {
+        let owned = vec![
+            owned_lease("a", "Pending", None),
+            owned_lease("b", "Bound", None),
+            owned_lease("c", "Released", None),
         ];
-        // cap 2: ranks 0,1 survive; rank 2 (lease-c) is excess.
-        assert!(!lease_exceeds_quota(&active, "lease-a", 2));
-        assert!(!lease_exceeds_quota(&active, "lease-b", 2));
-        assert!(lease_exceeds_quota(&active, "lease-c", 2));
-        // cap >= len: nothing is excess.
-        assert!(!lease_exceeds_quota(&active, "lease-c", 3));
-        // unknown lease (e.g. already deleted): not excess.
-        assert!(!lease_exceeds_quota(&active, "lease-z", 1));
+        assert!(matches!(
+            admission_decision(&owned, None, None, 3),
+            AdmissionDecision::Admit
+        ));
+        assert!(matches!(
+            admission_decision(&owned, None, None, 2),
+            AdmissionDecision::QuotaExceeded(2)
+        ));
+    }
+
+    #[test]
+    fn admission_decision_rejects_an_alias_held_by_an_active_lease() {
+        let owned = vec![
+            owned_lease("old", "Expired", Some("pr-1")),
+            owned_lease("live", "Bound", Some("pr-1")),
+        ];
+        match admission_decision(&owned, Some("pr-1"), None, 5) {
+            AdmissionDecision::AliasTaken(holder) => assert_eq!(holder, "live"),
+            other => panic!("expected AliasTaken, got {other:?}"),
+        }
+        assert!(matches!(
+            admission_decision(&owned, Some("pr-2"), None, 5),
+            AdmissionDecision::Admit
+        ));
+    }
+
+    #[test]
+    fn admission_decision_replays_a_keyed_create() {
+        let req = CreateLeaseRequest {
+            profile: Some("e2e-basic".into()),
+            ttl: Some("1h".into()),
+            idempotency_key: Some("k1".into()),
+            ..CreateLeaseRequest::default()
+        };
+        let key = cluster_create_key(&req, "e2e-basic").unwrap().unwrap();
+        let mut existing = owned_lease("keyed", "Bound", None);
+        let annotations = existing
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default);
+        annotations.insert(CREATE_KEY_ANNOTATION.into(), key.key_digest.clone());
+        annotations.insert(CREATE_INTENT_ANNOTATION.into(), key.intent_digest.clone());
+
+        // A replay wins even at the quota cap: it creates nothing.
+        match admission_decision(std::slice::from_ref(&existing), None, Some(&key), 1) {
+            AdmissionDecision::Replay(lease) => assert_eq!(lease.name_any(), "keyed"),
+            other => panic!("expected Replay, got {other:?}"),
+        }
+
+        let changed = CreateLeaseRequest {
+            ttl: Some("2h".into()),
+            ..req
+        };
+        let changed_key = cluster_create_key(&changed, "e2e-basic").unwrap().unwrap();
+        assert_eq!(changed_key.key_digest, key.key_digest);
+        assert!(matches!(
+            admission_decision(&[existing], None, Some(&changed_key), 5),
+            AdmissionDecision::KeyReused
+        ));
+    }
+
+    #[test]
+    fn cluster_create_key_is_bounded() {
+        let with_key = |key: &str| CreateLeaseRequest {
+            idempotency_key: Some(key.to_string()),
+            ..CreateLeaseRequest::default()
+        };
+        assert!(cluster_create_key(&with_key(""), "p").is_err());
+        assert!(cluster_create_key(&with_key(&"k".repeat(254)), "p").is_err());
+        assert!(cluster_create_key(&with_key(&"k".repeat(253)), "p").is_ok());
+        assert_eq!(
+            cluster_create_key(&CreateLeaseRequest::default(), "p"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn ownership_requires_matching_provider_and_issuer_when_stored() {
+        let caller = test_identity();
+        let lease = build_lease_crd("l", "ns", "p", "1h", &caller, 50, None, None);
+        assert_eq!(
+            lease.spec.requester.provider.as_deref(),
+            Some("github-actions")
+        );
+        assert_eq!(
+            lease.spec.requester.issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert!(owns_cluster_lease(&lease.spec.requester, &caller));
+
+        let other_provider = AuthIdentity {
+            provider: "clerk".into(),
+            ..test_identity()
+        };
+        assert!(!owns_cluster_lease(&lease.spec.requester, &other_provider));
+
+        let other_issuer = AuthIdentity {
+            issuer: "https://issuer.example".into(),
+            ..test_identity()
+        };
+        assert!(!owns_cluster_lease(&lease.spec.requester, &other_issuer));
+    }
+
+    /// Leases created before provider/issuer were stamped keep identity-only
+    /// ownership, so upgrading does not orphan them.
+    #[test]
+    fn ownership_of_legacy_leases_is_identity_only() {
+        let legacy = Requester {
+            requester_type: "github-actions:ci".into(),
+            identity: test_identity().identity,
+            provider: None,
+            issuer: None,
+        };
+        let other_provider = AuthIdentity {
+            provider: "clerk".into(),
+            ..test_identity()
+        };
+        assert!(owns_cluster_lease(&legacy, &test_identity()));
+        assert!(owns_cluster_lease(&legacy, &other_provider));
+        let stranger = AuthIdentity {
+            identity: "someone-else".into(),
+            ..test_identity()
+        };
+        assert!(!owns_cluster_lease(&legacy, &stranger));
+    }
+
+    #[test]
+    fn cluster_principal_hash_matches_the_sandbox_ledger_digest() {
+        let caller = test_identity();
+        let hash = cluster_principal_hash(&caller);
+        assert_eq!(hash.len(), 32);
+        let other_provider = AuthIdentity {
+            provider: "clerk".into(),
+            ..test_identity()
+        };
+        assert_ne!(hash, cluster_principal_hash(&other_provider));
     }
 
     #[test]
@@ -3973,12 +4296,18 @@ mod tests {
             Some(serde_json::json!({"actor": "lenij"})),
         );
 
-        let own = pool_lease_summary(&lease, &identity.identity);
+        let own = pool_lease_summary(&lease, &identity);
         assert_eq!(own.requester.as_deref(), Some(identity.identity.as_str()));
         assert_eq!(own.alias.as_deref(), Some("pr-3835"));
         assert_eq!(own.metadata, Some(serde_json::json!({"actor": "lenij"})));
 
-        let foreign = pool_lease_summary(&lease, "repo:other/repo:ref:refs/heads/main");
+        let foreign = pool_lease_summary(
+            &lease,
+            &AuthIdentity {
+                identity: "repo:other/repo:ref:refs/heads/main".into(),
+                ..test_identity()
+            },
+        );
         assert!(foreign.requester.is_none());
         assert!(foreign.alias.is_none());
         assert!(foreign.metadata.is_none());
@@ -5453,192 +5782,86 @@ mod tests {
         );
     }
 
-    // --- count_active_leases tests ---
+    // --- list_owned_leases tests ---
 
     #[tokio::test]
-    async fn test_count_active_leases_empty() {
+    async fn list_owned_leases_applies_full_ownership() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
+        let caller = test_identity();
 
-        // Mock K8s LIST returning empty list
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, ResponseTemplate};
-        let empty_list = crate::testutil::k8s_list_response::<serde_json::Value>(vec![]);
-        Mock::given(method("GET"))
-            .and(path_regex(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&empty_list))
-            .mount(&server)
-            .await;
-
-        let leases_api: kube::api::Api<ClusterLease> =
-            kube::api::Api::namespaced(client, "test-ns");
-        let count = count_active_leases(&leases_api, "test-identity")
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_count_active_leases_filters_correctly() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let server = wiremock::MockServer::start().await;
-        let client = crate::testutil::mock_k8s_client(&server);
-
-        let identity = "repo:org/repo:ref:refs/heads/main";
-
-        // Build claims in various phases
-        let claims = vec![
-            // Pending — should count
+        let claim = |name: &str, requester: serde_json::Value| {
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "c1", "namespace": "test-ns" },
-                "spec": {
-                    "poolRef": "e2e-basic",
-                    "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": identity },
-                    "priority": 50
-                },
-                "status": { "phase": "Pending" }
-            }),
-            // Bound — should count
-            serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "c2", "namespace": "test-ns" },
-                "spec": {
-                    "poolRef": "e2e-basic",
-                    "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": identity },
-                    "priority": 50
-                },
-                "status": { "phase": "Bound" }
-            }),
-            // Released — should NOT count
-            serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "c3", "namespace": "test-ns" },
-                "spec": {
-                    "poolRef": "e2e-basic",
-                    "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": identity },
-                    "priority": 50
-                },
-                "status": { "phase": "Released" }
-            }),
-            // Expired — should NOT count
-            serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "c4", "namespace": "test-ns" },
-                "spec": {
-                    "poolRef": "e2e-basic",
-                    "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": identity },
-                    "priority": 50
-                },
-                "status": { "phase": "Expired" }
-            }),
-            // Different identity — should NOT count
-            serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "c5", "namespace": "test-ns" },
-                "spec": {
-                    "poolRef": "e2e-basic",
-                    "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": "repo:other/repo:ref:refs/heads/main" },
-                    "priority": 50
-                },
-                "status": { "phase": "Pending" }
-            }),
-        ];
-
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, ResponseTemplate};
-        let list_resp = crate::testutil::k8s_list_response(claims);
-        Mock::given(method("GET"))
-            .and(path_regex(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&list_resp))
-            .mount(&server)
-            .await;
-
-        let leases_api: kube::api::Api<ClusterLease> =
-            kube::api::Api::namespaced(client, "test-ns");
-        let count = count_active_leases(&leases_api, identity).await.unwrap();
-        // Only c1 (Pending) and c2 (Bound) for the matching identity
-        assert_eq!(count, 2);
-    }
-
-    // #107 P2: alias-holder resolution keeps only the caller's ACTIVE leases and
-    // orders them oldest-first, so the first holder deterministically keeps the
-    // alias. (The alias-label match itself is a server-side label selector; here
-    // every claim carries the alias so we exercise the in-process identity /
-    // phase / ordering logic.)
-    #[tokio::test]
-    async fn test_active_alias_holders_sorted_filters_and_orders() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let server = wiremock::MockServer::start().await;
-        let client = crate::testutil::mock_k8s_client(&server);
-        let identity = "repo:org/repo:ref:refs/heads/main";
-
-        let claim = |name: &str, ts: &str, phase: &str, id: &str| {
-            serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": {
-                    "name": name,
-                    "namespace": "test-ns",
-                    "creationTimestamp": ts,
-                    "labels": { "kobe.kunobi.ninja/alias": "pr-1" }
-                },
+                "metadata": { "name": name, "namespace": "test-ns" },
                 "spec": {
                     "poolRef": "e2e-basic", "ttl": "1h",
-                    "requester": { "type": "github-actions:ci", "identity": id },
+                    "requester": requester,
                     "priority": 50
                 },
-                "status": { "phase": phase }
+                "status": { "phase": "Pending" }
             })
         };
         let claims = vec![
-            // Newer active holder.
-            claim("newer", "2026-01-02T00:00:00Z", "Bound", identity),
-            // Older active holder — should sort first.
-            claim("older", "2026-01-01T00:00:00Z", "Pending", identity),
-            // Terminal — excluded.
-            claim("gone", "2026-01-01T00:00:00Z", "Released", identity),
-            // Another identity — excluded.
             claim(
-                "foreign",
-                "2026-01-01T00:00:00Z",
-                "Bound",
-                "repo:other:ref:x",
+                "mine",
+                serde_json::json!({
+                    "type": "github-actions:ci", "identity": caller.identity,
+                    "provider": caller.provider, "issuer": caller.issuer
+                }),
+            ),
+            claim(
+                "legacy",
+                serde_json::json!({
+                    "type": "github-actions:ci", "identity": caller.identity
+                }),
+            ),
+            claim(
+                "other-provider",
+                serde_json::json!({
+                    "type": "clerk:user", "identity": caller.identity,
+                    "provider": "clerk", "issuer": caller.issuer
+                }),
+            ),
+            claim(
+                "other-identity",
+                serde_json::json!({
+                    "type": "github-actions:ci", "identity": "repo:other/repo:ref:refs/heads/main"
+                }),
             ),
         ];
 
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
-        let list_resp = crate::testutil::k8s_list_response(claims);
         Mock::given(method("GET"))
-            .and(path_regex(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&list_resp))
+            .and(query_param(
+                "labelSelector",
+                format!(
+                    "kobe.kunobi.ninja/requester-hash={}",
+                    hash_identity(&caller.identity)
+                ),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(claims)),
+            )
             .mount(&server)
             .await;
 
         let leases_api: kube::api::Api<ClusterLease> =
             kube::api::Api::namespaced(client, "test-ns");
-        let holders = active_alias_holders_sorted(&leases_api, identity, "pr-1")
+        let names: Vec<String> = list_owned_leases(&leases_api, &caller)
             .await
-            .unwrap();
-        assert_eq!(holders, vec!["older".to_string(), "newer".to_string()]);
+            .unwrap()
+            .iter()
+            .map(|lease| lease.name_any())
+            .collect();
+        assert_eq!(names, vec!["mine".to_string(), "legacy".to_string()]);
     }
 
     // --- Unknown route returns 404 ---
@@ -5803,8 +6026,9 @@ mod tests {
 
         let (state, server) = preflight_state().await;
         mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        mount_free_admission_lock(&server).await;
 
-        // Both the count and the post-create re-list see no active leases.
+        // The admission count sees no active leases.
         Mock::given(method("GET"))
             .and(path_regex(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
@@ -5871,15 +6095,286 @@ mod tests {
         assert_eq!(body["phase"].as_str(), Some("Pending"));
         assert_eq!(body["metadata"], metadata);
 
-        let create = server
+        let requests = server.received_requests().await.unwrap();
+        let position = |verb: http::Method, suffix: &str| {
+            requests
+                .iter()
+                .position(|request| request.method == verb && request.url.path().ends_with(suffix))
+        };
+        let create_at = position(http::Method::POST, "/clusterleases")
+            .expect("the accepted request must create one ClusterLease");
+        let lock_at = position(http::Method::POST, "/leases").expect("admission takes the lock");
+        let unlock_at = position(http::Method::DELETE, &admission_lock_path())
+            .expect("admission releases the lock");
+        assert!(
+            lock_at < create_at && create_at < unlock_at,
+            "the create must happen while the lock is held"
+        );
+
+        let created: serde_json::Value = serde_json::from_slice(&requests[create_at].body).unwrap();
+        assert_eq!(created["spec"]["metadata"], metadata);
+        assert_eq!(
+            created["spec"]["requester"]["provider"],
+            test_identity().provider
+        );
+        assert_eq!(
+            created["spec"]["requester"]["issuer"],
+            test_identity().issuer
+        );
+    }
+
+    fn admission_lock_path() -> String {
+        format!(
+            "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+            cluster_admission::lock_name(&cluster_principal_hash(&test_identity()))
+        )
+    }
+
+    fn admission_lock_json(rv: &str) -> serde_json::Value {
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+        serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": cluster_admission::lock_name(&cluster_principal_hash(&test_identity())),
+                "namespace": "test-ns",
+                "uid": "lock-uid",
+                "resourceVersion": rv,
+            },
+            "spec": {
+                "holderIdentity": "holder",
+                "leaseDurationSeconds": 30,
+                "acquireTime": now,
+                "renewTime": now,
+            }
+        })
+    }
+
+    /// Admission lock that is free: CREATE succeeds and the release DELETE is
+    /// accepted.
+    async fn mount_free_admission_lock(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(admission_lock_json("1")))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(admission_lock_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn healthy_pool_mock() -> wiremock::Mock {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-basic",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(pool_with_status(
+                    "e2e-basic",
+                    serde_json::json!({ "phase": "Healthy", "ready": 1 }),
+                )),
+            )
+    }
+
+    /// Two creates for one caller in the same second. The first holds the
+    /// admission lock; the second must not count, check or create until it is
+    /// released, and gives up with a retryable 503 when it is not.
+    #[tokio::test]
+    async fn create_lease_waits_for_a_concurrent_admission_and_creates_nothing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "AlreadyExists", "code": 409, "message": "exists"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(admission_lock_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admission_lock_json("5")))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["reason"].as_str(), Some("admission_busy"));
+        let touched_leases = server
             .received_requests()
             .await
             .unwrap()
             .into_iter()
-            .find(|request| request.method == http::Method::POST)
-            .expect("the accepted request must create one ClusterLease");
-        let created: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
-        assert_eq!(created["spec"]["metadata"], metadata);
+            .any(|request| request.url.path().contains("/clusterleases"));
+        assert!(
+            !touched_leases,
+            "a request that does not hold the lock must not count or create leases"
+        );
+    }
+
+    /// Under the lock the count is authoritative: at the cap, nothing is
+    /// created and nothing needs to be deleted afterwards.
+    #[tokio::test]
+    async fn create_lease_at_quota_creates_nothing_and_releases_the_lock() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+
+        let identity = AuthIdentity {
+            policy: crate::api::policy::Policy {
+                max_concurrent_leases: 1,
+                ..test_identity().policy
+            },
+            ..test_identity()
+        };
+        let existing = build_lease_crd(
+            "lease-held",
+            "test-ns",
+            "e2e-basic",
+            "1h",
+            &identity,
+            50,
+            None,
+            None,
+        );
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::to_value(&existing).unwrap()]),
+            ))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            identity,
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().ends_with("/clusterleases")
+                && (request.method == http::Method::POST || request.method == http::Method::DELETE)
+        }));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.method == http::Method::DELETE
+                    && request.url.path() == admission_lock_path()),
+            "a rejected create must still release the lock"
+        );
+    }
+
+    /// A repeated keyed create returns the first lease instead of creating a
+    /// second one.
+    #[tokio::test]
+    async fn create_lease_replays_a_repeated_idempotency_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+
+        let req = || CreateLeaseRequest {
+            profile: Some("e2e-basic".to_string()),
+            idempotency_key: Some("retry-1".to_string()),
+            ..CreateLeaseRequest::default()
+        };
+        let key = cluster_create_key(&req(), "e2e-basic").unwrap().unwrap();
+        let mut existing = build_lease_crd(
+            "lease-first",
+            "test-ns",
+            "e2e-basic",
+            "1h",
+            &test_identity(),
+            50,
+            None,
+            None,
+        );
+        let annotations = existing
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default);
+        annotations.insert(CREATE_KEY_ANNOTATION.into(), key.key_digest);
+        annotations.insert(CREATE_INTENT_ANNOTATION.into(), key.intent_digest);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::to_value(&existing).unwrap()]),
+            ))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(req()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"].as_str(), Some("lease-first"));
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.method == http::Method::POST
+                        && request.url.path().ends_with("/clusterleases")
+                })
+        );
     }
 
     fn k8s_not_found(message: &str) -> serde_json::Value {

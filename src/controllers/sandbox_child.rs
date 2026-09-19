@@ -738,6 +738,8 @@ fn internal_requester(outer_uid: &str) -> Requester {
         // immutable spec so the isolated authority can authenticate the exact
         // consumer without trusting mutable labels or owner references.
         identity: outer_uid.to_string(),
+        provider: None,
+        issuer: None,
     }
 }
 

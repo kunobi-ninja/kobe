@@ -75,7 +75,7 @@ for Cluster, `Ready` for Sandbox.
 | `ttl` | string | No | Requested TTL (e.g. `"30m"`, `"1h"`). Defaults to the pool's `spec.ttl`. Capped by AccessPolicy `maxTtl`. |
 | `alias` | string | No | DNS-label name unique among the requester's active leases. |
 | `metadata` | object | No | Opaque caller context. Cluster leases only. Maximum 8 KiB encoded JSON, 32 top-level keys, four nesting levels, and 128 JSON values. |
-| `idempotencyKey` | string | No | Sandbox create recovery key. Ignored for Cluster pools. |
+| `idempotencyKey` | string | No | Create recovery key, 1–253 bytes. Repeating a create with the same key and body returns the lease the first request created. |
 
 `metadata` is descriptive, untrusted, and creation-time only: the lease API
 does not expose an update operation. It never affects authorization, quota,
@@ -108,6 +108,19 @@ and alias.
 
 `effective_ttl` reports the TTL the server accepted after policy clamping.
 
+If the response to a Cluster create is lost, repeat the request with the same
+`idempotencyKey`. A matching lease that still exists comes back as `200 OK`
+with its current phase instead of a second lease being created. Reusing a key
+with a different pool, TTL, alias or metadata returns `409`.
+
+Creates for one caller are admitted one at a time across every API replica, so
+`maxConcurrentLeases` and alias uniqueness hold even when a CI matrix fires many
+creates at once. A caller is the full authenticated principal: provider, token
+issuer and identity. A request that cannot start admission within about five
+seconds, because another create for the same caller is still in progress, gets
+`503` with `reason: admission_busy` and `Retry-After: 1`. Nothing was created;
+retry it.
+
 Once bound, `GET /v1/leases/:id` returns:
 
 ```json
@@ -128,8 +141,15 @@ Once bound, `GET /v1/leases/:id` returns:
 | `400` | Invalid profile name, alias, TTL, or metadata |
 | `403` | Profile not allowed for your identity |
 | `404` | No pool with that name |
-| `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`) |
+| `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`), the alias is held by another active lease, or the `idempotencyKey` was used for a different request |
 | `429` | Concurrent lease limit reached, or server overloaded |
+| `503` | The pool cannot satisfy a lease now, or another create for the same caller is being admitted (`reason: admission_busy`) |
+
+> **Lease ownership after upgrading.** Cluster leases now record the provider
+> and token issuer that created them, and only a caller with the same provider,
+> issuer and identity can read, extend or release them. Leases created by an
+> earlier Kobe version have no provider or issuer recorded and stay owned by
+> identity alone until they end.
 
 `POST /v1/sandbox-leases` is a compatibility alias for this same create. Prefer
 `POST /v1/leases`. Kind-specific verbs (`exec`, `logs`, `attach`, `port-forward`,
