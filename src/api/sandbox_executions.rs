@@ -47,6 +47,9 @@ use crate::crd::{
 };
 use crate::sandbox::QuarantineReason;
 
+/// Label carrying the owning lease UID on every execution record.
+const LEASE_UID_LABEL: &str = crate::sandbox::SANDBOX_LEASE_UID_LABEL;
+
 /// Finalizer that keeps an execution record present until its exact process
 /// group and Kubernetes record have both been cleaned.
 pub const SANDBOX_EXECUTION_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-execution-cleanup";
@@ -901,7 +904,14 @@ async fn persist_terminal(
         let live = executions
             .get(&expected.name_any())
             .await
-            .map_err(|_| ExecutionRequestError::Backend)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    execution = %expected.name_any(),
+                    error = %error,
+                    "could not read the execution before recording its outcome"
+                );
+                ExecutionRequestError::Backend
+            })?;
         if live.uid().as_deref() != Some(expected_uid.as_str()) {
             return Err(ExecutionRequestError::Backend);
         }
@@ -929,7 +939,14 @@ async fn persist_terminal(
         {
             Ok(updated) => return Ok(updated),
             Err(kube::Error::Api(error)) if error.code == 409 || error.code == 422 => continue,
-            Err(_) => return Err(ExecutionRequestError::Backend),
+            Err(error) => {
+                tracing::warn!(
+                    execution = %expected.name_any(),
+                    error = %error,
+                    "execution outcome write failed"
+                );
+                return Err(ExecutionRequestError::Backend);
+            }
         }
     }
     Err(ExecutionRequestError::Backend)
@@ -1028,7 +1045,17 @@ pub async fn refresh(
     execution: &SandboxExecution,
 ) -> Option<SandboxExecution> {
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
-    executions.get(&execution.name_any()).await.ok()
+    executions
+        .get(&execution.name_any())
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                execution = %execution.name_any(),
+                error = %error,
+                "could not re-read the execution"
+            );
+        })
+        .ok()
 }
 
 /// Read one execution, but only if it belongs to this lease.
@@ -1117,6 +1144,10 @@ pub async fn run_execution_reaper(
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
     let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
     tracing::info!("Starting Sandbox execution reaper");
+    // Terminal records stay until their lease is released, so every sweep
+    // lists them again. Remember the ones already settled at this exact
+    // version instead of re-reading their lease and ledger every interval.
+    let mut settled = SettledTerminalRecords::default();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -1131,6 +1162,7 @@ pub async fn run_execution_reaper(
             }
         };
         let now = chrono::Utc::now();
+        settled.retain_listed(&listed.items);
         for execution in listed {
             let state = execution
                 .status
@@ -1138,7 +1170,14 @@ pub async fn run_execution_reaper(
                 .map(|status| status.state)
                 .unwrap_or_default();
             if state.is_terminal() {
-                complete_capacity_for_record(&client, &leases, ledger_namespace, &execution).await;
+                if settled.contains(&execution) {
+                    continue;
+                }
+                if complete_capacity_for_record(&client, &leases, ledger_namespace, &execution)
+                    .await
+                {
+                    settled.insert(&execution);
+                }
                 continue;
             }
             let setup_due = state == ExecutionState::Queued && queued_verdict_due(&execution, now);
@@ -1150,8 +1189,10 @@ pub async fn run_execution_reaper(
                 "execution never reached Running; declaring setup Unknown"
             );
             let terminal = record_queued_setup_unknown(&client, namespace, &execution).await;
-            if let Some(terminal) = terminal {
-                complete_capacity_for_record(&client, &leases, ledger_namespace, &terminal).await;
+            if let Some(terminal) = terminal
+                && complete_capacity_for_record(&client, &leases, ledger_namespace, &terminal).await
+            {
+                settled.insert(&terminal);
             }
         }
 
@@ -1321,12 +1362,45 @@ async fn reap_unbound_execution_capacity(
     }
 }
 
+/// Terminal records the reaper has already settled, by UID and resourceVersion.
+///
+/// A record that changes gets a new resourceVersion and is looked at again;
+/// entries for records no longer listed are dropped each sweep.
+#[derive(Debug, Default)]
+struct SettledTerminalRecords(std::collections::HashSet<(String, String)>);
+
+impl SettledTerminalRecords {
+    fn key(execution: &SandboxExecution) -> Option<(String, String)> {
+        Some((execution.uid()?, execution.resource_version()?))
+    }
+
+    fn contains(&self, execution: &SandboxExecution) -> bool {
+        Self::key(execution).is_some_and(|key| self.0.contains(&key))
+    }
+
+    fn insert(&mut self, execution: &SandboxExecution) {
+        if let Some(key) = Self::key(execution) {
+            self.0.insert(key);
+        }
+    }
+
+    fn retain_listed(&mut self, listed: &[SandboxExecution]) {
+        let current: std::collections::HashSet<_> = listed.iter().filter_map(Self::key).collect();
+        self.0.retain(|key| current.contains(key));
+    }
+}
+
+/// Retire the capacity of one terminal record that never started.
+///
+/// Returns whether the record needs no further reaper attention at its current
+/// version: its capacity is retired, or it is not the reaper's to retire.
+/// A transient error returns `false` so the next sweep tries again.
 async fn complete_capacity_for_record(
     client: &kube::Client,
     leases: &Api<SandboxLease>,
     ledger_namespace: &str,
     execution: &SandboxExecution,
-) {
+) -> bool {
     if execution
         .status
         .as_ref()
@@ -1336,24 +1410,24 @@ async fn complete_capacity_for_record(
         // looking Succeeded/Failed/Cancelled report can be forged while the
         // original process remains, so ordinary reaping never treats it as an
         // absence proof. Exact target destruction retires the slot later.
-        return;
+        return true;
     }
     let Some(lease_name) = execution.spec.lease_name.as_deref() else {
         // Legacy records were not admitted through the execution-capacity
         // ledger. Lifecycle cleanup fails closed on them; this generic reaper
         // must not guess which same-named parent used to own one.
-        return;
+        return true;
     };
     let lease = match leases.get(lease_name).await {
         Ok(lease) if lease.uid().as_deref() == Some(execution.spec.lease_uid.as_str()) => lease,
-        Ok(_) => return,
-        Err(kube::Error::Api(error)) if error.code == 404 => return,
+        Ok(_) => return true,
+        Err(kube::Error::Api(error)) if error.code == 404 => return true,
         Err(error) => {
             tracing::warn!(execution = %execution.name_any(), error = %error, "could not read execution parent while retiring capacity");
-            return;
+            return false;
         }
     };
-    if let Err(error) = crate::sandbox_access_ledger::complete_execution_capacity(
+    match crate::sandbox_access_ledger::complete_execution_capacity(
         client,
         ledger_namespace,
         &lease,
@@ -1362,7 +1436,11 @@ async fn complete_capacity_for_record(
     )
     .await
     {
-        tracing::warn!(execution = %execution.name_any(), error = %error, "could not retire terminal execution capacity");
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(execution = %execution.name_any(), error = %error, "could not retire terminal execution capacity");
+            false
+        }
     }
 }
 
@@ -1377,7 +1455,13 @@ pub enum ExecutionCleanupOutcome {
     /// capacity, destroy the exact target, then call
     /// [`cleanup_lease_executions_after_target_absence`] to retire it.
     AwaitTargetDestruction,
+    /// A transient failure or a lost optimistic race. Errors are logged where
+    /// they happen, so the caller only has to requeue.
     Retry,
+    /// A `Creating` reservation's record is not visible yet. Its writer binds
+    /// it within moments or the reaper eventually resolves the tombstone, so
+    /// the caller re-checks sooner than after an error.
+    AwaitCreation,
     Quarantine(QuarantineReason),
 }
 
@@ -1534,7 +1618,9 @@ async fn remove_execution_record(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionDeleteForbidden);
         }
-        Err(_) => return ExecutionCleanupOutcome::Retry,
+        Err(error) => {
+            return record_cleanup_retry(&execution.name_any(), "remove finalizer", &error);
+        }
     }
 
     let current = match executions.get(&execution.name_any()).await {
@@ -1542,7 +1628,9 @@ async fn remove_execution_record(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return ExecutionCleanupOutcome::Checkpointed;
         }
-        Err(_) => return ExecutionCleanupOutcome::Retry,
+        Err(error) => {
+            return record_cleanup_retry(&execution.name_any(), "re-read before delete", &error);
+        }
     };
     if current.uid().as_deref() != Some(expected_uid) {
         return ExecutionCleanupOutcome::Quarantine(
@@ -1565,15 +1653,36 @@ async fn remove_execution_record(
         Err(kube::Error::Api(error)) if error.code == 409 => {
             return ExecutionCleanupOutcome::Retry;
         }
-        Err(_) => return ExecutionCleanupOutcome::Retry,
+        Err(error) => return record_cleanup_retry(&execution.name_any(), "delete", &error),
     }
     match executions.get(&execution.name_any()).await {
         Err(kube::Error::Api(error)) if error.code == 404 => ExecutionCleanupOutcome::Checkpointed,
         Ok(replacement) if replacement.uid().as_deref() != Some(expected_uid) => {
             ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionReplacedDuringCleanup)
         }
-        Ok(_) | Err(_) => ExecutionCleanupOutcome::Retry,
+        // Still present after the delete: its finalizer removal or deletion
+        // has not been observed yet. The next pass re-reads it.
+        Ok(_) => ExecutionCleanupOutcome::Retry,
+        Err(error) => record_cleanup_retry(&execution.name_any(), "confirm deletion", &error),
     }
+}
+
+/// Keep a retried execution-cleanup error visible.
+///
+/// The release state machine only sees `Retry` and requeues, so an error
+/// dropped here left a stuck release with nothing in the log to explain it.
+fn record_cleanup_retry(
+    subject: &str,
+    step: &'static str,
+    error: &dyn std::fmt::Display,
+) -> ExecutionCleanupOutcome {
+    tracing::warn!(
+        subject,
+        step,
+        error = %error,
+        "Sandbox execution cleanup failed; retrying"
+    );
+    ExecutionCleanupOutcome::Retry
 }
 
 /// Cancel and inspect every execution before credential/workload cleanup.
@@ -1677,7 +1786,12 @@ async fn cleanup_lease_executions_inner(
     .await
     {
         Ok(manifest) => manifest,
-        Err(_) => {
+        Err(error) => {
+            tracing::warn!(
+                lease = %lease.name_any(),
+                error = %error,
+                "Sandbox execution manifest is unreadable; quarantining"
+            );
             return ExecutionCleanupOutcome::Quarantine(
                 QuarantineReason::ExecutionManifestUnverifiable,
             );
@@ -1688,15 +1802,6 @@ async fn cleanup_lease_executions_inner(
             QuarantineReason::NeverBoundExecutionManifestNonempty,
         );
     }
-    let executions: Api<SandboxExecution> =
-        Api::namespaced(management_client.clone(), execution_namespace);
-    let listed = match executions.list(&ListParams::default()).await {
-        Ok(listed) => listed,
-        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionListForbidden);
-        }
-        Err(_) => return ExecutionCleanupOutcome::Retry,
-    };
     let lease_uid = match lease.uid() {
         Some(uid) => uid,
         None => {
@@ -1705,37 +1810,37 @@ async fn cleanup_lease_executions_inner(
             );
         }
     };
-    let mut owned = std::collections::BTreeMap::new();
-    for execution in listed {
-        let labelled = execution
-            .labels()
-            .get("kobe.kunobi.ninja/sandbox-lease-uid")
-            .map(String::as_str)
-            == Some(lease_uid.as_str());
-        if execution.spec.lease_uid != lease_uid && !labelled {
-            continue;
+    let executions: Api<SandboxExecution> =
+        Api::namespaced(management_client.clone(), execution_namespace);
+    // Each step lists only this lease's labelled records: the namespace holds
+    // every lease's records, and a release runs this once per durable step.
+    // The label is mutable, so it is not the only evidence. A manifest entry
+    // missing from this list is re-read by name before it is treated as
+    // absent, and a full-namespace scan runs before cleanup can report
+    // `Clean`, which is what unlocks credential and workload teardown.
+    let labelled = ListParams::default().labels(&format!("{LEASE_UID_LABEL}={lease_uid}"));
+    let listed = match executions.list(&labelled).await {
+        Ok(listed) => listed,
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionListForbidden);
         }
-        if execution.spec.lease_uid != lease_uid || !labelled {
-            return ExecutionCleanupOutcome::Quarantine(
-                QuarantineReason::ExecutionIdentityUnverifiable,
-            );
-        }
-        if owned.insert(execution.name_any(), execution).is_some() {
-            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionNameDuplicated);
-        }
-    }
-    if owned
-        .keys()
-        .any(|name| !manifest.iter().any(|entry| entry.name == *name))
-    {
-        return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionNotInManifest);
-    }
+        Err(error) => return record_cleanup_retry(&lease.name_any(), "list executions", &error),
+    };
+    let mut owned = match owned_execution_records(listed, &lease_uid, &manifest) {
+        Ok(owned) => owned,
+        Err(reason) => return ExecutionCleanupOutcome::Quarantine(reason),
+    };
 
     // One durable mutation per pass. Re-listing after every record prevents a
     // lost response or concurrent status writer from carrying stale identity
     // into the next destructive operation.
     if let Some(entry) = manifest.first() {
         let Some(execution) = owned.remove(&entry.name) else {
+            if let Err(outcome) =
+                unlisted_record_is_absent(&executions, &entry.name, &lease_uid).await
+            {
+                return outcome;
+            }
             if !entry.active {
                 let retired = match entry.creation_state {
                     crate::sandbox_access_ledger::ExecutionCreationState::Rejected => {
@@ -1757,13 +1862,16 @@ async fn cleanup_lease_executions_inner(
                         .await
                     }
                     crate::sandbox_access_ledger::ExecutionCreationState::Creating => {
-                        return ExecutionCleanupOutcome::Retry;
+                        return ExecutionCleanupOutcome::AwaitCreation;
                     }
                 };
                 return match retired {
                     Ok(true) => ExecutionCleanupOutcome::Checkpointed,
+                    // Lost a manifest CAS to another writer; re-read next pass.
                     Ok(false) => ExecutionCleanupOutcome::Retry,
-                    Err(_) => ExecutionCleanupOutcome::Retry,
+                    Err(error) => {
+                        record_cleanup_retry(&lease.name_any(), "retire inactive execution", &error)
+                    }
                 };
             }
             if entry.execution_uid.is_some() {
@@ -1773,7 +1881,7 @@ async fn cleanup_lease_executions_inner(
             }
             // Neither age nor a strong 404 proves that an API request whose
             // response was lost cannot still create this exact object.
-            return ExecutionCleanupOutcome::Retry;
+            return ExecutionCleanupOutcome::AwaitCreation;
         };
         let execution_uid = match execution_identity_holds(&execution, lease) {
             Ok(uid) => uid,
@@ -1800,7 +1908,9 @@ async fn cleanup_lease_executions_inner(
             {
                 Ok(true) => ExecutionCleanupOutcome::Checkpointed,
                 Ok(false) => ExecutionCleanupOutcome::Retry,
-                Err(_) => ExecutionCleanupOutcome::Retry,
+                Err(error) => {
+                    record_cleanup_retry(&lease.name_any(), "expire unbound execution", &error)
+                }
             };
         }
         if entry.execution_uid.as_deref() != Some(execution_uid.as_str()) {
@@ -1955,7 +2065,7 @@ async fn cleanup_lease_executions_inner(
             return ExecutionCleanupOutcome::AwaitTargetDestruction;
         }
 
-        if crate::sandbox_access_ledger::complete_execution_capacity(
+        if let Err(error) = crate::sandbox_access_ledger::complete_execution_capacity(
             management_client,
             ledger_namespace,
             lease,
@@ -1963,13 +2073,27 @@ async fn cleanup_lease_executions_inner(
             process_absence_proven,
         )
         .await
-        .is_err()
         {
-            return ExecutionCleanupOutcome::Retry;
+            return record_cleanup_retry(&lease.name_any(), "complete execution capacity", &error);
         }
         return remove_execution_record(&executions, &terminal, &execution_uid).await;
     }
 
+    // The manifest is empty. Before reporting `Clean`, scan the whole
+    // namespace once: a record whose spec names this lease but whose label
+    // does not is invisible to the labelled lists above.
+    let everything = match executions.list(&ListParams::default()).await {
+        Ok(listed) => listed,
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionListForbidden);
+        }
+        Err(error) => {
+            return record_cleanup_retry(&lease.name_any(), "scan executions", &error);
+        }
+    };
+    if let Err(reason) = owned_execution_records(everything, &lease_uid, &manifest) {
+        return ExecutionCleanupOutcome::Quarantine(reason);
+    }
     match crate::sandbox_access_ledger::clear_execution_manifest(
         management_client,
         ledger_namespace,
@@ -1979,7 +2103,77 @@ async fn cleanup_lease_executions_inner(
     {
         Ok(true) => ExecutionCleanupOutcome::Checkpointed,
         Ok(false) => ExecutionCleanupOutcome::Clean,
-        Err(_) => ExecutionCleanupOutcome::Retry,
+        Err(error) => record_cleanup_retry(&lease.name_any(), "clear execution manifest", &error),
+    }
+}
+
+/// Collect the listed records that belong to one lease, keyed by name.
+///
+/// A record must carry the lease UID in both its spec and its label. Either one
+/// alone is a mislabelled or tampered record and fails closed, and so does a
+/// fully owned record the durable manifest does not list.
+fn owned_execution_records(
+    listed: impl IntoIterator<Item = SandboxExecution>,
+    lease_uid: &str,
+    manifest: &[crate::sandbox_access_ledger::ExecutionManifestEntry],
+) -> Result<std::collections::BTreeMap<String, SandboxExecution>, QuarantineReason> {
+    let mut owned = std::collections::BTreeMap::new();
+    for execution in listed {
+        let labelled =
+            execution.labels().get(LEASE_UID_LABEL).map(String::as_str) == Some(lease_uid);
+        if execution.spec.lease_uid != lease_uid && !labelled {
+            continue;
+        }
+        if execution.spec.lease_uid != lease_uid || !labelled {
+            return Err(QuarantineReason::ExecutionIdentityUnverifiable);
+        }
+        if owned.insert(execution.name_any(), execution).is_some() {
+            return Err(QuarantineReason::ExecutionNameDuplicated);
+        }
+    }
+    if owned
+        .keys()
+        .any(|name| !manifest.iter().any(|entry| entry.name == *name))
+    {
+        return Err(QuarantineReason::ExecutionNotInManifest);
+    }
+    Ok(owned)
+}
+
+/// Check that a manifest entry missing from the labelled list has no record
+/// naming this lease.
+///
+/// `Ok` means the name is free, or held by a record for another lease; the
+/// caller then applies its usual missing-record rules. A record carrying this
+/// lease's UID in only its spec or only its label is quarantined, as the full
+/// scan would. A fully owned record appeared after the list, so the caller
+/// re-lists on its next pass.
+async fn unlisted_record_is_absent(
+    executions: &Api<SandboxExecution>,
+    name: &str,
+    lease_uid: &str,
+) -> Result<(), ExecutionCleanupOutcome> {
+    match executions.get(name).await {
+        Ok(record) => {
+            let labelled =
+                record.labels().get(LEASE_UID_LABEL).map(String::as_str) == Some(lease_uid);
+            match (labelled, record.spec.lease_uid == lease_uid) {
+                (true, true) => Err(ExecutionCleanupOutcome::Retry),
+                (false, false) => Ok(()),
+                _ => Err(ExecutionCleanupOutcome::Quarantine(
+                    QuarantineReason::ExecutionIdentityUnverifiable,
+                )),
+            }
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => Err(
+            ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionListForbidden),
+        ),
+        Err(error) => Err(record_cleanup_retry(
+            name,
+            "read unlisted execution",
+            &error,
+        )),
     }
 }
 
@@ -3388,5 +3582,245 @@ mod tests {
             "sandbox-a",
             "somebody-else"
         ));
+    }
+
+    /// Gate and client fixture for execution-cleanup listing tests.
+    async fn cleanup_fixture(
+        manifest: serde_json::Value,
+    ) -> (wiremock::MockServer, kube::Client, SandboxLease) {
+        use sha2::{Digest as _, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{gate}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"coordination.k8s.io/v1",
+                "kind":"Lease",
+                "metadata":{
+                    "name":gate,"namespace":"test-ns","uid":"gate-uid","resourceVersion":"1",
+                    "labels":{
+                        "kobe.kunobi.ninja/sandbox-access-kind":"lease-gate",
+                        "kobe.kunobi.ninja/sandbox-lease-name":lease.name_any(),
+                        "kobe.kunobi.ninja/sandbox-access-lease-uid":lease_uid,
+                    },
+                    "annotations":{
+                        "kobe.kunobi.ninja/sandbox-access-state":"closed",
+                        "kobe.kunobi.ninja/sandbox-access-entries":"{}",
+                        "kobe.kunobi.ninja/sandbox-executions":manifest.to_string(),
+                    }
+                },
+                "spec":{}
+            })))
+            .mount(&server)
+            .await;
+        (server, client, lease)
+    }
+
+    /// A record naming this lease in its spec but not its label.
+    fn mislabelled_record(lease: &SandboxLease) -> SandboxExecution {
+        let mut record = build_execution_record(
+            "test-ns",
+            "execution-a",
+            lease,
+            &target(),
+            &request(),
+            &"d".repeat(64),
+            recorded_target("workspace"),
+        );
+        record.metadata.uid = Some("execution-uid".into());
+        record.metadata.resource_version = Some("execution-rv".into());
+        record.spec.lease_uid = lease.uid().unwrap();
+        record
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(LEASE_UID_LABEL);
+        record
+    }
+
+    fn execution_list(items: Vec<SandboxExecution>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+            "kind":"SandboxExecutionList",
+            "metadata":{"resourceVersion":"1"},
+            "items":items
+        })
+    }
+
+    const EXECUTIONS_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions";
+
+    /// Per-step lists are filtered by the lease-UID label. Because the label is
+    /// mutable, cleanup still scans the whole namespace before it reports
+    /// `Clean`, and a record that names the lease only in its spec fails
+    /// closed there.
+    #[tokio::test]
+    async fn cleanup_lists_by_label_and_scans_everything_before_clean() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, client, lease) = cleanup_fixture(serde_json::json!({})).await;
+        let selector = format!("{LEASE_UID_LABEL}={}", lease.uid().unwrap());
+        Mock::given(method("GET"))
+            .and(path(EXECUTIONS_PATH))
+            .and(query_param("labelSelector", selector.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(execution_list(vec![])))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(EXECUTIONS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(execution_list(vec![mislabelled_record(&lease)])),
+            )
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            cleanup_lease_executions_after_target_absence(
+                &client,
+                "test-ns",
+                "test-ns",
+                &lease,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
+            ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionIdentityUnverifiable)
+        );
+    }
+
+    /// A manifest entry missing from the labelled list is re-read by name. A
+    /// record there that names the lease only in its spec is quarantined as
+    /// unverifiable, not mistaken for a missing record.
+    #[tokio::test]
+    async fn an_unlisted_manifest_record_is_read_by_name_before_it_counts_as_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, client, lease) = cleanup_fixture(serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "executionUid": "execution-uid",
+                "creationState": "bound",
+                "active": true
+            }
+        }))
+        .await;
+        Mock::given(method("GET"))
+            .and(path(EXECUTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(execution_list(vec![])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{EXECUTIONS_PATH}/execution-a")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mislabelled_record(&lease)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            cleanup_lease_executions_after_target_absence(
+                &client,
+                "test-ns",
+                "test-ns",
+                &lease,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
+            ExecutionCleanupOutcome::Quarantine(QuarantineReason::ExecutionIdentityUnverifiable)
+        );
+    }
+
+    /// An absent `Creating` record is a short wait for its writer, reported
+    /// distinctly from an error so release re-checks it sooner.
+    #[tokio::test]
+    async fn an_absent_creating_record_awaits_creation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, client, lease) = cleanup_fixture(serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "creationState": "creating",
+                "active": true
+            }
+        }))
+        .await;
+        Mock::given(method("GET"))
+            .and(path(EXECUTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(execution_list(vec![])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{EXECUTIONS_PATH}/execution-a")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"NotFound","code":404
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            cleanup_lease_executions_after_target_absence(
+                &client,
+                "test-ns",
+                "test-ns",
+                &lease,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
+            ExecutionCleanupOutcome::AwaitCreation
+        );
+    }
+
+    /// The reaper skips a terminal record it already settled at the same
+    /// version, looks again once the record changes, and forgets records that
+    /// are gone.
+    #[test]
+    fn settled_terminal_records_are_keyed_by_uid_and_version() {
+        let mut record = mislabelled_record(&lease());
+        let mut settled = SettledTerminalRecords::default();
+        assert!(!settled.contains(&record));
+        settled.insert(&record);
+        assert!(settled.contains(&record));
+
+        record.metadata.resource_version = Some("execution-rv-2".into());
+        assert!(!settled.contains(&record));
+
+        settled.insert(&record);
+        settled.retain_listed(&[]);
+        assert!(!settled.contains(&record));
     }
 }
