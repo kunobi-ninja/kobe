@@ -192,12 +192,18 @@ impl ExecutionRequestError {
     }
 
     pub fn reason_code(&self) -> &'static str {
+        self.api_reason().as_str()
+    }
+
+    /// The reason carried in the caller's error body.
+    pub(crate) fn api_reason(&self) -> crate::api::error::ApiErrorReason {
+        use crate::api::error::ApiErrorReason as R;
         match self {
-            Self::IdempotencyConflict => "idempotency_conflict",
-            Self::Invalid { .. } => "invalid_request",
-            Self::Denied(denied) => denied.reason_code(),
-            Self::Backend => "backend_error",
-            Self::LimitReached => "execution_limit_exhausted",
+            Self::IdempotencyConflict => R::IdempotencyConflict,
+            Self::Invalid { .. } => R::InvalidRequest,
+            Self::Denied(denied) => denied.api_reason(),
+            Self::Backend => R::BackendError,
+            Self::LimitReached => R::ExecutionLimitExhausted,
         }
     }
 }

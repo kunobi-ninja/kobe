@@ -383,6 +383,7 @@ async fn run() -> anyhow::Result<()> {
         datastore: datastore.clone(),
         connect_cache: Default::default(),
         sandbox_admission_limiter: Default::default(),
+        cluster_admission_limiter: Default::default(),
         shutdown: shutdown.clone(),
         sandbox_enabled: agent_sandbox_mode.enabled(),
         iroh_endpoint: iroh_endpoint.clone(),

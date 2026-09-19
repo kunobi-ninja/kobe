@@ -189,17 +189,23 @@ impl SandboxAccessDenied {
     /// several into one: the operator has to be able to tell "expired" from
     /// "never placed" when someone reports that access stopped working.
     pub fn reason_code(&self) -> &'static str {
+        self.api_reason().as_str()
+    }
+
+    /// The reason carried in the caller's error body.
+    pub(crate) fn api_reason(&self) -> crate::api::error::ApiErrorReason {
+        use crate::api::error::ApiErrorReason as R;
         match self {
-            Self::NotFound => "not_found",
-            Self::NotReady { .. } => "not_ready",
-            Self::Expired => "expired",
-            Self::TargetUnresolved => "target_unresolved",
-            Self::ProvenanceIncomplete => "provenance_incomplete",
-            Self::PoolUnresolvable => "pool_unresolvable",
-            Self::NotDeclared { .. } => "not_declared",
-            Self::PortNameCoversRange => "port_name_covers_range",
-            Self::AmbiguousAlias => "ambiguous_alias",
-            Self::Backend => "backend_error",
+            Self::NotFound => R::NotFound,
+            Self::NotReady { .. } => R::NotReady,
+            Self::Expired => R::Expired,
+            Self::TargetUnresolved => R::TargetUnresolved,
+            Self::ProvenanceIncomplete => R::ProvenanceIncomplete,
+            Self::PoolUnresolvable => R::PoolUnresolvable,
+            Self::NotDeclared { .. } => R::NotDeclared,
+            Self::PortNameCoversRange => R::PortNameCoversRange,
+            Self::AmbiguousAlias => R::AmbiguousAlias,
+            Self::Backend => R::BackendError,
         }
     }
 
