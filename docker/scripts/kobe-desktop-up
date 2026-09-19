@@ -70,11 +70,15 @@ touch "$XAUTHORITY"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 start Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY"
 ready xdpyinfo -display "$DISPLAY"
-xsetroot -solid '#17324d'
 
 start dbus-daemon --session --nofork --address="$DBUS_SESSION_BUS_ADDRESS"
 ready dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames
 start openbox --sm-disable
+# Openbox clears the root window when it takes over the screen, so a colour set
+# before it runs is lost and the desktop comes up black. Paint once it has
+# announced itself as the window manager.
+ready bash -c 'xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id"'
+xsetroot -solid '#17324d'
 # A visible terminal makes an otherwise empty desktop immediately usable. The
 # Openbox right-click menu also exposes Terminal, Browser, and desktop status.
 start_optional xterm -title 'Kobe workspace' -geometry 100x28+32+32 -fa Monospace -fs 11 -e bash -lc 'printf "Kobe GUI workspace ready.\nRight-click the desktop for Terminal, Browser, and status.\n\n"; exec bash'
