@@ -66,13 +66,21 @@ impl VeleroCoordinator {
         self.ensure_namespace(&ns).await?;
 
         // Create the temporary cluster; on any subsequent failure we must clean it up.
-        if let Err(e) = backend
-            // Velero's golden-image coordinator creates an *ephemeral*
-            // cluster and immediately deletes it after snapshotting; no
-            // persistent ClusterInstance CR exists to own its children.
-            // Pass `None` — the explicit cleanup path is what we rely on.
-            .create(&cluster_name, &ns, &spec.cluster, &spec.addons, None)
-            .await
+        // Velero's golden-image coordinator creates an *ephemeral* cluster
+        // and immediately deletes it after snapshotting; no persistent
+        // ClusterInstance CR exists to own its children. Pass `None` — the
+        // explicit cleanup path is what we rely on. No controller drives this
+        // cluster's readiness either, so wait for it here: this runs in its
+        // own task, never on a reconcile worker.
+        if let Err(e) = crate::backend::create_and_wait(
+            backend,
+            &cluster_name,
+            &ns,
+            &spec.cluster,
+            &spec.addons,
+            None,
+        )
+        .await
         {
             error!(
                 profile = profile_name,

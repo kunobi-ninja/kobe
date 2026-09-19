@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::backend::ClusterBackend;
+use crate::backend::{ClusterBackend, CreateProgress};
 use crate::crd::{Addon, ClusterConfig, ReadinessGate};
 
 // ---------------------------------------------------------------------------
@@ -17,6 +17,10 @@ use crate::crd::{Addon, ClusterConfig, ReadinessGate};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockCall {
     Create {
+        name: String,
+        namespace: String,
+    },
+    AdvanceCreate {
         name: String,
         namespace: String,
     },
@@ -47,6 +51,7 @@ pub enum MockCall {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MockCalls {
     pub create: usize,
+    pub advance_create: usize,
     pub delete: usize,
     pub check_health: usize,
     pub extract_kubeconfig: usize,
@@ -59,6 +64,8 @@ pub struct MockCalls {
 struct MockInner {
     calls: Mutex<Vec<MockCall>>,
     create_error: Mutex<Option<String>>,
+    create_progress: Mutex<CreateProgress>,
+    readiness_budget: Mutex<Option<std::time::Duration>>,
     healthy: Mutex<bool>,
     kubeconfig: Mutex<String>,
     ready: Mutex<bool>,
@@ -87,6 +94,8 @@ impl MockBackend {
             inner: Arc::new(MockInner {
                 calls: Mutex::new(Vec::new()),
                 create_error: Mutex::new(None),
+                create_progress: Mutex::new(CreateProgress::NotDeferred),
+                readiness_budget: Mutex::new(None),
                 healthy: Mutex::new(true),
                 kubeconfig: Mutex::new("mock-kubeconfig".to_string()),
                 ready: Mutex::new(true),
@@ -99,6 +108,18 @@ impl MockBackend {
     /// Make subsequent `create` calls return an error with the given message.
     pub fn fail_create(&self, msg: &str) {
         *self.inner.create_error.lock().unwrap() = Some(msg.to_string());
+    }
+
+    /// Set what `advance_create` reports, and the budget
+    /// `create_readiness_budget` returns. The default is a backend that does
+    /// not defer readiness.
+    pub fn set_create_progress(
+        &self,
+        progress: CreateProgress,
+        budget: Option<std::time::Duration>,
+    ) {
+        *self.inner.create_progress.lock().unwrap() = progress;
+        *self.inner.readiness_budget.lock().unwrap() = budget;
     }
 
     /// Set the boolean returned by `check_health`.
@@ -130,6 +151,7 @@ impl MockBackend {
         for c in calls.iter() {
             match c {
                 MockCall::Create { .. } => counts.create += 1,
+                MockCall::AdvanceCreate { .. } => counts.advance_create += 1,
                 MockCall::Delete { .. } => counts.delete += 1,
                 MockCall::CheckHealth { .. } => counts.check_health += 1,
                 MockCall::ExtractKubeconfig { .. } => counts.extract_kubeconfig += 1,
@@ -158,6 +180,29 @@ impl ClusterBackend for MockBackend {
             anyhow::bail!("{msg}");
         }
         Ok(())
+    }
+
+    async fn advance_create(
+        &self,
+        name: &str,
+        namespace: &str,
+        _config: &ClusterConfig,
+        _addons: &[Addon],
+        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+    ) -> Result<CreateProgress> {
+        self.inner
+            .calls
+            .lock()
+            .unwrap()
+            .push(MockCall::AdvanceCreate {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+            });
+        Ok(*self.inner.create_progress.lock().unwrap())
+    }
+
+    fn create_readiness_budget(&self, _config: &ClusterConfig) -> Option<std::time::Duration> {
+        *self.inner.readiness_budget.lock().unwrap()
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {

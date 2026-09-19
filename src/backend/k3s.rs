@@ -45,14 +45,15 @@ use crate::crd::{
 };
 
 use super::{
-    ClusterBackend, GuestPodCrash, SchedulingBlocked, apply_addon_impl, check_readiness_gate_impl,
-    check_virtual_health, data_volume_claim_template, datastore, node_affinity_from_selector,
-    read_kubeconfig_secret, server_anti_affinity_terms, virtual_client_from_kubeconfig,
+    ClusterBackend, CreateProgress, GuestPodCrash, SchedulingBlocked, apply_addon_impl,
+    check_readiness_gate_impl, check_virtual_health, data_volume_claim_template, datastore,
+    node_affinity_from_selector, read_kubeconfig_secret, server_anti_affinity_terms,
+    virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
-const INSTANCE_UID_LABEL: &str = "kobe.kunobi.ninja/instance-uid";
+pub(crate) const INSTANCE_UID_LABEL: &str = "kobe.kunobi.ninja/instance-uid";
 
 /// Record a best-effort backend resource-op failure into
 /// `kobe_backend_delete_failures_total`. Only `op="delete"` is emitted today
@@ -1959,112 +1960,138 @@ impl K3sBackend {
         }
     }
 
-    /// Wait for the k3s cluster to become ready.
+    /// How long a k3s create may wait for its control plane.
     ///
-    /// Polls BOTH conditions in the SAME loop and only returns `Ok` when:
+    /// OrderedReady serializes bring-up, so N servers take proportionally
+    /// longer than one: 600s for the first server plus 180s per additional
+    /// one. `servers` is the RAW `config.servers`; 0 and 1 both get 600s.
+    fn readiness_budget(servers: u32) -> std::time::Duration {
+        std::time::Duration::from_secs(600 + 180 * u64::from(servers.saturating_sub(1)))
+    }
+
+    /// One readiness check of a k3s cluster whose objects `create` applied.
+    ///
+    /// Ready means BOTH:
     ///   (a) the controller-owned `{name}-kubeconfig` Secret contains a
     ///       non-empty `kubeconfig` key published by pod-0, AND
     ///   (b) the server StatefulSet reports enough ready replicas
     ///       (`server_sts_ready` against its CLAMPED `status.replicas`).
     ///
-    /// `servers` is the RAW `config.servers`; it only sizes the timeout budget
-    /// (see below). The readiness predicate keys off the StatefulSet's own
-    /// `status.replicas` (the clamped spec value), so `servers == 0` collapses
-    /// cleanly to the single-server path.
+    /// The predicate keys off the StatefulSet's own `status.replicas` (the
+    /// clamped spec value), so `servers == 0` collapses to the single-server
+    /// path. Gating on `readyReplicas` means a cluster is declared ready once
+    /// the server pod passes its TCP:6443 readiness probe, not the moment k3s
+    /// wrote its kubeconfig.
     ///
-    /// Single-server behavior note: the historical wait returned the instant
-    /// the kubeconfig Secret appeared. Additionally gating on `readyReplicas`
-    /// means a single-server cluster is declared Ready a moment later — once the
-    /// server pod passes its TCP:6443 readiness probe and joins the Service
-    /// Endpoints — instead of the moment k3s wrote its kubeconfig. A small,
-    /// safer delay (don't advertise Ready before 6443 accepts), not a regression.
+    /// Transient (non-404) API errors are logged and read as "not ready yet":
+    /// the caller checks again on its next pass, and only the readiness budget
+    /// ([`Self::readiness_budget`]) fails the instance.
     ///
-    /// Transient (non-404) API errors while polling are NOT fatal: they are
-    /// logged and treated as "not ready yet", so a blip does not fail an
-    /// otherwise-healthy provision. Only exhausting the budget fails — and an
-    /// idempotent `create_database` makes the ensuing reconcile retry safe.
-    ///
-    /// B3 (pod-0 SPOF): pod-0 is a hard bootstrap dependency under OrderedReady
-    /// (it seeds the CA and is the sole kubeconfig publisher); if pod-0 cannot
-    /// reach Ready, the instance burns the wait_ready budget and recycles —
-    /// mitigated by idempotent `create_database` (step 1) and the in-sidecar
-    /// retry (step 7). No operator-side fallback in this version.
-    async fn wait_ready(&self, name: &str, namespace: &str, servers: u32) -> Result<()> {
-        debug!(cluster = name, "Waiting for k3s cluster to become ready");
-
+    /// B3 (pod-0 SPOF): pod-0 is a hard bootstrap dependency under
+    /// OrderedReady (it seeds the CA and is the sole kubeconfig publisher); if
+    /// pod-0 cannot reach Ready, the instance exhausts the readiness budget
+    /// and recycles, mitigated by idempotent `create_database` and the
+    /// in-sidecar publish retry.
+    async fn control_plane_ready(&self, name: &str, namespace: &str) -> bool {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         let sts_name = format!("{name}-server");
 
-        // B2 (timeout budget): OrderedReady serializes bring-up, so N servers
-        // take proportionally longer than one. Scale the attempt budget with
-        // the count: 120 attempts (×5s = 600s) for the first server, +36
-        // attempts (+180s) per additional server. servers=1 → 600s (unchanged
-        // from the historical single-server budget); servers=3 → 192×5s = 960s.
-        let max_attempts = 120 + 36 * (servers.saturating_sub(1)) as usize;
-
-        for attempt in 0..max_attempts {
-            // (a) controller-reserved Secret has published kubeconfig data?
-            let secret_ready = match secrets.get(&secret_name).await {
-                Ok(secret) => secret
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("kubeconfig"))
-                    .is_some_and(|value| !value.0.is_empty()),
-                Err(kube::Error::Api(ae)) if ae.code == 404 => false,
-                // Transient (non-404) errors are not fatal: log and keep
-                // polling within the budget rather than failing the whole
-                // provision on a blip.
-                Err(e) => {
-                    warn!(cluster = name, error = %e, "transient error polling kubeconfig Secret; retrying");
-                    false
-                }
-            };
-
-            // (b) StatefulSet readyReplicas >= clamped spec replicas?
-            let sts_ready = match sts_api.get(&sts_name).await {
-                Ok(sts) => {
-                    let status = sts.status.as_ref();
-                    server_sts_ready(
-                        status.map(|s| s.replicas),
-                        status.and_then(|s| s.ready_replicas),
-                    )
-                }
-                Err(kube::Error::Api(ae)) if ae.code == 404 => false,
-                // Transient (non-404) errors are not fatal: log and keep polling.
-                Err(e) => {
-                    warn!(cluster = name, error = %e, "transient error polling server StatefulSet; retrying");
-                    false
-                }
-            };
-
-            if secret_ready && sts_ready {
-                info!(
-                    cluster = name,
-                    attempts = attempt + 1,
-                    "k3s cluster ready (kubeconfig published and server StatefulSet ready)"
-                );
-                return Ok(());
+        let secret_ready = match secrets.get(&secret_name).await {
+            Ok(secret) => secret
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kubeconfig"))
+                .is_some_and(|value| !value.0.is_empty()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => false,
+            Err(e) => {
+                warn!(cluster = name, error = %e, "transient error reading kubeconfig Secret; retrying");
+                false
             }
+        };
 
-            if attempt % 12 == 0 {
-                debug!(
-                    cluster = name,
-                    attempt = attempt + 1,
-                    secret_ready,
-                    sts_ready,
-                    "Waiting for k3s cluster readiness..."
-                );
+        let sts_ready = match sts_api.get(&sts_name).await {
+            Ok(sts) => {
+                let status = sts.status.as_ref();
+                server_sts_ready(
+                    status.map(|s| s.replicas),
+                    status.and_then(|s| s.ready_replicas),
+                )
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Err(kube::Error::Api(ae)) if ae.code == 404 => false,
+            Err(e) => {
+                warn!(cluster = name, error = %e, "transient error reading server StatefulSet; retrying");
+                false
+            }
+        };
+
+        debug!(
+            cluster = name,
+            secret_ready, sts_ready, "k3s control plane readiness"
+        );
+        secret_ready && sts_ready
+    }
+
+    /// Everything a k3s create does once the control plane is ready.
+    ///
+    /// Each step is idempotent, so a repeat after a crash or a failed status
+    /// write converges instead of duplicating: the kubeconfig check is
+    /// read-only, the agent Deployment goes through create-or-apply under the
+    /// exact instance owner, and addons are server-side applied.
+    async fn finish_create(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+        addons: &[Addon],
+        owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+    ) -> Result<()> {
+        if let Some(owner) = owner_ref {
+            self.seal_kubeconfig_secret_control(name, namespace, owner)
+                .await?;
         }
 
-        anyhow::bail!(
-            "k3s cluster {name} not ready after {} attempts ({}s)",
-            max_attempts,
-            max_attempts * 5
-        );
+        // Agents join through the server Service, so they are created only
+        // after the server is ready.
+        if let Some(agents) = config.agents
+            && agents > 0
+        {
+            let mut deploy = Self::build_agent_deployment(name, namespace, config, agents);
+            if let Some(owner) = owner_ref {
+                Self::stamp_instance_control(&mut deploy.metadata, owner);
+            }
+            if let (Some(owner), Some(spec)) = (owner_ref, deploy.spec.as_mut()) {
+                spec.template
+                    .metadata
+                    .get_or_insert_with(ObjectMeta::default)
+                    .labels
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
+            }
+            let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+            let deploy_name = format!("{name}-agent");
+            if let Some(owner) = owner_ref {
+                Self::create_or_apply_owned(&deploy_api, &deploy_name, deploy, owner).await?;
+            } else {
+                deploy_api
+                    .patch(
+                        &deploy_name,
+                        &PatchParams::apply("kobe-operator").force(),
+                        &Patch::Apply(&deploy),
+                    )
+                    .await
+                    .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
+            }
+            info!(cluster = name, agents = agents, "Agent Deployment applied");
+        }
+
+        for addon in addons {
+            self.apply_addon(name, namespace, addon).await?;
+        }
+
+        info!(cluster = name, "k3s cluster fully ready with addons");
+        Ok(())
     }
 
     /// Read the cluster's guest server/agent Pods and classify whether the
@@ -3475,13 +3502,16 @@ impl ClusterBackend for K3sBackend {
         fingerprint_rendered(&sts, &deploy)
     }
 
-    #[tracing::instrument(skip(self, config, addons, owner_ref), fields(cluster = name, namespace))]
+    /// Apply every host-side object of a k3s cluster and return without
+    /// waiting for it to boot. Addons need a ready control plane, so they
+    /// are applied by `advance_create`, not here.
+    #[tracing::instrument(skip(self, config, _addons, owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
-        addons: &[Addon],
+        _addons: &[Addon],
         owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         info!(cluster = name, "Creating k3s cluster");
@@ -3493,8 +3523,9 @@ impl ClusterBackend for K3sBackend {
         self.create_token_secret(name, namespace, owner_ref).await?;
 
         // Reserve the publisher's output name under the exact instance owner
-        // before any workload can write it. Readiness below requires the data
-        // key, so the empty placeholder cannot make the instance Ready.
+        // before any workload can write it. Readiness (`advance_create`)
+        // requires the data key, so the empty placeholder cannot make the
+        // instance Ready.
         if let Some(owner) = owner_ref {
             self.ensure_kubeconfig_secret_placeholder(name, namespace, owner)
                 .await?;
@@ -3655,54 +3686,32 @@ impl ClusterBackend for K3sBackend {
             );
         }
 
-        // 6. Wait for readiness: kubeconfig Secret published by pod-0 AND the
-        // server StatefulSet reporting readyReplicas >= clamped replicas.
-        self.wait_ready(name, namespace, config.servers).await?;
-        if let Some(owner) = owner_ref {
-            self.seal_kubeconfig_secret_control(name, namespace, owner)
-                .await?;
-        }
-
-        // 7. Create agent Deployment if requested
-        if let Some(agents) = config.agents
-            && agents > 0
-        {
-            let mut deploy = Self::build_agent_deployment(name, namespace, config, agents);
-            if let Some(owner) = owner_ref {
-                Self::stamp_instance_control(&mut deploy.metadata, owner);
-            }
-            if let (Some(owner), Some(spec)) = (owner_ref, deploy.spec.as_mut()) {
-                spec.template
-                    .metadata
-                    .get_or_insert_with(ObjectMeta::default)
-                    .labels
-                    .get_or_insert_with(BTreeMap::new)
-                    .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
-            }
-            let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-            let deploy_name = format!("{name}-agent");
-            if let Some(owner) = owner_ref {
-                Self::create_or_apply_owned(&deploy_api, &deploy_name, deploy, owner).await?;
-            } else {
-                deploy_api
-                    .patch(
-                        &deploy_name,
-                        &PatchParams::apply("kobe-operator").force(),
-                        &Patch::Apply(&deploy),
-                    )
-                    .await
-                    .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
-            }
-            info!(cluster = name, agents = agents, "Agent Deployment applied");
-        }
-
-        // 8. Apply addons
-        for addon in addons {
-            self.apply_addon(name, namespace, addon).await?;
-        }
-
-        info!(cluster = name, "k3s cluster fully ready with addons");
+        // Readiness, the agent Deployment and addons follow in
+        // `advance_create`, driven by the instance controller's requeues, so
+        // this call never parks a reconcile worker on a booting cluster.
+        info!(cluster = name, "k3s objects applied; readiness is deferred");
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, config, addons, owner_ref), fields(cluster = name, namespace))]
+    async fn advance_create(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+        addons: &[Addon],
+        owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+    ) -> Result<CreateProgress> {
+        if !self.control_plane_ready(name, namespace).await {
+            return Ok(CreateProgress::Pending);
+        }
+        self.finish_create(name, namespace, config, addons, owner_ref)
+            .await?;
+        Ok(CreateProgress::Complete)
+    }
+
+    fn create_readiness_budget(&self, config: &ClusterConfig) -> Option<std::time::Duration> {
+        Some(Self::readiness_budget(config.servers))
     }
 
     #[tracing::instrument(skip(self), fields(cluster = name, namespace))]
@@ -4038,6 +4047,12 @@ impl ClusterBackend for K3sBackend {
                 )?);
                 replicas
             }
+            // The agent Deployment is applied only after the control plane is
+            // ready (`advance_create`). Sealing before then would record a
+            // footprint without it and let verified teardown skip it.
+            None if config.agents.is_some_and(|agents| agents > 0) => anyhow::bail!(
+                "agent Deployment {agent_name} is not created yet; creation is incomplete"
+            ),
             None => 0,
         };
         let pdb_name = format!("{name}-server");
@@ -6700,16 +6715,112 @@ mod tests {
         );
     }
 
-    /// A StatefulSet GET response whose status reports `replicas` desired and
-    /// `replicas` ready — i.e. the cluster is fully Ready. Used by create-flow
-    /// tests so `wait_ready`'s readiness predicate is satisfied immediately.
-    fn ready_statefulset_response(name: &str, namespace: &str, replicas: i32) -> serde_json::Value {
+    /// A StatefulSet GET response reporting `replicas` desired and `ready`
+    /// ready.
+    fn statefulset_status_response(
+        name: &str,
+        namespace: &str,
+        replicas: i32,
+        ready: i32,
+    ) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "apps/v1",
             "kind": "StatefulSet",
             "metadata": { "name": name, "namespace": namespace },
-            "status": { "replicas": replicas, "readyReplicas": replicas }
+            "status": { "replicas": replicas, "readyReplicas": ready }
         })
+    }
+
+    /// Mount the two reads `control_plane_ready` makes: the published
+    /// kubeconfig Secret and the server StatefulSet reporting `ready` of 1.
+    async fn mount_control_plane(server: &MockServer, ready: i32) {
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_response("test-cluster-kubeconfig", "test-ns")),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/test-cluster-server",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_status_response(
+                    "test-cluster-server",
+                    "test-ns",
+                    1,
+                    ready,
+                )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn advance_create_is_pending_until_the_server_is_ready() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        mount_control_plane(&server, 0).await;
+        // Nothing post-ready may happen while the server is still booting.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/deployments/test-cluster-agent",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = base_config();
+        config.agents = Some(1);
+        let progress = backend
+            .advance_create("test-cluster", "test-ns", &config, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(progress, CreateProgress::Pending);
+    }
+
+    #[tokio::test]
+    async fn advance_create_post_ready_steps_are_idempotent() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        mount_control_plane(&server, 1).await;
+        // The agent Deployment is server-side applied on every completing
+        // pass, so a repeat after a crash converges on the same object.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/deployments/test-cluster-agent",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
+                "apps/v1",
+                "Deployment",
+                "test-cluster-agent",
+                "test-ns",
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = base_config();
+        config.agents = Some(1);
+        for _ in 0..2 {
+            let progress = backend
+                .advance_create("test-cluster", "test-ns", &config, &[], None)
+                .await
+                .unwrap();
+            assert_eq!(progress, CreateProgress::Complete);
+        }
+    }
+
+    #[test]
+    fn readiness_budget_scales_with_servers() {
+        assert_eq!(K3sBackend::readiness_budget(0).as_secs(), 600);
+        assert_eq!(K3sBackend::readiness_budget(1).as_secs(), 600);
+        assert_eq!(K3sBackend::readiness_budget(3).as_secs(), 960);
     }
 
     #[tokio::test]
@@ -6784,38 +6895,32 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Mock: GET kubeconfig secret (appears on first poll)
+        // `create` must return once the objects are applied: it never reads
+        // readiness, so a booting cluster cannot hold the caller.
         Mock::given(method("GET"))
             .and(path(
                 "/api/v1/namespaces/test-ns/secrets/test-cluster-kubeconfig",
             ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(secret_response("test-cluster-kubeconfig", "test-ns")),
-            )
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
             .mount(&server)
             .await;
-
-        // Mock: GET StatefulSet (wait_ready now polls readyReplicas too).
-        // Report 1 desired / 1 ready so the readiness predicate passes.
         Mock::given(method("GET"))
             .and(path(
                 "/apis/apps/v1/namespaces/test-ns/statefulsets/test-cluster-server",
             ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(ready_statefulset_response(
-                    "test-cluster-server",
-                    "test-ns",
-                    1,
-                )),
-            )
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
             .mount(&server)
             .await;
 
         let config = base_config();
-        let result = backend
-            .create("test-cluster", "test-ns", &config, &[], None)
-            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.create("test-cluster", "test-ns", &config, &[], None),
+        )
+        .await
+        .expect("create must not wait for readiness");
         assert!(result.is_ok(), "create should succeed: {result:?}");
     }
 
