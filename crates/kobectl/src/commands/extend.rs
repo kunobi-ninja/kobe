@@ -32,14 +32,29 @@ struct ExtendRequest<'a> {
 /// The cluster endpoint answers in snake_case and the Sandbox endpoint in the
 /// camelCase its API uses throughout; accept both rather than making callers
 /// care which kind they extended.
+///
+/// Both spellings are separate optional fields rather than a serde alias: an
+/// alias treats them as one field, so a body carrying both fails as a
+/// duplicate field, and the extension the server already applied looks failed.
 #[derive(Deserialize)]
 struct ExtendResponse {
-    #[serde(alias = "expiresAt")]
-    expires_at: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default, rename = "expiresAt")]
+    expires_at_camel: Option<String>,
     /// Sandbox only: running executions whose deadline the extension does not
     /// reach. Absent from cluster leases and older servers.
     #[serde(default, alias = "runningExecutions")]
     running_executions: Vec<RunningExecution>,
+}
+
+impl ExtendResponse {
+    fn expires_at(&self) -> Result<String> {
+        self.expires_at
+            .clone()
+            .or_else(|| self.expires_at_camel.clone())
+            .ok_or_else(|| anyhow::anyhow!("extend response has no expiry"))
+    }
 }
 
 /// A running execution that still stops before the lease's new expiry.
@@ -66,9 +81,9 @@ pub(crate) async fn extend_lease(
     lease_id: &str,
     by: &str,
 ) -> Result<String> {
-    Ok(extend_lease_response(config, lease_id, by)
+    extend_lease_response(config, lease_id, by)
         .await?
-        .expires_at)
+        .expires_at()
 }
 
 async fn extend_lease_response(
@@ -125,7 +140,7 @@ pub async fn extend(
     };
 
     let extended = extend_lease_response(&config, &lease_id, by).await?;
-    let expires_at = extended.expires_at;
+    let expires_at = extended.expires_at()?;
     match output {
         OutputFormat::Text => {
             println!(
@@ -155,6 +170,23 @@ pub async fn extend(
 
 #[cfg(test)]
 mod tests {
+
+    /// A body carrying both spellings must still parse. With a serde alias it
+    /// failed as a duplicate field, so a successful extension looked failed.
+    #[test]
+    fn extend_response_accepts_either_or_both_expiry_spellings() {
+        for body in [
+            r#"{"expires_at":"2026-09-18T23:30:00Z"}"#,
+            r#"{"expiresAt":"2026-09-18T23:30:00Z"}"#,
+            r#"{"expires_at":"2026-09-18T23:30:00Z","expiresAt":"2026-09-18T23:30:00Z"}"#,
+        ] {
+            let parsed: ExtendResponse = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed.expires_at().unwrap(), "2026-09-18T23:30:00Z");
+        }
+        let empty: ExtendResponse = serde_json::from_str("{}").unwrap();
+        assert!(empty.expires_at().is_err());
+    }
+
     use super::*;
 
     /// The Sandbox endpoint names running executions the extension does not

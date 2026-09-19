@@ -2740,7 +2740,16 @@ async fn advance_backend_create<B: ClusterBackend + Clone, C: ClusterBackend>(
     if backend.create_readiness_budget(&config.cluster).is_none() {
         return Ok(CreateProgress::NotDeferred);
     }
-    let addons = instance_addons(ctx, config, namespace).await?;
+    // This runs on every poll while the cluster boots, so a transient failure
+    // to read the BootstrapConfig must not fail the instance: treat it as not
+    // ready yet. A lasting failure still ends in the readiness budget.
+    let addons = match instance_addons(ctx, config, namespace).await {
+        Ok(addons) => addons,
+        Err(error) => {
+            warn!(instance = name, error = %format!("{error:#}"), "could not resolve bootstrap addons; retrying");
+            return Ok(CreateProgress::Pending);
+        }
+    };
     backend
         .advance_create(name, namespace, &config.cluster, &addons, owner_ref)
         .await
@@ -5071,6 +5080,39 @@ mod tests {
                 && operation["path"] == "/status/leaseRef"
                 && operation["value"].is_null()
         }));
+    }
+
+    /// A BootstrapConfig read that fails while the cluster boots keeps the
+    /// create pending instead of failing the instance: the read now runs on
+    /// every poll, not once.
+    #[tokio::test]
+    async fn bootstrap_lookup_failure_while_booting_stays_pending() {
+        let (ctx, server, _) = test_instance_context().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/bootstrapconfigs/flaky",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let k3s = crate::backend::k3s::K3sBackend::new(ctx.client.clone(), Default::default());
+        let config = ResolvedInstanceConfig {
+            owner_name: "pool".into(),
+            backend: Default::default(),
+            cluster: Default::default(),
+            addons: Vec::new(),
+            bootstraps: vec![BootstrapRef {
+                name: "flaky".into(),
+                params: Default::default(),
+            }],
+            health_check: None,
+            readiness_gates: Vec::new(),
+            snapshot: None,
+        };
+        let progress = advance_backend_create(&ctx, &k3s, &config, "booting", "test-ns", None)
+            .await
+            .expect("a transient lookup failure is not a provisioning failure");
+        assert!(matches!(progress, CreateProgress::Pending));
     }
 
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)

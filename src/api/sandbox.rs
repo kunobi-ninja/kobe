@@ -4858,11 +4858,10 @@ pub(crate) struct ExtendSandboxLeaseRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExtendSandboxLeaseResponse {
+    /// One key only (`expiresAt`). Installed CLIs read this with
+    /// `#[serde(alias = "expiresAt")]`, and serde rejects a body that carries
+    /// both spellings as a duplicate field.
     expires_at: String,
-    /// `expiresAt` again, in the Cluster extend answer's snake_case spelling,
-    /// so `PATCH /v1/leases/{id}` answers `expires_at` for both kinds.
-    #[serde(rename = "expires_at")]
-    expires_at_snake: String,
     extensions_count: u32,
     max_extensions: u32,
     /// Running executions whose deadline stays before the new expiry. An
@@ -5200,7 +5199,6 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     (
         StatusCode::OK,
         Json(ExtendSandboxLeaseResponse {
-            expires_at_snake: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             expires_at: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             extensions_count: next_count,
             max_extensions: grant.max_extensions,
@@ -10123,10 +10121,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert!(body.get("runningExecutions").is_none());
-        assert_eq!(
-            body["expires_at"], body["expiresAt"],
-            "PATCH /v1/leases/{{id}} answers `expires_at` for both lease kinds"
-        );
+        // Exactly one spelling: installed CLIs parse the expiry through a serde
+        // alias and reject a body that carries both as a duplicate field.
+        assert!(body["expiresAt"].is_string());
+        assert!(body.get("expires_at").is_none());
     }
 
     /// `GET /v1/leases/<alias>` reaches the Sandbox lease, the same lease

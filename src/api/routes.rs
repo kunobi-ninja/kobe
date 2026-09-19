@@ -656,16 +656,13 @@ struct ExtendLeaseRequest {
     extend_ttl: String,
 }
 
-/// Cluster extend answer.
-///
-/// `expires_at` is this endpoint's historical spelling. `expiresAt` carries the
-/// same value so one client parses both kinds: the Sandbox extend answer, which
-/// `PATCH /v1/leases/{sandbox-id}` returns, is camelCase and carries both too.
+/// Cluster extend answer, in this endpoint's historical snake_case spelling.
+/// The Sandbox extend answer is camelCase (`expiresAt`); clients read either.
 #[derive(Serialize)]
 struct ExtendLeaseResponse {
+    /// One key only. Installed CLIs read this with `#[serde(alias = "expiresAt")]`,
+    /// and serde rejects a body that carries both spellings as a duplicate field.
     expires_at: String,
-    #[serde(rename = "expiresAt")]
-    expires_at_camel: String,
 }
 
 #[derive(Serialize)]
@@ -2721,7 +2718,6 @@ async fn extend_lease<B: ClusterBackend>(
         Ok(new_expiry) => (
             StatusCode::OK,
             Json(ExtendLeaseResponse {
-                expires_at_camel: new_expiry.clone(),
                 expires_at: new_expiry,
             }),
         )
@@ -4740,6 +4736,50 @@ mod tests {
                 .all(|request| request.method != http::Method::PATCH),
             "a refused extend writes nothing"
         );
+    }
+
+    /// A successful Cluster extend answers with exactly one expiry key.
+    /// Installed CLIs parse it through a serde alias, and a body carrying both
+    /// `expires_at` and `expiresAt` fails there as a duplicate field.
+    #[tokio::test]
+    async fn cluster_extend_answers_with_one_expiry_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (state, server) = preflight_state().await;
+        let policy: crate::crd::access_policy::AccessPolicy =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "test" },
+                "spec": {
+                    "auth": { "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": ["test"],
+                        "algorithms": ["RS256"]
+                    }},
+                    "rules": [{ "pools": ["*"], "maxTtl": "4h",
+                                "maxConcurrentLeases": 5, "maxExtensions": 2 }]
+                }
+            }))
+            .unwrap();
+        state
+            .authenticator
+            .update_policies(vec![policy], std::collections::HashMap::new())
+            .await;
+        let mut lease = extendable_cluster_lease("lease-0123456789ab", "Bound", 0, 2);
+        lease.spec.requester.requester_type = "test".to_string();
+        mount_cluster_lease(&server, &lease).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{CLUSTER_LEASES}/lease-0123456789ab/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+
+        let response = extend_via_handler(state, "lease-0123456789ab", "30m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(body["expires_at"].is_string());
+        assert!(body.get("expiresAt").is_none());
     }
 
     /// A concurrent writer that wins the JSON-patch `test` is a conflict the

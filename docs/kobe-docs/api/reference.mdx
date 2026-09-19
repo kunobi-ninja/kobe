@@ -131,7 +131,7 @@ per response:
 |---|---|
 | Lease objects: `POST`/`GET /v1/leases`, `GET /v1/leases/:id`, the `/v1/sandbox-leases` equivalents | snake_case (`expires_at`, `queue_position`, `effective_ttl`, `cluster_name`, `provisioning_deadline`), except `resourceKind` |
 | Admission handoff fields on a Sandbox create: `statusUrl` | camelCase, next to the snake_case lease fields |
-| Extend: `PATCH /v1/leases/:id` | Both `expires_at` and `expiresAt` for both kinds. Sandbox also returns `extensionsCount`, `maxExtensions` and `runningExecutions`. |
+| Extend: `PATCH /v1/leases/:id` | Cluster: `expires_at`. Sandbox: `expiresAt`, plus `extensionsCount`, `maxExtensions` and `runningExecutions`. Each answer carries one spelling only. |
 | Pools, executions, `/v1/status` | camelCase |
 | Errors | `error`, `detail`, `reason` |
 
@@ -363,13 +363,12 @@ Extends a lease TTL. Only allowed up to `maxExtensions` times per lease (configu
 
 ```json
 {
-  "expires_at": "2026-04-09T16:00:00Z",
-  "expiresAt": "2026-04-09T16:00:00Z"
+  "expires_at": "2026-04-09T16:00:00Z"
 }
 ```
 
-`expiresAt` carries the same value as `expires_at`, so one client parses the
-Cluster and Sandbox extend answers the same way. A Sandbox id or alias is
+A Cluster lease answers with `expires_at`; a Sandbox lease answers with
+`expiresAt`. Each answer carries one spelling only. A Sandbox id or alias is
 extended as described under
 [`PATCH /v1/sandbox-leases/:id`](#patch-v1sandbox-leasesid).
 
