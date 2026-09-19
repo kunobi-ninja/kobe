@@ -107,7 +107,7 @@ deployment.
 Use cross-host migration to handle demand spikes:
 
 1. Run a baseline pool on an on-prem host (Host A).
-2. When queue depth exceeds `scaleUpThreshold` and Host A has hit
+2. When leases start queueing (`status.queueDepth > 0`) and Host A has hit
    `maxClusters`, deploy the same profile on a cloud host (Host B) with a
    higher `maxClusters`.
 3. Host B restores from the shared golden backup -- no need to rebuild.

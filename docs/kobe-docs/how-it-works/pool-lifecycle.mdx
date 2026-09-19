@@ -44,8 +44,10 @@ The lease has been released or expired. The operator destroys the instance and i
 ### Quarantined
 
 Verified cleanup could not prove that every exact resource is absent. The
-instance remains unavailable and still counts against pool capacity; the pool
-phase is also `Quarantined`, never `Healthy`. Operators should inspect the
+instance remains unavailable and still counts against pool capacity. The pool
+phase reads `Quarantined` where it would otherwise read `Healthy` or `Idle`;
+`Failing`, `Backoff`, `ScalingUp` and `ScalingDown` still show
+through, with the count in `status.quarantined`. Operators should inspect the
 `ClusterInstance` and `ClusterLease` receipt before retrying cleanup.
 
 `ClusterLease.spec.cleanupMode` is write-once. `Standard` is the default.
@@ -69,6 +71,19 @@ status:
   quarantined: 0 # cleanup could not be proven; still consumes capacity
   queueDepth: 0 # leases waiting for capacity
 ```
+
+`status.phase` summarizes the pool. The first matching phase wins:
+
+| Phase | Meaning |
+|---|---|
+| `Failing` | Three or more provision failures in a row. Needs an operator. |
+| `Backoff` | A provision failed; the pool is waiting before it retries. |
+| `Idle` | Scale-to-zero pool with nothing in it. |
+| `ScalingDown` | Above the warm target and recycling idle clusters. |
+| `Healthy` | At or above the warm target. Leased clusters alone do not count: a pool with nothing `Ready` and leases queued is not healthy. |
+| `ScalingUp` | Below the warm target, or leases are queued with nothing `Ready`. The pool is creating clusters or waiting for room to create one. If `creating` is 0 and every cluster is leased, the pool is exhausted: raise `maxClusters` or wait for releases. |
+
+`Quarantined` replaces `Healthy` or `Idle` while any member is quarantined.
 
 These counts are also visible via the API:
 
@@ -102,10 +117,13 @@ spec:
   scaling:
     minReady: 1
     maxClusters: 10
-    scaleUpThreshold: 0  # start creating more when ready count drops to this
     scaleDownAfter: 5m
     queueTimeout: 5m
 ```
+
+The pool creates clusters whenever `ready + creating` is below `minReady` plus the number of queued leases, up to `maxClusters`. `scaleUpThreshold` is reserved and has no effect; it is accepted so existing manifests stay valid.
+
+A pool without `scaling` keeps `size` clusters warm and may hold up to `size + 10` clusters in total, counting leased, creating and recycling ones, so it can refill while clusters are leased. It never scales down. Set `scaling.maxClusters` if you need a precise ceiling.
 
 ## Velero snapshots
 

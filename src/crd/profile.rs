@@ -198,6 +198,11 @@ pub struct CapiConfig {
 pub struct ClusterPoolSpec {
     /// Desired number of warm (idle + creating) clusters in the pool.
     /// Ignored when `scaling` is set — use `scaling.min_ready` instead.
+    ///
+    /// A fixed-size pool may hold up to `size + 10` members in total
+    /// (leased, creating and recycling included) so it can refill while
+    /// members are leased. It never scales down. Set `scaling.maxClusters`
+    /// for a precise ceiling.
     #[serde(default = "default_size")]
     pub size: u32,
 
@@ -1489,14 +1494,19 @@ pub struct DiagnosticsConfig {
 /// `ready`, `consecutiveFailures`) for programmatic decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ClusterPoolPhase {
-    /// At-or-above `minReady` ready clusters, or actively serving leases.
+    /// At-or-above `minReady` ready clusters. A scale-to-zero pool that is
+    /// serving leases with no claims queued is also Healthy.
     Healthy,
     /// At least one member is held because exact teardown evidence is missing.
-    /// This is never reported as Healthy even when other members are Ready.
+    /// Reported instead of `Healthy` or `Idle`; the more specific phases
+    /// (`Failing`, `Backoff`, `ScalingUp`, `ScalingDown`) still win, and
+    /// `status.quarantined` carries the count.
     Quarantined,
-    /// Creating clusters to reach `minReady` — either on first arrival
-    /// (no prior instances) or refilling after a scale-down / lease churn.
-    /// No consecutive failures.
+    /// Below `minReady`, or leases are queued with nothing Ready. The pool
+    /// is creating clusters, or waiting for room to create one (for example
+    /// every member is leased and the pool is at `maxClusters`). Check
+    /// `queueDepth`, `leased` and `creating` to tell these apart. No
+    /// consecutive failures.
     ScalingUp,
     /// Above `minReady` and shrinking toward it. Happens after
     /// `scaleDownAfter` reaps idle clusters, or while leases recycle and
