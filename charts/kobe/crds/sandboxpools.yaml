@@ -467,6 +467,8 @@ spec:
                   rule: '!has(self.files) || self.files.all(f, self.files.filter(other, other.path == f.path).size() == 1)'
                 - message: template file paths must not contain '.' or '..' segments
                   rule: '!has(self.files) || self.files.all(f, !f.path.matches(''(^|/)[.][.]?(/|$)''))'
+                - message: template file keys must not be '.' or start with '..'
+                  rule: '!has(self.files) || self.files.all(f, f.key != ''.'' && !f.key.startsWith(''..''))'
               transport:
                 default: direct
                 description: |-

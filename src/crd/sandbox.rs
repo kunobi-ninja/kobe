@@ -402,6 +402,10 @@ impl JsonSchema for SandboxPlacement {
     validation = Rule::new(r"!has(self.files) || self.files.all(f, !f.path.matches('(^|/)[.][.]?(/|$)'))")
         .message("template file paths must not contain '.' or '..' segments")
 )]
+#[x_kube(
+    validation = Rule::new("!has(self.files) || self.files.all(f, f.key != '.' && !f.key.startsWith('..'))")
+        .message("template file keys must not be '.' or start with '..'")
+)]
 pub struct SandboxTemplateSpec {
     /// Container selected by default for execution operations.
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
@@ -571,6 +575,8 @@ fn is_dns1123_label(label: &str) -> bool {
 
 fn is_secret_key(key: &str) -> bool {
     (1..=253).contains(&key.len())
+        && key != "."
+        && !key.starts_with("..")
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -2210,6 +2216,16 @@ mod tests {
             path: "/home/agent/.claude/.credentials.json".into(),
         }];
         assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn template_files_reject_reserved_secret_keys() {
+        for key in [".", "..", "..token", "", "a/b"] {
+            assert!(!is_secret_key(key), "accepted {key:?}");
+        }
+        for key in ["token", ".token", "credentials.json"] {
+            assert!(is_secret_key(key), "rejected {key:?}");
+        }
     }
 
     #[test]

@@ -1221,7 +1221,7 @@ await kubectl(["create", "namespace", namespace]);
 // Admission must retain valid file declarations and reject malformed ones
 // before any controller attempts to create a Pod.
 async function testTemplateFilesAdmission(): Promise<void> {
-	const file = { secret: "test-credentials", key: "..token", path: "/tmp/token" };
+	const file = { secret: "test-credentials", key: ".token", path: "/tmp/token" };
 	const pool = (files: typeof file[]) => ({
 		apiVersion: "kobe.kunobi.ninja/v1alpha1", kind: "SandboxPool",
 		metadata: { name: "file-contract", namespace },
@@ -1249,6 +1249,10 @@ async function testTemplateFilesAdmission(): Promise<void> {
 	for (const path of ["relative", "/", "/tmp/", "/tmp//token", "/tmp/./token", "/tmp/../token", "/tmp/.", "/tmp/..", "/tmp/\0token"]) {
 		const result = await probe([{ ...file, path }]);
 		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid path ${JSON.stringify(path)}: ${result.stderr}`);
+	}
+	for (const key of [".", "..", "..token"]) {
+		const result = await probe([{ ...file, key }]);
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted reserved key ${key}: ${result.stderr}`);
 	}
 	for (const files of [[file, file], Array.from({ length: 17 }, (_, i) => ({ ...file, path: `/tmp/token-${i}` }))]) {
 		const result = await probe(files);

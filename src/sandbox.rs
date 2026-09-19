@@ -367,8 +367,8 @@ pub(crate) const SANDBOX_SECRET_FILE_MODE: i32 = 0o444;
 /// Project administrator-declared Secret files into one volume per Secret and
 /// one read-only `subPath` mount per file. `subPath` keeps the parent directory
 /// writable so a tool home like `~/.claude` is not replaced by a Secret volume.
-/// Generated projection paths also support keys such as `..token`, which are
-/// valid Secret keys but cannot be used as Kubernetes volume paths.
+/// Generated projection paths keep Kubernetes volume paths separate from the
+/// administrator's Secret keys.
 pub(crate) fn project_secret_files(
     files: &[SandboxTemplateFile],
 ) -> (Vec<Volume>, Vec<VolumeMount>) {
@@ -2276,7 +2276,7 @@ mod tests {
             .into_iter()
             .map(|path| SandboxTemplateFile {
                 secret: "credentials".into(),
-                key: "..token".into(),
+                key: ".token".into(),
                 path: path.into(),
             })
             .collect();
@@ -2288,7 +2288,7 @@ mod tests {
         let secret = volumes[0].secret.as_ref().unwrap();
         let items = secret.items.as_ref().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].key, "..token");
+        assert_eq!(items[0].key, ".token");
         assert_eq!(items[0].path, "file-0");
         assert_eq!(
             pod.containers[0].volume_mounts,

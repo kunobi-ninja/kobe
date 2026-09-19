@@ -1087,7 +1087,7 @@ ${placement}
     runnerPath: /kobe-runner
 ${placement.includes("management") ? `    files:
       - secret: e2e-sandbox-files
-        key: ..token
+        key: .token
         path: /tmp/kobe-template-token
 ` : ""}    containers:
       - name: workspace
@@ -1122,7 +1122,7 @@ metadata:
   name: e2e-sandbox-files
   namespace: ${namespace}
 stringData:
-  ..token: template-file-proof
+  .token: template-file-proof
 ---
 apiVersion: v1
 kind: Secret
