@@ -13,7 +13,7 @@ use kube::api::{
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher::Config;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -2280,6 +2280,19 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
         // retained as cleanup handles, so there is nothing to reconcile here.
         // The transitions INTO this phase, and the retry that can leave it,
         // belong to the verified-teardown controller work.
+        //
+        // An operator override naming this lease's UID is the one other way
+        // out (`crate::quarantine`). Boxed to keep its awaits off this
+        // future's frame.
+        LeasePhase::Quarantined if crate::quarantine::release_requested(&lease.metadata) => {
+            Box::pin(release_quarantined_lease(
+                &ctx.client,
+                &ns,
+                &leases_api,
+                &lease,
+            ))
+            .await
+        }
         LeasePhase::Quarantined => Ok(Action::requeue(std::time::Duration::from_secs(300))),
 
         // The instance watch wakes this lease when its instance is deleted;
@@ -2365,15 +2378,77 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     }
 }
 
+/// Release a quarantined lease on operator override, without a verified
+/// teardown receipt.
+///
+/// Revokes access first: the connect-token Secret must be gone (or proven
+/// absent) before the lease that owns it is deleted. Then drops the receipt
+/// retention finalizer and deletes the lease under UID + resourceVersion
+/// preconditions. The bound instance is not touched; it carries its own
+/// quarantine and needs its own override.
+///
+/// A Sandbox composition lease is refused. Its receipt belongs to the owning
+/// SandboxLease, which retires it; deleting it here would leave that owner
+/// waiting for evidence that can no longer arrive.
+async fn release_quarantined_lease(
+    client: &Client,
+    namespace: &str,
+    leases_api: &Api<ClusterLease>,
+    lease: &ClusterLease,
+) -> Result<Action, LeaseError> {
+    let name = lease.name_any();
+    let pool = lease.spec.pool_ref.as_str();
+    if sandbox_composition_requires_outer_retirement(lease) {
+        warn!(
+            lease = %name,
+            "QUARANTINE OVERRIDE refused: a Sandbox composition lease is retired through its SandboxLease"
+        );
+        crate::quarantine::publish_warning(
+            client,
+            &lease.object_ref(&()),
+            "QuarantineReleaseRefused",
+            "Sandbox composition leases are released through their SandboxLease".into(),
+        )
+        .await;
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    }
+    let lease_uid = lease_uid_for(lease)?;
+    if let Err(error) =
+        crate::api::connect::delete_lease_connect_token(client, namespace, &name, lease_uid).await
+    {
+        warn!(lease = %name, "QUARANTINE OVERRIDE waiting: connect-token revoke failed: {error:#}");
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
+    warn!(
+        lease = %name,
+        pool,
+        annotation = crate::quarantine::RELEASE_QUARANTINE_ANNOTATION,
+        "QUARANTINE OVERRIDE: deleting quarantined lease without a verified teardown receipt"
+    );
+    crate::quarantine::record_release(
+        client,
+        &lease.object_ref(&()),
+        crate::quarantine::QuarantinedKind::Lease,
+        pool,
+        "released by operator override without a verified teardown receipt; access revoked".into(),
+    )
+    .await;
+    let lease = remove_receipt_retention_finalizer(client, namespace, lease).await?;
+    Ok(if delete_lease_crd(leases_api, &lease).await {
+        Action::await_change()
+    } else {
+        Action::requeue(std::time::Duration::from_secs(15))
+    })
+}
+
 /// The binding of a terminal Standard lease that only ever held a reservation
 /// intent: it never reached Bound (no `clusterName`), and nothing else keeps it
 /// (no unconsumed receipt, no outer Sandbox retirement, not verified cleanup).
 ///
-/// Such a lease is retireable once its exact instance is gone (see
-/// [`exact_bound_instance_is_gone`]). While that instance still exists with the
-/// same UID the lease stays: the instance may carry the reciprocal reservation,
-/// and the instance controller recycles a Leased instance whose exact lease is
-/// terminal.
+/// Such a lease is retireable once its exact instance holds nothing for it (see
+/// [`exact_instance_holds_nothing_for`]). While that instance still carries the
+/// reservation the lease stays: the instance controller recycles a Leased
+/// instance whose exact lease is terminal, and the lease is its handle.
 fn orphaned_standard_intent<'a>(
     lease: &ClusterLease,
     status: &'a ClusterLeaseStatus,
@@ -2391,7 +2466,8 @@ fn orphaned_standard_intent<'a>(
 }
 
 /// Retire a terminal lease matching [`orphaned_standard_intent`] whose exact
-/// instance is gone. `None` leaves the lease to the caller.
+/// instance is gone or no longer reserved for it. `None` leaves the lease to
+/// the caller.
 async fn retire_orphaned_standard_intent(
     client: &Client,
     namespace: &str,
@@ -2404,15 +2480,21 @@ async fn retire_orphaned_standard_intent(
     let Some(binding) = orphaned_standard_intent(lease, status, verified_cleanup) else {
         return Ok(None);
     };
-    if !exact_bound_instance_is_gone(client, namespace, binding).await? {
+    let Some(lease_uid) = lease.metadata.uid.as_deref() else {
         return Ok(None);
-    }
+    };
+    let Some(release) =
+        exact_instance_holds_nothing_for(client, namespace, lease_uid, binding).await?
+    else {
+        return Ok(None);
+    };
     info!(
         lease = %lease.name_any(),
         phase = %status.phase,
         instance = %binding.instance.name,
         reason,
-        "Retiring terminal lease: its unbound reservation intent names an instance that no longer exists"
+        release = release.as_str(),
+        "Retiring terminal lease: its unbound reservation intent holds no instance"
     );
     crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
         .with_label_values(&[
@@ -2428,20 +2510,67 @@ async fn retire_orphaned_standard_intent(
     }))
 }
 
-/// Whether the exact instance a binding names no longer exists: 404, or the
-/// name now belongs to a replacement with another UID. Lookup failures are
-/// errors, never absence.
-async fn exact_bound_instance_is_gone(
+/// Why the exact instance a reservation intent names holds nothing for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentRelease {
+    /// The instance is gone: 404, or the name belongs to a replacement.
+    InstanceGone,
+    /// The same instance exists but neither its `binding` nor its `leaseRef`
+    /// names this lease. The instance controller released the orphan
+    /// reservation (`ReleaseOrphan`), or another lease reserved it since.
+    ReservationReleased,
+}
+
+impl IntentRelease {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceGone => "instance_gone",
+            Self::ReservationReleased => "reservation_released",
+        }
+    }
+}
+
+/// Whether the exact instance a binding names holds nothing for the lease
+/// with `lease_uid`, and why. `None` means it may still hold the reservation.
+///
+/// Read from the instance, which is where a reservation lives: reserving is
+/// a resourceVersion-fenced write of `status.binding` and `status.leaseRef`,
+/// and releasing an orphan clears both. An instance that names this lease in
+/// either field still holds it. Lookup failures are errors, never absence.
+async fn exact_instance_holds_nothing_for(
     client: &Client,
     namespace: &str,
+    lease_uid: &str,
     binding: &LeaseBinding,
-) -> Result<bool, LeaseError> {
+) -> Result<Option<IntentRelease>, LeaseError> {
     let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
-    match instances.get(&binding.instance.name).await {
-        Ok(instance) => Ok(instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str())),
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
-        Err(error) => Err(error.into()),
+    let instance = match instances.get(&binding.instance.name).await {
+        Ok(instance) => instance,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(Some(IntentRelease::InstanceGone));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str()) {
+        return Ok(Some(IntentRelease::InstanceGone));
     }
+    Ok((!instance_names_lease(&instance, lease_uid)).then_some(IntentRelease::ReservationReleased))
+}
+
+/// Whether an instance's reservation fields name the lease with `lease_uid`.
+fn instance_names_lease(instance: &ClusterInstance, lease_uid: &str) -> bool {
+    let Some(status) = instance.status.as_ref() else {
+        return false;
+    };
+    let by_binding = status
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.lease.uid.as_deref() == Some(lease_uid));
+    let by_ref = status
+        .lease_ref
+        .as_ref()
+        .is_some_and(|reference| reference.uid.as_deref() == Some(lease_uid));
+    by_binding || by_ref
 }
 
 fn requires_attempt_bound_token_deletion(lease: &ClusterLease) -> bool {
@@ -5106,6 +5235,12 @@ fn entered_unsatisfiable_condition(
 ///
 /// The message echoes the pool fields an operator/client needs to decide
 /// whether to keep waiting: phase, consecutiveFailures, lastFailureReason.
+///
+/// Quarantine is read from the counts, not the phase, matching the API
+/// pre-flight: a pool below `minReady` with quarantined members and nothing
+/// Ready reports `ScalingUp`, yet its queue cannot advance until teardown
+/// evidence is repaired. Telling the tenant it is warming up would be wrong.
+/// The message leaves the count out because the pre-flight appends it.
 pub fn unsatisfiable_status(
     pool_ref: &str,
     pool_status: &Option<ClusterPoolStatus>,
@@ -5122,9 +5257,15 @@ pub fn unsatisfiable_status(
     };
 
     let phase = status.phase;
+    let quarantine_blocked = status.quarantined > 0 && status.ready == 0;
     let reason = match phase {
         Some(ClusterPoolPhase::Failing) => R::PoolExhausted,
+        // Same order as the API pre-flight: sustained failure first, then
+        // quarantine, whatever phase the pool happens to report.
+        _ if quarantine_blocked => R::CapacityBlocked,
         Some(ClusterPoolPhase::Backoff) => R::CapacityBlocked,
+        // Every slot is leased: the queue waits for a lease to end.
+        Some(ClusterPoolPhase::Exhausted) => R::CapacityBlocked,
         // Healthy/ScalingUp/Idle with no Ready cluster right now is a transient
         // warm-up; anything else (e.g. ScalingDown) is treated as degraded.
         Some(ClusterPoolPhase::Healthy)
@@ -5138,8 +5279,17 @@ pub fn unsatisfiable_status(
     let phase_str = phase
         .map(|p| format!("{p:?}"))
         .unwrap_or_else(|| "Unknown".to_string());
+    let cause = if phase == Some(ClusterPoolPhase::Failing) {
+        ""
+    } else if quarantine_blocked {
+        " is blocked by quarantined members, held until their teardown evidence is repaired;"
+    } else if phase == Some(ClusterPoolPhase::Exhausted) {
+        " has every cluster leased; waiting for a lease to end;"
+    } else {
+        ""
+    };
     let mut message = format!(
-        "no Ready cluster; pool {pool_ref} phase={phase_str}, consecutiveFailures={}",
+        "no Ready cluster; pool {pool_ref}{cause} phase={phase_str}, consecutiveFailures={}",
         status.consecutive_failures
     );
     if let Some(last) = status.last_failure_reason.as_deref() {
@@ -9598,6 +9748,51 @@ mod tests {
         assert!(msg.contains("warming up"), "got: {msg}");
     }
 
+    /// #338 made a pool with quarantined members and nothing Ready report
+    /// `ScalingUp`. The tenant must not read that as warming up.
+    #[test]
+    fn unsatisfiable_status_blames_quarantine_whatever_the_phase() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        for phase in [
+            Some(ClusterPoolPhase::ScalingUp),
+            Some(ClusterPoolPhase::Healthy),
+            Some(ClusterPoolPhase::Quarantined),
+            Some(ClusterPoolPhase::Backoff),
+            None,
+        ] {
+            let mut status = pool_status(phase, 0, None);
+            status.quarantined = 2;
+            let (msg, reason) = unsatisfiable_status("p", &Some(status));
+            assert_eq!(reason, R::CapacityBlocked, "phase {phase:?}");
+            assert!(msg.contains("blocked by quarantined members"), "got: {msg}");
+            assert!(!msg.contains("warming"), "got: {msg}");
+        }
+
+        // Ready members still bind, so quarantine alone is not the story.
+        let mut serving = pool_status(Some(ClusterPoolPhase::Quarantined), 0, None);
+        serving.quarantined = 1;
+        serving.ready = 1;
+        assert_eq!(unsatisfiable_status("p", &Some(serving)).1, R::Degraded);
+
+        // Sustained failure still wins, as in the API pre-flight.
+        let mut failing = pool_status(Some(ClusterPoolPhase::Failing), 3, None);
+        failing.quarantined = 1;
+        assert_eq!(
+            unsatisfiable_status("p", &Some(failing)).1,
+            R::PoolExhausted
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_status_explains_an_exhausted_pool() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let status = Some(pool_status(Some(ClusterPoolPhase::Exhausted), 0, None));
+        let (msg, reason) = unsatisfiable_status("p", &status);
+        assert_eq!(reason, R::CapacityBlocked);
+        assert!(msg.contains("every cluster leased"), "got: {msg}");
+        assert!(msg.contains("phase=Exhausted"), "got: {msg}");
+    }
+
     // -----------------------------------------------------------------------
     // reconcile_lease: Pending — no Ready cluster writes a status.message and
     // bumps kobe_lease_unsatisfiable_total (#189).
@@ -10292,12 +10487,37 @@ mod tests {
         assert_eq!(action, Action::await_change());
     }
 
-    /// While the exact instance exists it may carry the reservation, so the
-    /// lease stays as its handle.
+    /// While the exact instance carries the reservation, the lease stays as
+    /// its handle: the instance controller recycles it from there.
     #[tokio::test]
-    async fn expired_unbound_intent_whose_exact_instance_exists_is_kept() {
+    async fn expired_unbound_intent_whose_exact_instance_holds_it_is_kept() {
         let (ctx, server) = test_lease_context().await;
-        let (lease, _) = orphaned_intent_lease("orphan-live");
+        let (lease, binding) = orphaned_intent_lease("orphan-live");
+        mount_terminal_lease_reads(&server, &lease).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(exact_instance_for_binding(Some(&binding), "Leased")),
+            )
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 0).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+    }
+
+    /// The #340 known gap: the instance released the orphan reservation and
+    /// went back to Ready with the same UID. Resolution fails with
+    /// `ReciprocalBindingMismatch`, and before this the lease requeued every
+    /// 30s forever although it held nothing.
+    #[tokio::test]
+    async fn expired_unbound_intent_whose_instance_released_it_is_retired() {
+        let (ctx, server) = test_lease_context().await;
+        let (lease, _) = orphaned_intent_lease("orphan-released");
         mount_terminal_lease_reads(&server, &lease).await;
         Mock::given(method("GET"))
             .and(path(
@@ -10308,10 +10528,163 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_lease_delete(&server, &lease, 1).await;
+
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(ctx.backend.call_count().delete, 0);
+    }
+
+    /// Same instance, now reserved by a different lease: this one holds
+    /// nothing, and retiring it must not touch the other reservation.
+    #[tokio::test]
+    async fn expired_unbound_intent_whose_instance_serves_another_lease_is_retired() {
+        let (ctx, server) = test_lease_context().await;
+        let (lease, _) = orphaned_intent_lease("orphan-superseded");
+        mount_terminal_lease_reads(&server, &lease).await;
+        let other = exact_test_binding("someone-else", "someone-else-uid");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(exact_instance_for_binding(Some(&other), "Leased")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 1).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+    }
+
+    // -----------------------------------------------------------------------
+    // Quarantine override
+    // -----------------------------------------------------------------------
+
+    fn quarantined_lease(name: &str, annotation: Option<&str>) -> Arc<ClusterLease> {
+        let mut lease = make_test_lease(name, "Quarantined");
+        let binding = exact_test_binding(name, &format!("{name}-uid"));
+        let lease_mut = Arc::make_mut(&mut lease);
+        lease_mut.metadata.resource_version = Some("50".into());
+        lease_mut.metadata.finalizers = Some(vec![TEARDOWN_RECEIPT_RETENTION_FINALIZER.into()]);
+        if let Some(value) = annotation {
+            lease_mut.metadata.annotations = Some(std::collections::BTreeMap::from([(
+                crate::quarantine::RELEASE_QUARANTINE_ANNOTATION.to_string(),
+                value.to_string(),
+            )]));
+        }
+        lease_mut.status.as_mut().unwrap().binding = Some(binding);
+        lease
+    }
+
+    async fn mount_finalizer_patch(server: &MockServer, lease: &ClusterLease, expected: u64) {
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+                lease.name_any()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .expect(expected)
+            .mount(server)
+            .await;
+    }
+
+    /// Default stays fail-closed: a quarantined lease waits for evidence.
+    #[tokio::test]
+    async fn quarantined_lease_without_override_is_held() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = quarantined_lease("held", None);
+        mount_terminal_lease_reads(&server, &lease).await;
+        mount_finalizer_patch(&server, &lease, 0).await;
         mount_lease_delete(&server, &lease, 0).await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+    }
+
+    #[tokio::test]
+    async fn quarantine_override_for_another_uid_keeps_the_lease() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = quarantined_lease("copied", Some("some-other-uid"));
+        mount_terminal_lease_reads(&server, &lease).await;
+        mount_finalizer_patch(&server, &lease, 0).await;
+        mount_lease_delete(&server, &lease, 0).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+    }
+
+    /// The override revokes access, drops the retention finalizer, and
+    /// deletes the exact lease, counting the release.
+    #[tokio::test]
+    async fn quarantine_override_releases_the_exact_lease() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = quarantined_lease("released", Some("released-uid"));
+        mount_terminal_lease_reads(&server, &lease).await;
+        mount_finalizer_patch(&server, &lease, 1).await;
+        mount_lease_delete(&server, &lease, 1).await;
+        let before = crate::metrics::QUARANTINE_RELEASES_TOTAL
+            .with_label_values(&["test-profile", "lease"])
+            .get();
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert!(
+            crate::metrics::QUARANTINE_RELEASES_TOTAL
+                .with_label_values(&["test-profile", "lease"])
+                .get()
+                > before
+        );
+    }
+
+    /// A Sandbox composition's receipt belongs to its SandboxLease; the
+    /// override does not delete it out from under that owner.
+    #[tokio::test]
+    async fn quarantine_override_refuses_a_sandbox_composition_lease() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = quarantined_lease("composed", Some("composed-uid"));
+        let lease_mut = Arc::make_mut(&mut lease);
+        lease_mut.spec.requester.requester_type = "kobe:sandbox-composition".into();
+        lease_mut.spec.requester.identity = "outer-sandbox".into();
+        lease_mut.spec.cleanup_mode = Some(CleanupMode::VerifiedDestroy);
+        mount_terminal_lease_reads(&server, &lease).await;
+        mount_finalizer_patch(&server, &lease, 0).await;
+        mount_lease_delete(&server, &lease, 0).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn an_instance_holds_a_lease_through_either_reservation_field() {
+        let binding = exact_test_binding("mine", "mine-uid");
+        let parse = |value: serde_json::Value| -> ClusterInstance {
+            serde_json::from_value(value).unwrap()
+        };
+        let held = parse(exact_instance_for_binding(Some(&binding), "Leased"));
+        assert!(instance_names_lease(&held, "mine-uid"));
+
+        let mut ref_only = held.clone();
+        ref_only.status.as_mut().unwrap().binding = None;
+        assert!(instance_names_lease(&ref_only, "mine-uid"));
+
+        let mut binding_only = held.clone();
+        binding_only.status.as_mut().unwrap().lease_ref = None;
+        assert!(instance_names_lease(&binding_only, "mine-uid"));
+
+        let released = parse(exact_instance_for_binding(None, "Ready"));
+        assert!(!instance_names_lease(&released, "mine-uid"));
+        assert!(!instance_names_lease(&held, "other-uid"));
     }
 
     #[test]

@@ -617,20 +617,12 @@ pub fn compute_pool_actions(
     //
     // `scaling.scaleUpThreshold` is not read: it is reserved and has no
     // effect (see its CRD description).
-    let (min_ready, max_clusters, scale_down_after) = if let Some(scaling) = &spec.scaling {
-        (
-            scaling.min_ready,
-            scaling.max_clusters,
-            parse_duration(&scaling.scale_down_after),
-        )
+    let max_clusters = pool_capacity(profile);
+    let (min_ready, scale_down_after) = if let Some(scaling) = &spec.scaling {
+        (scaling.min_ready, parse_duration(&scaling.scale_down_after))
     } else {
-        // Fixed pool: `size` is the warm target, the ceiling leaves
-        // `FIXED_POOL_HEADROOM` on top of it, and there is no scale-down.
-        (
-            spec.size,
-            spec.size.saturating_add(FIXED_POOL_HEADROOM),
-            None,
-        )
+        // Fixed pool: `size` is the warm target and there is no scale-down.
+        (spec.size, None)
     };
 
     // Queued claims raise the warm target, but only for pools that opted
@@ -1119,6 +1111,16 @@ fn backoff_active(profile: &ClusterPool, now: chrono::DateTime<chrono::Utc>) -> 
     }
 }
 
+/// The most members a pool will hold at once: `scaling.maxClusters`, or for a
+/// fixed pool `size` plus [`FIXED_POOL_HEADROOM`]. Quarantined members count
+/// against it (see [`compute_pool_actions`]).
+pub fn pool_capacity(profile: &ClusterPool) -> u32 {
+    match &profile.spec.scaling {
+        Some(scaling) => scaling.max_clusters,
+        None => profile.spec.size.saturating_add(FIXED_POOL_HEADROOM),
+    }
+}
+
 /// Threshold of consecutive failures beyond which a pool is considered
 /// `Failing` (sustained, operator attention needed) rather than merely
 /// `Backoff` (transient rate-limit).
@@ -1136,9 +1138,10 @@ pub const FAILING_THRESHOLD: u32 = 3;
 /// 5. `Healthy`: at or above `minReady`. Leased members alone do not make
 ///    a pool healthy: with nothing Ready, a pool below `minReady` or with
 ///    claims queued is not at target.
-/// 6. `ScalingUp`: everything else. This includes an exhausted pool (every
-///    member leased, claims waiting, no room to create); `queueDepth`,
-///    `leased` and `creating` in the status tell that case apart.
+/// 6. `Exhausted`: nothing Ready or creating, claims queued, and every slot
+///    up to [`pool_capacity`] held by leased or recycling members. The queue
+///    advances only when a lease ends.
+/// 7. `ScalingUp`: everything else.
 ///
 /// Quarantined members replace `Idle` and `Healthy` with `Quarantined`: a
 /// pool holding capacity whose teardown could not be proven is never
@@ -1211,6 +1214,26 @@ pub fn compute_pool_phase(
         } else {
             ClusterPoolPhase::Healthy
         };
+    }
+
+    // Every slot is taken by live work and nothing is on its way: the queue
+    // waits for a lease to end, not for provisioning. Quarantine is excluded
+    // on purpose. Held members free nothing on their own, so a pool blocked
+    // by them keeps `ScalingUp` and reports the count in `status.quarantined`.
+    let total = counts.ready
+        + counts.leased
+        + counts.creating
+        + counts.recycling
+        + counts.unhealthy
+        + counts.quarantined;
+    if counts.ready == 0
+        && counts.creating == 0
+        && !quarantined
+        && queue_depth > 0
+        && counts.leased > 0
+        && total >= pool_capacity(profile)
+    {
+        return ClusterPoolPhase::Exhausted;
     }
 
     // Below target, creating now or about to, no failures.
@@ -3075,6 +3098,62 @@ mod tests {
         // Where the pool would otherwise be Healthy, quarantine shows.
         let phase = compute_pool_phase(&p, &quarantined(2, 0, 0), 0, 0, None, now);
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Quarantined);
+    }
+
+    #[test]
+    fn test_phase_exhausted_when_every_slot_is_leased_and_claims_queue() {
+        // maxClusters=8, all leased, two claims waiting, nothing creating.
+        let p = profile_with_min_ready(1);
+        let now = chrono::Utc::now();
+        let phase = compute_pool_phase(&p, &counts(0, 8, 0, 0), 2, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Exhausted);
+        // Recycling members still occupy slots.
+        let phase = compute_pool_phase(&p, &counts(0, 6, 0, 2), 1, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Exhausted);
+
+        // Room left, something creating, or nobody waiting: not exhausted.
+        let phase = compute_pool_phase(&p, &counts(0, 7, 0, 0), 2, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+        let phase = compute_pool_phase(&p, &counts(0, 7, 1, 0), 2, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+        let phase = compute_pool_phase(&p, &counts(0, 8, 0, 0), 0, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_exhausted_uses_fixed_pool_headroom() {
+        // Fixed pool of 2: the ceiling is size + FIXED_POOL_HEADROOM.
+        let p = make_profile(2, None);
+        let now = chrono::Utc::now();
+        let full = 2 + FIXED_POOL_HEADROOM;
+        let phase = compute_pool_phase(&p, &counts(0, full, 0, 0), 1, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Exhausted);
+        let phase = compute_pool_phase(&p, &counts(0, full - 1, 0, 0), 1, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    /// Quarantined members hold capacity that no lease end will free, so the
+    /// transient `Exhausted` phase would mislead. The count tells the story.
+    #[test]
+    fn test_phase_quarantine_is_never_exhausted() {
+        let p = profile_with_min_ready(1);
+        let held = StateCounts {
+            quarantined: 1,
+            ..counts(0, 7, 0, 0)
+        };
+        let phase = compute_pool_phase(&p, &held, 2, 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_failing_and_backoff_beat_exhausted() {
+        let p = profile_with_min_ready(1);
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        let phase = compute_pool_phase(&p, &counts(0, 8, 0, 0), 2, 1, Some(&future), now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Backoff);
+        let phase = compute_pool_phase(&p, &counts(0, 8, 0, 0), 2, 3, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
     }
 
     #[test]

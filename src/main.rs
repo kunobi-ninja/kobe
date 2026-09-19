@@ -8,6 +8,7 @@ mod lease_binding;
 mod metrics;
 pub mod pki;
 mod pool;
+mod quarantine;
 mod receipt_authority;
 mod sandbox;
 mod sandbox_access_ledger;

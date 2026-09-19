@@ -663,18 +663,40 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 warn!(instance = %name, reason, "Deletion fenced: exact lease binding is not verifiable");
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             }
+            // An operator released this quarantined instance on purpose (see
+            // `crate::quarantine`). Skip the evidence gate, which would only
+            // re-quarantine it, and run the ordinary teardown below.
+            let override_release = status.phase == ClusterInstancePhase::Quarantined
+                && crate::quarantine::release_requested(&instance.metadata);
             // Receipt-required teardown decides here, not after the fact: the
             // finalizer is the last handle on this capacity, and releasing it
             // on an accepted DELETE is exactly what makes "cleanup complete" a
             // guess. A lease asking for VerifiedDestroy must produce evidence
             // before the handle goes.
-            if let Some(outcome) = verified_teardown_gate(&ctx, &instance, &name, &ns).await {
+            if !override_release
+                && let Some(outcome) = verified_teardown_gate(&ctx, &instance, &name, &ns).await
+            {
                 return outcome;
             }
 
             match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
                 Ok(()) => {
                     cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
+                    if override_release {
+                        warn!(
+                            instance = %name,
+                            owner = %owner,
+                            "QUARANTINE OVERRIDE: releasing instance finalizer without verified teardown evidence"
+                        );
+                        crate::quarantine::record_release(
+                            &ctx.client,
+                            &instance.object_ref(&()),
+                            crate::quarantine::QuarantinedKind::Instance,
+                            owner,
+                            "released by operator override without verified teardown evidence; backend delete ran".into(),
+                        )
+                        .await;
+                    }
                     remove_finalizer(&instances_api, &instance, INSTANCE_FINALIZER).await?;
                     return Ok(Action::await_change());
                 }
@@ -1303,6 +1325,46 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         // operator patch of the phase, no "it has been stuck a while" fallback.
         // Those would return capacity to the pool on exactly the evidence the
         // quarantine exists to demand.
+        //
+        // The one deliberate exception is an operator override naming this
+        // exact UID (`crate::quarantine`). It deletes the instance through the
+        // ordinary finalizer path, which runs the backend delete; the pool
+        // then replaces it. It never returns this instance to Ready.
+        ClusterInstancePhase::Quarantined
+            if crate::quarantine::release_requested(&instance.metadata) =>
+        {
+            warn!(
+                instance = %name,
+                owner = %owner,
+                annotation = crate::quarantine::RELEASE_QUARANTINE_ANNOTATION,
+                "QUARANTINE OVERRIDE: operator requested release; deleting instance without verified teardown evidence"
+            );
+            crate::quarantine::publish_warning(
+                &ctx.client,
+                &instance.object_ref(&()),
+                "QuarantineReleaseRequested",
+                format!(
+                    "{} names this instance's UID; deleting it without verified teardown evidence",
+                    crate::quarantine::RELEASE_QUARANTINE_ANNOTATION
+                ),
+            )
+            .await;
+            // UID + resourceVersion fenced, like the Recycling delete: the
+            // annotation was read on exactly this version of this object.
+            let delete_params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: instance.metadata.uid.clone(),
+                    resource_version: instance.resource_version(),
+                }),
+                ..Default::default()
+            };
+            tolerate_lost_race(
+                instances_api.delete(&name, &delete_params).await,
+                &name,
+                "quarantine_override_delete",
+            )?;
+            Ok(Action::await_change())
+        }
         ClusterInstancePhase::Quarantined => {
             debug!(
                 instance = %name,
@@ -4601,7 +4663,7 @@ fn error_policy<B: ClusterBackend>(
 mod tests {
     use super::*;
     use crate::testutil::MockBackend;
-    use wiremock::matchers::{body_json, body_string_contains, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Find a derived condition by type. Panics if absent (tests assert
@@ -6906,5 +6968,206 @@ mod tests {
             ),
         )));
         assert_eq!(errors(), before);
+    }
+
+    // === Quarantine override ===
+
+    /// A quarantined, VerifiedDestroy-bound instance whose evidence can no
+    /// longer arrive. `annotation` is the release-quarantine value, if any.
+    fn quarantined_instance(
+        deleting: bool,
+        annotation: Option<&str>,
+    ) -> (Arc<ClusterInstance>, crate::crd::LeaseBinding) {
+        let binding = teardown_surface_binding();
+        let mut metadata = serde_json::json!({
+            "name": binding.instance.name,
+            "namespace": "test-ns",
+            "uid": binding.instance.uid,
+            "generation": 1,
+            "resourceVersion": "30",
+            "finalizers": [INSTANCE_FINALIZER],
+        });
+        if deleting {
+            metadata["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        }
+        if let Some(value) = annotation {
+            metadata["annotations"] = serde_json::json!({
+                crate::quarantine::RELEASE_QUARANTINE_ANNOTATION: value
+            });
+        }
+        let instance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": metadata,
+            "spec": {
+                "backend": { "type": "k3s" },
+                "cluster": { "version": "v1.31.3+k3s1" },
+                "addons": [],
+                "readinessGates": []
+            },
+            "status": {
+                "phase": "Quarantined",
+                "provisioned": true,
+                "binding": binding,
+                "leaseRef": binding.lease,
+                "stateSince": "2026-01-01T00:00:00Z",
+                "network": {
+                    "serviceCidr": "10.240.0.0/20",
+                    "clusterCidr": "10.248.0.0/20"
+                }
+            }
+        }))
+        .unwrap();
+        (Arc::new(instance), binding)
+    }
+
+    async fn mount_lease_gone(server: &MockServer, binding: &crate::crd::LeaseBinding) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+                binding.lease.name
+            )))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Default stays fail-closed: without the override a quarantined
+    /// instance is neither deleted nor torn down.
+    #[tokio::test]
+    async fn quarantined_instance_without_override_is_held() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let (instance, binding) = quarantined_instance(false, None);
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(backend.call_count().delete, 0);
+    }
+
+    /// An annotation that does not name this exact UID (a copied manifest, a
+    /// blanket `kubectl annotate`) must not release anything.
+    #[tokio::test]
+    async fn quarantine_override_for_another_uid_is_ignored() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let (instance, binding) = quarantined_instance(false, Some("some-other-uid"));
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(backend.call_count().delete, 0);
+    }
+
+    /// The override deletes the exact object it was read from.
+    #[tokio::test]
+    async fn quarantine_override_deletes_the_exact_instance() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let uid = teardown_surface_binding().instance.uid;
+        let (instance, binding) = quarantined_instance(false, Some(&uid));
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+                binding.instance.name
+            )))
+            .and(body_partial_json(serde_json::json!({
+                "preconditions": { "uid": uid, "resourceVersion": "30" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        // Teardown runs on the finalizer path, not here.
+        assert_eq!(backend.call_count().delete, 0);
+    }
+
+    /// On the finalizer path the override skips the evidence gate, runs the
+    /// backend delete, and releases the finalizer.
+    #[tokio::test]
+    async fn quarantine_override_runs_teardown_and_releases_the_finalizer() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let uid = teardown_surface_binding().instance.uid;
+        let (instance, binding) = quarantined_instance(true, Some(&uid));
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+                binding.instance.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}/status",
+                binding.instance.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let before = crate::metrics::QUARANTINE_RELEASES_TOTAL
+            .with_label_values(&["instance-surface", "instance"])
+            .get();
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(backend.call_count().delete, 1);
+        assert_eq!(
+            crate::metrics::QUARANTINE_RELEASES_TOTAL
+                .with_label_values(&["instance-surface", "instance"])
+                .get(),
+            before + 1
+        );
+    }
+
+    /// Without the override the same deleting instance stays behind the gate.
+    #[tokio::test]
+    async fn deleting_quarantined_instance_without_override_keeps_its_finalizer() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let (instance, binding) = quarantined_instance(true, None);
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+                binding.instance.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}/status",
+                binding.instance.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .mount(&server)
+            .await;
+
+        reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(backend.call_count().delete, 0);
     }
 }

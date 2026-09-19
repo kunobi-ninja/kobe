@@ -979,6 +979,7 @@ spec:
                 - Healthy
                 - Quarantined
                 - ScalingUp
+                - Exhausted
                 - ScalingDown
                 - Backoff
                 - Failing
