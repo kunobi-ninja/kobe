@@ -2398,47 +2398,68 @@ async fn release_quarantined_lease(
 ) -> Result<Action, LeaseError> {
     let name = lease.name_any();
     let pool = lease.spec.pool_ref.as_str();
+    let lease_uid = lease_uid_for(lease)?;
     if sandbox_composition_requires_outer_retirement(lease) {
-        warn!(
-            lease = %name,
-            "QUARANTINE OVERRIDE refused: a Sandbox composition lease is retired through its SandboxLease"
-        );
-        crate::quarantine::publish_warning(
-            client,
-            &lease.object_ref(&()),
-            "QuarantineReleaseRefused",
-            "Sandbox composition leases are released through their SandboxLease".into(),
-        )
-        .await;
+        // Once per lease per process: the refusal does not change on requeue,
+        // and a Warning event every five minutes would bury everything else.
+        if crate::quarantine::first_refusal(lease_uid) {
+            warn!(
+                lease = %name,
+                "QUARANTINE OVERRIDE refused: a Sandbox composition lease is retired through its SandboxLease"
+            );
+            crate::quarantine::publish_warning(
+                client,
+                &lease.object_ref(&()),
+                "QuarantineReleaseRefused",
+                "Sandbox composition leases are released through their SandboxLease".into(),
+            )
+            .await;
+        }
         return Ok(Action::requeue(std::time::Duration::from_secs(300)));
     }
-    let lease_uid = lease_uid_for(lease)?;
     if let Err(error) =
         crate::api::connect::delete_lease_connect_token(client, namespace, &name, lease_uid).await
     {
         warn!(lease = %name, "QUARANTINE OVERRIDE waiting: connect-token revoke failed: {error:#}");
         return Ok(Action::requeue(std::time::Duration::from_secs(30)));
     }
-    warn!(
-        lease = %name,
-        pool,
-        annotation = crate::quarantine::RELEASE_QUARANTINE_ANNOTATION,
-        "QUARANTINE OVERRIDE: deleting quarantined lease without a verified teardown receipt"
-    );
-    crate::quarantine::record_release(
-        client,
-        &lease.object_ref(&()),
-        crate::quarantine::QuarantinedKind::Lease,
-        pool,
-        "released by operator override without a verified teardown receipt; access revoked".into(),
-    )
-    .await;
+    let held_retention = lease
+        .finalizers()
+        .iter()
+        .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER);
     let lease = remove_receipt_retention_finalizer(client, namespace, lease).await?;
-    Ok(if delete_lease_crd(leases_api, &lease).await {
-        Action::await_change()
+    // Record only a release that happened. A failed finalizer write (for
+    // example the split-authority admission policy refusing it) or delete
+    // returns above or requeues below without counting, so a retry loop
+    // cannot inflate the counter or repeat the event.
+    let released = if lease.metadata.deletion_timestamp.is_some() {
+        // Already deleting: dropping our finalizer was the release, and only
+        // if it was still there. A lease this path deleted earlier, held open
+        // by another finalizer, was counted then.
+        held_retention
+    } else if delete_lease_crd(leases_api, &lease).await {
+        true
     } else {
-        Action::requeue(std::time::Duration::from_secs(15))
-    })
+        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    };
+    if released {
+        warn!(
+            lease = %name,
+            pool,
+            annotation = crate::quarantine::RELEASE_QUARANTINE_ANNOTATION,
+            "QUARANTINE OVERRIDE: released quarantined lease without a verified teardown receipt"
+        );
+        crate::quarantine::record_release(
+            client,
+            &lease.object_ref(&()),
+            crate::quarantine::QuarantinedKind::Lease,
+            pool,
+            "released by operator override without a verified teardown receipt; access revoked"
+                .into(),
+        )
+        .await;
+    }
+    Ok(Action::await_change())
 }
 
 /// The binding of a terminal Standard lease that only ever held a reservation
@@ -5217,14 +5238,22 @@ pub fn derive_lease_conditions(
 /// A steady `Satisfiable=False` condition with the same typed reason is not a
 /// new demand event. This keeps `kobe_lease_unsatisfiable_total` independent of
 /// controller requeue frequency while still counting reason transitions.
+///
+/// Moving between two transient reasons (`Warming`, `AtCapacity`) is not a new
+/// event either: a pool at its ceiling reports `Exhausted`, then `ScalingUp`
+/// while a recycled slot is recreated, then `Exhausted` again, and each of
+/// those flips would otherwise count the same waiting lease once more.
 fn entered_unsatisfiable_condition(
     previous: &[ClusterLeaseCondition],
     reason: crate::metrics::LeaseUnsatisfiableReason,
 ) -> bool {
+    use crate::metrics::LeaseUnsatisfiableReason as R;
+    let transient = [R::Warming, R::AtCapacity].map(R::condition_reason);
     !previous.iter().any(|condition| {
         condition.condition_type == "Satisfiable"
             && condition.status == "False"
-            && condition.reason == reason.condition_reason()
+            && (condition.reason == reason.condition_reason()
+                || (reason.is_transient() && transient.contains(&condition.reason.as_str())))
     })
 }
 
@@ -5265,7 +5294,7 @@ pub fn unsatisfiable_status(
         _ if quarantine_blocked => R::CapacityBlocked,
         Some(ClusterPoolPhase::Backoff) => R::CapacityBlocked,
         // Every slot is leased: the queue waits for a lease to end.
-        Some(ClusterPoolPhase::Exhausted) => R::CapacityBlocked,
+        Some(ClusterPoolPhase::Exhausted) => R::AtCapacity,
         // Healthy/ScalingUp/Idle with no Ready cluster right now is a transient
         // warm-up; anything else (e.g. ScalingDown) is treated as degraded.
         Some(ClusterPoolPhase::Healthy)
@@ -9788,7 +9817,11 @@ mod tests {
         use crate::metrics::LeaseUnsatisfiableReason as R;
         let status = Some(pool_status(Some(ClusterPoolPhase::Exhausted), 0, None));
         let (msg, reason) = unsatisfiable_status("p", &status);
-        assert_eq!(reason, R::CapacityBlocked);
+        assert_eq!(
+            reason,
+            R::AtCapacity,
+            "normal exhaustion is not capacity_blocked"
+        );
         assert!(msg.contains("every cluster leased"), "got: {msg}");
         assert!(msg.contains("phase=Exhausted"), "got: {msg}");
     }
@@ -10024,6 +10057,41 @@ mod tests {
             R::CapacityBlocked
         ));
         assert!(entered_unsatisfiable_condition(&[], R::PoolExhausted));
+    }
+
+    /// A full pool flips Exhausted -> ScalingUp -> Exhausted while a recycled
+    /// slot is recreated. The same waiting lease must be counted once.
+    #[test]
+    fn unsatisfiable_metric_ignores_flips_between_transient_reasons() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let previously = |reason: &str| {
+            vec![ClusterLeaseCondition {
+                condition_type: "Satisfiable".into(),
+                status: "False".into(),
+                reason: reason.into(),
+                message: String::new(),
+                last_transition_time: None,
+            }]
+        };
+        assert!(entered_unsatisfiable_condition(&[], R::AtCapacity));
+        assert!(!entered_unsatisfiable_condition(
+            &previously("Warming"),
+            R::AtCapacity
+        ));
+        assert!(!entered_unsatisfiable_condition(
+            &previously("AtCapacity"),
+            R::Warming
+        ));
+        // Leaving a transient state for a real problem still counts, and so
+        // does recovering into a transient one from a real problem.
+        assert!(entered_unsatisfiable_condition(
+            &previously("AtCapacity"),
+            R::PoolExhausted
+        ));
+        assert!(entered_unsatisfiable_condition(
+            &previously("CapacityBlocked"),
+            R::AtCapacity
+        ));
     }
 
     #[test]
@@ -10660,9 +10728,75 @@ mod tests {
         mount_terminal_lease_reads(&server, &lease).await;
         mount_finalizer_patch(&server, &lease, 0).await;
         mount_lease_delete(&server, &lease, 0).await;
+        // The refusal is announced once, not on every 300s requeue.
+        Mock::given(method("POST"))
+            .and(path("/apis/events.k8s.io/v1/namespaces/test-ns/events"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
 
+        let action = reconcile_lease(lease.clone(), ctx.clone()).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
         let action = reconcile_lease(lease, ctx).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+    }
+
+    /// With the split teardown authority, admission can refuse the finalizer
+    /// write. That is not a release: nothing is counted or announced, and the
+    /// lease is not deleted.
+    #[tokio::test]
+    async fn quarantine_override_does_not_record_a_refused_finalizer_write() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = quarantined_lease("refused-write", Some("refused-write-uid"));
+        mount_terminal_lease_reads(&server, &lease).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+                lease.name_any()
+            )))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Forbidden", "code": 403,
+                "message": "receipt retention cannot be removed before exact acknowledgement"
+            })))
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 0).await;
+        Mock::given(method("POST"))
+            .and(path("/apis/events.k8s.io/v1/namespaces/test-ns/events"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        assert!(reconcile_lease(lease, ctx).await.is_err());
+    }
+
+    /// A lease this path already deleted, held open by another finalizer, is
+    /// not counted a second time.
+    #[tokio::test]
+    async fn quarantine_override_counts_an_already_deleting_lease_once() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = quarantined_lease("deleting", Some("deleting-uid"));
+        let lease_mut = Arc::make_mut(&mut lease);
+        lease_mut.metadata.finalizers = Some(vec!["example.com/other".into()]);
+        lease_mut.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        mount_terminal_lease_reads(&server, &lease).await;
+        mount_finalizer_patch(&server, &lease, 0).await;
+        mount_lease_delete(&server, &lease, 0).await;
+        Mock::given(method("POST"))
+            .and(path("/apis/events.k8s.io/v1/namespaces/test-ns/events"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
     }
 
     #[test]

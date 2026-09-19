@@ -1206,21 +1206,33 @@ pub async fn run_profile_controller(
 
     let controller = Controller::new(profiles, Config::default())
         .owns(instances, Config::default())
-        .owns(leases, Config::default())
+        .owns(leases, Config::default());
+    // A deleted pool is never reconciled again; prune its gauges against the
+    // controller's own view of which pools exist.
+    let pool_store = controller.store();
+    let controller = controller
         .run(reconcile_profile, error_policy, ctx)
-        .for_each(|result| async move {
-            match result {
-                Ok((obj, _action)) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["profile", "ok"])
-                        .inc();
-                    debug!(profile = %obj.name, "Profile reconciled");
-                }
-                Err(e) => {
-                    crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["profile", "error"])
-                        .inc();
-                    error!("Profile reconciliation error: {e:?}");
+        .for_each(move |result| {
+            let live: std::collections::HashSet<String> = pool_store
+                .state()
+                .iter()
+                .map(|pool| pool.name_any())
+                .collect();
+            crate::metrics::prune_quarantine_gauges(&live);
+            async move {
+                match result {
+                    Ok((obj, _action)) => {
+                        crate::metrics::RECONCILIATIONS_TOTAL
+                            .with_label_values(&["profile", "ok"])
+                            .inc();
+                        debug!(profile = %obj.name, "Profile reconciled");
+                    }
+                    Err(e) => {
+                        crate::metrics::RECONCILIATIONS_TOTAL
+                            .with_label_values(&["profile", "error"])
+                            .inc();
+                        error!("Profile reconciliation error: {e:?}");
+                    }
                 }
             }
         });

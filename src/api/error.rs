@@ -209,6 +209,10 @@ impl From<crate::metrics::LeaseUnsatisfiableReason> for ApiErrorReason {
             R::CapacityBlocked => Self::CapacityBlocked,
             R::Degraded => Self::Degraded,
             R::Warming => Self::Warming,
+            // The pre-flight queues an Exhausted pool's leases rather than
+            // refusing them, so this never reaches the wire. Mapped to the
+            // nearest existing code to keep the vocabulary closed.
+            R::AtCapacity => Self::CapacityBlocked,
         }
     }
 }

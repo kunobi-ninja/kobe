@@ -40,6 +40,9 @@ telemetry:
 | IPAM | `kobe_ipam_bind_duration_seconds` |
 | Is anything quarantined, and for how long? | `kobe_quarantined{profile,kind}`, `kobe_quarantined_oldest_age_seconds` |
 | Did someone release a quarantine by hand? | `kobe_quarantine_releases_total{profile,kind}` |
+| Why can leases not be satisfied? | `kobe_lease_unsatisfiable_total{profile,reason}` |
+
+`reason` on `kobe_lease_unsatisfiable_total` is one of `pool_exhausted` (pool `Failing`), `capacity_blocked` (backoff at capacity, or quarantined members with nothing Ready), `degraded`, and `at_capacity` (pool `Exhausted`: every cluster leased, which is normal under load). A lease is counted when it becomes unsatisfiable or its reason changes. Moving between `at_capacity` and the uncounted `warming` does not count again, because a full pool flips between `Exhausted` and `ScalingUp` while a recycled slot is recreated. Alert on `capacity_blocked` and `pool_exhausted`, not on `at_capacity`.
 
 `reason` on `kobe_instance_recycles_total` is a closed set: `spec_drift`, `cert_expiry`, `creating_timeout`, `unhealthy`, `scale_down`, `bootstrap_failed`, `health_failed`, `lease_released`, `kobestore_degraded`, `ipam_conflict`, `manual`. Not every value is emitted yet; dashboards can still list the full set.
 

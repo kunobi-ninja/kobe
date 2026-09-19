@@ -12,6 +12,9 @@
 //! manifest, or set with a blanket `kubectl annotate --all`. Without it every
 //! quarantine stays fail-closed.
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
@@ -48,7 +51,34 @@ pub fn release_requested(meta: &ObjectMeta) -> bool {
     meta.annotations
         .as_ref()
         .and_then(|annotations| annotations.get(RELEASE_QUARANTINE_ANNOTATION))
-        .is_some_and(|value| value.trim() == uid)
+        // Exact, like the admission policy that lets the control plane drop
+        // a quarantined lease's receipt finalizer. A looser match here would
+        // start a release the API server then refuses on every retry.
+        .is_some_and(|value| value == uid)
+}
+
+/// `profile` label for a quarantine metric: the pool name, or a fixed value
+/// for an instance outside any pool, so object names never become labels.
+pub fn pool_label(pool_ref: Option<&crate::crd::ResourceRef>) -> &str {
+    pool_ref
+        .map(|reference| reference.name.as_str())
+        .unwrap_or(STANDALONE_POOL_LABEL)
+}
+
+/// `profile` label for objects that belong to no pool.
+pub const STANDALONE_POOL_LABEL: &str = "standalone";
+
+/// UIDs whose override this process already refused and announced.
+static REFUSED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Whether this is the first refusal of `uid` in this process. A restart
+/// announces an unchanged refusal once more, which is acceptable; a Warning
+/// event on every requeue is not.
+pub fn first_refusal(uid: &str) -> bool {
+    REFUSED
+        .lock()
+        .map(|mut refused| refused.insert(uid.to_string()))
+        .unwrap_or(true)
 }
 
 /// Record that an override released capacity without verified teardown
@@ -116,7 +146,8 @@ mod tests {
     #[test]
     fn release_requires_the_annotation_to_name_the_object_uid() {
         assert!(release_requested(&meta(Some("abc-123"), Some("abc-123"))));
-        assert!(release_requested(&meta(
+        // Exact only: the admission policy compares the raw value.
+        assert!(!release_requested(&meta(
             Some("abc-123"),
             Some(" abc-123\n")
         )));
@@ -130,5 +161,22 @@ mod tests {
         )));
         assert!(!release_requested(&meta(None, Some(""))));
         assert!(!release_requested(&meta(Some(""), Some(""))));
+    }
+
+    #[test]
+    fn a_refusal_is_announced_once_per_uid() {
+        assert!(first_refusal("refusal-test-uid-a"));
+        assert!(!first_refusal("refusal-test-uid-a"));
+        assert!(first_refusal("refusal-test-uid-b"));
+    }
+
+    #[test]
+    fn standalone_objects_get_a_fixed_label() {
+        assert_eq!(pool_label(None), STANDALONE_POOL_LABEL);
+        let pool = crate::crd::ResourceRef {
+            name: "ci".into(),
+            uid: None,
+        };
+        assert_eq!(pool_label(Some(&pool)), "ci");
     }
 }

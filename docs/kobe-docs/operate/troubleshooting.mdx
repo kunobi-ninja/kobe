@@ -47,7 +47,7 @@ Do not delete ledger or receipt objects to "free" the slot. That is how you hand
 
 Use this only when the evidence can never arrive, for example after the backend objects were removed by hand or the evidence store was lost. The release deletes the object without a verified teardown receipt. You are vouching that the tenant's data is gone.
 
-The annotation `kobe.kunobi.ninja/release-quarantine` releases one object. Its value must be that object's UID, so it cannot match a same-named replacement or a copied manifest.
+The annotation `kobe.kunobi.ninja/release-quarantine` releases one object. Its value must be exactly that object's UID, with no surrounding whitespace, so it cannot match a same-named replacement or a copied manifest.
 
 1. Confirm the backend resources are gone, or that you accept deleting them now:
 
@@ -56,7 +56,7 @@ The annotation `kobe.kunobi.ninja/release-quarantine` releases one object. Its v
    kubectl get clusterlease <lease> -n kobe-system -o yaml
    ```
 
-2. Release the instance. The operator runs the ordinary backend delete, drops its finalizer, and the pool replaces it:
+2. Release the instance. The operator deletes it and runs the ordinary backend delete once. It then waits for the backend to report the recorded footprint absent before dropping the finalizer, because dropping it frees the instance name and its CIDR for a replacement. The wait ends after 10 minutes with a warning, or at once, with a warning, if the backend cannot check absence for this instance. The pool then replaces it:
 
    ```sh
    kubectl annotate clusterinstance <instance> -n kobe-system \
@@ -70,11 +70,15 @@ The annotation `kobe.kunobi.ninja/release-quarantine` releases one object. Its v
      kobe.kunobi.ninja/release-quarantine="$(kubectl get clusterlease <lease> -n kobe-system -o jsonpath='{.metadata.uid}')"
    ```
 
-Each release logs a `QUARANTINE OVERRIDE` warning, posts a `QuarantineReleased` event on the object, and increments `kobe_quarantine_releases_total`. Alert on that counter.
+Each completed release logs a `QUARANTINE OVERRIDE` warning, posts a `QuarantineReleased` event on the object, and increments `kobe_quarantine_releases_total`. These happen once the finalizer is gone, not when the operator starts the release. Alert on that counter.
 
 The instance and the lease are released separately. Releasing only the lease leaves the instance quarantined and counting against `maxClusters`.
 
-A lease created for a Sandbox composition is not released this way. The operator posts `QuarantineReleaseRefused` and keeps it, because its owning `SandboxLease` retires it.
+With `teardownAuthority.separate=true`, an admission policy normally stops anyone from dropping a lease's receipt finalizer before the receipt is acknowledged. It makes one exception: the operator's own service account may drop it from a `Quarantined` lease whose `kobe.kunobi.ninja/release-quarantine` annotation already equals the lease's UID. The annotation has to be in place before the operator's write, so set it first, as above.
+
+In that mode, apply the annotation as yourself, not as the kobe service account. The policy refuses any attempt by the kobe control plane or the teardown authority to add or change it on a `ClusterLease` or `ClusterInstance`. The control plane can mark a lease `Quarantined` on its own, so the grant is what keeps the release a human decision. Removing the annotation is allowed from any identity.
+
+A lease created for a Sandbox composition is not released this way. The operator posts `QuarantineReleaseRefused` once and keeps it, because its owning `SandboxLease` retires it.
 
 ## Rolling back past the `Exhausted` phase
 
