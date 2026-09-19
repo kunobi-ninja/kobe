@@ -39,42 +39,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// path. Kobe's ids are `sbxe-<hex>` and fit comfortably.
 pub const MAX_ID_LEN: usize = 64;
 
-/// Most output the runner retains, per stream.
-///
-/// The spool is on the ephemeral disk the whole Pod shares, and the caller
-/// chooses what they run, so they choose how much it prints. Past this, output
-/// is discarded and the discarding is reported.
-pub const MAX_RETENTION_BYTES: u64 = 8 * 1024 * 1024;
-
 /// Most output one log reply may carry.
 ///
 /// A window rather than a file: the reply crosses an exec connection and is
 /// buffered by the operator, so its size must be a Kobe decision rather than a
 /// consequence of how much somebody's command printed.
 pub const MAX_LOG_CHUNK_BYTES: usize = 256 * 1024;
-
-/// Largest encoded start request, including its terminating newline.
-///
-/// Kobe validates this before spending an execution reservation, and the
-/// runner enforces the same value while reading stdin. Keeping the bound in the
-/// shared wire crate prevents a rollout from accepting an execution that the
-/// installed runner can only reject after its idempotency key is durable.
-pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
-
-/// Most stdin one execution may carry to its process.
-///
-/// This is a channel for **secrets and small inputs** — a token for
-/// `gh auth login --with-token`, a password, a short configuration document. It
-/// is emphatically not file transfer: the bytes travel base64-encoded inside
-/// the single start request that [`MAX_REQUEST_BYTES`] bounds as a whole, and
-/// both Kobe and the runner hold them in memory for the duration of the spawn.
-///
-/// Sixteen KiB encodes to just under 22 KiB of base64, which leaves the argv,
-/// the cwd and the JSON scaffolding comfortable room inside the 64 KiB request.
-/// A caller who exceeds it is **refused**, never truncated: half a token is
-/// still a secret, and a command that read half its input and then saw EOF
-/// would fail somewhere a long way from the cause.
-pub const MAX_STDIN_BYTES: usize = 16 * 1024;
 
 /// Hidden runner flag used only by the administrator-driven #82 live gate.
 ///
@@ -152,8 +122,8 @@ pub struct StartRequest {
     /// Wall-clock bound the runner enforces on its own, so a command outlives
     /// neither the connection that started it nor its lease.
     pub timeout_seconds: u64,
-    /// Per-stream retention cap. Output past it is discarded and the fact is
-    /// reported — never silently dropped.
+    /// Per-stream retention cap; zero retains all output. A positive cap
+    /// discards excess output and records truncation.
     pub max_output_bytes: u64,
     /// Bytes to write to the process's stdin, base64, then close.
     ///
@@ -165,11 +135,8 @@ pub struct StartRequest {
     /// somewhere it would be recorded. This is the other half of the intent
     /// that already puts the request itself on the runner's stdin.
     ///
-    /// Bounded by [`MAX_STDIN_BYTES`], and for secrets rather than files — see
-    /// that constant for why the bound is what it is. Base64 so exact bytes
-    /// survive the JSON: a token is not required to be UTF-8, and a lossy
-    /// conversion here would corrupt a credential in a way nothing downstream
-    /// could diagnose.
+    /// The operator validates any configured input ceiling before starting.
+    /// Base64 preserves exact bytes; malformed input is refused, never trimmed.
     ///
     /// **Absent when unused, and that is load-bearing.** A request that carries
     /// no stdin serialises byte-for-byte as it did before this field existed,
@@ -229,8 +196,7 @@ impl StartRequest {
     /// `/dev/null`, the second hands it a pipe that is immediately closed. Both
     /// see EOF, but only the second is a statement the caller made.
     ///
-    /// The bound is checked on the decoded bytes rather than the encoding, so
-    /// the error a caller gets names the size they actually sent.
+    /// The operator enforces any configured input ceiling before dispatch.
     pub fn stdin_bytes(&self) -> Result<Option<Vec<u8>>, StdinRejected> {
         use base64::Engine;
 
@@ -240,9 +206,6 @@ impl StartRequest {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| StdinRejected::NotBase64)?;
-        if bytes.len() > MAX_STDIN_BYTES {
-            return Err(StdinRejected::TooLarge);
-        }
         Ok(Some(bytes))
     }
 }
@@ -255,8 +218,6 @@ impl StartRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinRejected {
     NotBase64,
-    /// More than [`MAX_STDIN_BYTES`] once decoded.
-    TooLarge,
 }
 
 /// Where one supervised command is.
@@ -677,16 +638,11 @@ mod tests {
         );
     }
 
-    /// stdin is bounded, and the boundary refuses rather than truncates.
-    ///
-    /// Truncation is the failure mode that must never exist here: half a token
-    /// is still a secret, and the command that received it would fail
-    /// somewhere a long way from the request that caused it.
+    /// Size does not truncate valid input; invalid base64 is still refused.
     #[test]
-    fn oversized_stdin_is_refused_at_the_documented_boundary() {
+    fn stdin_larger_than_the_old_limit_is_preserved() {
         use base64::Engine;
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
         let mut request = StartRequest {
             protocol: PROTOCOL_VERSION,
             id: "sbxe-1".into(),
@@ -696,34 +652,10 @@ mod tests {
             max_output_bytes: 1024,
             stdin_base64: None,
         };
-        assert_eq!(request.stdin_bytes(), Ok(None));
-
-        // Absent and present-but-empty are different requests. The first leaves
-        // the process reading /dev/null; the second is a caller deliberately
-        // handing it an immediately-closed pipe.
-        request.stdin_base64 = Some(String::new());
-        assert_eq!(request.stdin_bytes(), Ok(Some(Vec::new())));
-
-        request.stdin_base64 = Some(encode(&vec![b'x'; MAX_STDIN_BYTES]));
-        assert_eq!(
-            request.stdin_bytes().unwrap().unwrap().len(),
-            MAX_STDIN_BYTES,
-            "exactly the bound is accepted"
-        );
-
-        request.stdin_base64 = Some(encode(&vec![b'x'; MAX_STDIN_BYTES + 1]));
-        assert_eq!(request.stdin_bytes(), Err(StdinRejected::TooLarge));
-
-        request.stdin_base64 = Some("not base64!!".into());
+        request.stdin_base64 = Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+        assert_eq!(request.stdin_bytes().unwrap(), Some(bytes));
+        request.stdin_base64 = Some("!invalid!".into());
         assert_eq!(request.stdin_bytes(), Err(StdinRejected::NotBase64));
-
-        // The encoded request still has to fit the whole-request bound, so the
-        // stdin ceiling must leave room for a command beside it.
-        let encoded_ceiling = MAX_STDIN_BYTES.div_ceil(3) * 4;
-        assert!(
-            encoded_ceiling + 1024 < MAX_REQUEST_BYTES,
-            "the stdin bound must leave room for argv inside MAX_REQUEST_BYTES"
-        );
     }
 
     /// Exact bytes survive, including the ones that are not text.

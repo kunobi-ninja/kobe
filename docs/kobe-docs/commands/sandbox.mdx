@@ -148,10 +148,9 @@ This stores the credential only in the active lease. Run `gh auth logout -h
 github.com` in the workspace before releasing it if the credential must be
 removed early.
 
-For secrets and small inputs, not file transfer: the server refuses more than
-16 KiB rather than truncating it, and the CLI refuses to buffer a large file
-into a request that was never going to be accepted. Kobe stores none of it —
-only a digest of the request reaches the execution record.
+Stdin has no byte ceiling by default. The CLI buffers it for the request, so
+large inputs use local memory. Operators can set `agentSandbox.stdinMaxBytes`;
+input above that ceiling is refused before execution, never truncated.
 
 ### Long-running commands with `--detach`
 
@@ -188,7 +187,7 @@ returns.
 
 ## `kobe logs`
 
-A bounded tail of the sandbox's own output.
+Read the sandbox's output. Use `--tail` to request only the last lines. The operator may configure a line ceiling; the default returns all available lines.
 
 ```bash
 kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --tail 500

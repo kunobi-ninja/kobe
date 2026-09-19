@@ -54,36 +54,16 @@ const LEASE_UID_LABEL: &str = crate::sandbox::SANDBOX_LEASE_UID_LABEL;
 /// group and Kubernetes record have both been cleaned.
 pub const SANDBOX_EXECUTION_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-execution-cleanup";
 
-/// Maximum number of execution records retained for one Sandbox lifetime.
-///
-/// This bounds Kubernetes history and, together with
-/// [`EXECUTION_OUTPUT_RETENTION_BYTES`], bounds the runner spool even when a
-/// caller uses a fresh idempotency key for every command.
+// Explicit ceilings used by bounded-capacity regression fixtures.
+#[cfg(test)]
 pub const MAX_EXECUTIONS_PER_LEASE: usize = 256;
-
-/// Upper bound on ledger entries whose process group is known or possibly
-/// still running.
-///
-/// An execution that crossed Kubernetes `startedAt` holds its slot until the
-/// exact Sandbox target is destroyed — same-UID runner state cannot prove the
-/// group is gone — so this bound grows monotonically over a lease's life and
-/// is effectively a second lifetime budget. It therefore must not be smaller
-/// than [`MAX_EXECUTIONS_PER_LEASE`], or it would silently become THE lifetime
-/// budget: that is how a lease could once run only eight durable commands in
-/// its entire life while the extend feature advertised long-running sessions.
+#[cfg(test)]
 pub const MAX_ACTIVE_EXECUTIONS_PER_LEASE: usize = MAX_EXECUTIONS_PER_LEASE;
-
-/// Per-stream runner retention used by Kobe.
-///
-/// The runner accepts up to eight MiB, but Kobe deliberately uses the smaller
-/// production cap. At the lifetime record limit, stdout plus stderr therefore
-/// occupy at most 512 MiB before small metadata overhead.
-pub const EXECUTION_OUTPUT_RETENTION_BYTES: u64 = 1024 * 1024;
 
 /// Longest a reserved record may remain Queued before it becomes Unknown.
 ///
 /// The slot is written before the CR and the CR before `Running`. A process
-/// crash in either gap must not hold one of eight active slots forever; after
+/// crash in either gap must not leave a reservation unresolved forever; after
 /// this bound the gate keeps the idempotency key spent, while the active slot
 /// is retired with an honest Unknown record.
 pub const EXECUTION_SETUP_GRACE: chrono::Duration = chrono::Duration::minutes(5);
@@ -227,18 +207,10 @@ pub struct ExecutionRequest {
     /// This field lives on the in-memory request and nowhere else. It is hashed
     /// into the record's `requestDigest` and forwarded to the runner; it is
     /// never persisted. See [`crate::crd::execution`] for why the durable
-    /// record must not hold it. Bounded by [`MAX_EXECUTION_STDIN_BYTES`], which
-    /// refuses rather than truncates.
+    /// record must not hold it. The operator may configure a byte ceiling;
+    /// excess input is refused before reservation, never truncated.
     pub stdin: Option<Vec<u8>>,
 }
-
-/// Most stdin one execution may carry.
-///
-/// The runner's own ceiling, re-exported rather than copied: two hand-kept
-/// copies of a limit drift, and the drift would show up as a reservation the
-/// target can only reject after the caller's idempotency key is already spent.
-/// Kobe checks it first for exactly that reason.
-pub const MAX_EXECUTION_STDIN_BYTES: usize = kobe_runner::protocol::MAX_STDIN_BYTES;
 
 /// Longest a caller-supplied idempotency key may be.
 ///
@@ -348,11 +320,13 @@ pub fn validate_request(request: &ExecutionRequest) -> Result<(), ExecutionReque
             return Err(ExecutionRequestError::Invalid { what: "cwd" });
         }
     }
-    if request
-        .stdin
-        .as_ref()
-        .is_some_and(|stdin| stdin.len() > MAX_EXECUTION_STDIN_BYTES)
-    {
+    if request.stdin.as_ref().is_some_and(|stdin| {
+        crate::sandbox_limits::exceeds(
+            "stdin_bytes",
+            stdin.len() as u64,
+            crate::sandbox_limits::get().stdin_bytes,
+        )
+    }) {
         // Refused, never trimmed to fit. stdin exists on this API to carry a
         // secret, and half a secret is still a secret — the command would
         // receive it, fail an authentication, and report something that looks
@@ -3087,69 +3061,28 @@ mod tests {
         assert!(with(&|r| r.idempotency_key = "k".repeat(MAX_IDEMPOTENCY_KEY)).is_ok());
     }
 
-    /// Oversized stdin is refused at the documented boundary, not trimmed.
-    ///
-    /// stdin exists on this API to carry a secret. Half a secret is still a
-    /// secret: the command would receive it, fail an authentication, and report
-    /// something that looks nothing like "your input was too large". Refusing
-    /// before the reservation is what keeps the caller's idempotency key
-    /// reusable for the request they meant to make.
+    /// Default input size is not restricted by the former fixed ceiling.
     #[test]
-    fn oversized_stdin_is_refused_before_anything_is_reserved() {
-        let with_stdin = |stdin: Option<Vec<u8>>| {
-            let mut request = request();
-            request.stdin = stdin;
-            validate_request(&request)
-        };
-
-        assert!(with_stdin(None).is_ok(), "no stdin at all stays valid");
-        assert!(
-            with_stdin(Some(Vec::new())).is_ok(),
-            "an empty stdin is a request a caller may make"
-        );
-        assert!(with_stdin(Some(b"ghp_token".to_vec())).is_ok());
-        assert!(with_stdin(Some(vec![b'x'; MAX_EXECUTION_STDIN_BYTES])).is_ok());
-
-        assert_eq!(
-            with_stdin(Some(vec![b'x'; MAX_EXECUTION_STDIN_BYTES + 1])),
-            Err(ExecutionRequestError::Invalid { what: "stdin" }),
-            "one byte past the bound is refused, not trimmed"
-        );
-
-        // The caller is told to fix their request, not to send it again.
-        assert_eq!(
-            ExecutionRequestError::Invalid { what: "stdin" }.http_status(),
-            axum::http::StatusCode::BAD_REQUEST
-        );
-
-        // Kobe's ceiling is the runner's ceiling. Two hand-kept copies would
-        // drift, and the drift would surface only after the reservation was
-        // already durable.
-        assert_eq!(
-            MAX_EXECUTION_STDIN_BYTES,
-            kobe_runner::protocol::MAX_STDIN_BYTES
-        );
+    fn stdin_above_the_old_ceiling_is_accepted_by_default() {
+        let mut request = request();
+        request.stdin = Some(vec![b'x'; 2 * 1024 * 1024]);
+        assert!(validate_request(&request).is_ok());
     }
 
-    /// A maximal stdin still fits the one line the runner reads.
-    ///
-    /// [`MAX_EXECUTION_STDIN_BYTES`] and the runner's whole-request bound are
-    /// two different ceilings and both apply. If the first could produce a
-    /// request that violates the second, an accepted reservation would be
-    /// followed by a target-side rejection — after the idempotency key was
-    /// already spent.
+    /// Larger inputs survive the complete operator-to-runner request.
     #[test]
-    fn a_maximal_stdin_still_fits_the_encoded_start_request() {
+    fn large_stdin_survives_operator_serialization() {
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
         let request = crate::api::sandbox_runner::start_request(
-            "sbxe-0123456789abcdef0123456789abcdef",
-            &["/usr/bin/gh".into(), "auth".into(), "login".into()],
-            Some("/workspace"),
+            "sbxe-1",
+            &["cat".into()],
+            None,
             std::time::Duration::from_secs(60),
-            Some(&vec![b'x'; MAX_EXECUTION_STDIN_BYTES]),
+            Some(&bytes),
         );
-        let line = crate::api::sandbox_runner::start_line(&request)
-            .expect("a maximal stdin must still encode inside the request bound");
-        assert!(line.len() <= kobe_runner::protocol::MAX_REQUEST_BYTES);
+        let line = crate::api::sandbox_runner::start_line(&request).unwrap();
+        let decoded: kobe_runner::protocol::StartRequest = serde_json::from_slice(&line).unwrap();
+        assert_eq!(decoded.stdin_bytes().unwrap(), Some(bytes));
     }
 
     /// A reused key with a different secret conflicts rather than returning the

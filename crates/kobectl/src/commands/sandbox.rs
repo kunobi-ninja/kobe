@@ -229,40 +229,13 @@ struct ExecRequestBody<'a> {
     stdin: Option<&'a str>,
 }
 
-/// Most stdin `kobe exec --stdin` will read before refusing.
-///
-/// The server owns the real bound and returns its own message when a payload
-/// exceeds it — this CLI does not invent explanations for limits it does not
-/// enforce. What this ceiling prevents is the local mistake: an accidental
-/// `kobe exec ... --stdin < a-large-file` buffering gigabytes into memory
-/// before the server ever sees it. Generous on purpose, so the refusal a caller
-/// normally meets is the server's.
-const MAX_LOCAL_STDIN_BYTES: usize = 1024 * 1024;
-
-/// Read the bytes `--stdin` forwards, from this process's own stdin.
-///
-/// Read whole and only then sent, because the request is one JSON document:
-/// there is no streaming half of this API, and pretending otherwise would mean
-/// discovering at byte 900,000 that the request was never going to be accepted.
-/// Bytes rather than text — a token is not required to be UTF-8, and a lossy
-/// conversion would corrupt a credential in a way that surfaces as an
-/// authentication failure far from the cause.
+/// Read exact stdin bytes without a client-side size ceiling. Input is buffered
+/// for the JSON start request; the operator enforces any configured limit.
 fn read_stdin_payload(source: &mut impl std::io::Read) -> Result<Vec<u8>> {
-    use std::io::Read;
-
     let mut bytes = Vec::new();
-    // One byte past the ceiling, so "exactly at the limit" and "over it" are
-    // distinguishable and the refusal is explicit rather than a silent trim.
     source
-        .take(MAX_LOCAL_STDIN_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .context("could not read stdin")?;
-    if bytes.len() > MAX_LOCAL_STDIN_BYTES {
-        anyhow::bail!(
-            "--stdin is for secrets and small inputs, not file transfer: \
-             refusing to send more than {MAX_LOCAL_STDIN_BYTES} bytes"
-        );
-    }
     Ok(bytes)
 }
 
@@ -2567,26 +2540,11 @@ mod tests {
         assert_eq!(detached["detach"], true);
     }
 
-    /// `--stdin` refuses a file rather than buffering one.
-    ///
-    /// The bound is local and generous — the server owns the real one and its
-    /// message is what a caller normally sees. This exists so an accidental
-    /// `--stdin < a-large-file` fails immediately instead of reading gigabytes
-    /// into memory to build a request that was never going to be accepted.
+    /// Input above the old local ceiling must arrive without truncation.
     #[test]
-    fn forwarded_stdin_is_refused_rather_than_truncated_past_the_local_bound() {
-        let exact = vec![b'x'; MAX_LOCAL_STDIN_BYTES];
-        assert_eq!(
-            read_stdin_payload(&mut exact.as_slice()).unwrap().len(),
-            MAX_LOCAL_STDIN_BYTES
-        );
-
-        let over = vec![b'x'; MAX_LOCAL_STDIN_BYTES + 1];
-        let error = read_stdin_payload(&mut over.as_slice()).unwrap_err();
-        assert!(
-            error.to_string().contains("not file transfer"),
-            "the refusal must say why: {error}"
-        );
+    fn forwarded_stdin_has_no_local_byte_ceiling() {
+        let large = vec![b'x'; 2 * 1024 * 1024];
+        assert_eq!(read_stdin_payload(&mut large.as_slice()).unwrap(), large);
 
         // Exact bytes, including the ones that are not text: a credential is
         // not required to be UTF-8.

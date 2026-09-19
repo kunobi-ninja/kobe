@@ -1,75 +1,24 @@
-//! Per-principal rate limiting for lease admission.
-//!
-//! Sandbox and Cluster lease creation each hold one [`AdmissionRateLimiter`]
-//! in `AppState`. The reasoning below was written for Sandbox admission, whose
-//! refused attempts are the most expensive, and holds for Cluster admission
-//! too: a refused Cluster create still reads the pool, takes the principal's
-//! admission lock and lists their leases. A throttled attempt of either kind
-//! answers `429` with `reason: rate_limited` and `Retry-After`.
-//!
-//! ## Why this is not the concurrency limit
-//!
-//! `max_concurrent_leases` bounds how many sandboxes a principal may *hold*. It
-//! says nothing about how fast they may *ask*, and refusing an attempt is not
-//! free: by the time admission can answer "no", the request has already cost
-//! the API server a `SandboxLease` CREATE, up to `max_concurrent_leases`
-//! reservation CREATEs, and a fenced DELETE to undo them. A principal sitting
-//! at their limit can therefore retry forever, spend none of their own quota,
-//! and still saturate the API server that every unrelated principal shares.
-//!
-//! ## Why the budget is charged per attempt
-//!
-//! The budget is charged before that work is scheduled and is never refunded,
-//! so a caller whose requests all fail is charged exactly like one whose
-//! requests all succeed. Charging on success — or refunding on failure — would
-//! leave the loop above completely unbounded, which is the specific evasion
-//! this module exists to close. That is why the charge is the first statement
-//! of the handler and not a decision taken at one of its exits: every exit
-//! below it has already paid.
-//!
-//! A *throttled* unkeyed attempt is different, and costs nothing: it is refused
-//! before any I/O. A keyed attempt may perform one exact-name GET so a caller
-//! that lost an already-committed create response can recover that object; a
-//! miss still performs no admission mutation and returns the same throttle.
-//! Charging a refusal again would turn a bounded delay into permanent lockout
-//! for a tight retry loop, which punishes bad retry code rather than bounding
-//! load.
-//!
-//! ## Scope, stated narrowly
-//!
-//! This is a per-process limiter, so with `N` API replicas a principal's
-//! effective ceiling is `N` times the numbers below. That is deliberate: a
-//! cluster-wide limiter would need a write per *rejected* attempt, spending the
-//! exact resource it is meant to protect. Bounding the blast radius by a
-//! constant factor is the honest claim; a global rate guarantee is not.
+//! Optional admission throttling, shared per replica and authenticated identity.
+//! With the default zero burst, requests are counted but never throttled. A
+//! configured burst refills over twenty seconds. The bucket is charged before
+//! admission work, including failed attempts. Rejections carry Retry-After.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Attempts a principal may make back-to-back from an idle start.
-///
-/// Sized for the legitimate shape of the workload: an agent runner opening a
-/// handful of sandboxes at once must never see a 429, and no realistic caller
-/// bursts past this without something being wrong — `max_concurrent_leases`
-/// caps what they could usefully be holding anyway.
-///
-/// Crate-visible so the admission handler's own test can drive the boundary
-/// through the real endpoint. A test that hard-coded `10` would keep passing if
-/// this value moved, which is the one thing it must not do.
+/// Explicit burst used by admission regression tests.
+#[cfg(test)]
 pub(crate) const ADMISSION_BURST: f64 = 10.0;
 
-/// Sustained refill, in attempts per second, once the burst is spent.
-///
-/// One attempt every two seconds. Interactive use never notices; a retry loop
-/// is cut from "as fast as the network allows" to a rate whose worst case is a
-/// bounded, uninteresting trickle of apiserver writes.
+/// Refill rate for the test fixture's ten-token burst.
+#[cfg(test)]
 const ADMISSION_REFILL_PER_SEC: f64 = 0.5;
 
 /// Ceiling on distinct principals tracked at once.
 ///
 /// The map only ever holds principals that attempted admission within the last
-/// [`ADMISSION_BURST`] / [`ADMISSION_REFILL_PER_SEC`] seconds (anything older
+/// twenty seconds (anything older
 /// has refilled and is pruned), so this bound is reached only under a genuine
 /// flood from thousands of distinct credentials.
 const MAX_TRACKED_PRINCIPALS: usize = 10_000;
@@ -85,20 +34,22 @@ pub(crate) enum RateLimitDecision {
 
 /// One principal's budget.
 ///
-/// A bucket that has refilled to [`ADMISSION_BURST`] is indistinguishable from
+/// A bucket that has refilled to its configured burst is indistinguishable from
 /// a bucket that has never been used, which is what makes eviction safe: the
 /// limiter can forget an idle principal without ever giving them budget they
 /// had not already earned back.
 #[derive(Debug, Clone, Copy)]
 struct TokenBucket {
     tokens: f64,
+    burst: f64,
     updated_at: Instant,
 }
 
 impl TokenBucket {
-    fn fresh(now: Instant) -> Self {
+    fn fresh(now: Instant, burst: f64) -> Self {
         Self {
-            tokens: ADMISSION_BURST,
+            tokens: burst,
+            burst,
             updated_at: now,
         }
     }
@@ -110,7 +61,7 @@ impl TokenBucket {
     /// subtraction would panic in a release-critical path to save nothing.
     fn refilled(self, now: Instant) -> f64 {
         let elapsed = now.saturating_duration_since(self.updated_at).as_secs_f64();
-        (self.tokens + elapsed * ADMISSION_REFILL_PER_SEC).min(ADMISSION_BURST)
+        (self.tokens + elapsed * (self.burst / 20.0)).min(self.burst)
     }
 
     /// Spend one token if there is one. Pure: `now` is supplied, so every
@@ -124,14 +75,14 @@ impl TokenBucket {
         }
         self.tokens = tokens;
         RateLimitDecision::Throttled {
-            retry_after: Duration::from_secs_f64((1.0 - tokens) / ADMISSION_REFILL_PER_SEC),
+            retry_after: Duration::from_secs_f64((1.0 - tokens) / (self.burst / 20.0)),
         }
     }
 
     /// Whether this bucket now carries exactly what a new one would, and can
     /// therefore be dropped without changing any future decision.
     fn is_idle(&self, now: Instant) -> bool {
-        self.refilled(now) >= ADMISSION_BURST
+        self.refilled(now) >= self.burst
     }
 }
 
@@ -141,10 +92,21 @@ impl TokenBucket {
 /// Entries are two words and every operation is a hash lookup, so a coarse lock
 /// is cheaper here than anything asynchronous, and it is never held across an
 /// `.await`.
-#[derive(Clone, Default)]
-pub struct AdmissionRateLimiter(Arc<Mutex<HashMap<String, TokenBucket>>>);
+#[derive(Clone)]
+pub struct AdmissionRateLimiter(Arc<Mutex<HashMap<String, TokenBucket>>>, u64);
+
+impl Default for AdmissionRateLimiter {
+    fn default() -> Self {
+        Self::with_burst(crate::sandbox_limits::get().admission_burst)
+    }
+}
 
 impl AdmissionRateLimiter {
+    /// Zero disables rate enforcement. A configured bucket refills in 20s.
+    pub(crate) fn with_burst(burst: u64) -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())), burst)
+    }
+
     /// Charge one admission attempt against `principal`.
     ///
     /// `principal` must be the same digest that names the quota and alias
@@ -156,6 +118,11 @@ impl AdmissionRateLimiter {
     }
 
     fn charge_at(&self, principal: &str, now: Instant) -> RateLimitDecision {
+        crate::metrics::SANDBOX_ADMISSION_ATTEMPTS.inc();
+        if self.1 == 0 {
+            return RateLimitDecision::Allowed;
+        }
+
         let mut buckets = self
             .0
             .lock()
@@ -175,11 +142,11 @@ impl AdmissionRateLimiter {
             // itself exactly when it is needed. Refusing instead keeps the
             // apiserver-write bound intact, which is what this protects.
             return RateLimitDecision::Throttled {
-                retry_after: Duration::from_secs_f64(1.0 / ADMISSION_REFILL_PER_SEC),
+                retry_after: Duration::from_secs_f64(20.0 / self.1 as f64),
             };
         }
 
-        let mut bucket = TokenBucket::fresh(now);
+        let mut bucket = TokenBucket::fresh(now, self.1 as f64);
         let decision = bucket.take(now);
         buckets.insert(principal.to_string(), bucket);
         decision
@@ -190,6 +157,15 @@ impl AdmissionRateLimiter {
 mod tests {
     use super::*;
 
+    #[test]
+    fn admission_is_unlimited_by_default() {
+        let limiter = AdmissionRateLimiter::default();
+        for _ in 0..1000 {
+            assert_eq!(limiter.charge("caller"), RateLimitDecision::Allowed);
+        }
+        assert!(limiter.0.lock().unwrap().is_empty());
+    }
+
     /// A caller who is refused must still be charged.
     ///
     /// If budget were spent only by attempts that end in success, a principal
@@ -199,7 +175,7 @@ mod tests {
     /// of the outcome by construction — this pins that it never grows one.
     #[test]
     fn budget_is_spent_by_the_attempt_not_by_its_outcome() {
-        let limiter = AdmissionRateLimiter::default();
+        let limiter = AdmissionRateLimiter::with_burst(10);
         let now = Instant::now();
         for attempt in 0..ADMISSION_BURST as u32 {
             assert_eq!(
@@ -228,7 +204,7 @@ mod tests {
         // bucket's clock, so reusing one would make the second assertion depend
         // on the first rather than on the rule under test.
         let exhausted = |start: Instant| {
-            let limiter = AdmissionRateLimiter::default();
+            let limiter = AdmissionRateLimiter::with_burst(10);
             for _ in 0..ADMISSION_BURST as u32 {
                 assert_eq!(
                     limiter.charge_at("principal", start),
@@ -270,7 +246,7 @@ mod tests {
     /// which is precisely the collateral damage the limit is meant to prevent.
     #[test]
     fn exhausting_one_principal_leaves_every_other_principal_untouched() {
-        let limiter = AdmissionRateLimiter::default();
+        let limiter = AdmissionRateLimiter::with_burst(10);
         let now = Instant::now();
         for _ in 0..ADMISSION_BURST as u32 + 5 {
             let _ = limiter.charge_at("noisy", now);
@@ -291,7 +267,7 @@ mod tests {
     #[test]
     fn eviction_can_only_drop_buckets_that_have_already_refilled() {
         let now = Instant::now();
-        let mut spent = TokenBucket::fresh(now);
+        let mut spent = TokenBucket::fresh(now, 10.0);
         assert_eq!(spent.take(now), RateLimitDecision::Allowed);
         assert!(
             !spent.is_idle(now),
@@ -312,7 +288,7 @@ mod tests {
     /// off for everyone by filling it — the failure mode has to be refusal.
     #[test]
     fn a_full_principal_table_refuses_rather_than_forgets() {
-        let limiter = AdmissionRateLimiter::default();
+        let limiter = AdmissionRateLimiter::with_burst(10);
         let now = Instant::now();
         for principal in 0..MAX_TRACKED_PRINCIPALS {
             assert_eq!(

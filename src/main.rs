@@ -13,6 +13,7 @@ mod receipt_authority;
 mod sandbox;
 mod sandbox_access_ledger;
 mod sandbox_ledger;
+mod sandbox_limits;
 mod sandbox_runtime;
 mod telemetry;
 mod velero;
@@ -210,6 +211,9 @@ async fn run() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
+    sandbox_limits::initialize()?;
+    let sandbox_stream_max_bytes =
+        (sandbox_limits::get().stream_bytes != 0).then_some(sandbox_limits::get().stream_bytes);
     // Iroh P2P data-plane endpoint (#197). Config is refused at STARTUP for the
     // same reason as the Agent Sandbox mode above: a misconfigured relay must
     // fail boot, not the first iroh session. Default is the public relay;
@@ -387,6 +391,7 @@ async fn run() -> anyhow::Result<()> {
         cluster_admission_limiter: Default::default(),
         shutdown: shutdown.clone(),
         sandbox_enabled: agent_sandbox_mode.enabled(),
+        sandbox_stream_max_bytes,
         iroh_endpoint: iroh_endpoint.clone(),
         iroh_sessions: iroh_sessions.clone(),
     };

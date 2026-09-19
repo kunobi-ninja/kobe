@@ -51,11 +51,18 @@ reconnectability.
 
 Output from every durable execution is retained inside the container until the
 Sandbox is torn down and can be read back through
-`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Kobe retains at most
-1 MiB of stdout and 1 MiB of stderr per execution, and accepts at most 256
-idempotency keys over one Sandbox lifetime. Requests beyond the limit return
-`409 Conflict` with reason `execution_limit_exhausted`: retrying cannot
-succeed; request a new lease.
+`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Output retention and
+execution count have no default Kobe ceiling. Operators can set
+`agentSandbox.outputMaxBytes` per output stream and
+`agentSandbox.maxExecutionsPerLease` over a lease's lifetime. A configured
+execution ceiling returns `409 Conflict` with `execution_limit_exhausted`;
+configured output ceilings report truncation. Usage measurements remain on
+when enforcement is disabled.
+
+These defaults require the updated runner image. Existing leases retain their
+old image; an old runner can reject an unlimited-retention request. Update
+SandboxPool images and replace old leases before using the new defaults.
+Disk, memory and Kubernetes object-size constraints still apply.
 
 Cancelling an execution asks the runner to terminate its whole process group.
 Lease release first closes new access, then asks every recorded runner to

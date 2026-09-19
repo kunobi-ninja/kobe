@@ -697,18 +697,11 @@ pub async fn resolve_target_cluster(
     Ok(TargetCluster { admin, config })
 }
 
-/// How much of a Sandbox's output one request may return.
-///
-/// Bounded because the caller controls neither how much their agent writes nor
-/// how often they ask. An unbounded read is a way to make the operator buffer
-/// a workload's entire log in memory on demand.
-pub const MAX_LOG_TAIL_LINES: i64 = 2_000;
-const DEFAULT_LOG_TAIL_LINES: i64 = 200;
-
+/// Select a Sandbox's logs and optionally request a tail.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxLogsQuery {
-    /// Lines from the end. Clamped, never honoured unbounded.
+    /// Lines from the end. Omission returns all lines unless configured otherwise.
     #[serde(default)]
     pub tail: Option<i64>,
     /// Container name. Only the pool's own container resolves; the field
@@ -717,18 +710,25 @@ pub struct SandboxLogsQuery {
     pub container: Option<String>,
 }
 
-/// Clamp a caller-supplied tail into the permitted range.
-///
-/// Clamped rather than rejected: a caller asking for more than the cap wants
-/// as much as they can have, and failing the request teaches them to retry in
-/// a loop, which is worse for everyone.
-pub fn clamp_tail(requested: Option<i64>) -> i64 {
-    requested
-        .unwrap_or(DEFAULT_LOG_TAIL_LINES)
-        .clamp(1, MAX_LOG_TAIL_LINES)
+/// Preserve the caller tail and apply an optional operator ceiling. Without
+/// either, return all available log lines.
+pub fn clamp_tail(requested: Option<i64>) -> Option<i64> {
+    tail_with_limit(requested, crate::sandbox_limits::get().log_tail_lines)
 }
 
-/// Read a bounded tail of one Sandbox's output.
+fn tail_with_limit(requested: Option<i64>, limit: u64) -> Option<i64> {
+    let requested = requested.filter(|n| *n >= 0);
+    if let Some(lines) = requested {
+        crate::sandbox_limits::exceeds("log_tail_lines", lines as u64, limit);
+    }
+    let cap = (limit != 0).then_some(i64::try_from(limit).unwrap_or(i64::MAX));
+    match (requested, cap) {
+        (Some(n), Some(cap)) => Some(n.min(cap)),
+        (n, cap) => n.or(cap),
+    }
+}
+
+/// Read one Sandbox's logs, optionally restricted to a tail.
 ///
 /// The first consumer of the resolver, and deliberately the smallest one: it
 /// exercises principal → lease → provenance → Pod → container end to end
@@ -742,7 +742,7 @@ pub async fn read_sandbox_logs(
     client: &kube::Client,
     target: &SandboxTarget,
     container: &str,
-    tail_lines: i64,
+    tail_lines: Option<i64>,
 ) -> Result<String, SandboxAccessDenied> {
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::LogParams;
@@ -762,23 +762,22 @@ pub async fn read_sandbox_logs(
 
     let params = LogParams {
         container: Some(container.to_string()),
-        tail_lines: Some(tail_lines),
-        // Never `follow`: this endpoint returns a bounded body, and a followed
+        tail_lines,
+        // Never `follow`: this endpoint returns a snapshot, and a followed
         // stream here would hold a connection open with no revocation path.
         follow: false,
         ..Default::default()
     };
-    pods.logs(&target.pod_name, &params)
+    let logs = pods
+        .logs(&target.pod_name, &params)
         .await
-        .map_err(|error| backend_denied(&error))
+        .map_err(|error| backend_denied(&error))?;
+    crate::sandbox_limits::observe("log_tail_lines", logs.lines().count() as u64);
+    Ok(logs)
 }
 
-/// The largest command output one exec response may carry.
-///
-/// The caller controls what they run, so they control how much it prints.
-/// Without a cap, `cat /dev/urandom` is a way to make the operator buffer
-/// unbounded memory on request — from inside a sandbox that exists precisely
-/// because its occupant is not trusted.
+/// Explicit output ceiling used by bounded-read regression tests.
+#[cfg(test)]
 pub const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, serde::Deserialize)]
@@ -810,7 +809,7 @@ pub struct SandboxExecResponse {
     pub truncated: bool,
 }
 
-/// Run one command inside the Sandbox and return its bounded output.
+/// Run one command and return its output, with any configured byte ceiling.
 ///
 /// No stdin and no TTY: this is the request/response surface, and both of those
 /// need a stream protocol with its own revocation story (#83). No shell either
@@ -822,6 +821,13 @@ pub async fn exec_in_sandbox(
     command: &[String],
     timeout: std::time::Duration,
 ) -> Result<SandboxExecResponse, SandboxAccessDenied> {
+    struct MeasureDuration(std::time::Instant);
+    impl Drop for MeasureDuration {
+        fn drop(&mut self) {
+            crate::sandbox_limits::observe("legacy_exec_seconds", self.0.elapsed().as_secs());
+        }
+    }
+    let _duration = MeasureDuration(std::time::Instant::now());
     let raw = exec_capped(
         client,
         target,
@@ -829,9 +835,17 @@ pub async fn exec_in_sandbox(
         command,
         None,
         timeout,
-        MAX_EXEC_OUTPUT_BYTES,
+        crate::sandbox_limits::capacity(crate::sandbox_limits::get().output_bytes),
     )
     .await?;
+
+    crate::sandbox_limits::observe("output_bytes", raw.stdout.len() as u64);
+    crate::sandbox_limits::observe("output_bytes", raw.stderr.len() as u64);
+    if raw.truncated {
+        crate::metrics::SANDBOX_USAGE_REJECTED
+            .with_label_values(&["output_bytes"])
+            .inc();
+    }
 
     Ok(SandboxExecResponse {
         // Lossy on purpose: a sandboxed command's output is arbitrary bytes,
@@ -1082,7 +1096,7 @@ where
 {
     use tokio::io::AsyncReadExt;
 
-    let mut limited = stream.take((cap + 1) as u64);
+    let mut limited = stream.take((cap as u64).saturating_add(1));
     if limited.read_to_end(into).await.is_err() {
         return true;
     }
@@ -1096,6 +1110,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unlimited_output_read_preserves_bytes_without_overflow() {
+        let expected = vec![b'x'; 2 * 1024 * 1024];
+        let mut stream = expected.as_slice();
+        let mut actual = Vec::new();
+        assert!(!read_capped(&mut stream, &mut actual, usize::MAX).await);
+        assert_eq!(actual, expected);
+    }
 
     fn reference(kind: &str, name: &str, uid: &str) -> crate::crd::SandboxObjectReference {
         crate::crd::SandboxObjectReference {
@@ -1686,25 +1709,22 @@ mod tests {
         target_from_provenance(&ready_lease(), &pool, now()).unwrap()
     }
 
-    /// A caller cannot ask the operator to buffer an unbounded log.
-    ///
-    /// They control neither how much their agent writes nor how often they
-    /// ask. Clamping rather than rejecting is deliberate: refusing an
-    /// over-large request teaches callers to retry in a loop, which costs more
-    /// than serving the cap once.
+    /// No default log ceiling; explicit caller tails are preserved.
     #[test]
-    fn a_log_tail_is_always_bounded() {
-        assert_eq!(clamp_tail(None), 200);
-        assert_eq!(clamp_tail(Some(50)), 50);
-        assert_eq!(clamp_tail(Some(MAX_LOG_TAIL_LINES)), MAX_LOG_TAIL_LINES);
+    fn log_tail_has_no_default_ceiling() {
+        assert_eq!(clamp_tail(None), None);
+        assert_eq!(clamp_tail(Some(50)), Some(50));
+        assert_eq!(clamp_tail(Some(20_000)), Some(20_000));
+        assert_eq!(clamp_tail(Some(0)), Some(0));
+        assert_eq!(clamp_tail(Some(-1)), None);
+    }
 
-        for requested in [MAX_LOG_TAIL_LINES + 1, i64::MAX, 0, -1, i64::MIN] {
-            let clamped = clamp_tail(Some(requested));
-            assert!(
-                (1..=MAX_LOG_TAIL_LINES).contains(&clamped),
-                "tail {requested} clamped to {clamped}, outside the permitted range"
-            );
-        }
+    #[test]
+    fn explicit_log_ceiling_applies_to_default_and_requested_tails() {
+        assert_eq!(tail_with_limit(None, 2000), Some(2000));
+        assert_eq!(tail_with_limit(Some(3000), 2000), Some(2000));
+        assert_eq!(tail_with_limit(Some(50), 2000), Some(50));
+        assert_eq!(tail_with_limit(Some(0), 2000), Some(0));
     }
 
     /// Unknown log options are refused, not ignored.

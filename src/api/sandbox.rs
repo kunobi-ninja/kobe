@@ -108,7 +108,7 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
         )
         .route(
             "/v1/sandbox-leases/{id}/executions",
-            post(create_sandbox_execution::<B>),
+            post(create_sandbox_execution::<B>).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
             "/v1/sandbox-leases/{id}/executions/{execution}",
@@ -131,7 +131,7 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
         .route("/v1/leases/{id}/session", post(sandbox_session::<B>))
         .route(
             "/v1/leases/{id}/executions",
-            post(create_sandbox_execution::<B>),
+            post(create_sandbox_execution::<B>).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
             "/v1/leases/{id}/executions/{execution}",
@@ -170,10 +170,8 @@ struct CreateExecutionRequest {
     /// Base64 because a credential is not required to be UTF-8 and a JSON
     /// string is. Absent means the process reads `/dev/null`; an empty string
     /// means a pipe that is immediately closed, which is a different thing to
-    /// ask for. Bounded once decoded by
-    /// [`MAX_EXECUTION_STDIN_BYTES`](crate::api::sandbox_executions::MAX_EXECUTION_STDIN_BYTES)
-    /// and refused rather than truncated past it: this is a channel for secrets
-    /// and small inputs, not a file transfer.
+    /// ask for. Input size is unlimited unless the operator configures
+    /// a ceiling; an oversized input is refused before reserving the command.
     ///
     /// Never persisted. It is hashed into the execution's request digest and
     /// forwarded to the runner; no field of the durable record can hold it.
@@ -383,9 +381,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             Err(error) => return execution_denied(&identity, &id, &error),
         };
 
-    // The same encoded-byte ceiling is enforced by the runner. Prove it before
-    // registration, capacity CAS, or CR creation so an oversized command cannot
-    // spend an idempotency key on something the target must reject.
+    // Check encoding before reserving an execution or spending its key.
     let candidate_execution =
         crate::crd::execution_name(&target.lease_uid, &requested.idempotency_key);
     let candidate_start = crate::api::sandbox_runner::start_request(
@@ -393,9 +389,6 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         &requested.argv,
         requested.cwd.as_deref(),
         initial_timeout,
-        // Included, because base64 stdin is part of what has to fit. A bound
-        // proved on a request smaller than the one Kobe will actually send is
-        // not a bound.
         requested.stdin.as_deref(),
     );
     if crate::api::sandbox_runner::start_line(&candidate_start).is_err() {
@@ -2191,6 +2184,10 @@ impl UpgradeIntent {
     }
 }
 
+fn optional_stream_duration(seconds: u64) -> Option<std::time::Duration> {
+    (seconds != 0).then(|| std::time::Duration::from_secs(seconds))
+}
+
 struct UpgradeContext {
     target: crate::api::sandbox_access::SandboxTarget,
     container: String,
@@ -2198,6 +2195,8 @@ struct UpgradeContext {
     /// declared attach command, else nothing at all.
     command: Option<Vec<String>>,
     scoped: kube::Client,
+    /// Byte ceiling captured from operator configuration before upgrading.
+    max_stream_bytes: Option<u64>,
     /// The registration claimed before the upgrade. Held here so the slot is
     /// never released between being taken and the stream starting.
     guard: crate::api::sandbox_streams::StreamGuard,
@@ -2503,6 +2502,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
         };
 
     Ok(UpgradeContext {
+        max_stream_bytes: state.sandbox_stream_max_bytes,
         target,
         container,
         command,
@@ -2623,9 +2623,9 @@ async fn sandbox_attach<B: ClusterBackend>(
         };
 
         let mut limits = transport::StreamLimits::new(
-            transport::IDLE_TIMEOUT,
-            transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            optional_stream_duration(crate::sandbox_limits::get().stream_idle_seconds),
+            optional_stream_duration(crate::sandbox_limits::get().stream_duration_seconds),
+            context.max_stream_bytes,
         );
         let end = transport::pump_attached(&mut socket, &mut attached, &mut limits, revoked).await;
         attached.abort();
@@ -2729,9 +2729,9 @@ async fn sandbox_port_forward<B: ClusterBackend>(
         };
 
         let mut limits = transport::StreamLimits::new(
-            transport::IDLE_TIMEOUT,
-            transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            optional_stream_duration(crate::sandbox_limits::get().stream_idle_seconds),
+            optional_stream_duration(crate::sandbox_limits::get().stream_duration_seconds),
+            context.max_stream_bytes,
         );
         let end = transport::pump_duplex(&mut socket, &mut stream, &mut limits, revoked).await;
         transport::close_with(&mut socket, end).await;
@@ -2961,9 +2961,9 @@ async fn serve_iroh_session(
             return;
         };
         let mut limits = transport::StreamLimits::new(
-            transport::IDLE_TIMEOUT,
-            transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            optional_stream_duration(crate::sandbox_limits::get().stream_idle_seconds),
+            optional_stream_duration(crate::sandbox_limits::get().stream_duration_seconds),
+            context.max_stream_bytes,
         );
         let end = transport::pump_duplex_iroh(&mut link, &mut stream, &mut limits, revoked).await;
         transport::close_with_iroh(&mut link, end).await;
@@ -2997,9 +2997,9 @@ async fn serve_iroh_session(
             }
         };
         let mut limits = transport::StreamLimits::new(
-            transport::IDLE_TIMEOUT,
-            transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            optional_stream_duration(crate::sandbox_limits::get().stream_idle_seconds),
+            optional_stream_duration(crate::sandbox_limits::get().stream_duration_seconds),
+            context.max_stream_bytes,
         );
         let end =
             transport::pump_attached_iroh(&mut link, &mut attached, &mut limits, revoked).await;
@@ -3025,9 +3025,12 @@ async fn serve_iroh_session(
 /// The caller chooses the command, so they choose how long it takes. Without a
 /// bound, `sleep infinity` holds an API worker permanently — from inside a
 /// sandbox that exists precisely because its occupant is not trusted.
-const SANDBOX_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+fn legacy_exec_timeout() -> std::time::Duration {
+    optional_stream_duration(crate::sandbox_limits::get().legacy_exec_seconds)
+        .unwrap_or(std::time::Duration::MAX)
+}
 
-/// Run one command inside a Sandbox and return its bounded output.
+/// Run one command inside a Sandbox, using optional operator usage ceilings.
 ///
 /// Request/response only: no stdin, no TTY, no shell. Those need a stream
 /// protocol with its own revocation story, which is #83, and a shell would make
@@ -3106,12 +3109,12 @@ async fn sandbox_exec<B: ClusterBackend>(
         }
     };
 
-    // The fixed endpoint bound is only a ceiling. The exact lease is the
+    // Any configured endpoint timeout is only a ceiling. The exact lease is the
     // authority to execute, so a command may never be granted time beyond its
     // remaining TTL. Compute this immediately before opening the exec stream;
     // credential setup and stream registration may have consumed part of it.
     let timeout =
-        match executions::effective_timeout(SANDBOX_EXEC_TIMEOUT, &lease, chrono::Utc::now()) {
+        match executions::effective_timeout(legacy_exec_timeout(), &lease, chrono::Utc::now()) {
             Ok(timeout) => timeout,
             Err(executions::ExecutionRequestError::Denied(denied)) => {
                 return access_denied(&identity, &id, "exec", denied);
@@ -3164,7 +3167,7 @@ async fn sandbox_exec<B: ClusterBackend>(
     }
 }
 
-/// Read a bounded tail of one Sandbox's output.
+/// Read one Sandbox's logs with an optional tail.
 ///
 /// The first operation to go through #81's resolver: principal → owned, Ready,
 /// unexpired lease → recorded provenance → the exact Pod and container. It
@@ -8369,9 +8372,12 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
