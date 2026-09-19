@@ -205,8 +205,15 @@ enum ExecutionCleanupAdvance {
     DestroyTarget,
     /// Requeue after this long.
     Retry(std::time::Duration),
+    /// A `Creating` reservation is stale; record the stall and poll slowly.
+    CreationStalled,
     Quarantine(QuarantineReason),
 }
+
+/// `CleanupVerified=False` reason for a release held by a `Creating`
+/// execution reservation that has not resolved.
+const EXECUTION_CREATION_STALL_REASON: &str = "ExecutionCreationUnresolved";
+const EXECUTION_CREATION_STALL_MESSAGE: &str = "An execution reservation is still Creating; release waits until its writer binds it or the reaper retires it";
 
 /// Re-list execution cleanup state after the bounded same-pass drain stopped
 /// while cleanup was still checkpointing.
@@ -329,13 +336,34 @@ fn execution_cleanup_advance(
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
             ExecutionCleanupAdvance::Retry(EXECUTION_CLEANUP_RETRY)
         }
-        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation { stale: false } => {
             ExecutionCleanupAdvance::Retry(EXECUTION_CREATION_RETRY)
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation { stale: true } => {
+            ExecutionCleanupAdvance::CreationStalled
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
             ExecutionCleanupAdvance::Quarantine(reason)
         }
     }
+}
+
+/// Record that release is held by a stale `Creating` reservation, once, and
+/// poll at the error interval. Nothing else would show why the lease sits in
+/// Releasing: the reaper may never resolve a reservation with no recorded
+/// writer.
+async fn record_execution_creation_stall(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> Result<Action, SandboxPlacementError> {
+    Box::pin(record_cleanup_stall(
+        lease,
+        ctx,
+        EXECUTION_CREATION_STALL_REASON,
+        EXECUTION_CREATION_STALL_MESSAGE,
+        EXECUTION_CLEANUP_RETRY,
+    ))
+    .await
 }
 
 /// The upstream API resources this controller writes.
@@ -540,10 +568,16 @@ const POOL_CERTIFICATION_RECHECK: std::time::Duration = std::time::Duration::fro
 /// flight; the WarmPool has observed its current generation, asks for
 /// `warmCapacity` replicas, and reports no more than that, but fewer Ready;
 /// and the shortfall started less than [`POOL_REFILL_GRACE`] ago. The start is
-/// the `WarmPoolRefilling` condition's transition time, or `now` for a new
-/// refill. Anything else (a spec change, a replaced object, a surplus, or a
-/// refill that outlasts the grace) returns `None` and takes the full
-/// certification gate.
+/// the `WarmPoolRefilling` condition's transition time, clamped to `now` so a
+/// clock skewed ahead on a previous leader cannot extend the hold, or `now`
+/// for a new refill. Anything else (a spec change, a replaced object, a
+/// surplus, or a refill that outlasts the grace) returns `None` and takes the
+/// full certification gate.
+///
+/// Counts alone cannot tell an adoption refill from members that crashed or
+/// lost their node, so the caller also requires every unready member to be a
+/// Sandbox created within the grace; see
+/// [`sandbox_pool_certification::unready_warm_members_are_fresh`](crate::controllers::sandbox_pool_certification).
 ///
 /// Holding Ready skips the per-pass population re-validation for the window.
 /// The final Claim gate still re-validates the pool live before any tenant
@@ -591,7 +625,7 @@ fn certified_pool_refill_started(
         })
         .and_then(|condition| condition.last_transition_time.as_deref())
         .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-        .map(|time| time.with_timezone(&chrono::Utc))
+        .map(|time| time.with_timezone(&chrono::Utc).min(now))
         .unwrap_or(now);
     (now < started + POOL_REFILL_GRACE).then_some(started)
 }
@@ -1132,7 +1166,31 @@ pub async fn reconcile_pool(
     // A certified pool whose WarmPool is only refilling after an adoption keeps
     // its Ready condition; see `certified_pool_refill_started`.
     let now = chrono::Utc::now();
-    if let Some(started) = certified_pool_refill_started(&pool, &observation, now) {
+    let refill_started = match certified_pool_refill_started(&pool, &observation, now) {
+        Some(started) => {
+            match crate::controllers::sandbox_pool_certification::warm_pool_refill_members_are_fresh(
+                &ctx.client,
+                &ctx.namespace,
+                &observation.warm_pool,
+                now,
+                POOL_REFILL_GRACE,
+            )
+            .await
+            {
+                Ok(true) => Some(started),
+                Ok(false) => {
+                    info!(pool = %name, "SandboxPool has unready warm members older than a refill; withholding Ready");
+                    None
+                }
+                Err(error) => {
+                    warn!(pool = %name, error = %error, "could not list warm members to confirm a refill");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(started) = refill_started {
         let mut status = pool_status(
             &pool,
             observation.ready_replicas,
@@ -5181,6 +5239,9 @@ async fn drive_release(
             ExecutionCleanupAdvance::Retry(after) => {
                 return Ok(Action::requeue(after));
             }
+            ExecutionCleanupAdvance::CreationStalled => {
+                return Box::pin(record_execution_creation_stall(lease, ctx)).await;
+            }
             ExecutionCleanupAdvance::Quarantine(reason) => {
                 return quarantine_lease(lease, ctx, reason).await;
             }
@@ -5253,8 +5314,15 @@ async fn drive_release(
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
                     return Ok(execution_cleanup_checkpoint_action());
                 }
-                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                    stale: false,
+                } => {
                     return Ok(Action::requeue(EXECUTION_CREATION_RETRY));
+                }
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                    stale: true,
+                } => {
+                    return Box::pin(record_execution_creation_stall(lease, ctx)).await;
                 }
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
                 | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction =>
@@ -5760,8 +5828,25 @@ async fn record_post_proof_cleanup_failure(
     message: &str,
     retry: std::time::Duration,
 ) -> Result<Action, SandboxPlacementError> {
+    debug_assert!(footprint_absence_proven(
+        &lease.status.clone().unwrap_or_default()
+    ));
+    Box::pin(record_cleanup_stall(lease, ctx, reason, message, retry)).await
+}
+
+/// Record why release cannot finish yet as `CleanupVerified=False`, and warn,
+/// once per distinct reason and message. Later passes only requeue.
+///
+/// Usable before or after target absence: `False` never counts as a terminal
+/// timestamp, and verified release overwrites it with `True`.
+async fn record_cleanup_stall(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: &str,
+    message: &str,
+    retry: std::time::Duration,
+) -> Result<Action, SandboxPlacementError> {
     let status = lease.status.clone().unwrap_or_default();
-    debug_assert!(footprint_absence_proven(&status));
     let already_recorded = status.conditions.iter().any(|condition| {
         condition.condition_type == CLEANUP_VERIFIED_CONDITION
             && condition.status == crate::crd::SandboxConditionStatus::False
@@ -5782,10 +5867,10 @@ async fn record_post_proof_cleanup_failure(
         message,
     );
     if !patch_lease_status_fenced(ctx, lease, &next).await? {
-        debug!(lease = %lease.name_any(), reason, "post-proof cleanup failure checkpoint lost a status race");
+        debug!(lease = %lease.name_any(), reason, "cleanup stall checkpoint lost a status race");
         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
     }
-    warn!(lease = %lease.name_any(), reason, "post-proof cleanup remains incomplete");
+    warn!(lease = %lease.name_any(), reason, message, "Sandbox release cleanup remains incomplete");
     Ok(Action::requeue(retry))
 }
 
@@ -6104,8 +6189,13 @@ async fn cleanup_child_executions_after_proof(
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
             Ok(Some(execution_cleanup_checkpoint_action()))
         }
-        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation { stale: false } => {
             Ok(Some(Action::requeue(EXECUTION_CREATION_RETRY)))
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation { stale: true } => {
+            Box::pin(record_execution_creation_stall(lease, ctx))
+                .await
+                .map(Some)
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
             // This function runs only after exact target-absence proof. Reaching
@@ -7190,6 +7280,9 @@ async fn release_bound_child_composition(
                         ExecutionCleanupAdvance::Retry(after) => {
                             return Ok(Action::requeue(after));
                         }
+                        ExecutionCleanupAdvance::CreationStalled => {
+                            return Box::pin(record_execution_creation_stall(lease, ctx)).await;
+                        }
                         ExecutionCleanupAdvance::Quarantine(reason) => {
                             return quarantine_lease(lease, ctx, reason).await;
                         }
@@ -7744,8 +7837,15 @@ async fn finish_child_release_after_proof(
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
                 return Ok(execution_cleanup_checkpoint_action());
             }
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                stale: false,
+            } => {
                 return Ok(Action::requeue(EXECUTION_CREATION_RETRY));
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                stale: true,
+            } => {
+                return Box::pin(record_execution_creation_stall(lease, ctx)).await;
             }
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
             | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
@@ -10423,16 +10523,21 @@ fn pod_lease_triggers(pod: &Pod, leases: &[Arc<SandboxLease>]) -> Vec<ObjectRef<
         .collect()
 }
 
-/// Keep a footprint watch's object, logging an error instead of dropping it
-/// silently. The fallback poll still covers the lease while the watch backs off.
+/// Keep a watched object, logging an error instead of dropping it silently.
+/// `watch` names which controller's trigger failed; its backstop timer still
+/// covers the object while the watch backs off.
 fn watched_object<K>(
+    watch: &'static str,
     kind: &'static str,
     event: Result<K, kube::runtime::watcher::Error>,
 ) -> Option<K> {
     event
-        .inspect_err(|error| warn!(kind, error = %error, "Sandbox release footprint watch failed"))
+        .inspect_err(|error| warn!(watch, kind, error = %error, "Sandbox trigger watch failed"))
         .ok()
 }
+
+const RELEASE_FOOTPRINT_WATCH: &str = "release footprint";
+const POOL_WATCH: &str = "SandboxPool";
 
 /// Reconcile requests for leases whose Claim, Sandbox or Pod changed.
 fn release_footprint_triggers(
@@ -10450,7 +10555,7 @@ fn release_footprint_triggers(
     .default_backoff()
     .touched_objects()
     .filter_map(|claim| async move {
-        watched_object("SandboxClaim", claim)
+        watched_object(RELEASE_FOOTPRINT_WATCH, "SandboxClaim", claim)
             .as_ref()
             .and_then(claim_lease_trigger)
     })
@@ -10459,7 +10564,7 @@ fn release_footprint_triggers(
         .default_backoff()
         .touched_objects()
         .filter_map(|sandbox| async move {
-            watched_object("Sandbox", sandbox)
+            watched_object(RELEASE_FOOTPRINT_WATCH, "Sandbox", sandbox)
                 .as_ref()
                 .and_then(sandbox_lease_trigger)
         })
@@ -10474,7 +10579,7 @@ fn release_footprint_triggers(
     .default_backoff()
     .touched_objects()
     .flat_map(move |pod| {
-        let triggers = watched_object("Pod", pod)
+        let triggers = watched_object(RELEASE_FOOTPRINT_WATCH, "Pod", pod)
             .map(|pod| pod_lease_triggers(&pod, &leases.state()))
             .unwrap_or_default();
         futures::stream::iter(triggers)
@@ -10538,7 +10643,7 @@ fn pool_event_triggers(
             .default_backoff()
             .touched_objects()
             .filter_map(move |object| async move {
-                watched_object(kind, object)
+                watched_object(POOL_WATCH, kind, object)
                     .as_ref()
                     .and_then(|object| pool_owner_trigger(&object.metadata))
             })
@@ -10548,7 +10653,7 @@ fn pool_event_triggers(
         .default_backoff()
         .touched_objects()
         .flat_map(move |cluster_pool| {
-            let triggers = watched_object("ClusterPool", cluster_pool)
+            let triggers = watched_object(POOL_WATCH, "ClusterPool", cluster_pool)
                 .map(|cluster_pool| cluster_pool_triggers(&cluster_pool.name_any(), &pools.state()))
                 .unwrap_or_default();
             futures::stream::iter(triggers)
@@ -10747,11 +10852,66 @@ pub(crate) mod tests {
     fn a_creating_execution_is_rechecked_sooner_than_an_error() {
         assert_eq!(
             execution_cleanup_advance(
-                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation,
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                    stale: false
+                },
             ),
             ExecutionCleanupAdvance::Retry(EXECUTION_CREATION_RETRY)
         );
+        // A stale reservation stops polling fast and is recorded instead.
+        assert_eq!(
+            execution_cleanup_advance(
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation {
+                    stale: true
+                },
+            ),
+            ExecutionCleanupAdvance::CreationStalled
+        );
         assert!(EXECUTION_CREATION_RETRY <= std::time::Duration::from_secs(2));
+    }
+
+    /// A stale `Creating` reservation holding release is recorded as
+    /// `CleanupVerified=False` once, with the slow poll; a pass that finds it
+    /// already recorded writes nothing.
+    #[tokio::test]
+    async fn a_stale_creating_reservation_is_recorded_once() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+
+        assert_eq!(
+            record_execution_creation_stall(&lease, &ctx).await.unwrap(),
+            Action::requeue(EXECUTION_CLEANUP_RETRY)
+        );
+        let written: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(written.len(), 1);
+        let condition = written[0]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|condition| condition["type"] == CLEANUP_VERIFIED_CONDITION)
+            .expect("stall condition");
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], EXECUTION_CREATION_STALL_REASON);
+
+        let mut recorded = lease.clone();
+        recorded.status = Some(serde_json::from_value(written[0].clone()).unwrap());
+        assert_eq!(
+            record_execution_creation_stall(&recorded, &ctx)
+                .await
+                .unwrap(),
+            Action::requeue(EXECUTION_CLEANUP_RETRY)
+        );
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 1);
     }
 
     /// A Ready lease is looked at again no later than just after its expiry,
@@ -12174,11 +12334,31 @@ pub(crate) mod tests {
     /// whose WarmPool reports `warm_status`, with a fixed lease population.
     /// Returns the written status and the requeue action.
     async fn reconcile_management_pool_with(
+        pool: SandboxPool,
+        warm_status: serde_json::Value,
+    ) -> (serde_json::Value, Action) {
+        reconcile_management_pool_with_members(pool, warm_status, vec![]).await
+    }
+
+    /// As [`reconcile_management_pool_with`], with the WarmPool's live
+    /// Sandbox members.
+    async fn reconcile_management_pool_with_members(
         mut pool: SandboxPool,
         warm_status: serde_json::Value,
+        members: Vec<serde_json::Value>,
     ) -> (serde_json::Value, Action) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1",
+                "kind": "SandboxList",
+                "metadata": { "resourceVersion": "1" },
+                "items": members
+            })))
+            .mount(&server)
+            .await;
         let ctx = Arc::new(SandboxContext {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
@@ -12410,6 +12590,126 @@ pub(crate) mod tests {
         assert_eq!(refilling["status"], "True");
         assert_eq!(status["certification"]["phase"], "certified");
         assert_eq!(action, Action::requeue(POOL_STEADY_RECHECK));
+    }
+
+    /// A warm member that was created long ago and has gone unready (a crash,
+    /// a lost node) is a degraded pool, not a refill, even though the counts
+    /// look the same. Ready drops at once.
+    #[tokio::test]
+    async fn an_old_unready_warm_member_withdraws_ready() {
+        let old = chrono::Utc::now() - chrono::Duration::hours(1);
+        let member = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "warm-1",
+                "namespace": NS,
+                "uid": "warm-1-uid",
+                "generation": 1,
+                "creationTimestamp": old.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            },
+            "status": { "conditions": [{
+                "type": "Ready", "status": "False", "observedGeneration": 1
+            }]}
+        });
+        let (status, _) = reconcile_management_pool_with_members(
+            certified_pool(2),
+            serde_json::json!({ "replicas": 2, "readyReplicas": 1, "observedGeneration": 1 }),
+            vec![member],
+        )
+        .await;
+        let ready = condition_of(&status, POOL_READY_CONDITION).expect("Ready condition");
+        assert_eq!(ready["status"], "False");
+        assert!(condition_of(&status, POOL_REFILLING_CONDITION).is_none());
+    }
+
+    /// Unready members count as a refill only while every one of them is
+    /// younger than the grace; Ready and deleting members do not matter.
+    #[test]
+    fn only_young_unready_members_are_a_refill() {
+        let now = chrono::Utc::now();
+        let member = |age: i64, ready: bool, deleting: bool| {
+            let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1",
+                "kind": "Sandbox",
+                "metadata": {
+                    "name": "warm",
+                    "generation": 1,
+                    "creationTimestamp": (now - chrono::Duration::seconds(age))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                },
+                "status": { "conditions": [{
+                    "type": "Ready",
+                    "status": if ready { "True" } else { "False" },
+                    "observedGeneration": 1
+                }]}
+            }))
+            .unwrap();
+            if deleting {
+                object.metadata.deletion_timestamp = object.metadata.creation_timestamp.clone();
+            }
+            object
+        };
+        let fresh = |members: &[DynamicObject]| {
+            crate::controllers::sandbox_pool_certification::unready_warm_members_are_fresh(
+                members,
+                now,
+                POOL_REFILL_GRACE,
+            )
+        };
+        assert!(fresh(&[member(3600, true, false), member(5, false, false)]));
+        assert!(fresh(&[member(3600, false, true)]));
+        assert!(!fresh(&[member(3600, false, false)]));
+        assert!(!fresh(&[
+            member(5, false, false),
+            member(600, false, false)
+        ]));
+    }
+
+    /// A refill start recorded in the future (a skewed clock on a previous
+    /// leader) is clamped to now, so it cannot stretch the hold.
+    #[test]
+    fn a_future_refill_start_is_clamped_to_now() {
+        let mut pool = certified_pool(2);
+        let now = chrono::Utc::now();
+        pool.status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(SandboxCondition {
+                condition_type: POOL_REFILLING_CONDITION.into(),
+                status: SandboxConditionStatus::True,
+                reason: POOL_REFILLING_REASON.into(),
+                message: String::new(),
+                observed_generation: Some(POOL_GENERATION),
+                last_transition_time: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+            });
+        let warm_pool = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("kobe-agents".into()),
+                namespace: Some(NS.into()),
+                uid: Some("warm-pool-uid".into()),
+                generation: Some(1),
+                ..ObjectMeta::default()
+            },
+            data: serde_json::json!({
+                "spec": { "replicas": 2 },
+                "status": { "observedGeneration": 1 }
+            }),
+        };
+        let mut template = warm_pool.clone();
+        template.metadata.uid = Some("template-uid".into());
+        let observation = WarmPoolObservation {
+            replicas: 2,
+            ready_replicas: 1,
+            template,
+            warm_pool,
+        };
+        assert_eq!(
+            certified_pool_refill_started(&pool, &observation, now),
+            Some(now)
+        );
     }
 
     /// A refill that outlasts the grace is a degraded pool: Ready drops and
@@ -14746,7 +15046,8 @@ pub(crate) mod tests {
         let creating = serde_json::json!({
             "requestDigest": "e".repeat(64),
             "podUid": "pod-uid",
-            "reservedAt": "2020-01-01T00:00:00Z",
+            // Reserved just now: an in-flight exec, not a stall.
+            "reservedAt": chrono::Utc::now().to_rfc3339(),
             "creationState": "creating",
             "active": true
         });
@@ -18292,7 +18593,8 @@ current-context: child
         let creating = serde_json::json!({
             "requestDigest": "e".repeat(64),
             "podUid": "pod-uid",
-            "reservedAt": "2026-08-20T00:00:00Z",
+            // Reserved just now: an in-flight exec, not a stall.
+            "reservedAt": chrono::Utc::now().to_rfc3339(),
             "creationState": "creating",
             "active": true
         });

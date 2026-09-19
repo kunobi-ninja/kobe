@@ -1458,11 +1458,35 @@ pub enum ExecutionCleanupOutcome {
     /// A transient failure or a lost optimistic race. Errors are logged where
     /// they happen, so the caller only has to requeue.
     Retry,
-    /// A `Creating` reservation's record is not visible yet. Its writer binds
-    /// it within moments or the reaper eventually resolves the tombstone, so
-    /// the caller re-checks sooner than after an error.
-    AwaitCreation,
+    /// A `Creating` reservation's record is not visible yet. A young one is
+    /// normally bound by its writer within moments, so the caller re-checks
+    /// soon. A `stale` one (older than [`EXECUTION_CREATION_STALE`], or with an
+    /// unreadable reservation time) may never resolve: the reaper retires it
+    /// only after the setup grace, and only when its recorded writer is
+    /// provably gone. The caller must make that stall visible.
+    AwaitCreation {
+        stale: bool,
+    },
     Quarantine(QuarantineReason),
+}
+
+/// Age after which a `Creating` reservation stops being an in-flight exec and
+/// becomes a stall worth reporting.
+pub const EXECUTION_CREATION_STALE: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Whether a `Creating` reservation made at `reserved_at` is stale at `now`.
+fn creation_is_stale(reserved_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(reserved_at)
+        .map(|reserved| now - reserved.with_timezone(&chrono::Utc) >= EXECUTION_CREATION_STALE)
+        .unwrap_or(true)
+}
+
+fn await_creation(
+    entry: &crate::sandbox_access_ledger::ExecutionManifestEntry,
+) -> ExecutionCleanupOutcome {
+    ExecutionCleanupOutcome::AwaitCreation {
+        stale: creation_is_stale(&entry.reserved_at, chrono::Utc::now()),
+    }
 }
 
 /// Whether a terminal runner report for a started execution requires target
@@ -1862,7 +1886,7 @@ async fn cleanup_lease_executions_inner(
                         .await
                     }
                     crate::sandbox_access_ledger::ExecutionCreationState::Creating => {
-                        return ExecutionCleanupOutcome::AwaitCreation;
+                        return await_creation(entry);
                     }
                 };
                 return match retired {
@@ -1881,7 +1905,7 @@ async fn cleanup_lease_executions_inner(
             }
             // Neither age nor a strong 404 proves that an API request whose
             // response was lost cannot still create this exact object.
-            return ExecutionCleanupOutcome::AwaitCreation;
+            return await_creation(entry);
         };
         let execution_uid = match execution_identity_holds(&execution, lease) {
             Ok(uid) => uid,
@@ -3801,8 +3825,22 @@ mod tests {
                 &tokio_util::sync::CancellationToken::new(),
             )
             .await,
-            ExecutionCleanupOutcome::AwaitCreation
+            // The fixture reserved it weeks ago.
+            ExecutionCleanupOutcome::AwaitCreation { stale: true }
         );
+    }
+
+    /// A reservation is young for its first 30 seconds; after that, or with
+    /// an unreadable timestamp, it is a stall.
+    #[test]
+    fn a_creating_reservation_turns_stale_after_thirty_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!creation_is_stale("2026-09-01T00:00:45Z", now));
+        assert!(creation_is_stale("2026-09-01T00:00:30Z", now));
+        assert!(creation_is_stale("2026-09-01T00:00:00Z", now));
+        assert!(creation_is_stale("not a time", now));
     }
 
     /// The reaper skips a terminal record it already settled at the same
