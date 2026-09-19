@@ -1,8 +1,8 @@
 //! `kobe extend` — extend the TTL of an active lease.
 //!
-//! Thin client over `PATCH /v1/leases/{id}` for cluster leases and
-//! `PATCH /v1/sandbox-leases/{id}` for Sandbox leases. Both add the requested
-//! duration to the current expiry, subject to the policy's `max_extensions`
+//! Thin client over `PATCH /v1/leases/{id}`, which serves both lease kinds
+//! (see [`super::lease_request_paths`] for servers before v0.41.0). Both kinds
+//! add the requested duration to the current expiry, subject to the policy's `max_extensions`
 //! count and an absolute ceiling — `bound_at + max_ttl` for a cluster,
 //! `ready_at + max_ttl` for a Sandbox, whose runtime starts at readiness.
 
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::config::{CliConfig, ResolvedConfig};
 use super::leases::format_relative_time;
 use super::select::{OnAmbiguous, resolve_lease_id};
-use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, print_json, send_lease_request};
 
 /// Sandbox lease ids are self-identifying, so the client routes to the right
 /// endpoint without a lookup. Mirrors the server's `LEASE_ID_PREFIX`.
@@ -76,24 +76,9 @@ async fn extend_lease_response(
     lease_id: &str,
     by: &str,
 ) -> Result<ExtendResponse> {
-    let endpoint = config.endpoint.as_str();
-    let path = if is_sandbox_lease(lease_id) {
-        format!("/v1/sandbox-leases/{lease_id}")
-    } else {
-        format!("/v1/leases/{lease_id}")
-    };
     let body = serde_json::to_vec(&ExtendRequest { extend_ttl: by })?;
-    // Body signing is not yet supported server-side; sign with an empty body
-    // for now (matches `lease_create`).
-    let token = get_auth_header(config, "PATCH", &path, b"").await?;
-
-    let client = authed_client();
-    let response = with_auth(client.patch(format!("{endpoint}{path}")), &token)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .reaching(config)?;
+    let response =
+        send_lease_request(config, reqwest::Method::PATCH, lease_id, Some(&body)).await?;
 
     let status = response.status();
     if !status.is_success() {

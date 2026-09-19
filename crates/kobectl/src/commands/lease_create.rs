@@ -166,10 +166,11 @@ pub(crate) async fn create_lease_request(
 ///
 /// Retried: `503` with reason `admission_busy` (another create for the same
 /// identity held the admission lock, which CI matrix jobs sharing one identity
-/// hit routinely) and `429` carrying `Retry-After` (the API server's overload
-/// guard). Everything else is final. That includes the lease-quota `429`, which
-/// has no `Retry-After`, and pool pre-flight `503`s, whose `Retry-After` can be
-/// minutes away.
+/// hit routinely) and `429` carrying `Retry-After` (reason `rate_limited` for
+/// the per-principal admission budget, `server_busy` for the API server's
+/// overload guard). Everything else is final. That includes the lease-quota
+/// `429` (reason `quota_exhausted`, no `Retry-After`) and pool pre-flight
+/// `503`s, whose `Retry-After` can be minutes away.
 fn create_retry_base(status: u16, body: &str, retry_after: Option<&str>) -> Option<Duration> {
     let retry_after = retry_after
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -179,7 +180,14 @@ fn create_retry_base(status: u16, body: &str, retry_after: Option<&str>) -> Opti
             .ok()
             .and_then(|v| v["reason"].as_str().map(|r| r == "admission_busy"))
             .unwrap_or(false),
-        429 => retry_after.is_some(),
+        // Older servers send no reason on 429; Retry-After alone decides.
+        429 => {
+            retry_after.is_some()
+                && serde_json::from_str::<JsonValue>(body)
+                    .ok()
+                    .and_then(|v| v["reason"].as_str().map(|r| r != "quota_exhausted"))
+                    .unwrap_or(true)
+        }
         _ => false,
     };
     retryable.then(|| {
@@ -769,6 +777,10 @@ mod tests {
             create_retry_base(429, r#"{"error":"Server is under heavy load"}"#, Some("2")),
             Some(Duration::from_secs(2))
         );
+        assert_eq!(
+            create_retry_base(429, r#"{"reason":"rate_limited"}"#, Some("3")),
+            Some(Duration::from_secs(3))
+        );
 
         // Final answers: the lease quota (429 without Retry-After), a pool
         // that cannot serve the lease, and anything else.
@@ -779,6 +791,11 @@ mod tests {
                 None
             ),
             None
+        );
+        assert_eq!(
+            create_retry_base(429, r#"{"reason":"quota_exhausted"}"#, Some("1")),
+            None,
+            "a quota refusal is final even if a proxy adds Retry-After"
         );
         assert_eq!(
             create_retry_base(503, r#"{"reason":"capacity_blocked"}"#, Some("30")),
