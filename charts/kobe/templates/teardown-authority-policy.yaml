@@ -106,6 +106,17 @@ spec:
         request.resource.resource != 'clusterleases' || request.operation != 'UPDATE' || !has(oldObject.metadata.finalizers) || !oldObject.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention') || (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention')) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement) || (request.userInfo.username == {{ $controlPlaneUsername | quote }} && has(oldObject.metadata.annotations) && 'kobe.kunobi.ninja/release-quarantine' in oldObject.metadata.annotations && oldObject.metadata.annotations['kobe.kunobi.ninja/release-quarantine'] == oldObject.metadata.uid && has(oldObject.status) && has(oldObject.status.phase) && oldObject.status.phase == 'Quarantined')
       message: "receipt retention cannot be removed before exact acknowledgement"
       reason: Forbidden
+    # The release-quarantine grant must come from a person, never from either
+    # kobe identity. Otherwise the control plane could annotate and then drop
+    # teardown evidence on its own. Removing the annotation stays allowed.
+    - expression: >-
+        request.resource.resource != 'clusterleases' || !(request.userInfo.username in [{{ $controlPlaneUsername | quote }}, {{ $authorityUsername | quote }}]) || request.operation == 'DELETE' || !has(object.metadata.annotations) || !('kobe.kunobi.ninja/release-quarantine' in object.metadata.annotations) || (oldObject != null && has(oldObject.metadata.annotations) && 'kobe.kunobi.ninja/release-quarantine' in oldObject.metadata.annotations && oldObject.metadata.annotations['kobe.kunobi.ninja/release-quarantine'] == object.metadata.annotations['kobe.kunobi.ninja/release-quarantine'])
+      message: "only an operator may grant a quarantine release"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || !(request.userInfo.username in [{{ $controlPlaneUsername | quote }}, {{ $authorityUsername | quote }}]) || request.operation == 'DELETE' || !has(object.metadata.annotations) || !('kobe.kunobi.ninja/release-quarantine' in object.metadata.annotations) || (oldObject != null && has(oldObject.metadata.annotations) && 'kobe.kunobi.ninja/release-quarantine' in oldObject.metadata.annotations && oldObject.metadata.annotations['kobe.kunobi.ninja/release-quarantine'] == object.metadata.annotations['kobe.kunobi.ninja/release-quarantine'])
+      message: "only an operator may grant a quarantine release"
+      reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

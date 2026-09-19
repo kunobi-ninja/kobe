@@ -546,7 +546,43 @@ try {
 				: `retention drop ${why} failed for another reason: ${result.stderr}`,
 		);
 
+	// The grant must come from a person. The control plane can set phase
+	// Quarantined itself, so if it could also annotate, it alone could drop
+	// the evidence. Neither kobe identity may add or change the annotation.
+	const annotateRetainedAs = (username: string, value: string) =>
+		kubectlAs(
+			username,
+			[
+				"annotate",
+				"--overwrite",
+				"clusterlease",
+				retained,
+				"-n",
+				namespace,
+				`${releaseAnnotation}=${value}`,
+			],
+			true,
+		);
+	const selfGranted = await annotateRetainedAs(controlPlaneUsername, retainedUid);
+	assert(
+		selfGranted.exitCode !== 0 &&
+			selfGranted.stderr.includes(
+				"only an operator may grant a quarantine release",
+			),
+		selfGranted.exitCode === 0
+			? "control plane granted itself a quarantine release"
+			: `control plane annotation was rejected for another reason: ${selfGranted.stderr}`,
+	);
+	// The authority is already confined to status writes (RBAC and the
+	// status-only rule); any rejection will do.
+	const authorityGranted = await annotateRetainedAs(authorityUsername, retainedUid);
+	assert(
+		authorityGranted.exitCode !== 0,
+		"teardown authority granted a quarantine release",
+	);
+
 	await setRetainedPhase("Released");
+	// The admin identity of this context stands in for a person.
 	await annotateRetained(retainedUid);
 	retentionDenied(
 		await dropRetention(controlPlaneUsername),
@@ -563,6 +599,23 @@ try {
 	assert(
 		released.exitCode === 0,
 		`control plane could not release a quarantined lease: ${released.stderr}`,
+	);
+	// Withdrawing a grant is not a grant; the control plane may clear it.
+	const cleared = await kubectlAs(
+		controlPlaneUsername,
+		[
+			"annotate",
+			"clusterlease",
+			retained,
+			"-n",
+			namespace,
+			`${releaseAnnotation}-`,
+		],
+		true,
+	);
+	assert(
+		cleared.exitCode === 0,
+		`control plane could not clear a quarantine grant: ${cleared.stderr}`,
 	);
 
 	// The namespace firewall has its own binding; authority enforcement does

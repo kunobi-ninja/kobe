@@ -76,6 +76,8 @@ The instance and the lease are released separately. Releasing only the lease lea
 
 With `teardownAuthority.separate=true`, an admission policy normally stops anyone from dropping a lease's receipt finalizer before the receipt is acknowledged. It makes one exception: the operator's own service account may drop it from a `Quarantined` lease whose `kobe.kunobi.ninja/release-quarantine` annotation already equals the lease's UID. The annotation has to be in place before the operator's write, so set it first, as above.
 
+In that mode, apply the annotation as yourself, not as the kobe service account. The policy refuses any attempt by the kobe control plane or the teardown authority to add or change it on a `ClusterLease` or `ClusterInstance`. The control plane can mark a lease `Quarantined` on its own, so the grant is what keeps the release a human decision. Removing the annotation is allowed from any identity.
+
 A lease created for a Sandbox composition is not released this way. The operator posts `QuarantineReleaseRefused` once and keeps it, because its owning `SandboxLease` retires it.
 
 ## Rolling back past the `Exhausted` phase
