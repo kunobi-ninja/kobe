@@ -2,12 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::Secret;
 use kobe_state_machine::{
     BindingState as ModelBindingState, FinalizationDecision, InstancePhase as ModelInstancePhase,
     LeasePhase as ModelLeasePhase, exact_binding_finalization,
 };
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions};
+use kube::api::{
+    Api, DeleteParams, ListParams, PartialObjectMeta, Patch, PatchParams, Preconditions,
+};
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::watcher::Config;
 use kube::{Client, ResourceExt};
 use tokio::sync::RwLock;
@@ -488,6 +492,15 @@ pub struct LeaseContext<B: ClusterBackend> {
     /// Legacy backend factory kept during the ClusterInstance migration.
     #[allow(dead_code)]
     pub factory: Option<BackendFactory>,
+    /// ClusterInstances as the controller's instance watch last saw them.
+    /// Sizes the bind window (see [`bind_window`]). `None` outside the running
+    /// controller, which leaves the window at the queue head.
+    pub instances: Option<Store<ClusterInstance>>,
+    /// Wakes the leases a queue removal moved into the bind window. `None`
+    /// outside the running controller.
+    pub queue_wakes: Option<tokio::sync::mpsc::UnboundedSender<ObjectRef<ClusterLease>>>,
+    /// Consecutive failed reconciles per lease, for [`error_policy`] backoff.
+    pub failures: Mutex<HashMap<String, u32>>,
 }
 
 struct ActiveLeaseReconcileGuard<'a> {
@@ -521,6 +534,20 @@ pub enum LeaseError {
 }
 
 /// Start the lease reconciler controller.
+///
+/// Besides its own ClusterLease watch, the controller reconciles on:
+/// - ClusterInstance events: a lease named by an instance (binding or
+///   leaseRef, now or on the previous event), and the front of a pool's queue
+///   when one of its instances becomes free capacity. See
+///   [`instance_lease_triggers`].
+/// - connect-token Secret events, for NeverBound proof. See
+///   [`connect_token_lease_triggers`].
+/// - queue removals, which wake the leases that entered the bind window. See
+///   [`LeaseContext::dequeue`].
+///
+/// ClusterLease deletions are also evicted from the in-memory queue as they
+/// happen, so a deleted Pending lease does not hold a queue slot until the
+/// reaper's next sweep.
 pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     client: Client,
     namespace: &str,
@@ -531,6 +558,10 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     shutdown: CancellationToken,
 ) {
     let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let secrets: Api<PartialObjectMeta<Secret>> = Api::namespaced(client.clone(), namespace);
+    let (instance_store, instance_writer) = kube::runtime::reflector::store();
+    let (queue_wakes, queue_wake_requests) = tokio::sync::mpsc::unbounded_channel();
 
     let ctx = Arc::new(LeaseContext {
         client: client.clone(),
@@ -541,6 +572,9 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
         namespace: namespace.to_string(),
         authenticator,
         factory,
+        instances: Some(instance_store),
+        queue_wakes: Some(queue_wakes),
+        failures: Mutex::new(HashMap::new()),
     });
 
     rebuild_queues(&ctx).await;
@@ -554,8 +588,23 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
 
     info!("Starting lease controller");
 
-    let controller = Controller::new(leases, Config::default())
-        .run(reconcile_lease, error_policy, ctx)
+    let controller = Controller::new(leases.clone(), Config::default());
+    let lease_store = controller.store();
+    // Every extra watch is built with `default_backoff()`: `watches_with`
+    // retries without one, and a failing watch would spin.
+    let controller = controller
+        .reconcile_on(instance_lease_triggers(
+            instances,
+            instance_writer,
+            Some(lease_store),
+        ))
+        .reconcile_on(connect_token_lease_triggers(secrets))
+        .reconcile_on(lease_deletion_evictions(leases, ctx.clone()))
+        .reconcile_on(futures::stream::unfold(
+            queue_wake_requests,
+            |mut requests| async move { requests.recv().await.map(|lease| (lease, requests)) },
+        ))
+        .run(reconcile_lease_tracked, error_policy, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {
@@ -581,6 +630,348 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     }
 }
 
+/// Backstop for a Pending lease. Instance events and queue removals wake it;
+/// this only covers an event the watches missed.
+const PENDING_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop while a Recycling lease waits for its instance to be deleted. The
+/// instance watch delivers the delete.
+const RECYCLING_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+/// Retry after a failed ClusterInstance read while Recycling.
+const RECYCLING_READ_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
+/// Backstop while NeverBound proof waits for the connect token and every
+/// instance reference to go. The Secret and instance watches deliver both.
+const NEVER_BOUND_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Retry after an optimistic-concurrency conflict. The object changed under
+/// us; re-reading it right away is the whole fix.
+const CONFLICT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// First retry after a failed reconcile. Doubles per consecutive failure.
+const ERROR_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Longest retry after repeated failed reconciles.
+const ERROR_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl<B: ClusterBackend> LeaseContext<B> {
+    /// How many Pending leases of `pool` may attempt a reservation at once.
+    fn bind_window(&self, pool: &str) -> usize {
+        bind_window(
+            self.instances
+                .as_ref()
+                .map_or(0, |store| free_instances_in_pool(&store.state(), pool)),
+        )
+    }
+
+    /// Remove a lease from its pool's queue and wake the leases the removal
+    /// moved into the bind window. Without the wake, the next lease only
+    /// noticed on its backstop timer.
+    async fn dequeue(&self, pool: &str, lease_name: &str) {
+        let Some(removed_at) = remove_from_queue(&self.queues, pool, lease_name).await else {
+            return;
+        };
+        let window = self.bind_window(pool);
+        if removed_at >= window {
+            return;
+        }
+        let Some(wakes) = self.queue_wakes.as_ref() else {
+            return;
+        };
+        let names = {
+            let queues = self.queues.read().await;
+            queues
+                .get(pool)
+                .map(|queue| queue_window(queue, window))
+                .unwrap_or_default()
+        };
+        for name in names {
+            // The receiver only closes when the controller stops.
+            let _ = wakes.send(ObjectRef::new(&name).within(&self.namespace));
+        }
+    }
+}
+
+/// Number of Pending leases allowed to attempt reservation: one per free
+/// instance, and always at least the queue head.
+///
+/// A strict head-of-line queue let one unsatisfiable head (say, one that
+/// cannot accept any Ready instance's provenance) hold every other lease of
+/// the pool until its queue timeout, even with several instances Ready.
+/// Leases inside the window reserve concurrently. That is safe: the instance
+/// reservation is a resourceVersion-fenced status patch, so two leases racing
+/// for the same instance produce one `Reserved` and one `Occupied`, and the
+/// loser clears its own intent and waits. Leases outside the window still
+/// wait, so when capacity is scarcer than demand, priority order decides who
+/// binds. With a single free instance the window is the head alone, and an
+/// unsatisfiable head still blocks its pool until the queue timeout.
+fn bind_window(free_instances: usize) -> usize {
+    free_instances.max(1)
+}
+
+/// Whether `instance` is free capacity a Pending lease may reserve: Ready,
+/// carrying neither side of a reservation, and not being deleted.
+fn instance_is_free_capacity(instance: &ClusterInstance) -> bool {
+    // An instance under deletion is not free capacity, however idle its
+    // status looks. Between `deletionTimestamp` being set and the finalizer
+    // completing, phase can still read Ready with no leaseRef; binding there
+    // would hand a tenant a cluster that is going away, and
+    // `resolve_lease_binding` would then refuse the connection
+    // (`InstanceDeleting`) on a lease that already reached Bound and consumed
+    // pool capacity.
+    //
+    // A genuinely-free instance carries neither side of a reciprocal
+    // reservation. A stale full-status writer may revert phase or drop the
+    // display-only leaseRef while the authoritative binding survives;
+    // selecting that instance would manufacture a competing lease intent and
+    // risk clearing it before the adopted pair reaches verified teardown.
+    instance.metadata.deletion_timestamp.is_none()
+        && instance.status.as_ref().is_some_and(|status| {
+            status.phase == ClusterInstancePhase::Ready
+                && status.lease_ref.is_none()
+                && status.binding.is_none()
+        })
+}
+
+const POOL_LABEL: &str = "kobe.kunobi.ninja/pool";
+
+fn instance_pool(instance: &ClusterInstance) -> Option<&str> {
+    instance.labels().get(POOL_LABEL).map(String::as_str)
+}
+
+fn free_instances_in_pool(instances: &[Arc<ClusterInstance>], pool: &str) -> usize {
+    instances
+        .iter()
+        .filter(|instance| instance_pool(instance) == Some(pool))
+        .filter(|instance| instance_is_free_capacity(instance))
+        .count()
+}
+
+/// Names of the first `window` queued leases, in queue order.
+fn queue_window(queue: &[PendingLease], window: usize) -> Vec<String> {
+    queue
+        .iter()
+        .take(window)
+        .map(|pending| pending.lease_name.clone())
+        .collect()
+}
+
+/// Leases an instance names through its reservation (`binding` or `leaseRef`).
+fn leases_named_by_instance(instance: &ClusterInstance) -> std::collections::BTreeSet<String> {
+    let Some(status) = instance.status.as_ref() else {
+        return Default::default();
+    };
+    status
+        .binding
+        .iter()
+        .map(|binding| binding.lease.name.clone())
+        .chain(
+            status
+                .lease_ref
+                .iter()
+                .map(|reference| reference.name.clone()),
+        )
+        .collect()
+}
+
+/// Remembers which leases each instance named on its previous event.
+///
+/// An update that drops a reservation no longer names the lease, yet that
+/// lease may be the one waiting for it: NeverBound proof waits for every
+/// instance reference to go. Reporting the union of old and new names wakes
+/// it.
+#[derive(Default)]
+struct InstanceLeaseIndex {
+    named: HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl InstanceLeaseIndex {
+    fn applied(&mut self, instance: &ClusterInstance) -> std::collections::BTreeSet<String> {
+        let current = leases_named_by_instance(instance);
+        let mut touched = self
+            .named
+            .insert(instance.name_any(), current.clone())
+            .unwrap_or_default();
+        touched.extend(current);
+        touched
+    }
+
+    fn deleted(&mut self, instance: &ClusterInstance) -> std::collections::BTreeSet<String> {
+        let mut touched = self.named.remove(&instance.name_any()).unwrap_or_default();
+        touched.extend(leases_named_by_instance(instance));
+        touched
+    }
+}
+
+/// Pending leases to wake because `instance` is free capacity: the first
+/// `window` Pending leases of its pool, in queue order (priority, then age).
+fn pending_leases_to_wake(
+    instance: &ClusterInstance,
+    leases: &[Arc<ClusterLease>],
+    window: usize,
+) -> Vec<String> {
+    let Some(pool) = instance_pool(instance) else {
+        return Vec::new();
+    };
+    if !instance_is_free_capacity(instance) {
+        return Vec::new();
+    }
+    let mut pending: Vec<&ClusterLease> = leases
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|lease| lease.spec.pool_ref == pool)
+        .filter(|lease| lease.metadata.deletion_timestamp.is_none())
+        .filter(|lease| {
+            lease
+                .status
+                .as_ref()
+                .is_none_or(|status| status.phase == LeasePhase::Pending)
+        })
+        .collect();
+    pending.sort_by(|a, b| {
+        b.spec
+            .priority
+            .cmp(&a.spec.priority)
+            .then(created_at_for(a).cmp(&created_at_for(b)))
+    });
+    pending
+        .into_iter()
+        .take(window)
+        .map(|lease| lease.name_any())
+        .collect()
+}
+
+/// Reconcile requests for the leases an instance event concerns.
+///
+/// The instance watch is reflected into `writer`, whose store sizes the bind
+/// window. With `pending` set, an instance that became free capacity also
+/// wakes the front of its pool's queue; the release authority passes `None`
+/// because it never binds.
+fn instance_lease_triggers(
+    instances: Api<ClusterInstance>,
+    writer: kube::runtime::reflector::store::Writer<ClusterInstance>,
+    pending: Option<Store<ClusterLease>>,
+) -> impl futures::Stream<Item = ObjectRef<ClusterLease>> + Send + 'static {
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    let instance_store = writer.as_reader();
+    let mut index = InstanceLeaseIndex::default();
+    watcher(instances, Config::default())
+        .default_backoff()
+        .reflect(writer)
+        .filter_map(|event| async move {
+            event
+                .inspect_err(
+                    |error| warn!(error = %error, "ClusterInstance watch for leases failed"),
+                )
+                .ok()
+        })
+        .flat_map(move |event| {
+            let (instance, names) = match &event {
+                watcher::Event::Apply(instance) | watcher::Event::InitApply(instance) => {
+                    let mut names = index.applied(instance);
+                    if let (Some(leases), Some(pool)) = (pending.as_ref(), instance_pool(instance))
+                    {
+                        let window =
+                            bind_window(free_instances_in_pool(&instance_store.state(), pool));
+                        names.extend(pending_leases_to_wake(instance, &leases.state(), window));
+                    }
+                    (Some(instance), names)
+                }
+                watcher::Event::Delete(instance) => (Some(instance), index.deleted(instance)),
+                watcher::Event::Init | watcher::Event::InitDone => (None, Default::default()),
+            };
+            let namespace = instance.and_then(|instance| instance.namespace());
+            futures::stream::iter(
+                names
+                    .into_iter()
+                    .map(|name| lease_ref(&name, namespace.as_deref()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+}
+
+fn lease_ref(name: &str, namespace: Option<&str>) -> ObjectRef<ClusterLease> {
+    let reference = ObjectRef::new(name);
+    match namespace {
+        Some(namespace) => reference.within(namespace),
+        None => reference,
+    }
+}
+
+const CONNECT_SECRET_SUFFIX: &str = "-connect-token";
+
+/// The lease a connect-token Secret belongs to, from its deterministic name
+/// (see [`crate::api::connect::connect_secret_name`]).
+fn lease_for_connect_secret(secret_name: &str) -> Option<&str> {
+    secret_name
+        .strip_suffix(CONNECT_SECRET_SUFFIX)
+        .filter(|lease| !lease.is_empty())
+}
+
+/// Reconcile requests for leases whose connect-token Secret changed or went
+/// away. NeverBound proof waits for that Secret to be absent.
+///
+/// Watches metadata only: the namespace also holds kubeconfig Secrets, and
+/// their contents are none of this controller's business.
+fn connect_token_lease_triggers(
+    secrets: Api<PartialObjectMeta<Secret>>,
+) -> impl futures::Stream<Item = ObjectRef<ClusterLease>> + Send + 'static {
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    watcher(secrets, Config::default())
+        .default_backoff()
+        .touched_objects()
+        .filter_map(|secret| async move {
+            let secret = secret
+                .inspect_err(|error| warn!(error = %error, "connect-token Secret watch failed"))
+                .ok()?;
+            let lease = lease_for_connect_secret(secret.metadata.name.as_deref()?)?;
+            Some(lease_ref(lease, secret.metadata.namespace.as_deref()))
+        })
+}
+
+/// Evict deleted leases from the in-memory queue as the deletes happen.
+///
+/// The controller's own watch drops Deleted events, and a lease without a
+/// finalizer is gone before any reconcile can see it. Its queue entry stayed
+/// until the reaper's next sweep and, sorted oldest-first, usually held the
+/// head. The reaper sweep remains for deletes this watch misses across a
+/// relist. Yields nothing itself: [`LeaseContext::dequeue`] sends the wakes.
+fn lease_deletion_evictions<B: ClusterBackend + 'static>(
+    leases: Api<ClusterLease>,
+    ctx: Arc<LeaseContext<B>>,
+) -> impl futures::Stream<Item = ObjectRef<ClusterLease>> + Send + 'static {
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    watcher(leases, Config::default())
+        .default_backoff()
+        .filter_map(move |event| {
+            let ctx = ctx.clone();
+            async move {
+                match event {
+                    Ok(watcher::Event::Delete(lease)) => {
+                        ctx.dequeue(&lease.spec.pool_ref, &lease.name_any()).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "ClusterLease deletion watch failed"),
+                }
+                None
+            }
+        })
+}
+
+/// Reconcile, then forget the lease's failure count on success so the next
+/// failure starts the backoff over.
+async fn reconcile_lease_tracked<B: ClusterBackend + Clone + 'static>(
+    lease: Arc<ClusterLease>,
+    ctx: Arc<LeaseContext<B>>,
+) -> Result<Action, LeaseError> {
+    let name = lease.name_any();
+    let result = reconcile_lease(lease, ctx.clone()).await;
+    if result.is_ok()
+        && let Ok(mut failures) = ctx.failures.lock()
+    {
+        failures.remove(&name);
+    }
+    result
+}
+
 #[derive(Clone)]
 struct ReleaseAuthorityContext {
     client: Client,
@@ -600,12 +991,19 @@ pub async fn run_release_authority_controller(
     shutdown: CancellationToken,
 ) {
     let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let secrets: Api<PartialObjectMeta<Secret>> = Api::namespaced(client.clone(), namespace);
     let context = Arc::new(ReleaseAuthorityContext {
         client,
         namespace: namespace.to_string(),
     });
     info!("Starting isolated release-attempt authority");
+    // NeverBound proof waits on instance references and the connect-token
+    // Secret, so both wake the lease they concern.
+    let (_instance_store, instance_writer) = kube::runtime::reflector::store();
     let controller = Controller::new(leases, Config::default())
+        .reconcile_on(instance_lease_triggers(instances, instance_writer, None))
+        .reconcile_on(connect_token_lease_triggers(secrets))
         .run(
             reconcile_release_authority,
             release_authority_error_policy,
@@ -628,11 +1026,13 @@ async fn reconcile_release_authority(
 ) -> Result<Action, LeaseError> {
     let status = lease.status.clone().unwrap_or_default();
 
+    // Until the lease itself changes there is nothing to attest, and the
+    // lease watch delivers that change.
     if lease.spec.cleanup_mode != Some(CleanupMode::VerifiedDestroy)
         || !matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
         || lease.metadata.deletion_timestamp.is_some()
     {
-        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        return Ok(Action::await_change());
     }
     if lease
         .annotations()
@@ -644,7 +1044,7 @@ async fn reconcile_release_authority(
             .iter()
             .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
     {
-        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        return Ok(Action::await_change());
     }
 
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
@@ -671,7 +1071,7 @@ async fn reconcile_release_authority(
     if unbound_release_proof_is_complete_for_lease(&lease, &status)
         || status.teardown_receipt.is_some()
     {
-        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        return Ok(Action::await_change());
     }
     if status.unbound_release_verified_at.is_some() {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
@@ -681,7 +1081,9 @@ async fn reconcile_release_authority(
     let Some(verified_at) =
         authority_never_bound_observation(&ctx.client, &ctx.namespace, &lease).await?
     else {
-        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+        // The Secret and instance watches wake this lease when the token or an
+        // instance reference goes; the timer only backs them up.
+        return Ok(Action::requeue(NEVER_BOUND_BACKSTOP));
     };
     record_authority_unbound_release_proof(&leases, &lease, &status, attempt, &verified_at).await?;
     Ok(Action::requeue(std::time::Duration::from_secs(1)))
@@ -1019,15 +1421,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // Evict on the way out. This covers only the narrow race
                 // where the delete lands after this reconcile was
                 // dispatched (store hit) but before its apiserver GET.
-                // It is NOT the fix for deletes in general: kube-runtime
+                // Deletes in general produce no reconcile here: kube-runtime
                 // drives the controller from `applied_objects()`, which
-                // drops Deleted events, and requeues resolve through the
-                // reflector store — so a `kubectl delete` of a queued
-                // lease produces no reconcile here at all. The reaper's
-                // sweep (`prune_queues_against_live`) is what actually
-                // guarantees the entry goes away; this just gets there
-                // sooner when the race does happen.
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                // drops Deleted events. `lease_deletion_evictions` handles
+                // them as they happen, and the reaper's sweep
+                // (`prune_queues_against_live`) catches any that watch
+                // missed.
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return Ok(Action::await_change());
             }
             Err(err) => return Err(LeaseError::Kube(err)),
@@ -1046,12 +1446,12 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
         match sandbox_composition_allocation_gate(&ctx.client, &ns, &lease).await {
             SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized(_) => {}
             SandboxCompositionGate::NeedsMigration(identity) => {
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity)
                     .await;
             }
             SandboxCompositionGate::Closed(identity) => {
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return close_stale_sandbox_composition(
                     &ctx.client,
                     &ns,
@@ -1062,14 +1462,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 .await;
             }
             SandboxCompositionGate::Invalid => {
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
             }
             SandboxCompositionGate::Retry => {
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
             SandboxCompositionGate::LegacyBoundRecovery => {
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
             }
         }
@@ -1157,7 +1557,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     created_at_for(&lease),
                 ))
                 .await?;
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 return Ok(Action::requeue(std::time::Duration::from_secs(if bound {
                     60
                 } else {
@@ -1188,7 +1588,8 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 })
                 .unwrap_or_else(chrono::Utc::now);
 
-            let (is_head, position) = {
+            let window = ctx.bind_window(&lease.spec.pool_ref);
+            let (in_window, position) = {
                 let mut queues = ctx.queues.write().await;
                 let queue = queues
                     .entry(lease.spec.pool_ref.clone())
@@ -1212,8 +1613,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     .position(|p| p.lease_name == name)
                     .map(|p| p as u32 + 1)
                     .unwrap_or(0);
-                let head = queue.first().map(|h| h.lease_name == name).unwrap_or(false);
-                (head, pos)
+                (pos >= 1 && pos as usize <= window, pos)
             };
 
             let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
@@ -1240,10 +1640,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             {
                 Ok(queued) => queued,
                 Err(error) if optimistic_conflict(&error) => {
-                    return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                    return Ok(Action::requeue(CONFLICT_RETRY));
                 }
                 Err(error) => return Err(error.into()),
             };
+
+            // Event-driven wakes cover capacity and queue changes; the queue
+            // timeout is a clock deadline, so the backstop never sleeps past it.
+            let mut pending_requeue = PENDING_BACKSTOP;
 
             // Every pool shape gets a queue timeout, not just autoscaled ones
             // (#233). A fixed-size pool's `size` is as hard a ceiling as an
@@ -1271,20 +1675,30 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     crate::metrics::LEASE_QUEUE_WAIT_SECONDS
                         .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
                         .observe(age.num_milliseconds() as f64 / 1000.0);
-                    remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                    ctx.dequeue(&lease.spec.pool_ref, &name).await;
                     expire_lease_fenced(&leases_api, &queued_lease).await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                 }
+                if let Ok(remaining) = (timeout - age).to_std() {
+                    pending_requeue = pending_requeue.min(remaining.max(CONFLICT_RETRY));
+                }
             }
 
-            if !is_head {
-                debug!(lease = %name, position, "Not queue head, waiting for higher-priority leases");
-                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+            if !in_window {
+                debug!(lease = %name, position, window, "Outside the bind window, waiting for higher-priority leases");
+                return Ok(Action::requeue(pending_requeue));
             }
 
-            let reserved_binding =
-                reserve_ready_instance(&ctx.client, &ns, &queued_lease, ctx.factory.as_ref())
-                    .await?;
+            // Leases inside the window start from different Ready instances so
+            // concurrent reservations rarely collide (see `bind_window`).
+            let reserved_binding = reserve_ready_instance(
+                &ctx.client,
+                &ns,
+                &queued_lease,
+                ctx.factory.as_ref(),
+                position.saturating_sub(1) as usize,
+            )
+            .await?;
 
             if let Some(binding) = reserved_binding {
                 // The instance reservation is durable. If this final status
@@ -1294,7 +1708,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // Keep the retrying finalizer future off the already-large
                 // reconcile state machine's stack frame.
                 let bound = Box::pin(finalize_binding(&ctx, &ns, &binding, created_at)).await?;
-                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                ctx.dequeue(&lease.spec.pool_ref, &name).await;
                 Ok(Action::requeue(std::time::Duration::from_secs(if bound {
                     60
                 } else {
@@ -1312,7 +1726,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     .and_then(|p| p.status);
                 let (message, reason) = unsatisfiable_status(&lease.spec.pool_ref, &pool_status);
 
-                // Count the edge, not every ~5s reconcile of the same Pending
+                // Count the edge, not every reconcile of the same Pending
                 // lease. Request-time preflight rejections are counted in the
                 // API; here we count only entry into an unsatisfiable condition
                 // or a change of reason. Warming is a normal cold-start.
@@ -1336,7 +1750,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // lease: Bound=False (phase Pending) and Satisfiable=False
                 // carrying the unsatisfiable reason. Preserve lastTransitionTime
                 // against the on-disk conditions so a steady-state warm-up
-                // doesn't churn the timestamp on every ~5s requeue tick.
+                // doesn't churn the timestamp on every requeue.
                 let pending_status = ClusterLeaseStatus {
                     phase: LeasePhase::Pending,
                     message: Some(message.clone()),
@@ -1367,7 +1781,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     warn!(lease = %name, "Failed to write unsatisfiable status message (continuing): {e}");
                 }
 
-                Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                Ok(Action::requeue(pending_requeue))
             }
         }
 
@@ -1425,7 +1839,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
         LeasePhase::Released | LeasePhase::Expired => {
             info!(lease = %name, phase = %phase, "Processing lease termination");
 
-            remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+            ctx.dequeue(&lease.spec.pool_ref, &name).await;
 
             let mut terminal_lease = (*lease).clone();
             let mut terminal_status = status.clone();
@@ -1572,7 +1986,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             )
                             .await?
                             else {
-                                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                                return Ok(Action::requeue(NEVER_BOUND_BACKSTOP));
                             };
                             record_unbound_release_proof(
                                 &leases_api,
@@ -1688,6 +2102,39 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     });
                 }
                 Err(err) => {
+                    // A reservation intent that never reached Bound, whose
+                    // exact instance is gone, holds nothing: retire it. Before
+                    // this arm such leases re-reconciled every 30s forever.
+                    if token_delete_result.is_ok()
+                        && let Some(binding) = orphaned_standard_intent(
+                            &terminal_lease,
+                            &terminal_status,
+                            verified_cleanup,
+                        )
+                        && exact_bound_instance_is_gone(&ctx.client, &ns, binding).await?
+                    {
+                        info!(
+                            lease = %name,
+                            phase = %phase,
+                            instance = %binding.instance.name,
+                            reason = err.reason_code(),
+                            "Retiring terminal lease: its unbound reservation intent names an instance that no longer exists"
+                        );
+                        crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                            .with_label_values(&[
+                                terminal_lease.spec.pool_ref.as_str(),
+                                phase.to_string().as_str(),
+                            ])
+                            .inc();
+                        let terminal_lease =
+                            remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                                .await?;
+                        return Ok(if delete_lease_crd(&leases_api, &terminal_lease).await {
+                            Action::await_change()
+                        } else {
+                            Action::requeue(std::time::Duration::from_secs(15))
+                        });
+                    }
                     mark_binding_unverified(&leases_api, &terminal_lease, err.reason_code())
                         .await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(30)));
@@ -1788,7 +2235,10 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
         // belong to the verified-teardown controller work.
         LeasePhase::Quarantined => Ok(Action::requeue(std::time::Duration::from_secs(300))),
 
+        // The instance watch wakes this lease when its instance is deleted;
+        // the timers below only back that up.
         LeasePhase::Recycling => {
+            let mut read_failed = false;
             let cluster_gone = if let Some(binding) = &status.binding {
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
                 match instances_api.get(&binding.instance.name).await {
@@ -1808,6 +2258,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     Err(kube::Error::Api(ae)) if ae.code == 404 => true,
                     Err(e) => {
                         warn!(lease = %name, cluster = %binding.instance.name, "Failed to query ClusterInstance during recycle: {e}");
+                        read_failed = true;
                         false
                     }
                 }
@@ -1857,9 +2308,54 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 })
             } else {
                 debug!(lease = %name, "Lease in recycling phase, waiting for cluster cleanup");
-                Ok(Action::requeue(std::time::Duration::from_secs(15)))
+                Ok(Action::requeue(if read_failed {
+                    RECYCLING_READ_RETRY
+                } else {
+                    RECYCLING_BACKSTOP
+                }))
             }
         }
+    }
+}
+
+/// The binding of a terminal Standard lease that only ever held a reservation
+/// intent: it never reached Bound (no `clusterName`), and nothing else keeps it
+/// (no unconsumed receipt, no outer Sandbox retirement, not verified cleanup).
+///
+/// Such a lease is retireable once its exact instance is gone (see
+/// [`exact_bound_instance_is_gone`]). While that instance still exists with the
+/// same UID the lease stays: the instance may carry the reciprocal reservation,
+/// and the instance controller recycles a Leased instance whose exact lease is
+/// terminal.
+fn orphaned_standard_intent<'a>(
+    lease: &ClusterLease,
+    status: &'a ClusterLeaseStatus,
+    verified_cleanup: bool,
+) -> Option<&'a LeaseBinding> {
+    let binding = status.binding.as_ref()?;
+    (!verified_cleanup
+        && matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        && status.cluster_name.is_none()
+        && binding.cleanup_mode == CleanupMode::Standard
+        && lease.spec.cleanup_mode.unwrap_or_default() == CleanupMode::Standard
+        && !sandbox_composition_requires_outer_retirement(lease)
+        && !teardown_receipt_unconsumed(lease, status))
+    .then_some(binding)
+}
+
+/// Whether the exact instance a binding names no longer exists: 404, or the
+/// name now belongs to a replacement with another UID. Lookup failures are
+/// errors, never absence.
+async fn exact_bound_instance_is_gone(
+    client: &Client,
+    namespace: &str,
+    binding: &LeaseBinding,
+) -> Result<bool, LeaseError> {
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    match instances.get(&binding.instance.name).await {
+        Ok(instance) => Ok(instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str())),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -3342,11 +3838,18 @@ async fn persist_reserved_connect_token(
     }
 }
 
+/// Reserve a free Ready instance of the lease's pool, or resume the lease's
+/// existing reservation intent.
+///
+/// `start` rotates the candidate order: the lease at bind-window slot `start`
+/// tries the `start`-th Ready instance first, so leases reserving at the same
+/// time spread across instances instead of all racing for the first one.
 async fn reserve_ready_instance(
     client: &Client,
     namespace: &str,
     lease: &ClusterLease,
     factory: Option<&BackendFactory>,
+    start: usize,
 ) -> Result<Option<LeaseBinding>, LeaseError> {
     // A resumed intent is already authority-bearing. Revalidate it before the
     // idempotent receipt-fence metadata upgrade so a replaced outer pool can
@@ -3405,35 +3908,10 @@ async fn reserve_ready_instance(
     let instances = instances_api.list(&lp).await?;
     let mut ready: Vec<ClusterInstance> = instances
         .into_iter()
-        .filter(|instance| {
-            // An instance under deletion is not free capacity, however idle its
-            // status looks. Between `deletionTimestamp` being set and the
-            // finalizer completing, phase can still read Ready with no
-            // leaseRef; binding there would hand a tenant a cluster that is
-            // going away, and `resolve_lease_binding` would then refuse the
-            // connection (`InstanceDeleting`) on a lease that already reached
-            // Bound and consumed pool capacity.
-            if instance.metadata.deletion_timestamp.is_some() {
-                return false;
-            }
-            instance
-                .status
-                .as_ref()
-                // A genuinely-free instance is Ready and carries neither side
-                // of a reciprocal reservation. A stale full-status writer may
-                // revert phase or drop the display-only leaseRef while the
-                // authoritative binding survives; selecting that instance
-                // would manufacture a competing lease intent and risk clearing
-                // it before the adopted pair reaches verified teardown.
-                .map(|s| {
-                    s.phase == ClusterInstancePhase::Ready
-                        && s.lease_ref.is_none()
-                        && s.binding.is_none()
-                })
-                .unwrap_or(false)
-        })
+        .filter(instance_is_free_capacity)
         .collect();
     ready.sort_by_key(|instance| instance.name_any());
+    rotate_candidates(&mut ready, start);
 
     if ready.is_empty() {
         return Ok(None);
@@ -3535,6 +4013,14 @@ async fn reserve_ready_instance(
     }
 
     Ok(None)
+}
+
+/// Rotate `candidates` left by `start` (modulo its length).
+fn rotate_candidates<T>(candidates: &mut [T], start: usize) {
+    if !candidates.is_empty() {
+        let len = candidates.len();
+        candidates.rotate_left(start % len);
+    }
 }
 
 fn lease_uid_for(lease: &ClusterLease) -> Result<&str, LeaseError> {
@@ -4305,28 +4791,30 @@ async fn run_reaper<B: ClusterBackend>(
     }
 }
 
+/// Remove `lease_name` from `profile`'s queue, returning the position it held.
 async fn remove_from_queue(
     queues: &RwLock<HashMap<String, Vec<PendingLease>>>,
     profile: &str,
     lease_name: &str,
-) {
+) -> Option<usize> {
     let mut queues = queues.write().await;
-    if let Some(queue) = queues.get_mut(profile) {
-        queue.retain(|p| p.lease_name != lease_name);
-    }
+    let queue = queues.get_mut(profile)?;
+    let position = queue.iter().position(|p| p.lease_name == lease_name)?;
+    queue.remove(position);
+    Some(position)
 }
 
 /// Drop queue entries whose lease is no longer `Pending` on the
 /// apiserver, returning the names evicted.
 ///
-/// This is the authoritative cleanup, and it exists because the
-/// reconcile path cannot be. kube-runtime's `Controller` is driven by
-/// `applied_objects()`, which drops Deleted events, and every scheduled
-/// requeue resolves through the reflector store first — so once a
-/// deleted lease leaves the store, **no reconcile ever runs for it**.
-/// The 404 branch in `reconcile_lease` therefore only catches the narrow
-/// race where a delete lands mid-reconcile; a plain `kubectl delete` of
-/// a queued lease never reaches it.
+/// This is the backstop for [`lease_deletion_evictions`], which evicts
+/// deletes as they happen but cannot see one that landed while its watch
+/// was relisting. The reconcile path cannot do either: kube-runtime's
+/// `Controller` is driven by `applied_objects()`, which drops Deleted
+/// events, and every scheduled requeue resolves through the reflector
+/// store first — so once a deleted lease leaves the store, **no reconcile
+/// ever runs for it**. The 404 branch in `reconcile_lease` only catches
+/// the narrow race where a delete lands mid-reconcile.
 ///
 /// That matters because a stranded entry is not a leak but a deadlock:
 /// the queue is sorted oldest-first within a priority, so the ghost sits
@@ -4335,8 +4823,8 @@ async fn remove_from_queue(
 ///
 /// Sweeping from a LIST is safe against the obvious race — a lease
 /// created after the LIST could be pruned here, but the queue insert in
-/// `reconcile_lease` is idempotent and runs on a 5s requeue, so it
-/// re-inserts itself on the next pass. A transient drop self-heals; a
+/// `reconcile_lease` is idempotent, so it re-inserts itself on its next
+/// pass (at the latest, its Pending backstop). A transient drop self-heals; a
 /// permanent ghost does not.
 fn prune_queues_against_live(
     queues: &mut HashMap<String, Vec<PendingLease>>,
@@ -4576,13 +5064,40 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
     }
 }
 
+/// Retry a failed reconcile.
+///
+/// An optimistic-concurrency conflict retries after [`CONFLICT_RETRY`]: the
+/// lease changed under the reconcile and the next read settles it. Any other
+/// error backs off exponentially per lease (see [`error_backoff`]); a success
+/// resets the count (see [`reconcile_lease_tracked`]).
 fn error_policy<B: ClusterBackend>(
-    _lease: Arc<ClusterLease>,
+    lease: Arc<ClusterLease>,
     error: &LeaseError,
-    _ctx: Arc<LeaseContext<B>>,
+    ctx: Arc<LeaseContext<B>>,
 ) -> Action {
-    error!("Lease reconciliation error: {error}");
-    Action::requeue(std::time::Duration::from_secs(30))
+    if let LeaseError::Kube(kube_error) = error
+        && optimistic_conflict(kube_error)
+    {
+        debug!(lease = %lease.name_any(), "Lease reconcile lost an optimistic race; retrying");
+        return Action::requeue(CONFLICT_RETRY);
+    }
+    let failures = ctx.failures.lock().map_or(1, |mut failures| {
+        let count = failures.entry(lease.name_any()).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    });
+    let delay = error_backoff(failures);
+    error!(lease = %lease.name_any(), failures, retry_in = ?delay, "Lease reconciliation error: {error}");
+    Action::requeue(delay)
+}
+
+/// Delay before retry number `failures` (1-based): [`ERROR_BACKOFF_BASE`]
+/// doubled per earlier failure, capped at [`ERROR_BACKOFF_MAX`].
+fn error_backoff(failures: u32) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    ERROR_BACKOFF_BASE
+        .saturating_mul(1 << doublings)
+        .min(ERROR_BACKOFF_MAX)
 }
 
 #[cfg(test)]
@@ -4683,6 +5198,9 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
+            instances: None,
+            queue_wakes: None,
+            failures: Mutex::new(HashMap::new()),
         });
         (ctx, server)
     }
@@ -4782,7 +5300,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&ctx.client, "test-ns", &lease, None).await;
+        let result = reserve_ready_instance(&ctx.client, "test-ns", &lease, None, 0).await;
         assert!(
             matches!(result, Ok(None)),
             "an instance with a deletionTimestamp must not be reserved, got {result:?}"
@@ -4859,7 +5377,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&client, "test-ns", &lease, None).await;
+        let result = reserve_ready_instance(&client, "test-ns", &lease, None, 0).await;
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
@@ -4917,7 +5435,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&client, "test-ns", &lease, None).await;
+        let result = reserve_ready_instance(&client, "test-ns", &lease, None, 0).await;
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a binding must not be reserved, got {result:?}"
@@ -5393,7 +5911,7 @@ mod tests {
             .await;
 
         assert!(
-            reserve_ready_instance(&ctx.client, "test-ns", &lease, None)
+            reserve_ready_instance(&ctx.client, "test-ns", &lease, None, 0)
                 .await
                 .unwrap()
                 .is_none()
@@ -5432,7 +5950,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let resumed = reserve_ready_instance(&client, "test-ns", &lease, None)
+        let resumed = reserve_ready_instance(&client, "test-ns", &lease, None, 0)
             .await
             .unwrap();
         assert_eq!(resumed, Some(binding));
@@ -7069,12 +7587,52 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_error_policy_returns_requeue() {
+    async fn error_policy_backs_off_exponentially_per_lease() {
         let (ctx, _server) = test_lease_context().await;
         let lease = make_test_lease("err-lease", "Pending");
-        let error = LeaseError::Lifecycle(anyhow::anyhow!("test error"));
-        let action = error_policy(lease, &error, ctx);
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+        let error = || LeaseError::Lifecycle(anyhow::anyhow!("test error"));
+        let delays: Vec<Action> = (0..3)
+            .map(|_| error_policy(lease.clone(), &error(), ctx.clone()))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![
+                Action::requeue(std::time::Duration::from_secs(2)),
+                Action::requeue(std::time::Duration::from_secs(4)),
+                Action::requeue(std::time::Duration::from_secs(8)),
+            ]
+        );
+
+        // Another lease starts its own count.
+        let other = make_test_lease("other-lease", "Pending");
+        assert_eq!(
+            error_policy(other, &error(), ctx.clone()),
+            Action::requeue(ERROR_BACKOFF_BASE)
+        );
+    }
+
+    #[test]
+    fn error_backoff_caps_at_the_maximum() {
+        assert_eq!(error_backoff(1), ERROR_BACKOFF_BASE);
+        assert_eq!(error_backoff(9), ERROR_BACKOFF_MAX);
+        assert_eq!(error_backoff(u32::MAX), ERROR_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn error_policy_retries_optimistic_conflicts_immediately() {
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("conflict-lease", "Pending");
+        let conflict = LeaseError::Kube(api_error(409, "Conflict", vec![]));
+        for _ in 0..3 {
+            assert_eq!(
+                error_policy(lease.clone(), &conflict, ctx.clone()),
+                Action::requeue(CONFLICT_RETRY)
+            );
+        }
+        assert!(
+            ctx.failures.lock().unwrap().is_empty(),
+            "a lost race is not a failure and must not grow the backoff"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7355,8 +7913,8 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        // No ready cluster → requeue at 5s.
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        // No ready cluster: the instance watch wakes it when one appears.
+        assert_eq!(action, Action::requeue(PENDING_BACKSTOP));
     }
 
     // -----------------------------------------------------------------------
@@ -7666,7 +8224,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease, None)
+        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease, None, 0)
             .await
             .unwrap()
             .expect("ready instance should be reserved");
@@ -8346,7 +8904,7 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(15)));
+        assert_eq!(action, Action::requeue(RECYCLING_BACKSTOP));
     }
 
     // -----------------------------------------------------------------------
@@ -8389,8 +8947,8 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        // Cluster still present → requeue at 15s.
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(15)));
+        // Cluster still present: the instance watch reports its delete.
+        assert_eq!(action, Action::requeue(RECYCLING_BACKSTOP));
     }
 
     // -----------------------------------------------------------------------
@@ -8997,7 +9555,7 @@ mod tests {
             .get();
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(action, Action::requeue(PENDING_BACKSTOP));
 
         // The metric for the Failing-pool reason incremented.
         let after = crate::metrics::LEASE_UNSATISFIABLE_TOTAL
@@ -9209,5 +9767,422 @@ mod tests {
             Some(now),
             "transition time updated when Bound status flips"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Event-driven wakes: bind window, instance/secret mappers, queue eviction
+    // -----------------------------------------------------------------------
+
+    fn instance_fixture(name: &str, pool: &str, phase: &str) -> ClusterInstance {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "uid": format!("{name}-uid"),
+                "labels": { "kobe.kunobi.ninja/pool": pool }
+            },
+            "spec": {},
+            "status": { "phase": phase }
+        }))
+        .unwrap()
+    }
+
+    fn pending_lease_fixture(name: &str, priority: u32, created: &str) -> Arc<ClusterLease> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "uid": format!("{name}-uid"),
+                    "creationTimestamp": created
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "user@test.com" },
+                    "priority": priority
+                },
+                "status": { "phase": "Pending" }
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn pending(name: &str) -> PendingLease {
+        PendingLease {
+            lease_name: name.into(),
+            priority: 50,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn bind_window_is_one_per_free_instance_and_never_empty() {
+        assert_eq!(bind_window(0), 1, "the head always gets to try");
+        assert_eq!(bind_window(1), 1);
+        assert_eq!(bind_window(3), 3);
+    }
+
+    #[test]
+    fn free_instances_counts_only_unreserved_ready_instances_of_the_pool() {
+        let mut reserved = instance_fixture("reserved", "test-profile", "Ready");
+        reserved.status.as_mut().unwrap().lease_ref = Some(ResourceRef {
+            name: "someone".into(),
+            uid: Some("someone-uid".into()),
+        });
+        let mut deleting = instance_fixture("deleting", "test-profile", "Ready");
+        deleting.metadata.deletion_timestamp =
+            serde_json::from_value(serde_json::json!("2026-01-01T00:00:00Z")).unwrap();
+        let instances: Vec<Arc<ClusterInstance>> = vec![
+            instance_fixture("free-1", "test-profile", "Ready"),
+            instance_fixture("free-2", "test-profile", "Ready"),
+            instance_fixture("creating", "test-profile", "Creating"),
+            instance_fixture("other-pool", "other", "Ready"),
+            reserved,
+            deleting,
+        ]
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+        assert_eq!(free_instances_in_pool(&instances, "test-profile"), 2);
+    }
+
+    #[test]
+    fn rotate_candidates_spreads_window_slots_across_instances() {
+        let mut candidates = vec!["a", "b", "c"];
+        rotate_candidates(&mut candidates, 1);
+        assert_eq!(candidates, ["b", "c", "a"]);
+        let mut candidates = vec!["a", "b", "c"];
+        rotate_candidates(&mut candidates, 4);
+        assert_eq!(candidates, ["b", "c", "a"], "slots past the end wrap");
+        let mut empty: Vec<&str> = Vec::new();
+        rotate_candidates(&mut empty, 2);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_free_instance_wakes_the_front_of_its_pool_queue_in_priority_order() {
+        let leases = vec![
+            pending_lease_fixture("old-low", 10, "2026-01-01T00:00:00Z"),
+            pending_lease_fixture("new-high", 90, "2026-01-01T00:05:00Z"),
+            pending_lease_fixture("old-high", 90, "2026-01-01T00:01:00Z"),
+        ];
+        let free = instance_fixture("free", "test-profile", "Ready");
+        assert_eq!(
+            pending_leases_to_wake(&free, &leases, 2),
+            ["old-high", "new-high"]
+        );
+        assert_eq!(
+            pending_leases_to_wake(&free, &leases, 1),
+            ["old-high"],
+            "a window of one wakes only the head"
+        );
+    }
+
+    #[test]
+    fn an_instance_that_is_not_free_wakes_no_pending_lease() {
+        let leases = vec![pending_lease_fixture("waiting", 50, "2026-01-01T00:00:00Z")];
+        let creating = instance_fixture("creating", "test-profile", "Creating");
+        assert!(pending_leases_to_wake(&creating, &leases, 1).is_empty());
+        let other_pool = instance_fixture("elsewhere", "other", "Ready");
+        assert!(pending_leases_to_wake(&other_pool, &leases, 1).is_empty());
+    }
+
+    #[test]
+    fn instance_index_reports_a_lease_the_instance_stopped_naming() {
+        let binding = exact_test_binding("held", "held-uid");
+        let mut reserved = instance_fixture("pool-test-1", "test-profile", "Leased");
+        reserved.status.as_mut().unwrap().binding = Some(binding.clone());
+        reserved.status.as_mut().unwrap().lease_ref = Some(binding.lease.clone());
+        let released = instance_fixture("pool-test-1", "test-profile", "Ready");
+
+        let mut index = InstanceLeaseIndex::default();
+        assert_eq!(
+            index.applied(&reserved).into_iter().collect::<Vec<_>>(),
+            ["held"]
+        );
+        assert_eq!(
+            index.applied(&released).into_iter().collect::<Vec<_>>(),
+            ["held"],
+            "dropping the reservation must still wake the lease it named"
+        );
+        assert!(index.applied(&released).is_empty());
+    }
+
+    #[test]
+    fn instance_index_reports_the_lease_of_a_deleted_instance() {
+        let binding = exact_test_binding("recycling", "recycling-uid");
+        let mut instance = instance_fixture("pool-test-1", "test-profile", "Recycling");
+        instance.status.as_mut().unwrap().binding = Some(binding);
+        let mut index = InstanceLeaseIndex::default();
+        index.applied(&instance);
+        assert_eq!(
+            index.deleted(&instance).into_iter().collect::<Vec<_>>(),
+            ["recycling"]
+        );
+        assert!(index.named.is_empty(), "a deleted instance is forgotten");
+    }
+
+    #[test]
+    fn connect_secret_maps_back_to_its_lease() {
+        let name = crate::api::connect::connect_secret_name("lease-abc");
+        assert_eq!(lease_for_connect_secret(&name), Some("lease-abc"));
+        assert_eq!(lease_for_connect_secret("pool-test-1-kubeconfig"), None);
+        assert_eq!(lease_for_connect_secret("-connect-token"), None);
+    }
+
+    #[test]
+    fn queue_window_takes_the_front_in_order() {
+        let queue = vec![pending("a"), pending("b"), pending("c")];
+        assert_eq!(queue_window(&queue, 2), ["a", "b"]);
+        assert_eq!(queue_window(&queue, 5), ["a", "b", "c"]);
+    }
+
+    /// Removing the head used to leave the next lease waiting for its timer.
+    #[tokio::test]
+    async fn dequeue_of_the_head_wakes_the_new_head() {
+        let (ctx, _server) = test_lease_context().await;
+        let (wakes, mut woken) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Arc::new(LeaseContext {
+            queue_wakes: Some(wakes),
+            ..Arc::into_inner(ctx).expect("sole owner")
+        });
+        ctx.queues.write().await.insert(
+            "test-profile".into(),
+            vec![pending("head"), pending("next"), pending("last")],
+        );
+
+        ctx.dequeue("test-profile", "head").await;
+
+        assert_eq!(woken.try_recv().unwrap().name, "next");
+        assert!(woken.try_recv().is_err(), "only the bind window is woken");
+        let queue = ctx.queues.read().await["test-profile"].clone();
+        assert_eq!(queue_window(&queue, 5), ["next", "last"]);
+    }
+
+    #[tokio::test]
+    async fn dequeue_behind_the_window_wakes_nobody() {
+        let (ctx, _server) = test_lease_context().await;
+        let (wakes, mut woken) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Arc::new(LeaseContext {
+            queue_wakes: Some(wakes),
+            ..Arc::into_inner(ctx).expect("sole owner")
+        });
+        ctx.queues.write().await.insert(
+            "test-profile".into(),
+            vec![pending("head"), pending("next")],
+        );
+
+        ctx.dequeue("test-profile", "next").await;
+        ctx.dequeue("test-profile", "not-queued").await;
+
+        assert!(woken.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_from_queue_reports_the_position_it_removed() {
+        let queues = RwLock::new(HashMap::from([(
+            "test-profile".to_string(),
+            vec![pending("a"), pending("b")],
+        )]));
+        assert_eq!(
+            remove_from_queue(&queues, "test-profile", "b").await,
+            Some(1)
+        );
+        assert_eq!(remove_from_queue(&queues, "test-profile", "b").await, None);
+        assert_eq!(remove_from_queue(&queues, "missing", "a").await, None);
+    }
+
+    /// A Pending lease outside the bind window waits on a backstop timer; the
+    /// instance watch and queue wakes are what move it.
+    #[tokio::test]
+    async fn pending_lease_behind_the_head_waits_on_the_backstop() {
+        let (ctx, server) = test_lease_context().await;
+        ctx.queues
+            .write()
+            .await
+            .insert("test-profile".into(), vec![pending("ahead")]);
+        let mut lease = make_test_lease("behind", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/behind",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/behind/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+        // Any reservation attempt would list instances; a lease outside the
+        // window must not.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(PENDING_BACKSTOP));
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal Standard leases whose unbound reservation intent names a gone
+    // instance
+    // -----------------------------------------------------------------------
+
+    /// The int-pro leak shape: Expired, reservation intent recorded while
+    /// Pending, never Bound (no clusterName), Standard cleanup.
+    fn orphaned_intent_lease(name: &str) -> (Arc<ClusterLease>, LeaseBinding) {
+        let binding = exact_test_binding(name, &format!("{name}-uid"));
+        let mut lease = make_never_bound_expired_lease(name);
+        Arc::make_mut(&mut lease).status.as_mut().unwrap().binding = Some(binding.clone());
+        (lease, binding)
+    }
+
+    async fn mount_terminal_lease_reads(server: &MockServer, lease: &ClusterLease) {
+        let name = lease.name_any();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/namespaces/test-ns/secrets/{name}-connect-token"
+            )))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_lease_delete(server: &MockServer, lease: &ClusterLease, expected: u64) {
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+                lease.name_any()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .expect(expected)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn expired_unbound_intent_whose_instance_is_gone_is_retired() {
+        let (ctx, server) = test_lease_context().await;
+        let (lease, _) = orphaned_intent_lease("orphan-404");
+        mount_terminal_lease_reads(&server, &lease).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 1).await;
+
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(ctx.backend.call_count().delete, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_unbound_intent_whose_name_was_reused_is_retired() {
+        let (ctx, server) = test_lease_context().await;
+        let (lease, _) = orphaned_intent_lease("orphan-replaced");
+        mount_terminal_lease_reads(&server, &lease).await;
+        let mut replacement = exact_instance_for_binding(None, "Ready");
+        replacement["metadata"]["uid"] = serde_json::json!("replacement-uid");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replacement))
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 1).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+    }
+
+    /// While the exact instance exists it may carry the reservation, so the
+    /// lease stays as its handle.
+    #[tokio::test]
+    async fn expired_unbound_intent_whose_exact_instance_exists_is_kept() {
+        let (ctx, server) = test_lease_context().await;
+        let (lease, _) = orphaned_intent_lease("orphan-live");
+        mount_terminal_lease_reads(&server, &lease).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_instance_for_binding(None, "Ready")),
+            )
+            .mount(&server)
+            .await;
+        mount_lease_delete(&server, &lease, 0).await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn only_standard_never_bound_intents_are_retirement_candidates() {
+        let (lease, binding) = orphaned_intent_lease("candidate");
+        let status = lease.status.clone().unwrap();
+        assert_eq!(
+            orphaned_standard_intent(&lease, &status, false),
+            Some(&binding)
+        );
+        assert_eq!(
+            orphaned_standard_intent(&lease, &status, true),
+            None,
+            "verified cleanup keeps its receipt protocol"
+        );
+
+        let mut verified = (*lease).clone();
+        verified.spec.cleanup_mode = Some(CleanupMode::VerifiedDestroy);
+        let mut verified_status = status.clone();
+        verified_status.binding.as_mut().unwrap().cleanup_mode = CleanupMode::VerifiedDestroy;
+        assert_eq!(
+            orphaned_standard_intent(&verified, &verified_status, false),
+            None
+        );
+
+        let mut was_bound = status.clone();
+        was_bound.cluster_name = Some("pool-test-1".into());
+        assert_eq!(orphaned_standard_intent(&lease, &was_bound, false), None);
+
+        let mut no_binding = status.clone();
+        no_binding.binding = None;
+        assert_eq!(orphaned_standard_intent(&lease, &no_binding, false), None);
+
+        let mut recycling = status;
+        recycling.phase = LeasePhase::Recycling;
+        assert_eq!(orphaned_standard_intent(&lease, &recycling, false), None);
     }
 }
