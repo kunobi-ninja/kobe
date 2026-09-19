@@ -35,9 +35,22 @@ return kubeconfig with a short-lived client certificate
 
 The pool controller keeps enough `ClusterInstance` objects to satisfy `size` or `scaling.minReady`. The instance controller provisions and health-checks the backend. The lease controller binds, issues kubeconfig, and enforces release and expiry.
 
+Instance and lease move through these phases:
+
 ```
-Creating → Ready (warm) → Leased → Recycling → destroyed, replaced
+ClusterInstance:  Creating → Ready (warm) → Leased → Recycling → deleted, replacement created
+                                                         ↘ Quarantined
+
+ClusterLease:     Pending → Bound → Released / Expired → Recycling → deleted
+                                                             ↘ Quarantined
 ```
+
+- **Binding.** A `Pending` lease waits in the pool queue until a `Ready` instance is free. Binding reserves that one instance: the lease and the instance record the same binding, including the lease's `cleanupMode`. Teardown follows the recorded mode, so editing the lease later cannot change how its capacity is cleaned up.
+- **Standard cleanup** (the default). On release or expiry the backend deletes the instance's resources, the `ClusterInstance` is deleted, and the pool creates a replacement.
+- **VerifiedDestroy cleanup.** Teardown checks each resource recorded in the instance's creation manifest and writes a receipt to the lease. Only k3s supports it; other backends refuse the lease before binding. If absence cannot be proven, the instance and lease move to `Quarantined`. A quarantined instance is never rebound and still counts against pool capacity until an operator resolves it.
+- **Retention.** A `ClusterLease` is deleted once its instance is gone. A lease with a teardown receipt nobody has consumed yet is kept until it is, and a `Quarantined` lease stays until cleanup is proven. Terminal `SandboxLease` records are kept as an audit trail for 168 hours by default (`agentSandbox.leaseRetention` in the Helm chart, `KOBE_SANDBOX_LEASE_RETENTION` on the operator).
+
+An instance whose provisioning or bootstrap fails moves from `Creating` to `Failed` and is replaced. See [Pool lifecycle](/docs/how-it-works/pool-lifecycle) for each phase.
 
 ## Sandbox lease flow
 

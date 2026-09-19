@@ -13,13 +13,17 @@ are pluggable. Pick from what ships today.
 
 | Need | Backend | Status |
 |---|---|---|
-| Nested real clusters | `k3s` / `k0s` | Production default |
-| High density, low overhead | `vcluster` | Production |
-| Provider-managed real infra | `capi` | Available (no CI provider in-tree) |
+| Nested real clusters | `k3s` | Production default |
+| Nested real clusters on k0s | `k0s` | Supported; fewer operator checks than k3s |
+| High density, low overhead | `vcluster` | Supported; honors `cluster.version` only |
+| Provider-managed real infra | `capi` | Available; no CI coverage |
 | Full isolation, native fidelity | `pkobe` | Not available yet |
 | Proxy-based virtual clusters | `vkobe` (kobe-sync) | On hold |
 
-Configuration for each backend: [Backends](/docs/pools/backends).
+k3s is the only backend that implements verified teardown, drift detection
+across operator upgrades, and scheduling-blocked and crashloop detection. It
+is also the only backend whose CI leg can fail a release. The full
+capability table is in [Backends](/docs/pools/backends#choosing-a-backend).
 
 ## Density: vcluster
 
@@ -32,10 +36,18 @@ This backend inherits vcluster's syncer semantics and fidelity boundaries
 (cloud identity such as IRSA, syncer coverage, version skew). Tenants who need
 full cluster semantics should use k3s, k0s, or CAPI instead.
 
+vcluster reads only `cluster.version` from the pool's `spec.cluster`. Other
+fields such as `servers`, `persistence`, `taints`, and `placement` are
+accepted and ignored. Set chart values through `spec.backend.vcluster.values`.
+
 ## Isolation: k3s / k0s / CAPI
 
-Nested k3s and k0s are today's production path for real control planes and
-nodes. CAPI delegates to an infrastructure provider you already run.
+Nested k3s is the production path for real control planes and nodes. k0s
+provisions the same shape with the k0s distribution but lacks the k3s-only
+checks above and does not support `kubeletSharedMount` or `registryMirrors`.
+
+CAPI delegates to an infrastructure provider you already run. It ignores
+`spec.cluster` and has no CI leg, so validate it against your provider first.
 
 A native isolation runtime (pkobe) is tracked as
 [#23](https://github.com/kunobi-ninja/kobe/issues/23) / [#24](https://github.com/kunobi-ninja/kobe/issues/24).
