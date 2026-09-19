@@ -666,37 +666,31 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             // An operator released this quarantined instance on purpose (see
             // `crate::quarantine`). Skip the evidence gate, which would only
             // re-quarantine it, and run the ordinary teardown below.
-            let override_release = status.phase == ClusterInstancePhase::Quarantined
-                && crate::quarantine::release_requested(&instance.metadata);
+            if status.phase == ClusterInstancePhase::Quarantined
+                && crate::quarantine::release_requested(&instance.metadata)
+            {
+                return Box::pin(release_quarantined_instance_finalizer(
+                    &ctx,
+                    &config,
+                    &instance,
+                    &name,
+                    &ns,
+                    &instances_api,
+                ))
+                .await;
+            }
             // Receipt-required teardown decides here, not after the fact: the
             // finalizer is the last handle on this capacity, and releasing it
             // on an accepted DELETE is exactly what makes "cleanup complete" a
             // guess. A lease asking for VerifiedDestroy must produce evidence
             // before the handle goes.
-            if !override_release
-                && let Some(outcome) = verified_teardown_gate(&ctx, &instance, &name, &ns).await
-            {
+            if let Some(outcome) = verified_teardown_gate(&ctx, &instance, &name, &ns).await {
                 return outcome;
             }
 
             match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
                 Ok(()) => {
                     cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
-                    if override_release {
-                        warn!(
-                            instance = %name,
-                            owner = %owner,
-                            "QUARANTINE OVERRIDE: releasing instance finalizer without verified teardown evidence"
-                        );
-                        crate::quarantine::record_release(
-                            &ctx.client,
-                            &instance.object_ref(&()),
-                            crate::quarantine::QuarantinedKind::Instance,
-                            owner,
-                            "released by operator override without verified teardown evidence; backend delete ran".into(),
-                        )
-                        .await;
-                    }
                     remove_finalizer(&instances_api, &instance, INSTANCE_FINALIZER).await?;
                     return Ok(Action::await_change());
                 }
@@ -1488,6 +1482,180 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         }
         _ => Ok(Action::requeue(std::time::Duration::from_secs(30))),
     }
+}
+
+/// Set on a quarantined instance released by override once its backend delete
+/// was accepted, to the RFC3339 time of that delete. The delete is not
+/// repeated while it is present, and the absence wait is measured from it.
+pub(crate) const QUARANTINE_RELEASE_BACKEND_DELETED_ANNOTATION: &str =
+    "kobe.kunobi.ninja/quarantine-release-backend-deleted-at";
+
+/// How long an override release waits for the backend to report its
+/// footprint absent before dropping the finalizer anyway.
+const QUARANTINE_RELEASE_ABSENCE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(10);
+
+/// How often an override release re-checks backend absence.
+const QUARANTINE_RELEASE_ABSENCE_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What the override release does with the finalizer after the backend
+/// delete was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideAbsence {
+    /// The backend observed its footprint absent.
+    Absent,
+    /// Still present or not yet provable; check again.
+    Wait,
+    /// Not proven absent within [`QUARANTINE_RELEASE_ABSENCE_TIMEOUT`].
+    TimedOut,
+    /// The backend cannot observe absence for this instance (no creation
+    /// manifest, or no absence check for its backend).
+    Unobservable,
+}
+
+/// Decide the next step from what the backend reported (`None`: it cannot
+/// observe) and when the backend delete was accepted.
+fn override_absence(
+    observed_absent: Option<bool>,
+    deleted_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OverrideAbsence {
+    match observed_absent {
+        None => OverrideAbsence::Unobservable,
+        Some(true) => OverrideAbsence::Absent,
+        Some(false) if now - deleted_at >= QUARANTINE_RELEASE_ABSENCE_TIMEOUT => {
+            OverrideAbsence::TimedOut
+        }
+        Some(false) => OverrideAbsence::Wait,
+    }
+}
+
+/// Ask the backend whether the footprint recorded in the creation manifest is
+/// gone. Read-only. `None` when it cannot tell.
+async fn backend_reports_absent<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+) -> Option<bool> {
+    let manifest = instance.status.as_ref()?.creation_manifest.as_ref()?;
+    let attempt = "quarantine-release";
+    let checks = if ctx.factory.is_some() {
+        resolve_verified_backend(ctx, instance)
+            .await?
+            .verify_absent_manifest(name, namespace, manifest, attempt)
+            .await
+    } else {
+        ctx.backend
+            .verify_absent_manifest(name, namespace, manifest, attempt)
+            .await
+    }
+    .ok()?;
+    Some(checks.iter().all(|check| {
+        matches!(
+            check.result,
+            crate::crd::CheckResult::Verified | crate::crd::CheckResult::NotApplicable
+        )
+    }))
+}
+
+/// Finalizer path for a quarantined instance an operator released by
+/// annotation (see [`crate::quarantine`]). Skips the evidence gate, which
+/// would only re-quarantine it.
+///
+/// 1. Runs the ordinary backend delete once, then stamps
+///    [`QUARANTINE_RELEASE_BACKEND_DELETED_ANNOTATION`] so a later pass does
+///    not repeat it.
+/// 2. Waits until the backend reports its footprint absent, for up to
+///    [`QUARANTINE_RELEASE_ABSENCE_TIMEOUT`]. Dropping the finalizer frees
+///    the instance name and its CIDRClaim, so a replacement could reuse both
+///    while the old namespace is still terminating.
+/// 3. Drops the finalizer, and only then records the release, so a failed
+///    write does not count or announce a release that did not happen.
+async fn release_quarantined_instance_finalizer<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+    instances_api: &Api<ClusterInstance>,
+) -> Result<Action, InstanceError> {
+    let owner = crate::quarantine::pool_label(instance.spec.pool_ref.as_ref());
+    let deleted_at = instance
+        .annotations()
+        .get(QUARANTINE_RELEASE_BACKEND_DELETED_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc));
+    let Some(deleted_at) = deleted_at else {
+        if let Err(error) = delete_instance_backend(ctx, config, instance, name, namespace).await {
+            warn!(
+                instance = %name,
+                error = %format!("{error:#}"),
+                "QUARANTINE OVERRIDE: backend delete failed; will retry"
+            );
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+        cleanup_orphan_projected_resources(&ctx.client, name, namespace).await;
+        let (Some(uid), Some(resource_version)) = (
+            instance.metadata.uid.as_deref(),
+            instance.resource_version(),
+        ) else {
+            return Ok(Action::requeue(QUARANTINE_RELEASE_ABSENCE_RECHECK));
+        };
+        // The release annotation is present, so the map exists.
+        let key = QUARANTINE_RELEASE_BACKEND_DELETED_ANNOTATION.replace('/', "~1");
+        let patch = crate::controllers::lease::json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            {
+                "op": "add",
+                "path": format!("/metadata/annotations/{key}"),
+                "value": chrono::Utc::now().to_rfc3339()
+            }
+        ]));
+        tolerate_lost_race(
+            instances_api
+                .patch(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+                .await,
+            name,
+            "quarantine_override_mark_deleted",
+        )?;
+        return Ok(Action::requeue(QUARANTINE_RELEASE_ABSENCE_RECHECK));
+    };
+
+    let observed = backend_reports_absent(ctx, instance, name, namespace).await;
+    match override_absence(observed, deleted_at, chrono::Utc::now()) {
+        OverrideAbsence::Wait => {
+            debug!(instance = %name, "QUARANTINE OVERRIDE: waiting for the backend to report absence");
+            return Ok(Action::requeue(QUARANTINE_RELEASE_ABSENCE_RECHECK));
+        }
+        OverrideAbsence::Absent => {}
+        OverrideAbsence::TimedOut => warn!(
+            instance = %name,
+            owner,
+            "QUARANTINE OVERRIDE: backend did not report absence within the timeout; releasing the finalizer anyway"
+        ),
+        OverrideAbsence::Unobservable => warn!(
+            instance = %name,
+            owner,
+            "QUARANTINE OVERRIDE: backend cannot observe absence for this instance; releasing the finalizer on the accepted delete"
+        ),
+    }
+    remove_finalizer(instances_api, instance, INSTANCE_FINALIZER).await?;
+    warn!(
+        instance = %name,
+        owner,
+        "QUARANTINE OVERRIDE: released instance finalizer without verified teardown evidence"
+    );
+    crate::quarantine::record_release(
+        &ctx.client,
+        &instance.object_ref(&()),
+        crate::quarantine::QuarantinedKind::Instance,
+        owner,
+        "released by operator override without verified teardown evidence; backend delete ran"
+            .into(),
+    )
+    .await;
+    Ok(Action::await_change())
 }
 
 /// Whether a terminal (Failed/Unhealthy) *standalone* instance has been in that
@@ -6977,6 +7145,7 @@ mod tests {
     fn quarantined_instance(
         deleting: bool,
         annotation: Option<&str>,
+        backend_deleted_at: Option<&str>,
     ) -> (Arc<ClusterInstance>, crate::crd::LeaseBinding) {
         let binding = teardown_surface_binding();
         let mut metadata = serde_json::json!({
@@ -6994,6 +7163,10 @@ mod tests {
             metadata["annotations"] = serde_json::json!({
                 crate::quarantine::RELEASE_QUARANTINE_ANNOTATION: value
             });
+        }
+        if let Some(at) = backend_deleted_at {
+            metadata["annotations"][QUARANTINE_RELEASE_BACKEND_DELETED_ANNOTATION] =
+                serde_json::json!(at);
         }
         let instance = serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -7040,7 +7213,7 @@ mod tests {
     #[tokio::test]
     async fn quarantined_instance_without_override_is_held() {
         let (ctx, server, backend) = test_instance_context().await;
-        let (instance, binding) = quarantined_instance(false, None);
+        let (instance, binding) = quarantined_instance(false, None, None);
         mount_lease_gone(&server, &binding).await;
         Mock::given(method("PATCH"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
@@ -7061,7 +7234,7 @@ mod tests {
     #[tokio::test]
     async fn quarantine_override_for_another_uid_is_ignored() {
         let (ctx, server, backend) = test_instance_context().await;
-        let (instance, binding) = quarantined_instance(false, Some("some-other-uid"));
+        let (instance, binding) = quarantined_instance(false, Some("some-other-uid"), None);
         mount_lease_gone(&server, &binding).await;
         Mock::given(method("PATCH"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
@@ -7082,7 +7255,7 @@ mod tests {
     async fn quarantine_override_deletes_the_exact_instance() {
         let (ctx, server, backend) = test_instance_context().await;
         let uid = teardown_surface_binding().instance.uid;
-        let (instance, binding) = quarantined_instance(false, Some(&uid));
+        let (instance, binding) = quarantined_instance(false, Some(&uid), None);
         Mock::given(method("DELETE"))
             .and(path(format!(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
@@ -7102,44 +7275,129 @@ mod tests {
         assert_eq!(backend.call_count().delete, 0);
     }
 
-    /// On the finalizer path the override skips the evidence gate, runs the
-    /// backend delete, and releases the finalizer.
+    fn instance_root_path(binding: &crate::crd::LeaseBinding) -> String {
+        format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+            binding.instance.name
+        )
+    }
+
+    /// First pass on the finalizer path: the override skips the evidence
+    /// gate, runs the backend delete once, and stamps that it did. The
+    /// finalizer stays and nothing is counted yet.
     #[tokio::test]
-    async fn quarantine_override_runs_teardown_and_releases_the_finalizer() {
+    async fn quarantine_override_deletes_the_backend_once_before_the_finalizer() {
         let (ctx, server, backend) = test_instance_context().await;
         let uid = teardown_surface_binding().instance.uid;
-        let (instance, binding) = quarantined_instance(true, Some(&uid));
+        let (instance, binding) = quarantined_instance(true, Some(&uid), None);
         mount_lease_gone(&server, &binding).await;
         Mock::given(method("PATCH"))
-            .and(path(format!(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
-                binding.instance.name
-            )))
+            .and(path(instance_root_path(&binding)))
+            .and(body_string_contains(
+                "quarantine-release-backend-deleted-at",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
-            .and(path(format!(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}/status",
-                binding.instance.name
-            )))
+            .and(path(instance_root_path(&binding)))
+            .and(body_string_contains("/metadata/finalizers"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
             .expect(0)
             .mount(&server)
             .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{}/status", instance_root_path(&binding))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(QUARANTINE_RELEASE_ABSENCE_RECHECK));
+        assert_eq!(backend.call_count().delete, 1);
+    }
+
+    /// Later pass: the delete is not repeated. With no absence check
+    /// available the finalizer goes, and only then is the release counted.
+    #[tokio::test]
+    async fn quarantine_override_releases_the_finalizer_and_counts_once() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let uid = teardown_surface_binding().instance.uid;
+        let deleted_at = chrono::Utc::now().to_rfc3339();
+        let (instance, binding) = quarantined_instance(true, Some(&uid), Some(&deleted_at));
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .and(path(instance_root_path(&binding)))
+            .and(body_string_contains("/metadata/finalizers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .expect(1)
+            .mount(&server)
+            .await;
         let before = crate::metrics::QUARANTINE_RELEASES_TOTAL
-            .with_label_values(&["instance-surface", "instance"])
+            .with_label_values(&[crate::quarantine::STANDALONE_POOL_LABEL, "instance"])
             .get();
 
         let action = reconcile_instance(instance, ctx).await.unwrap();
         assert_eq!(action, Action::await_change());
-        assert_eq!(backend.call_count().delete, 1);
+        assert_eq!(backend.call_count().delete, 0, "backend delete repeated");
         assert_eq!(
             crate::metrics::QUARANTINE_RELEASES_TOTAL
-                .with_label_values(&["instance-surface", "instance"])
+                .with_label_values(&[crate::quarantine::STANDALONE_POOL_LABEL, "instance"])
                 .get(),
             before + 1
+        );
+    }
+
+    /// A refused finalizer write is not a release: the reconcile fails before
+    /// anything is recorded, and the retry does not re-run the backend delete.
+    #[tokio::test]
+    async fn quarantine_override_does_not_record_a_failed_finalizer_release() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let uid = teardown_surface_binding().instance.uid;
+        let deleted_at = chrono::Utc::now().to_rfc3339();
+        let (instance, binding) = quarantined_instance(true, Some(&uid), Some(&deleted_at));
+        mount_lease_gone(&server, &binding).await;
+        Mock::given(method("PATCH"))
+            .and(path(instance_root_path(&binding)))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Forbidden", "code": 403
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/apis/events.k8s.io/v1/namespaces/test-ns/events"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        assert!(reconcile_instance(instance, ctx).await.is_err());
+        assert_eq!(backend.call_count().delete, 0);
+    }
+
+    #[test]
+    fn override_waits_for_absence_within_a_bounded_time() {
+        let deleted = chrono::Utc::now();
+        let soon = deleted + chrono::Duration::minutes(1);
+        let late = deleted + QUARANTINE_RELEASE_ABSENCE_TIMEOUT;
+        assert_eq!(
+            override_absence(Some(true), deleted, soon),
+            OverrideAbsence::Absent
+        );
+        assert_eq!(
+            override_absence(Some(false), deleted, soon),
+            OverrideAbsence::Wait
+        );
+        assert_eq!(
+            override_absence(Some(false), deleted, late),
+            OverrideAbsence::TimedOut
+        );
+        assert_eq!(
+            override_absence(None, deleted, soon),
+            OverrideAbsence::Unobservable
         );
     }
 
@@ -7147,7 +7405,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_quarantined_instance_without_override_keeps_its_finalizer() {
         let (ctx, server, backend) = test_instance_context().await;
-        let (instance, binding) = quarantined_instance(true, None);
+        let (instance, binding) = quarantined_instance(true, None, None);
         mount_lease_gone(&server, &binding).await;
         Mock::given(method("PATCH"))
             .and(path(format!(

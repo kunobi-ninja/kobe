@@ -914,6 +914,41 @@ pub static QUARANTINED_OLDEST_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new
     .unwrap()
 });
 
+/// Drop the quarantine gauge series of pools that no longer exist.
+///
+/// The pool reconcile sets them, but a deleted pool is never reconciled
+/// again, so its last value would stay on `/metrics` until restart and keep a
+/// `kobe_quarantined_oldest_age_seconds > 3600` alert firing for nothing.
+pub fn prune_quarantine_gauges(live_pools: &std::collections::HashSet<String>) {
+    use prometheus::core::Collector;
+    for gauge in [&*QUARANTINED, &*QUARANTINED_OLDEST_AGE_SECONDS] {
+        let stale: Vec<std::collections::HashMap<String, String>> = gauge
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .filter(|labels| {
+                labels
+                    .get("profile")
+                    .is_some_and(|profile| !live_pools.contains(profile))
+            })
+            .collect();
+        for labels in &stale {
+            let labels: std::collections::HashMap<&str, &str> = labels
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let _ = gauge.remove(&labels);
+        }
+    }
+}
+
 /// Quarantined objects released by the operator override annotation, without
 /// verified teardown evidence. Keyed by pool and `kind` (`lease`, `instance`).
 /// Every increment is a manual decision to trust capacity whose cleanup was
@@ -1005,6 +1040,11 @@ pub enum LeaseUnsatisfiableReason {
     /// Healthy-but-empty warm pool: clusters are still coming up. Transient;
     /// the lease should bind shortly. (Returned as 202, not 503.)
     Warming,
+    /// Pool phase is `Exhausted`: every cluster is leased and the lease waits
+    /// for one to end. Normal under load, so kept apart from
+    /// `CapacityBlocked` and its alerts. The create pre-flight never refuses
+    /// on it; the lease is queued.
+    AtCapacity,
 }
 
 impl LeaseUnsatisfiableReason {
@@ -1015,7 +1055,16 @@ impl LeaseUnsatisfiableReason {
             Self::CapacityBlocked => "capacity_blocked",
             Self::Degraded => "degraded",
             Self::Warming => "warming",
+            Self::AtCapacity => "at_capacity",
         }
+    }
+
+    /// Transient reasons clear on their own as leases end or clusters come
+    /// up. A pool at its ceiling alternates between them while a recycled
+    /// slot is recreated, so moving from one to the other is not a new
+    /// unsatisfiable event.
+    pub const fn is_transient(self) -> bool {
+        matches!(self, Self::Warming | Self::AtCapacity)
     }
 
     /// PascalCase reason for a Kubernetes status `Condition` — K8s convention
@@ -1027,6 +1076,7 @@ impl LeaseUnsatisfiableReason {
             Self::CapacityBlocked => "CapacityBlocked",
             Self::Degraded => "Degraded",
             Self::Warming => "Warming",
+            Self::AtCapacity => "AtCapacity",
         }
     }
 }
@@ -1912,6 +1962,36 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_gauges_of_deleted_pools_are_dropped() {
+        use prometheus::core::Collector;
+        QUARANTINED
+            .with_label_values(&["prune-live", "instance"])
+            .set(1);
+        QUARANTINED
+            .with_label_values(&["prune-gone", "lease"])
+            .set(2);
+        QUARANTINED_OLDEST_AGE_SECONDS
+            .with_label_values(&["prune-gone"])
+            .set(7200);
+
+        prune_quarantine_gauges(&std::collections::HashSet::from(["prune-live".to_string()]));
+
+        let profiles = |gauge: &IntGaugeVec| -> Vec<String> {
+            gauge
+                .collect()
+                .iter()
+                .flat_map(|family| family.get_metric())
+                .flat_map(|metric| metric.get_label())
+                .filter(|pair| pair.name() == "profile")
+                .map(|pair| pair.value().to_string())
+                .collect()
+        };
+        assert!(profiles(&QUARANTINED).contains(&"prune-live".to_string()));
+        assert!(!profiles(&QUARANTINED).contains(&"prune-gone".to_string()));
+        assert!(!profiles(&QUARANTINED_OLDEST_AGE_SECONDS).contains(&"prune-gone".to_string()));
+    }
+
+    #[test]
     fn lease_unsatisfiable_reason_as_str() {
         assert_eq!(
             LeaseUnsatisfiableReason::PoolExhausted.as_str(),
@@ -1923,6 +2003,7 @@ mod tests {
         );
         assert_eq!(LeaseUnsatisfiableReason::Degraded.as_str(), "degraded");
         assert_eq!(LeaseUnsatisfiableReason::Warming.as_str(), "warming");
+        assert_eq!(LeaseUnsatisfiableReason::AtCapacity.as_str(), "at_capacity");
     }
 
     /// The lease-timing histograms must register with their full

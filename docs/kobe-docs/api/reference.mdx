@@ -243,7 +243,7 @@ says the same thing if the pool becomes blocked after the lease was queued.
 
 A pool in phase `Exhausted` (every cluster leased, leases queued) is not
 refused. The lease is queued with `202` and binds when a lease ends; its
-`Satisfiable` condition reads `CapacityBlocked` meanwhile.
+`Satisfiable` condition reads `AtCapacity` meanwhile.
 
 Once bound, `GET /v1/leases/:id` returns:
 

@@ -99,8 +99,11 @@ spec:
         request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || ((oldObject == null || !has(oldObject.status) || !has(oldObject.status.conditions) ? [] : oldObject.status.conditions.filter(c, c.type == 'AllocationAbsent')) == (!has(object.status) || !has(object.status.conditions) ? [] : object.status.conditions.filter(c, c.type == 'AllocationAbsent')))
       message: "only the teardown authority may change AllocationAbsent evidence"
       reason: Forbidden
+    # The one exception is an operator's quarantine release: the control
+    # plane, on a Quarantined lease whose release-quarantine annotation names
+    # its own UID. Such a lease has no acknowledgement and never will.
     - expression: >-
-        request.resource.resource != 'clusterleases' || request.operation != 'UPDATE' || !has(oldObject.metadata.finalizers) || !oldObject.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention') || (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention')) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement)
+        request.resource.resource != 'clusterleases' || request.operation != 'UPDATE' || !has(oldObject.metadata.finalizers) || !oldObject.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention') || (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention')) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement) || (request.userInfo.username == {{ $controlPlaneUsername | quote }} && has(oldObject.metadata.annotations) && 'kobe.kunobi.ninja/release-quarantine' in oldObject.metadata.annotations && oldObject.metadata.annotations['kobe.kunobi.ninja/release-quarantine'] == oldObject.metadata.uid && has(oldObject.status) && has(oldObject.status.phase) && oldObject.status.phase == 'Quarantined')
       message: "receipt retention cannot be removed before exact acknowledgement"
       reason: Forbidden
 ---
