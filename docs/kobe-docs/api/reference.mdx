@@ -116,10 +116,30 @@ with a different pool, TTL, alias or metadata returns `409`.
 Creates for one caller are admitted one at a time across every API replica, so
 `maxConcurrentLeases` and alias uniqueness hold even when a CI matrix fires many
 creates at once. A caller is the full authenticated principal: provider, token
-issuer and identity. A request that cannot start admission within about five
-seconds, because another create for the same caller is still in progress, gets
-`503` with `reason: admission_busy` and `Retry-After: 1`. Nothing was created;
-retry it.
+issuer and identity. All jobs of one CI workflow run usually share a principal,
+so their creates queue behind each other. Each admission takes well under a
+second, and a waiting request keeps trying for up to 25 seconds, backing off
+from 50 ms to 1 s with jitter.
+
+A request still waiting after 25 seconds gets `503` with
+`reason: admission_busy` and `Retry-After: 1`. Nothing was created. Retry it
+with the same `idempotencyKey`, after the `Retry-After` delay plus some random
+jitter so a matrix does not retry in lockstep. `kobe lease` and
+`kobe with-lease` do this for you.
+
+A create that the Kubernetes API server does not confirm within 10 seconds
+gets `503` with `Retry-After: 1` unless the lease can be found afterwards.
+Retry it with the same `idempotencyKey`: if the first attempt did land, the
+retry returns that lease.
+
+A keyed retry is matched against existing leases before the pool pre-flight
+runs, so it gets its lease back even if the pool has since gone into
+`Backoff`.
+
+The pre-flight refuses a pool that has quarantined members and no Ready
+member with `503` and `reason: capacity_blocked`, whatever phase the pool
+reports. Quarantined members hold their capacity until their teardown evidence
+is repaired, so such a lease could not be served.
 
 Once bound, `GET /v1/leases/:id` returns:
 
@@ -142,8 +162,8 @@ Once bound, `GET /v1/leases/:id` returns:
 | `403` | Profile not allowed for your identity |
 | `404` | No pool with that name |
 | `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`), the alias is held by another active lease, or the `idempotencyKey` was used for a different request |
-| `429` | Concurrent lease limit reached, or server overloaded |
-| `503` | The pool cannot satisfy a lease now, or another create for the same caller is being admitted (`reason: admission_busy`) |
+| `429` | Concurrent lease limit reached (no `Retry-After`), or server overloaded (`Retry-After: 1`; retry) |
+| `503` | The pool cannot satisfy a lease now, another create for the same caller is still being admitted (`reason: admission_busy`; retry), or the create timed out (retry with the same `idempotencyKey`) |
 
 > **Lease ownership after upgrading.** Cluster leases now record the provider
 > and token issuer that created them, and only a caller with the same provider,
