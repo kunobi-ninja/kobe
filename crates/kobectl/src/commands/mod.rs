@@ -617,6 +617,69 @@ pub(crate) fn with_auth(
     }
 }
 
+/// The auth method types a `/v1/status` body advertises, in order and without
+/// repeats. `None` when the body has no method list at all.
+///
+/// Each method is an object whose `type` names it (`AuthMethodInfo` on the
+/// server), and one type can appear once per provider: two OIDC issuers are
+/// two `oidc` entries.
+pub(crate) fn advertised_auth_methods(status: &serde_json::Value) -> Option<Vec<String>> {
+    let methods = status["auth"]["methods"].as_array()?;
+    let mut types: Vec<String> = Vec::new();
+    for method in methods {
+        if let Some(kind) = method["type"].as_str()
+            && !types.iter().any(|seen| seen == kind)
+        {
+            types.push(kind.to_string());
+        }
+    }
+    Some(types)
+}
+
+#[cfg(test)]
+mod auth_method_tests {
+    use super::advertised_auth_methods;
+    use serde_json::json;
+
+    /// The shape zur1-worker1 serves: two OIDC providers. Reading the entries
+    /// as strings found nothing, so `doctor` warned that `oidc` was not
+    /// advertised and `init` chose no auth at all.
+    #[test]
+    fn methods_are_read_from_each_entrys_type() {
+        let status = json!({"auth": {"methods": [
+            {"type": "oidc", "issuer": "https://token.actions.githubusercontent.com", "description": "github-actions"},
+            {"type": "oidc", "issuer": "https://clerk.kunobi.com", "clientId": "abc", "description": "kunobi-oauth"},
+            {"type": "ssh", "audience": "kobe"},
+        ]}});
+        assert_eq!(
+            advertised_auth_methods(&status),
+            Some(vec!["oidc".to_string(), "ssh".to_string()])
+        );
+    }
+
+    /// No list is different from an empty one: `doctor` does not second-guess
+    /// a server that does not say, and `init` treats both as no auth.
+    #[test]
+    fn a_missing_list_is_none_and_an_empty_one_is_empty() {
+        assert_eq!(advertised_auth_methods(&json!({})), None);
+        assert_eq!(
+            advertised_auth_methods(&json!({"auth": {"methods": []}})),
+            Some(vec![])
+        );
+    }
+
+    /// An entry without a string `type` names no method and is skipped.
+    #[test]
+    fn entries_without_a_type_are_skipped() {
+        let status =
+            json!({"auth": {"methods": [{"issuer": "x"}, "oidc", {"type": 3}, {"type": "token"}]}});
+        assert_eq!(
+            advertised_auth_methods(&status),
+            Some(vec!["token".to_string()])
+        );
+    }
+}
+
 #[cfg(test)]
 mod reachability_tests {
     use super::*;

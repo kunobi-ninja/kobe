@@ -315,16 +315,13 @@ async fn discover_auth_mode(endpoint: &str) -> Result<AuthMode> {
         .json()
         .await
         .context("could not parse /v1/status")?;
-    let methods: Vec<&str> = body["auth"]["methods"]
-        .as_array()
-        .map(|methods| methods.iter().filter_map(|m| m.as_str()).collect())
-        .unwrap_or_default();
+    let methods = super::advertised_auth_methods(&body).unwrap_or_default();
     for (name, mode) in [
         ("ssh", AuthMode::Ssh),
         ("oidc", AuthMode::Oidc),
         ("token", AuthMode::Token),
     ] {
-        if methods.contains(&name) {
+        if methods.iter().any(|method| method == name) {
             return Ok(mode);
         }
     }

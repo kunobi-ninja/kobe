@@ -201,28 +201,15 @@ async fn endpoint_check(config: &ResolvedConfig) -> Check {
         Ok(response) if response.status().is_success() => {
             let body: serde_json::Value = response.json().await.unwrap_or_default();
             let version = body["version"].as_str().unwrap_or("?");
-            let methods = body["auth"]["methods"]
-                .as_array()
-                .map(|methods| {
-                    methods
-                        .iter()
-                        .filter_map(|method| method.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            let detail = if methods.is_empty() {
+            let methods = super::advertised_auth_methods(&body);
+            let listed = methods.as_deref().unwrap_or_default().join(", ");
+            let detail = if listed.is_empty() {
                 format!("api {version}")
             } else {
-                format!("api {version}, auth methods: {methods}")
+                format!("api {version}, auth methods: {listed}")
             };
-            let advertised = body["auth"]["methods"]
-                .as_array()
-                .map(|methods| {
-                    methods
-                        .iter()
-                        .any(|method| method.as_str() == Some(&config.auth.to_string()))
-                })
+            let advertised = methods
+                .map(|methods| methods.contains(&config.auth.to_string()))
                 .unwrap_or(true);
             if advertised || config.auth == AuthMode::None {
                 ok("endpoint", detail)
