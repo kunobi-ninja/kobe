@@ -856,3 +856,44 @@ invariant(
 );
 
 console.log("Agent Sandbox Helm modes and the pinned release fixture are valid");
+
+// Byte limits are opt-in and must reach the operator without rounding.
+for (const yaml of [disabledYaml, externalYaml, managedYaml]) {
+	invariant(
+		/name: KOBE_SANDBOX_STREAM_MAX_BYTES\s+value: "0"/.test(yaml),
+		"default stream byte ceiling must be unlimited",
+	);
+}
+for (const bytes of [2147483648, 9007199254740991]) {
+	const yaml = await helm("external", "kobe", "kobe-system", [
+		"--set",
+		`agentSandbox.streamMaxBytes=${bytes}`,
+	]);
+	invariant(
+		yaml.includes(
+			`name: KOBE_SANDBOX_STREAM_MAX_BYTES\n              value: "${bytes}"`,
+		),
+		"configured stream byte ceiling was lost or rounded",
+	);
+}
+for (const bytes of ["-1", "1.5", "bad", "9007199254740992"]) {
+	const process = Bun.spawn(
+		[
+			"helm",
+			"template",
+			"kobe",
+			chart,
+			"--set",
+			`agentSandbox.streamMaxBytes=${bytes}`,
+		],
+		{ stdout: "ignore", stderr: "pipe" },
+	);
+	const [stderr, code] = await Promise.all([
+		new Response(process.stderr).text(),
+		process.exited,
+	]);
+	invariant(
+		code !== 0 && stderr.includes("streamMaxBytes"),
+		`invalid stream byte ceiling ${bytes} was accepted`,
+	);
+}

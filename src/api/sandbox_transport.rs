@@ -31,7 +31,7 @@
 //! it means a client that believes it sent a resize, or a signal, and was
 //! silently disregarded.
 //!
-//! # Limits are not optional
+//! # Stream limits
 //!
 //! Every one of these exists because the caller controls the workload:
 //!
@@ -39,7 +39,7 @@
 //!   cluster indefinitely, and nobody notices because nothing is wrong.
 //! * **maximum duration** — an *active* stream would otherwise outlive any
 //!   sensible bound simply by staying busy.
-//! * **byte ceiling** — `yes` is a one-word denial-of-service.
+//! * **byte ceiling** — optional, configured by the operator; absent by default.
 //! * **concurrency** — enforced before upgrade, from #83's registry.
 //!
 //! A stream is also cancelled the moment its lease stops permitting access.
@@ -76,13 +76,20 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// separate transport bound at all.
 pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// Most bytes carried across both directions before the stream is closed.
-///
-/// `yes > /dev/null` is a one-word way to make the operator relay unbounded
-/// traffic from inside a sandbox whose occupant is, by construction, not
-/// trusted. Counting both directions also prevents a caller from receiving the
-/// full bound and then sending another full bound back.
-pub const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+/// Parse the operator's per-stream byte ceiling. Unset or zero allows unlimited
+/// traffic; a positive value counts bytes across both directions. Invalid
+/// values fail startup rather than silently changing the configured ceiling.
+pub fn parse_max_stream_bytes(value: Option<&str>) -> anyhow::Result<Option<u64>> {
+    let Some(value) = value else { return Ok(None) };
+    anyhow::ensure!(
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "KOBE_SANDBOX_STREAM_MAX_BYTES must be a non-negative integer (0 means unlimited)"
+    );
+    let bytes = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("KOBE_SANDBOX_STREAM_MAX_BYTES exceeds the supported byte count")
+    })?;
+    Ok((bytes != 0).then_some(bytes))
+}
 
 /// Longest an upgraded operation may spend opening its exact target stream.
 ///
@@ -229,7 +236,7 @@ pub fn server_frame(channel: u8, payload: &[u8]) -> Message {
 /// Tracks the limits that end a stream.
 ///
 /// Separated from the copying so the rules are testable without a socket, and
-/// because these bounds are the reason the transport is safe to expose at all.
+/// because time bounds and optional byte ceilings apply to every transport.
 #[derive(Debug)]
 pub struct StreamLimits {
     started: tokio::time::Instant,
@@ -237,11 +244,12 @@ pub struct StreamLimits {
     bytes: u64,
     idle_timeout: Duration,
     max_duration: Duration,
-    max_bytes: u64,
+    max_bytes: Option<u64>,
 }
 
 impl StreamLimits {
-    pub fn new(idle_timeout: Duration, max_duration: Duration, max_bytes: u64) -> Self {
+    /// Create stream bounds; `None` leaves the byte count unlimited.
+    pub fn new(idle_timeout: Duration, max_duration: Duration, max_bytes: Option<u64>) -> Self {
         Self::starting_at(
             tokio::time::Instant::now(),
             idle_timeout,
@@ -258,7 +266,7 @@ impl StreamLimits {
         now: tokio::time::Instant,
         idle_timeout: Duration,
         max_duration: Duration,
-        max_bytes: u64,
+        max_bytes: Option<u64>,
     ) -> Self {
         Self {
             started: now,
@@ -274,7 +282,7 @@ impl StreamLimits {
     pub fn record(&mut self, bytes: usize, now: tokio::time::Instant) -> Result<(), StreamEnd> {
         self.last_activity = now;
         self.bytes = self.bytes.saturating_add(bytes as u64);
-        if self.bytes > self.max_bytes {
+        if self.max_bytes.is_some_and(|max| self.bytes > max) {
             return Err(StreamEnd::ByteLimitExceeded);
         }
         self.check(now)
@@ -971,6 +979,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn byte_ceiling_is_opt_in_and_invalid_configuration_is_rejected() {
+        assert_eq!(parse_max_stream_bytes(None).unwrap(), None);
+        assert_eq!(parse_max_stream_bytes(Some("0")).unwrap(), None);
+        assert_eq!(
+            parse_max_stream_bytes(Some("536870912")).unwrap(),
+            Some(536870912)
+        );
+        for value in [
+            "",
+            "-1",
+            "+1",
+            "1.5",
+            "512Mi",
+            " 10",
+            "18446744073709551616",
+        ] {
+            assert!(parse_max_stream_bytes(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn default_stream_can_exceed_512_mib_and_still_obeys_time_bounds() {
+        let start = tokio::time::Instant::now();
+        let mut limits = StreamLimits::starting_at(
+            start,
+            IDLE_TIMEOUT,
+            MAX_STREAM_DURATION,
+            parse_max_stream_bytes(None).unwrap(),
+        );
+        // Exercise accounting without allocating or transferring gigabytes.
+        for _ in 0..4 {
+            assert!(limits.record(512 * 1024 * 1024, start).is_ok());
+        }
+        assert_eq!(
+            limits.check(start + IDLE_TIMEOUT),
+            Err(StreamEnd::IdleTimeout)
+        );
+        assert_eq!(
+            limits.check(start + MAX_STREAM_DURATION),
+            Err(StreamEnd::DurationExceeded)
+        );
+    }
+
     /// Every bound actually binds, and reports the rule that fired.
     ///
     /// Reporting matters: a client that cannot tell "you were idle" from "your
@@ -980,8 +1032,12 @@ mod tests {
         let start = tokio::time::Instant::now();
 
         // Bytes.
-        let mut limits =
-            StreamLimits::starting_at(start, Duration::from_secs(60), Duration::from_secs(600), 10);
+        let mut limits = StreamLimits::starting_at(
+            start,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Some(10),
+        );
         assert!(limits.record(10, start).is_ok());
         assert_eq!(
             limits.record(1, start).unwrap_err(),
@@ -993,7 +1049,7 @@ mod tests {
             start,
             Duration::from_secs(60),
             Duration::from_secs(600),
-            1024,
+            Some(1024),
         );
         assert!(limits.check(start + Duration::from_secs(59)).is_ok());
         assert_eq!(
@@ -1007,7 +1063,7 @@ mod tests {
             start,
             Duration::from_secs(60),
             Duration::from_secs(600),
-            1_000_000,
+            Some(1_000_000),
         );
         for second in 1..600 {
             assert!(
@@ -1037,7 +1093,7 @@ mod tests {
             start,
             Duration::from_secs(60),
             Duration::from_secs(600),
-            1024,
+            Some(1024),
         );
 
         assert_eq!(limits.next_deadline(start), Duration::from_secs(60));
@@ -1052,7 +1108,7 @@ mod tests {
             start,
             Duration::from_secs(600),
             Duration::from_secs(60),
-            1024,
+            Some(1024),
         );
         assert_eq!(limits.next_deadline(start), Duration::from_secs(60));
 
@@ -1083,7 +1139,8 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_io_cannot_outlive_the_stream_deadline() {
         let now = tokio::time::Instant::now();
-        let limits = StreamLimits::starting_at(now, Duration::from_secs(60), Duration::ZERO, 1024);
+        let limits =
+            StreamLimits::starting_at(now, Duration::from_secs(60), Duration::ZERO, Some(1024));
         let revoked = CancellationToken::new();
 
         assert_eq!(

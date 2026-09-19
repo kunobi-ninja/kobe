@@ -2198,6 +2198,8 @@ struct UpgradeContext {
     /// declared attach command, else nothing at all.
     command: Option<Vec<String>>,
     scoped: kube::Client,
+    /// Byte ceiling captured from operator configuration before upgrading.
+    max_stream_bytes: Option<u64>,
     /// The registration claimed before the upgrade. Held here so the slot is
     /// never released between being taken and the stream starting.
     guard: crate::api::sandbox_streams::StreamGuard,
@@ -2503,6 +2505,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
         };
 
     Ok(UpgradeContext {
+        max_stream_bytes: state.sandbox_stream_max_bytes,
         target,
         container,
         command,
@@ -2625,7 +2628,7 @@ async fn sandbox_attach<B: ClusterBackend>(
         let mut limits = transport::StreamLimits::new(
             transport::IDLE_TIMEOUT,
             transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            context.max_stream_bytes,
         );
         let end = transport::pump_attached(&mut socket, &mut attached, &mut limits, revoked).await;
         attached.abort();
@@ -2731,7 +2734,7 @@ async fn sandbox_port_forward<B: ClusterBackend>(
         let mut limits = transport::StreamLimits::new(
             transport::IDLE_TIMEOUT,
             transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            context.max_stream_bytes,
         );
         let end = transport::pump_duplex(&mut socket, &mut stream, &mut limits, revoked).await;
         transport::close_with(&mut socket, end).await;
@@ -2963,7 +2966,7 @@ async fn serve_iroh_session(
         let mut limits = transport::StreamLimits::new(
             transport::IDLE_TIMEOUT,
             transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            context.max_stream_bytes,
         );
         let end = transport::pump_duplex_iroh(&mut link, &mut stream, &mut limits, revoked).await;
         transport::close_with_iroh(&mut link, end).await;
@@ -2999,7 +3002,7 @@ async fn serve_iroh_session(
         let mut limits = transport::StreamLimits::new(
             transport::IDLE_TIMEOUT,
             transport::MAX_STREAM_DURATION,
-            transport::MAX_STREAM_BYTES,
+            context.max_stream_bytes,
         );
         let end =
             transport::pump_attached_iroh(&mut link, &mut attached, &mut limits, revoked).await;
@@ -8372,6 +8375,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),

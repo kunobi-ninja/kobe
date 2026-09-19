@@ -88,6 +88,9 @@ pub struct AppState<B: ClusterBackend> {
     /// validated at startup. Disabled deployments do not mount Sandbox HTTP
     /// routes, so they cannot admit leases that no controller will reconcile.
     pub sandbox_enabled: bool,
+    /// Optional byte ceiling shared by attach and port-forward on both transports.
+    /// `None` allows unlimited traffic; time and concurrency bounds still apply.
+    pub sandbox_stream_max_bytes: Option<u64>,
     /// Operator-side iroh endpoint for P2P session bytes (#197). `None` when
     /// the operator disabled iroh (`KOBE_IROH_RELAY=disabled`); pools that
     /// request `iroh` transport are then rejected at admission, never silently
@@ -5010,6 +5013,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -5046,6 +5050,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -5141,6 +5146,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -5691,6 +5697,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -5790,6 +5797,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -5891,6 +5899,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -6002,6 +6011,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -6088,6 +6098,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -6202,6 +6213,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),
@@ -6569,6 +6581,7 @@ mod tests {
             sandbox_admission_limiter: Default::default(),
             cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
             iroh_endpoint: None,
             iroh_sessions: Default::default(),

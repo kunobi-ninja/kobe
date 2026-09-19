@@ -94,6 +94,12 @@
           "minimum": 4,
           "maximum": 1000000
         },
+        "streamMaxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Per-stream bytes across both directions. Zero means unlimited (default)."
+        },
         "irohRelay": {
           "type": "string",
           "minLength": 1,

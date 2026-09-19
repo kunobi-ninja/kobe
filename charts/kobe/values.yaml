@@ -138,6 +138,9 @@ agentSandbox:
   #             refused at admission, never silently served over WebSocket.
   #   <urls>    Comma-separated relay URLs for a self-hosted relay map.
   irohRelay: public
+  # Per-stream bytes across both directions for attach, SSH and port-forward.
+  # Zero (default) means unlimited. Applies to WebSocket and iroh transports.
+  streamMaxBytes: 0
   # Aggregate object ceiling across every caller. This namespace contains only
   # admission tokens plus distributed operation gates/principal ledgers, so
   # the quota cannot starve unrelated leader elections. Each live Sandbox can

@@ -62,6 +62,8 @@ When Sandbox mode is enabled, the chart creates a ledger namespace `<release>-sa
 
 `agentSandbox.irohRelay` is `public` (n0 relays), `disabled`, or a comma-separated list of self-hosted relay URLs. Pools that request iroh transport are refused if relays are disabled.
 
+`agentSandbox.streamMaxBytes` defaults to `0` (unlimited). Set a positive byte count to cap each attach, SSH or port-forward connection across both directions. The setting applies to WebSocket and iroh. For example, `--set agentSandbox.streamMaxBytes=2147483648` sets a 2 GiB ceiling. Without Helm, set `KOBE_SANDBOX_STREAM_MAX_BYTES` on the operator; unset or `0` means unlimited. Invalid values prevent startup. Streams still have a 15-minute idle timeout and a 4-hour maximum duration.
+
 ### Teardown authority
 
 On Kubernetes 1.30+, `teardownAuthority.separate=true` runs teardown proof under a dedicated ServiceAccount. Helm installs two fail-closed ValidatingAdmissionPolicy boundaries: ordinary lifecycle code cannot forge or erase protected evidence, and it cannot replace the authority namespace or cluster-scoped RBAC. The default is single-process mode for older API servers.
