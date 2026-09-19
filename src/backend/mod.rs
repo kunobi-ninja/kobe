@@ -1895,6 +1895,33 @@ mod tests {
             footprint.is_none(),
             "an unimplemented backend must not seal a creation manifest"
         );
+
+        let manifest = crate::crd::TeardownCreationManifest {
+            schema_version: crate::crd::TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION,
+            instance: crate::crd::ResourceRef {
+                name: "pool-x-0".into(),
+                uid: Some("instance-uid".into()),
+            },
+            namespace: "test-ns".into(),
+            backend_type: crate::crd::BackendType::K3s,
+            config_digest: "a".repeat(64),
+            service_cidr: "10.240.0.0/20".into(),
+            cluster_cidr: "10.248.0.0/20".into(),
+            server_replicas: 1,
+            agent_replicas: 0,
+            resources: Vec::new(),
+            storage: Vec::new(),
+            datastore: DatastoreProvenance::EmbeddedSqlite,
+            sealed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let outcome = backend
+            .delete_verified_manifest("pool-x-0", "test-ns", &manifest, "attempt-1")
+            .await;
+        assert_eq!(
+            outcome,
+            Err(VerifiedDestroyUnsupported),
+            "an unimplemented backend must not return an empty (clean-looking) check list"
+        );
     }
 
     #[tokio::test]

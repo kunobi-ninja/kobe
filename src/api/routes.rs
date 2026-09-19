@@ -353,7 +353,9 @@ async fn concurrency_limit(
     let _permit = match sem.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
-            return (
+            // Retry-After marks this 429 as transient. The lease-quota 429
+            // carries none, and clients use that to tell the two apart.
+            let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(ErrorResponse {
                     error: "Server is under heavy load".to_string(),
@@ -362,6 +364,11 @@ async fn concurrency_limit(
                 }),
             )
                 .into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from_static("1"),
+            );
+            return response;
         }
     };
     next.run(request).await
@@ -972,8 +979,9 @@ const LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS: u64 = 30;
 
 /// #189 lease-create pre-flight. Returns `Some(503 response)` when the pool
 /// cannot satisfy a new lease right now — a `Failing` pool with zero Ready
-/// members, or a `Backoff` pool with no schedulable headroom (zero Ready and
-/// already at its capacity bound). Returns `None` when a Ready member exists
+/// members, a `Backoff` pool with no schedulable headroom (zero Ready and
+/// already at its capacity bound), or a pool with quarantined members and
+/// zero Ready. See [`pool_preflight_reason`]. Returns `None` when a Ready member exists
 /// (bindable regardless of pool phase) or for a healthy-but-empty / warming
 /// pool, so the caller proceeds to the normal 202 Pending path.
 ///
@@ -981,53 +989,19 @@ const LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS: u64 = 30;
 /// `next_attempt_at` when present, else a sane default) and a bounded
 /// machine-readable `reason`. Increments `kobe_lease_unsatisfiable_total`.
 fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Response> {
-    use crate::crd::ClusterPoolPhase;
-    use crate::metrics::LeaseUnsatisfiableReason as R;
-
+    let reason = pool_preflight_reason(pool)?;
     let status = pool.status.clone();
-    let phase = status.as_ref().and_then(|s| s.phase);
-    let ready = status.as_ref().map(|s| s.ready).unwrap_or(0);
-
-    // Capacity bound: the most clusters this pool will ever run. Prefer the
-    // autoscaler ceiling; fall back to the fixed size.
-    let capacity = pool
-        .spec
-        .scaling
-        .as_ref()
-        .map(|s| s.max_clusters)
-        .unwrap_or(pool.spec.size)
-        .max(pool.spec.size);
-    let in_flight = status
-        .as_ref()
-        .map(|s| s.ready + s.leased + s.creating + s.recycling + s.unhealthy + s.quarantined)
-        .unwrap_or(0);
-    let at_capacity = in_flight >= capacity;
-
-    let reject_reason = match phase {
-        // Sustained failures AND nothing Ready to hand out — won't bind
-        // without operator action. A Failing pool that still has Ready
-        // members must keep serving them: replacement provisioning being
-        // broken doesn't invalidate the clusters that already came up, and
-        // rejecting those leases turns a background provisioning problem
-        // into a full CI outage (2026-07-20: 5 Ready / 0 leased, every
-        // claim 503'd for hours).
-        Some(ClusterPoolPhase::Failing) if ready == 0 => Some(R::PoolExhausted),
-        // In a backoff window AND no headroom to create or hand out a cluster.
-        Some(ClusterPoolPhase::Backoff) if ready == 0 && at_capacity => Some(R::CapacityBlocked),
-        // Quarantine is deliberately capacity-holding. With no Ready member,
-        // accepting another lease would create a queue that cannot advance
-        // until teardown evidence is repaired.
-        Some(ClusterPoolPhase::Quarantined) if ready == 0 => Some(R::CapacityBlocked),
-        // Failing/Backoff with Ready members, healthy-but-empty, scaling up,
-        // idle, etc.: bindable now or a transient warm-up — proceed to the
-        // normal 202 path.
-        _ => None,
-    };
-
-    let reason = reject_reason?;
+    let quarantined = status.as_ref().map(|s| s.quarantined).unwrap_or(0);
 
     // Build the human message from the pool's health (shared classifier).
-    let (message, _) = crate::controllers::lease::unsatisfiable_status(profile, &status);
+    let (mut message, _) = crate::controllers::lease::unsatisfiable_status(profile, &status);
+    if quarantined > 0 {
+        // The phase in the message may read `ScalingUp` (see
+        // `pool_preflight_reason`); say what actually holds the capacity.
+        message.push_str(&format!(
+            ", quarantined={quarantined} (members held until teardown evidence is repaired)"
+        ));
+    }
 
     // Retry-After: seconds until the pool's next provision attempt, if known
     // and in the future; otherwise a sane default.
@@ -1062,6 +1036,56 @@ fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Respons
             .insert(HeaderName::from_static("retry-after"), value);
     }
     Some(resp)
+}
+
+/// Why the pool cannot take a new lease right now, if it cannot. Pure: no
+/// metrics, no logging, so a caller can ask before deciding to reject.
+fn pool_preflight_reason(pool: &ClusterPool) -> Option<crate::metrics::LeaseUnsatisfiableReason> {
+    use crate::crd::ClusterPoolPhase;
+    use crate::metrics::LeaseUnsatisfiableReason as R;
+
+    let status = pool.status.as_ref();
+    let phase = status.and_then(|s| s.phase);
+    let ready = status.map(|s| s.ready).unwrap_or(0);
+    let quarantined = status.map(|s| s.quarantined).unwrap_or(0);
+
+    // Capacity bound: the most clusters this pool will ever run. Prefer the
+    // autoscaler ceiling; fall back to the fixed size.
+    let capacity = pool
+        .spec
+        .scaling
+        .as_ref()
+        .map(|s| s.max_clusters)
+        .unwrap_or(pool.spec.size)
+        .max(pool.spec.size);
+    let in_flight = status
+        .map(|s| s.ready + s.leased + s.creating + s.recycling + s.unhealthy + s.quarantined)
+        .unwrap_or(0);
+    let at_capacity = in_flight >= capacity;
+
+    match phase {
+        // Sustained failures AND nothing Ready to hand out — won't bind
+        // without operator action. A Failing pool that still has Ready
+        // members must keep serving them: replacement provisioning being
+        // broken doesn't invalidate the clusters that already came up, and
+        // rejecting those leases turns a background provisioning problem
+        // into a full CI outage (2026-07-20: 5 Ready / 0 leased, every
+        // claim 503'd for hours).
+        Some(ClusterPoolPhase::Failing) if ready == 0 => Some(R::PoolExhausted),
+        // In a backoff window AND no headroom to create or hand out a cluster.
+        Some(ClusterPoolPhase::Backoff) if ready == 0 && at_capacity => Some(R::CapacityBlocked),
+        // Quarantine holds capacity on purpose. With no Ready member,
+        // accepting another lease would create a queue that cannot advance
+        // until teardown evidence is repaired. Decided on the count, not the
+        // phase: the pool reports `Quarantined` only when it would otherwise
+        // be Idle or Healthy, so a pool below minReady with quarantined
+        // members and nothing Ready reports `ScalingUp`.
+        _ if quarantined > 0 && ready == 0 => Some(R::CapacityBlocked),
+        // Failing/Backoff with Ready members, healthy-but-empty, scaling up,
+        // idle, etc.: bindable now or a transient warm-up — proceed to the
+        // normal 202 path.
+        _ => None,
+    }
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -1472,13 +1496,23 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
     // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
     // empty warm pool keeps the 202 Pending below. Missing pools are rejected
-    // above in `resolve_create_pool_kind`. Runs before the admission lock so a
-    // slow pool read never lengthens the critical section.
+    // above in `resolve_create_pool_kind`. The pool read runs before the
+    // admission lock so it never lengthens the critical section.
+    //
+    // A keyed create is a possible retry of one that already succeeded, and
+    // that retry must get its lease back even if the pool has since gone into
+    // Backoff. Its rejection is decided under the lock, after the replay
+    // check, in `admit_cluster_lease`.
+    let mut deferred_preflight: Option<ClusterPool> = None;
     {
         let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
         match pools_api.get(&profile).await {
             Ok(pool) => {
-                if let Some(unavailable) = pool_preflight_rejection(&profile, &pool) {
+                if create_key.is_some() {
+                    if pool_preflight_reason(&pool).is_some() {
+                        deferred_preflight = Some(pool);
+                    }
+                } else if let Some(unavailable) = pool_preflight_rejection(&profile, &pool) {
                     return unavailable;
                 }
             }
@@ -1543,26 +1577,55 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
             }
         };
 
+    // Admission runs in its own task. A client that disconnects drops this
+    // handler's future, and that must not cancel the critical section between
+    // the create and the lock release. A panic in the task drops the guard,
+    // whose `Drop` releases the lock.
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    let admitted = admit_cluster_lease(
-        &leases_api,
-        &guard,
-        &identity,
-        &policy,
-        &lease,
-        req.alias.as_deref(),
-        create_key.as_ref(),
-    )
-    .await;
-    if let Err(e) = guard.release(&locks).await {
-        // The lease outcome is already decided. An unreleased lock expires on
-        // its own; until then this principal's next create waits or gets 503.
-        error!(
-            lock = %lock_name,
-            error = %e,
-            "Failed to release Cluster admission lock"
-        );
-    }
+    let admission = tokio::spawn({
+        let identity = identity.clone();
+        let policy = policy.clone();
+        let lease = lease.clone();
+        let alias = req.alias.clone();
+        let create_key = create_key.clone();
+        let profile = profile.clone();
+        async move {
+            let admitted = admit_cluster_lease(
+                &leases_api,
+                &guard,
+                &identity,
+                &policy,
+                &lease,
+                alias.as_deref(),
+                create_key.as_ref(),
+                deferred_preflight
+                    .as_ref()
+                    .map(|pool| (profile.as_str(), pool)),
+            )
+            .await;
+            if let Err(e) = guard.release().await {
+                // The lease outcome is already decided. An unreleased lock
+                // expires on its own; until then this principal's next create
+                // waits or gets 503.
+                error!(
+                    lock = %lock_name,
+                    error = %e,
+                    "Failed to release Cluster admission lock"
+                );
+            }
+            admitted
+        }
+    });
+    let admitted = match admission.await {
+        Ok(admitted) => admitted,
+        Err(e) => {
+            return infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Lease admission failed",
+                e,
+            );
+        }
+    };
     match admitted {
         Ok(ClusterAdmission::Created) => {}
         Ok(ClusterAdmission::Replay(existing)) => {
@@ -3541,10 +3604,36 @@ enum ClusterAdmission {
     Replay(Box<ClusterLease>),
 }
 
+/// Bound on the lease CREATE under the admission lock.
+///
+/// The lock is never renewed. The create starts at most [`LOCK_SAFE_WINDOW`]
+/// after acquiring it, so this plus [`LEASE_CREATE_RECOVERY_TIMEOUT`] must
+/// stay well inside [`LOCK_DURATION`]: 10 + 10 + 3 leaves 7 seconds for clock
+/// skew between replicas.
+///
+/// [`LOCK_SAFE_WINDOW`]: cluster_admission::LOCK_SAFE_WINDOW
+/// [`LOCK_DURATION`]: cluster_admission::LOCK_DURATION
+#[cfg(not(test))]
+const LEASE_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const LEASE_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Bound on the GET that decides whether a timed-out CREATE landed.
+const LEASE_CREATE_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Count, check and create one Cluster lease while holding `guard`.
 ///
+/// Order: idempotent replay first, then the deferred pool pre-flight (only
+/// passed for keyed creates, see `create_lease`), then quota and alias.
 /// Every failure is returned as the response to send. Nothing here deletes a
 /// lease after the fact: the lock makes the pre-create checks authoritative.
+///
+/// The CREATE is bounded by [`LEASE_CREATE_TIMEOUT`]. On timeout the lease
+/// may or may not have been stored, so a GET by its (unique) name decides:
+/// found means created, absent means the request fails with a retryable 503.
+/// A CREATE that the API server commits after that GET leaves a lease the
+/// caller never heard about; a keyed retry replays it.
+#[allow(clippy::too_many_arguments)]
 async fn admit_cluster_lease(
     leases_api: &Api<ClusterLease>,
     guard: &cluster_admission::AdmissionLockGuard,
@@ -3553,6 +3642,7 @@ async fn admit_cluster_lease(
     lease: &ClusterLease,
     alias: Option<&str>,
     create_key: Option<&ClusterCreateKey>,
+    deferred_preflight: Option<(&str, &ClusterPool)>,
 ) -> Result<ClusterAdmission, Box<Response>> {
     let owned = list_owned_leases(leases_api, identity).await.map_err(|e| {
         Box::new(infra_error(
@@ -3562,7 +3652,16 @@ async fn admit_cluster_lease(
         ))
     })?;
 
-    match admission_decision(&owned, alias, create_key, policy.max_concurrent_leases) {
+    let decision = admission_decision(&owned, alias, create_key, policy.max_concurrent_leases);
+    if !matches!(
+        decision,
+        AdmissionDecision::Replay(_) | AdmissionDecision::KeyReused
+    ) && let Some((profile, pool)) = deferred_preflight
+        && let Some(unavailable) = pool_preflight_rejection(profile, pool)
+    {
+        return Err(Box::new(unavailable));
+    }
+    match decision {
         AdmissionDecision::Admit => {}
         AdmissionDecision::Replay(existing) => return Ok(ClusterAdmission::Replay(existing)),
         AdmissionDecision::KeyReused => {
@@ -3622,17 +3721,60 @@ async fn admit_cluster_lease(
         return Err(Box::new(admission_busy_response()));
     }
 
-    leases_api
-        .create(&PostParams::default(), lease)
-        .await
-        .map_err(|e| {
-            Box::new(infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create lease",
-                e,
-            ))
-        })?;
-    Ok(ClusterAdmission::Created)
+    match tokio::time::timeout(
+        LEASE_CREATE_TIMEOUT,
+        leases_api.create(&PostParams::default(), lease),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(ClusterAdmission::Created),
+        Ok(Err(e)) => Err(Box::new(infra_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create lease",
+            e,
+        ))),
+        Err(_) => recover_timed_out_create(leases_api, &lease.name_any()).await,
+    }
+}
+
+/// Decide a CREATE that hit [`LEASE_CREATE_TIMEOUT`] by reading the lease back
+/// by name. The name is generated per request, so a match is this request's
+/// lease and nothing is created twice.
+async fn recover_timed_out_create(
+    leases_api: &Api<ClusterLease>,
+    name: &str,
+) -> Result<ClusterAdmission, Box<Response>> {
+    warn!(lease = %name, "Lease create timed out; checking whether it landed");
+    match tokio::time::timeout(LEASE_CREATE_RECOVERY_TIMEOUT, leases_api.get_opt(name)).await {
+        Ok(Ok(Some(_))) => Ok(ClusterAdmission::Created),
+        Ok(Ok(None)) => Err(Box::new(create_timed_out_response())),
+        Ok(Err(e)) => {
+            warn!(lease = %name, error = %e, "Could not read back a timed-out lease create");
+            Err(Box::new(create_timed_out_response()))
+        }
+        Err(_) => Err(Box::new(create_timed_out_response())),
+    }
+}
+
+/// 503 for a CREATE that timed out and was not found afterwards.
+fn create_timed_out_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "Timed out creating the lease".to_string(),
+            detail: Some(
+                "The API server did not confirm the create in time; retry with the same idempotencyKey"
+                    .to_string(),
+            ),
+            reason: None,
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("retry-after"),
+        HeaderValue::from_static("1"),
+    );
+    response
 }
 
 /// 503 for a create that could not get (or keep) the principal's admission
@@ -6310,6 +6452,330 @@ mod tests {
         );
     }
 
+    const CLUSTER_LEASES: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases";
+
+    /// Echo a ClusterLease CREATE back as the stored object.
+    fn echo_created() -> impl Fn(&wiremock::Request) -> wiremock::ResponseTemplate {
+        |request: &wiremock::Request| {
+            wiremock::ResponseTemplate::new(201)
+                .set_body_raw(request.body.clone(), "application/json")
+        }
+    }
+
+    async fn wait_for_lock_release(server: &wiremock::MockServer) -> Vec<wiremock::Request> {
+        for _ in 0..300 {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| {
+                request.method == http::Method::DELETE
+                    && request.url.path() == admission_lock_path()
+            }) {
+                return requests;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the admission lock was never released");
+    }
+
+    /// A client that disconnects mid-admission drops the handler future. The
+    /// admission must still run to completion and release the lock instead of
+    /// leaving the principal blocked until the lock expires.
+    #[tokio::test]
+    async fn create_lease_releases_the_lock_when_the_request_is_dropped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(
+                        Vec::<serde_json::Value>::new(),
+                    ))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(echo_created())
+            .mount(&server)
+            .await;
+
+        let handler = tokio::spawn(create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        ));
+        // Abort once admission is under way: the lock is held and the
+        // (slow) quota LIST has been sent.
+        for _ in 0..300 {
+            let counting = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.method == http::Method::GET && request.url.path() == CLUSTER_LEASES
+                });
+            if counting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+
+        let requests = wait_for_lock_release(&server).await;
+        let create_at = requests
+            .iter()
+            .position(|r| r.method == http::Method::POST && r.url.path() == CLUSTER_LEASES)
+            .expect("admission ran to completion after the client went away");
+        let unlock_at = requests
+            .iter()
+            .position(|r| r.method == http::Method::DELETE && r.url.path() == admission_lock_path())
+            .unwrap();
+        assert!(
+            create_at < unlock_at,
+            "the lock is released after the create"
+        );
+    }
+
+    async fn mount_stalled_create(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        mount_empty_list(server).await;
+        Mock::given(method("POST"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_empty_list(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// A CREATE that stalls must not outlive the lock. It is abandoned after
+    /// `LEASE_CREATE_TIMEOUT`; the lease is not found by name, so the caller
+    /// gets a retryable 503 and the lock is released.
+    #[tokio::test]
+    async fn create_lease_times_out_a_stalled_create_and_releases_the_lock() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+        mount_stalled_create(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!("^{CLUSTER_LEASES}/lease-[0-9a-f]+$")))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(k8s_not_found("clusterleases not found")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        wait_for_lock_release(&server).await;
+    }
+
+    /// The stalled CREATE did land: the read-back finds it by name and the
+    /// request succeeds without creating a second lease.
+    #[tokio::test]
+    async fn create_lease_recovers_a_timed_out_create_that_landed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+        mount_stalled_create(&server).await;
+        let stored = build_lease_crd(
+            "lease-stored",
+            "test-ns",
+            "e2e-basic",
+            "1h",
+            &test_identity(),
+            50,
+            None,
+            None,
+        );
+        Mock::given(method("GET"))
+            .and(path_regex(format!("^{CLUSTER_LEASES}/lease-[0-9a-f]+$")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&stored))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let creates = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == http::Method::POST && r.url.path() == CLUSTER_LEASES)
+            .count();
+        assert_eq!(creates, 1, "recovery must not create a second lease");
+    }
+
+    fn backoff_pool_mock() -> wiremock::Mock {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-basic",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(pool_with_status(
+                    "e2e-basic",
+                    serde_json::json!({
+                        "phase": "Backoff",
+                        "ready": 0,
+                        "creating": 3,
+                        "consecutiveFailures": 1
+                    }),
+                )),
+            )
+    }
+
+    /// A keyed retry of a create that already succeeded gets its lease back
+    /// even after the pool went into Backoff. The pre-flight must not answer
+    /// 503 before the replay check has run.
+    #[tokio::test]
+    async fn create_lease_replays_a_keyed_retry_against_a_backoff_pool() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        backoff_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+
+        let req = || CreateLeaseRequest {
+            profile: Some("e2e-basic".to_string()),
+            idempotency_key: Some("retry-backoff".to_string()),
+            ..CreateLeaseRequest::default()
+        };
+        let key = cluster_create_key(&req(), "e2e-basic").unwrap().unwrap();
+        let mut existing = build_lease_crd(
+            "lease-first",
+            "test-ns",
+            "e2e-basic",
+            "1h",
+            &test_identity(),
+            50,
+            None,
+            None,
+        );
+        let annotations = existing
+            .metadata
+            .annotations
+            .get_or_insert_with(Default::default);
+        annotations.insert(CREATE_KEY_ANNOTATION.into(), key.key_digest);
+        annotations.insert(CREATE_INTENT_ANNOTATION.into(), key.intent_digest);
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::to_value(&existing).unwrap()]),
+            ))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(req()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"].as_str(), Some("lease-first"));
+    }
+
+    /// A keyed create with nothing to replay is still refused by the
+    /// pre-flight, and releases the lock it took to check.
+    #[tokio::test]
+    async fn create_lease_keyed_first_attempt_against_a_backoff_pool_is_refused() {
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        backoff_pool_mock().mount(&server).await;
+        mount_free_admission_lock(&server).await;
+        mount_empty_list(&server).await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                idempotency_key: Some("first".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"].as_str(), Some("capacity_blocked"));
+        let requests = wait_for_lock_release(&server).await;
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method == http::Method::POST && r.url.path() == CLUSTER_LEASES)
+        );
+    }
+
     /// A repeated keyed create returns the first lease instead of creating a
     /// second one.
     #[tokio::test]
@@ -6647,5 +7113,36 @@ mod tests {
         ))
         .unwrap();
         assert!(pool_preflight_rejection("e2e-basic", &mixed).is_none());
+    }
+
+    /// Since the pool reports `Quarantined` only when it would otherwise be
+    /// Idle or Healthy, a pool below `minReady` with quarantined members and
+    /// nothing Ready reports `ScalingUp`. The pre-flight must still refuse it:
+    /// the decision follows the quarantine count, not the phase label.
+    #[tokio::test]
+    async fn pool_preflight_refuses_quarantined_capacity_whatever_the_phase() {
+        for phase in ["ScalingUp", "Healthy", "Backoff"] {
+            let pool: ClusterPool = serde_json::from_value(pool_with_status(
+                "e2e-basic",
+                serde_json::json!({ "phase": phase, "quarantined": 2, "ready": 0 }),
+            ))
+            .unwrap();
+            let response = pool_preflight_rejection("e2e-basic", &pool)
+                .unwrap_or_else(|| panic!("{phase} pool holding only quarantined capacity"));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response_json(response).await;
+            assert_eq!(body["reason"].as_str(), Some("capacity_blocked"), "{body}");
+            assert!(
+                body["detail"].as_str().unwrap().contains("quarantined=2"),
+                "the message must name the quarantine, not a warm-up: {body}"
+            );
+        }
+
+        let serving: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "ScalingUp", "quarantined": 2, "ready": 1 }),
+        ))
+        .unwrap();
+        assert!(pool_preflight_rejection("e2e-basic", &serving).is_none());
     }
 }

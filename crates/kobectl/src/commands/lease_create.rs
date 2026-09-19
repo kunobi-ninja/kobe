@@ -67,39 +67,83 @@ struct LeaseCreateOutput {
 
 const CLUSTER_CAPABILITIES: &[&str] = &["kubeconfig", "extend", "release"];
 
+/// How long a create keeps retrying a transient refusal when no
+/// `--wait-timeout` bounds it.
+const CREATE_RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+/// Longest single pause between create attempts, whatever `Retry-After` says.
+const CREATE_RETRY_MAX_PAUSE: Duration = Duration::from_secs(10);
+
 /// POST `/v1/leases` and return the accepted (Pending) lease. Shared by the
 /// `lease` command and `with-lease` (#107 P3). `alias` becomes the lease's
 /// `kobe.kunobi.ninja/alias` label server-side.
+///
+/// Every attempt of one call sends the same `idempotencyKey`, generated once
+/// here. A retry after a lost response therefore gets the lease the first
+/// attempt created instead of a second one. Transient refusals are retried
+/// (see [`create_retry_base`]) until `deadline`, or for
+/// [`CREATE_RETRY_BUDGET`] when there is none.
 pub(crate) async fn create_lease_request(
     config: &super::config::ResolvedConfig,
     pool: &str,
     ttl: &str,
     alias: Option<&str>,
     metadata: Option<&JsonValue>,
+    deadline: Option<Instant>,
 ) -> Result<LeaseAcceptedResponse> {
     let endpoint = config.endpoint.as_str();
+    let idempotency_key = super::sandbox::new_idempotency_key();
     let body_json = serde_json::json!({
         "profile": pool,
         "ttl": ttl,
         "alias": alias,
         "metadata": metadata,
+        "idempotencyKey": idempotency_key,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
-    // Body signing not yet supported server-side (extractor doesn't have body access).
-    // Sign with empty body for now.
-    let token = get_auth_header(config, "POST", "/v1/leases", b"").await?;
-
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + CREATE_RETRY_BUDGET);
     let client = authed_client();
-    let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
-        .header("Content-Type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await
-        .reaching(config)?;
 
-    let status = response.status();
-    if !status.is_success() {
+    loop {
+        // Body signing not yet supported server-side (extractor doesn't have body access).
+        // Sign with empty body for now. Signed per attempt: the signature is
+        // time-bound.
+        let token = get_auth_header(config, "POST", "/v1/leases", b"").await?;
+        let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
+            .header("Content-Type", "application/json")
+            .body(body_bytes.clone())
+            .send()
+            .await
+            .reaching(config)?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await?);
+        }
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = response.text().await.unwrap_or_default();
+
+        if let Some(base) = create_retry_base(status.as_u16(), &text, retry_after.as_deref()) {
+            let pause = with_jitter(base);
+            if Instant::now() + pause < deadline {
+                eprintln!(
+                    "Lease create not admitted yet (HTTP {status}); retrying in {:.1}s",
+                    pause.as_secs_f64()
+                );
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        anyhow::bail!("Interrupted before the lease was created");
+                    }
+                    _ = tokio::time::sleep(pause) => {}
+                }
+                continue;
+            }
+        }
+
         // Keep the server's `detail` (pool phase, consecutive failures, last
         // failure reason) — a bare "Pool cannot satisfy a new lease" hides
         // the actionable part of a 503 rejection.
@@ -115,8 +159,42 @@ pub(crate) async fn create_lease_request(
             .unwrap_or(text);
         anyhow::bail!("Failed to lease cluster (HTTP {status}): {msg}");
     }
+}
 
-    Ok(response.json().await?)
+/// Whether a refused create is worth retrying, and the pause the server asked
+/// for before jitter.
+///
+/// Retried: `503` with reason `admission_busy` (another create for the same
+/// identity held the admission lock, which CI matrix jobs sharing one identity
+/// hit routinely) and `429` carrying `Retry-After` (the API server's overload
+/// guard). Everything else is final. That includes the lease-quota `429`, which
+/// has no `Retry-After`, and pool pre-flight `503`s, whose `Retry-After` can be
+/// minutes away.
+fn create_retry_base(status: u16, body: &str, retry_after: Option<&str>) -> Option<Duration> {
+    let retry_after = retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let retryable = match status {
+        503 => serde_json::from_str::<JsonValue>(body)
+            .ok()
+            .and_then(|v| v["reason"].as_str().map(|r| r == "admission_busy"))
+            .unwrap_or(false),
+        429 => retry_after.is_some(),
+        _ => false,
+    };
+    retryable.then(|| {
+        retry_after
+            .unwrap_or(Duration::from_secs(1))
+            .min(CREATE_RETRY_MAX_PAUSE)
+    })
+}
+
+/// `base` plus up to half of it again (at least 250 ms of spread), so jobs
+/// refused together do not come back together.
+fn with_jitter(base: Duration) -> Duration {
+    let spread = (base / 2).max(Duration::from_millis(250));
+    let random = (uuid::Uuid::new_v4().as_u128() as u64) % (spread.as_millis() as u64 + 1);
+    base + Duration::from_millis(random)
 }
 
 pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
@@ -227,6 +305,7 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                 command.ttl,
                 command.name,
                 metadata.as_ref(),
+                parse_wait_timeout(command.wait_timeout)?,
             )
             .await?;
             if command.no_wait {
@@ -668,6 +747,198 @@ pub(crate) fn parse_cli_duration(s: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_retries_admission_busy_and_overload_only() {
+        let busy = r#"{"error":"busy","reason":"admission_busy"}"#;
+        assert_eq!(
+            create_retry_base(503, busy, Some("1")),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            create_retry_base(503, busy, None),
+            Some(Duration::from_secs(1)),
+            "a missing Retry-After still retries"
+        );
+        assert_eq!(
+            create_retry_base(503, busy, Some("600")),
+            Some(CREATE_RETRY_MAX_PAUSE),
+            "a long Retry-After is capped"
+        );
+        assert_eq!(
+            create_retry_base(429, r#"{"error":"Server is under heavy load"}"#, Some("2")),
+            Some(Duration::from_secs(2))
+        );
+
+        // Final answers: the lease quota (429 without Retry-After), a pool
+        // that cannot serve the lease, and anything else.
+        assert_eq!(
+            create_retry_base(
+                429,
+                r#"{"error":"Concurrent lease limit (2) reached"}"#,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            create_retry_base(503, r#"{"reason":"capacity_blocked"}"#, Some("30")),
+            None
+        );
+        assert_eq!(create_retry_base(503, "not json", Some("1")), None);
+        assert_eq!(create_retry_base(500, busy, Some("1")), None);
+        assert_eq!(create_retry_base(409, busy, Some("1")), None);
+    }
+
+    #[test]
+    fn create_retry_jitter_spreads_within_half_the_base() {
+        let base = Duration::from_secs(2);
+        let pauses: std::collections::HashSet<Duration> =
+            (0..64).map(|_| with_jitter(base)).collect();
+        assert!(pauses.len() > 1, "retries must be jittered");
+        assert!(
+            pauses
+                .iter()
+                .all(|pause| *pause >= base && *pause <= base + base / 2)
+        );
+        let zero = with_jitter(Duration::ZERO);
+        assert!(zero <= Duration::from_millis(250));
+    }
+
+    /// Serve one canned response per connection and record each request body.
+    fn canned_server(
+        responses: Vec<String>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            bodies.push(
+                                serde_json::from_slice(&request[split + 4..split + 4 + length])
+                                    .unwrap(),
+                            );
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            bodies
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn http_response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn test_config(endpoint: String) -> super::super::config::ResolvedConfig {
+        super::super::config::ResolvedConfig {
+            target: None,
+            endpoint,
+            auth: crate::commands::config::AuthMode::None,
+            token: None,
+            ssh_fingerprint: None,
+            default_pool: None,
+        }
+    }
+
+    /// CI matrix jobs share one identity, so a create can be told another
+    /// one is being admitted. The CLI retries it with the same idempotency
+    /// key, so a retry of a create that did land returns that lease.
+    #[tokio::test]
+    async fn create_lease_request_retries_admission_busy_with_one_key() {
+        let busy = http_response(
+            "503 Service Unavailable",
+            "Retry-After: 0\r\n",
+            r#"{"error":"Another lease request for this identity is being admitted","reason":"admission_busy"}"#,
+        );
+        let accepted = http_response(
+            "202 Accepted",
+            "",
+            r#"{"id":"lease-abc","phase":"Pending","profile":"ci","queuePosition":0}"#,
+        );
+        let (endpoint, server) = canned_server(vec![busy.clone(), busy, accepted]);
+
+        let lease = create_lease_request(&test_config(endpoint), "ci", "1h", None, None, None)
+            .await
+            .expect("the third attempt is admitted");
+        assert_eq!(lease.id, "lease-abc");
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 3);
+        let key = bodies[0]["idempotencyKey"].as_str().expect("a key is sent");
+        assert!(!key.is_empty());
+        assert!(
+            bodies.iter().all(|body| body["idempotencyKey"] == key),
+            "every attempt must reuse the key: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_lease_request_gives_up_at_the_deadline() {
+        let busy = http_response(
+            "503 Service Unavailable",
+            "Retry-After: 5\r\n",
+            r#"{"error":"busy","reason":"admission_busy"}"#,
+        );
+        let (endpoint, server) = canned_server(vec![busy]);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let error = create_lease_request(
+            &test_config(endpoint),
+            "ci",
+            "1h",
+            None,
+            None,
+            Some(deadline),
+        )
+        .await
+        .err()
+        .expect("a retry past the deadline is not attempted");
+        assert!(error.to_string().contains("HTTP 503"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_lease_request_does_not_retry_a_pool_rejection() {
+        let rejected = http_response(
+            "503 Service Unavailable",
+            "Retry-After: 0\r\n",
+            r#"{"error":"Pool cannot satisfy a new lease","reason":"pool_exhausted"}"#,
+        );
+        let (endpoint, server) = canned_server(vec![rejected]);
+        let error = create_lease_request(&test_config(endpoint), "ci", "1h", None, None, None)
+            .await
+            .err()
+            .expect("a pool rejection is final");
+        assert!(error.to_string().contains("Pool cannot satisfy"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 
     #[test]
     fn usable_lease_requires_bound_phase_and_kubeconfig() {

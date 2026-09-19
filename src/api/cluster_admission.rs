@@ -41,15 +41,42 @@ pub(crate) const LOCK_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const LOCK_SAFE_WINDOW: Duration = Duration::from_secs(10);
 
 /// How long a request waits for another request of the same principal to
-/// finish admission before giving up with a retryable error.
+/// finish admission before giving up with a retryable `503 admission_busy`.
+///
+/// Admission for one principal is serial, and CI matrix jobs share one
+/// principal (repository and ref), so a matrix of a few dozen jobs queues
+/// here. One admission is normally well under a second; 25 seconds lets a
+/// burst drain without failing jobs, while staying bounded so a wedged holder
+/// cannot hold requests open indefinitely. Clients should still retry
+/// `admission_busy` (the `kobe` CLI does).
 #[cfg(not(test))]
-pub(crate) const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(5);
-/// Handler tests exercise the busy path without waiting five seconds.
+pub(crate) const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(25);
+/// Handler tests exercise the busy path without waiting 25 seconds.
 #[cfg(test)]
 pub(crate) const LOCK_WAIT_BUDGET: Duration = Duration::from_millis(250);
 
-/// Pause between attempts while the lock is held by a live holder.
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// First pause after finding the lock held by a live holder.
+const LOCK_RETRY_INITIAL: Duration = Duration::from_millis(50);
+
+/// Longest pause between attempts. Keeps a long queue from polling the API
+/// server every few milliseconds while still noticing a release quickly.
+const LOCK_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// Pause before retry `attempt` (0-based) while the lock is held.
+///
+/// Exponential from [`LOCK_RETRY_INITIAL`] up to [`LOCK_RETRY_MAX`], with
+/// "equal jitter": half the step is fixed and half is random. Waiters that
+/// arrived together (a CI matrix starting at once) then spread out instead
+/// of hitting the API server in lockstep.
+pub(crate) fn lock_retry_delay(attempt: u32) -> Duration {
+    use rand::Rng;
+    let step = LOCK_RETRY_INITIAL
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(LOCK_RETRY_MAX);
+    let half = step / 2;
+    let jitter_ms = rand::rng().random_range(0..=half.as_millis() as u64);
+    half + Duration::from_millis(jitter_ms)
+}
 
 /// Label marking admission-lock objects so an operator can find them.
 pub(crate) const ADMISSION_LOCK_LABEL: &str = "kobe.kunobi.ninja/cluster-admission-lock";
@@ -79,12 +106,23 @@ pub(crate) enum AdmissionLockError {
 /// Release is fenced on both UID and `resourceVersion`: a takeover replaces
 /// the object in place, so it keeps the UID, and only the version tells the
 /// original holder that the lock is no longer theirs.
+///
+/// Call [`AdmissionLockGuard::release`] when admission is done. A guard
+/// dropped without it (a cancelled request future, a panic) spawns the same
+/// fenced delete on the current Tokio runtime, so the principal is not
+/// blocked for the rest of [`LOCK_DURATION`].
 #[derive(Debug)]
 pub(crate) struct AdmissionLockGuard {
+    api: Api<Lease>,
+    held: Option<HeldLock>,
+    acquired_at: Instant,
+}
+
+#[derive(Debug)]
+struct HeldLock {
     name: String,
     uid: String,
     resource_version: String,
-    acquired_at: Instant,
 }
 
 impl AdmissionLockGuard {
@@ -99,45 +137,85 @@ impl AdmissionLockGuard {
     /// removed; neither is an error for this request. Other failures are
     /// returned: the lock then expires on its own after [`LOCK_DURATION`], and
     /// the next request for this principal waits or takes it over.
-    pub(crate) async fn release(self, api: &Api<Lease>) -> Result<(), kube::Error> {
-        let params = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(self.uid.clone()),
-                resource_version: Some(self.resource_version.clone()),
-            }),
-            ..DeleteParams::default()
-        };
-        match api.delete(&self.name, &params).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {
-                warn!(
-                    lock = %self.name,
-                    code = error.code,
-                    "Cluster admission lock was no longer ours at release"
-                );
-                Ok(())
-            }
-            Err(error) => Err(error),
+    pub(crate) async fn release(mut self) -> Result<(), kube::Error> {
+        match self.held.take() {
+            Some(held) => delete_fenced(&self.api, &held).await,
+            None => Ok(()),
         }
     }
 }
 
+impl Drop for AdmissionLockGuard {
+    fn drop(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                lock = %held.name,
+                "Cluster admission lock dropped outside a runtime; it expires on its own"
+            );
+            return;
+        };
+        warn!(
+            lock = %held.name,
+            "Cluster admission lock dropped without release; releasing in the background"
+        );
+        let api = self.api.clone();
+        runtime.spawn(async move {
+            if let Err(error) = delete_fenced(&api, &held).await {
+                warn!(
+                    lock = %held.name,
+                    error = %error,
+                    "Failed to release a dropped Cluster admission lock; it expires on its own"
+                );
+            }
+        });
+    }
+}
+
+async fn delete_fenced(api: &Api<Lease>, held: &HeldLock) -> Result<(), kube::Error> {
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(held.uid.clone()),
+            resource_version: Some(held.resource_version.clone()),
+        }),
+        ..DeleteParams::default()
+    };
+    match api.delete(&held.name, &params).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {
+            warn!(
+                lock = %held.name,
+                code = error.code,
+                "Cluster admission lock was no longer ours at release"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Acquire the admission lock `name`, waiting up to `wait_budget` for a live
-/// holder to finish.
+/// holder to finish. Retries back off per [`lock_retry_delay`].
 pub(crate) async fn acquire(
     api: &Api<Lease>,
     name: &str,
     wait_budget: Duration,
 ) -> Result<AdmissionLockGuard, AdmissionLockError> {
     let deadline = Instant::now() + wait_budget;
+    let mut attempt = 0;
     loop {
         if let Some(guard) = try_acquire(api, name).await? {
             return Ok(guard);
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(AdmissionLockError::Busy);
         }
-        tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
+        let pause = lock_retry_delay(attempt).min(deadline - now);
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(pause).await;
     }
 }
 
@@ -155,7 +233,7 @@ async fn try_acquire(
         .create(&PostParams::default(), &lock_object(name, now, None))
         .await
     {
-        Ok(created) => return guard_for(created, started).map(Some),
+        Ok(created) => return guard_for(api, created, started).map(Some),
         Err(kube::Error::Api(error)) if error.code == 409 => {}
         Err(error) => return Err(error.into()),
     }
@@ -179,7 +257,7 @@ async fn try_acquire(
     {
         Ok(taken) => {
             warn!(lock = %name, "Took over an expired Cluster admission lock");
-            guard_for(taken, started).map(Some)
+            guard_for(api, taken, started).map(Some)
         }
         // Another contender took it over first, or the holder deleted it.
         Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => Ok(None),
@@ -187,14 +265,21 @@ async fn try_acquire(
     }
 }
 
-fn guard_for(lease: Lease, started: Instant) -> Result<AdmissionLockGuard, AdmissionLockError> {
+fn guard_for(
+    api: &Api<Lease>,
+    lease: Lease,
+    started: Instant,
+) -> Result<AdmissionLockGuard, AdmissionLockError> {
     let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
         return Err(AdmissionLockError::MissingMetadata);
     };
     Ok(AdmissionLockGuard {
-        name: lease.name_any(),
-        uid,
-        resource_version,
+        api: api.clone(),
+        held: Some(HeldLock {
+            name: lease.name_any(),
+            uid,
+            resource_version,
+        }),
         acquired_at: started,
     })
 }
@@ -323,9 +408,11 @@ mod tests {
         let guard = acquire(&api(&server).await, &lock_name("abc"), Duration::ZERO)
             .await
             .expect("a free lock is acquired");
-        assert_eq!(guard.uid, "lock-uid");
-        assert_eq!(guard.resource_version, "7");
+        let held = guard.held.as_ref().unwrap();
+        assert_eq!(held.uid, "lock-uid");
+        assert_eq!(held.resource_version, "7");
         assert!(guard.still_safe());
+        std::mem::forget(guard);
 
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -395,7 +482,8 @@ mod tests {
         let guard = acquire(&api(&server).await, &lock_name("abc"), Duration::ZERO)
             .await
             .expect("an expired lock is taken over");
-        assert_eq!(guard.resource_version, "8");
+        assert_eq!(guard.held.as_ref().unwrap().resource_version, "8");
+        std::mem::forget(guard);
 
         let put = server
             .received_requests()
@@ -476,13 +564,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = AdmissionLockGuard {
-            name: lock_name("abc"),
-            uid: "lock-uid".into(),
-            resource_version: "7".into(),
-            acquired_at: Instant::now(),
-        };
-        guard.release(&api(&server).await).await.unwrap();
+        let guard = held_guard(api(&server).await);
+        guard.release().await.unwrap();
 
         let delete = &server.received_requests().await.unwrap()[0];
         let body: serde_json::Value = serde_json::from_slice(&delete.body).unwrap();
@@ -501,13 +584,102 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = AdmissionLockGuard {
-            name: lock_name("abc"),
-            uid: "lock-uid".into(),
-            resource_version: "7".into(),
+        let guard = held_guard(api(&server).await);
+        guard.release().await.unwrap();
+    }
+
+    fn held_guard(api: Api<Lease>) -> AdmissionLockGuard {
+        AdmissionLockGuard {
+            api,
+            held: Some(HeldLock {
+                name: lock_name("abc"),
+                uid: "lock-uid".into(),
+                resource_version: "7".into(),
+            }),
             acquired_at: Instant::now(),
-        };
-        guard.release(&api(&server).await).await.unwrap();
+        }
+    }
+
+    /// A request future cancelled while holding the lock (client disconnect,
+    /// pod shutdown, a panic unwinding) must not leave the principal blocked
+    /// until the lock expires: dropping the guard sends the same fenced
+    /// delete as an explicit release.
+    #[tokio::test]
+    async fn dropping_the_guard_releases_the_lock() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(lock_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handler = tokio::spawn({
+            let api = api(&server).await;
+            async move {
+                let _guard = held_guard(api);
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        handler.abort();
+        let _ = handler.await;
+
+        let delete = wait_for_delete(&server).await;
+        let body: serde_json::Value = serde_json::from_slice(&delete.body).unwrap();
+        assert_eq!(body["preconditions"]["uid"], "lock-uid");
+        assert_eq!(body["preconditions"]["resourceVersion"], "7");
+    }
+
+    /// An explicit release is the only delete: the guard's drop does not send
+    /// a second one.
+    #[tokio::test]
+    async fn release_then_drop_deletes_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(lock_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        held_guard(api(&server).await).release().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    async fn wait_for_delete(server: &MockServer) -> wiremock::Request {
+        for _ in 0..200 {
+            if let Some(delete) = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|request| request.method == http::Method::DELETE)
+            {
+                return delete;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the admission lock was never released");
+    }
+
+    #[test]
+    fn lock_retry_delay_backs_off_with_jitter_up_to_the_cap() {
+        for attempt in 0..40 {
+            let step = LOCK_RETRY_INITIAL
+                .saturating_mul(1u32 << attempt.min(16))
+                .min(LOCK_RETRY_MAX);
+            let delay = lock_retry_delay(attempt);
+            assert!(delay >= step / 2 && delay <= step, "{attempt}: {delay:?}");
+            assert!(delay <= LOCK_RETRY_MAX);
+        }
+        assert!(lock_retry_delay(0) <= Duration::from_millis(50));
+        assert!(lock_retry_delay(20) >= Duration::from_millis(500));
+        let spread: std::collections::HashSet<_> = (0..32).map(|_| lock_retry_delay(10)).collect();
+        assert!(spread.len() > 1, "retries must be jittered");
     }
 
     #[test]

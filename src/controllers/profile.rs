@@ -844,7 +844,11 @@ mod cluster_instance_tests {
         let (ctx, server) = test_profile_context().await;
         let patched = mount_instance(
             &server,
-            serde_json::json!({ "phase": "Creating", "specHash": "hash-on-disk" }),
+            serde_json::json!({
+                "phase": "Creating",
+                "specHash": "hash-on-disk",
+                "stateSince": "2026-04-13T10:05:00Z"
+            }),
         )
         .await;
 
@@ -856,6 +860,68 @@ mod cluster_instance_tests {
         .await;
 
         assert!(patched.lock().unwrap().is_empty());
+    }
+
+    /// A new instance whose initial status write was lost has no
+    /// `stateSince`, and the stuck-Creating timeout only fires on an instance
+    /// that has one. The backfill starts that clock, fenced on the version it
+    /// read, and leaves an existing hash alone.
+    #[tokio::test]
+    async fn backfill_stamps_a_missing_state_since() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({ "phase": "Creating", "specHash": "hash-on-disk" }),
+        )
+        .await;
+
+        backfill_spec_hashes(
+            &ctx.client,
+            "test-ns",
+            &[("pool-test-profile-0".to_string(), "hash-other".to_string())],
+        )
+        .await;
+
+        let writes = patched.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1, "a missing stateSince is backfilled");
+        let ops = writes[0].as_array().unwrap();
+        assert!(ops.iter().any(|op| op["op"] == "test"
+            && op["path"] == "/metadata/resourceVersion"
+            && op["value"] == "20"));
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "add" && op["path"] == "/status/stateSince"),
+            "expected a stateSince add, got: {ops:?}"
+        );
+        assert!(!writes_to(&writes[0], "/status/specHash"));
+        assert!(!writes_to(&writes[0], "/status/phase"));
+    }
+
+    /// With no status at all, the backfill writes both the hash and the
+    /// clock, so the instance can still time out of `Creating`.
+    #[tokio::test]
+    async fn backfill_without_status_writes_hash_and_state_since() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(&server, serde_json::Value::Null).await;
+
+        backfill_spec_hashes(
+            &ctx.client,
+            "test-ns",
+            &[("pool-test-profile-0".to_string(), "hash-new".to_string())],
+        )
+        .await;
+
+        let writes = patched.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        let status = writes[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["path"] == "/status")
+            .map(|op| op["value"].clone())
+            .expect("a whole-status add");
+        assert_eq!(status["specHash"], "hash-new");
+        assert!(status["stateSince"].is_string(), "{status}");
     }
 
     /// A recycle decided against a stale snapshot must not land.
@@ -2103,9 +2169,10 @@ async fn ensure_cluster_instance(
         // Retried on optimistic 409s: the instance controller routinely wins
         // the first status write right after CREATE, and losing that race
         // must not skip this patch — `created_with` is written here and
-        // nowhere else (the post-create backfill writes only `spec_hash`), and a
-        // pool-managed instance without backend provenance is refused
-        // deletion fail-closed, wedging recycle permanently.
+        // nowhere else (the post-create backfill writes only `spec_hash` and
+        // a missing `stateSince`), and a pool-managed instance without
+        // backend provenance is refused deletion fail-closed, wedging recycle
+        // permanently.
         let mut attempts = 0;
         let patch_result = loop {
             attempts += 1;
@@ -2161,13 +2228,14 @@ async fn ensure_cluster_instance(
             }
         };
         if let Err(err) = patch_result {
-            // Best-effort: the periodic sync will retry. Log so an operator
-            // upgrade race is visible rather than silently leaving a hash
-            // unset.
+            // The end-of-reconcile backfill (`backfill_spec_hashes`) makes one
+            // more attempt at `spec_hash` and `stateSince`. Nothing retries
+            // `created_with`, so log loudly: an instance without it is refused
+            // deletion until an operator repairs it.
             warn!(
                 cluster = %cluster_name,
                 error = %err,
-                "Failed to write initial status (spec_hash) after create; pool sync will retry"
+                "Failed to write initial status after create; end-of-reconcile backfill retries spec_hash and stateSince only"
             );
         }
     }
@@ -2279,10 +2347,15 @@ async fn mark_instance_recycling(
     }
 }
 
-/// Stamp `spec_hash` on an instance whose status does not have one yet.
+/// Stamp `spec_hash` and `stateSince` on an instance whose status is missing
+/// them.
 ///
-/// Writes nothing else, and nothing at all if a hash is already present,
-/// so it can never replace or erase provenance written by anyone else.
+/// Each field is added only when absent, and the patch is fenced on the uid
+/// and `resourceVersion` it read, so it can never replace or erase a value
+/// written by anyone else. `stateSince` matters because the stuck-Creating
+/// timeout in [`crate::pool::compute_pool_actions`] only fires on an instance
+/// that has one: without it, a new instance whose initial status write was
+/// lost could sit in `Creating` forever.
 async fn backfill_spec_hash(
     client: &Client,
     namespace: &str,
@@ -2291,11 +2364,10 @@ async fn backfill_spec_hash(
 ) -> Result<(), kube::Error> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
     let instance = instances_api.get(cluster_name).await?;
-    if instance
-        .status
-        .as_ref()
-        .is_some_and(|s| s.spec_hash.is_some())
-    {
+    let (has_hash, has_since) = instance.status.as_ref().map_or((false, false), |s| {
+        (s.spec_hash.is_some(), s.state_since.is_some())
+    });
+    if has_hash && has_since {
         return Ok(());
     }
     let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
@@ -2306,20 +2378,31 @@ async fn backfill_spec_hash(
             "instance has no resourceVersion",
         )))
     })?;
-    let write = if instance.status.is_some() {
-        serde_json::json!({ "op": "add", "path": "/status/specHash", "value": spec_hash })
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut ops = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": rv }),
+    ];
+    if instance.status.is_some() {
+        if !has_hash {
+            ops.push(
+                serde_json::json!({ "op": "add", "path": "/status/specHash", "value": spec_hash }),
+            );
+        }
+        if !has_since {
+            ops.push(
+                serde_json::json!({ "op": "add", "path": "/status/stateSince", "value": now }),
+            );
+        }
     } else {
         let status = ClusterInstanceStatus {
             spec_hash: Some(spec_hash.to_string()),
+            state_since: Some(now),
             ..Default::default()
         };
-        serde_json::json!({ "op": "add", "path": "/status", "value": status })
-    };
-    let patch = crate::controllers::lease::json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        write
-    ]));
+        ops.push(serde_json::json!({ "op": "add", "path": "/status", "value": status }));
+    }
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(ops));
     instances_api
         .patch_status(
             cluster_name,
@@ -2408,19 +2491,22 @@ async fn collect_and_emit_cert_expiry(
     per_instance
 }
 
-/// Backfill `spec_hash` on instances created this reconcile.
+/// Backfill `spec_hash` and a missing `stateSince` on instances created this
+/// reconcile.
 ///
 /// [`ensure_cluster_instance`] writes the initial status right after
 /// CREATE and retries lost races, but it can still give up. Without a hash
-/// the instance is drift-blind until the unstamped grace elapses, so this
-/// gives it one more try with the hash it was created for.
+/// the instance is drift-blind until the unstamped grace elapses, and without
+/// `stateSince` the stuck-Creating timeout never fires, so this gives it one
+/// more try with the hash it was created for.
 ///
 /// This is the only end-of-reconcile status write the pool controller
-/// makes. Phase, `idleSince` and `stateSince` belong to the instance and
-/// lease controllers: copying them from the pool snapshot could revert a
-/// newer transition, such as a health-failed `Ready → Recycling` whose
-/// backend is then deleted, back to a leasable `Ready`. The pool writes
-/// only its own intent, in [`mark_instance_recycling`].
+/// makes. Phase, `idleSince` and an existing `stateSince` belong to the
+/// instance and lease controllers: copying them from the pool snapshot could
+/// revert a newer transition, such as a health-failed `Ready → Recycling`
+/// whose backend is then deleted, back to a leasable `Ready`. The pool only
+/// fills a `stateSince` nobody has written, and otherwise writes only its own
+/// intent, in [`mark_instance_recycling`].
 async fn backfill_spec_hashes(client: &Client, namespace: &str, created: &[(String, String)]) {
     for (cluster_name, spec_hash) in created {
         if let Err(err) = backfill_spec_hash(client, namespace, cluster_name, spec_hash).await {

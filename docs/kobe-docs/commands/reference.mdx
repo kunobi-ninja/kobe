@@ -124,6 +124,8 @@ Prints the lease ID, resource kind, capabilities, and expiry. While waiting, Ctr
 
 If the CLI is older than the operator, `kobe status` and `kobe lease` print a warning.
 
+For a Cluster pool, `kobe lease` and `kobe with-lease` send one idempotency key per run. When the server answers that another create for the same identity is still being admitted (common when a CI matrix starts many jobs at once), or that it is overloaded, the CLI waits for `Retry-After` plus some jitter and tries again with the same key. It prints each retry on stderr and gives up after `--wait-timeout`, or after 2 minutes when that flag is unset.
+
 | Flag | Default | Description |
 |---|---|---|
 | `--ttl` | `1h` | Requested TTL. Capped by AccessPolicy `maxTtl`. |
