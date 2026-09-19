@@ -285,6 +285,11 @@ ENV PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/opt/kobe/no
 ENV MISE_TRUSTED_CONFIG_PATHS=/home/agent/work
 ENV MISE_YES=1
 
+# Without a locale every process runs in C/POSIX, so the desktop's xterm reads
+# UTF-8 as Latin-1 and the login banner's `·` renders as `Â·`. C.UTF-8 ships
+# with libc; no locales package is needed.
+ENV LANG=C.UTF-8
+
 # Fixed desktop paths so independent runner executions join the SAME desktop:
 # a second `kobe exec` has no shell and no way to discover a random one. All of
 # it is writable by the workload, with no /run and no root. Setting these does
