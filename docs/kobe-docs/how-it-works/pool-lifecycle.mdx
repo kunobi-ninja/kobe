@@ -48,7 +48,9 @@ instance remains unavailable and still counts against pool capacity. The pool
 phase reads `Quarantined` where it would otherwise read `Healthy` or `Idle`;
 `Failing`, `Backoff`, `ScalingUp` and `ScalingDown` still show
 through, with the count in `status.quarantined`. Operators should inspect the
-`ClusterInstance` and `ClusterLease` receipt before retrying cleanup.
+`ClusterInstance` and `ClusterLease` receipt before retrying cleanup. There is
+no timeout. If the evidence can never arrive, an operator can release the
+object by hand; see [Troubleshooting](/docs/operate/troubleshooting#release-a-quarantined-lease-or-instance).
 
 `ClusterLease.spec.cleanupMode` is write-once. `Standard` is the default.
 `VerifiedDestroy` requires an immutable creation manifest, exact Kubernetes
@@ -81,9 +83,13 @@ status:
 | `Idle` | Scale-to-zero pool with nothing in it. |
 | `ScalingDown` | Above the warm target and recycling idle clusters. |
 | `Healthy` | At or above the warm target. Leased clusters alone do not count: a pool with nothing `Ready` and leases queued is not healthy. |
-| `ScalingUp` | Below the warm target, or leases are queued with nothing `Ready`. The pool is creating clusters or waiting for room to create one. If `creating` is 0 and every cluster is leased, the pool is exhausted: raise `maxClusters` or wait for releases. |
+| `Exhausted` | Nothing `Ready` or `Creating`, leases queued, and every slot up to the ceiling (`maxClusters`, or `size` plus 10 for a fixed pool) is leased or recycling. The queue moves when a lease ends. Raise `maxClusters` if this is common. |
+| `ScalingUp` | Below the warm target, or leases are queued with nothing `Ready`. The pool is creating clusters or waiting for room to create one. |
 
 `Quarantined` replaces `Healthy` or `Idle` while any member is quarantined.
+Quarantined members never make a pool `Exhausted`: they free nothing when a
+lease ends, so a pool held by them keeps `ScalingUp` and shows the count in
+`quarantined`.
 
 These counts are also visible via the API:
 

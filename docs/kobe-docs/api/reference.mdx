@@ -238,7 +238,12 @@ runs, so it gets its lease back even if the pool has since gone into
 The pre-flight refuses a pool that has quarantined members and no Ready
 member with `503` and `reason: capacity_blocked`, whatever phase the pool
 reports. Quarantined members hold their capacity until their teardown evidence
-is repaired, so such a lease could not be served.
+is repaired, so such a lease could not be served. The lease's `status.message`
+says the same thing if the pool becomes blocked after the lease was queued.
+
+A pool in phase `Exhausted` (every cluster leased, leases queued) is not
+refused. The lease is queued with `202` and binds when a lease ends; its
+`Satisfiable` condition reads `CapacityBlocked` meanwhile.
 
 Once bound, `GET /v1/leases/:id` returns:
 
@@ -423,6 +428,14 @@ the operations available to the caller.
   }
 ]
 ```
+
+---
+
+Possible values for a pool `phase`: `Healthy`, `Quarantined`, `ScalingUp`,
+`Exhausted`, `ScalingDown`, `Backoff`, `Failing`, `Idle`. See
+[Pool status](/docs/how-it-works/pool-lifecycle#pool-status) for what each
+means. A phase is omitted when the operator has not written one yet; treat
+an unknown value the same way.
 
 ---
 

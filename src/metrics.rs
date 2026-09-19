@@ -884,6 +884,49 @@ pub static LEASES_RETIRED_UNBOUND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
     .unwrap()
 });
 
+/// Quarantined objects per pool, by `kind` (`lease` or `instance`).
+///
+/// Set on every pool reconcile. Quarantine has no timeout, so a value that
+/// stays above zero means teardown evidence is not arriving and someone has to
+/// look; see "Release a quarantined lease or instance" in the troubleshooting
+/// guide. Quarantined instances also count against `maxClusters`.
+pub static QUARANTINED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_quarantined",
+        "Quarantined objects per pool, by kind (lease, instance)",
+        &["profile", "kind"]
+    )
+    .unwrap()
+});
+
+/// Seconds since the longest-quarantined instance of each pool entered
+/// quarantine, from its `stateSince`. Zero when none is quarantined.
+///
+/// Instances only: a lease records no time of entering quarantine, and every
+/// quarantined lease belongs to a quarantined instance unless that instance
+/// was released first.
+pub static QUARANTINED_OLDEST_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_quarantined_oldest_age_seconds",
+        "Seconds the longest-quarantined instance of a pool has been held",
+        &["profile"]
+    )
+    .unwrap()
+});
+
+/// Quarantined objects released by the operator override annotation, without
+/// verified teardown evidence. Keyed by pool and `kind` (`lease`, `instance`).
+/// Every increment is a manual decision to trust capacity whose cleanup was
+/// never proven, so alert on any change.
+pub static QUARANTINE_RELEASES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_quarantine_releases_total",
+        "Quarantined objects released by operator override, by kind",
+        &["profile", "kind"]
+    )
+    .unwrap()
+});
+
 /// Guest-cluster pod OOM-kills observed by the KobeStore health controller.
 /// Keyed by the bounded [`GuestPodRole`] so a server-vs-kine OOM is
 /// distinguishable without per-pod cardinality.
@@ -1493,6 +1536,9 @@ pub fn init() {
     LazyLock::force(&POOL_GUEST_VERSION_ADVISORY);
     LazyLock::force(&POOL_CAPACITY_BLOCKED);
     LazyLock::force(&POOL_EFFECTIVE_MEMORY_REQUEST_BYTES);
+    LazyLock::force(&QUARANTINED);
+    LazyLock::force(&QUARANTINED_OLDEST_AGE_SECONDS);
+    LazyLock::force(&QUARANTINE_RELEASES_TOTAL);
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);

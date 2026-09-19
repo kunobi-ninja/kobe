@@ -328,6 +328,9 @@ pub fn child_pool_is_composition_eligible(
                 // unusable capacity. Composition still queues; Failing and
                 // Quarantined stay fail-closed above.
                 | ClusterPoolPhase::Backoff
+                // Every slot leased with claims queued: transient, like
+                // ScalingUp. The child queues until a lease ends.
+                | ClusterPoolPhase::Exhausted
         )
     ) {
         return Err(ChildPlacementError::CapacityUnavailable {

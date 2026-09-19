@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::backend::BackendFactory;
 use crate::crd::{
     ClusterInstance, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
-    ClusterPoolStatus, LeasePhase, ResourceRef, SnapshotRefreshTrigger,
+    ClusterPoolPhase, ClusterPoolStatus, LeasePhase, ResourceRef, SnapshotRefreshTrigger,
 };
 use crate::pool::{
     ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
@@ -266,6 +266,32 @@ mod cluster_instance_tests {
             crash_message: None,
             cert_horizon_secs: None,
         }
+    }
+
+    #[test]
+    fn oldest_quarantined_age_reads_only_quarantined_members() {
+        let now = chrono::Utc::now();
+        let at = |state, secs_ago: Option<i64>| ClusterEntry {
+            state_since: secs_ago.map(|secs| now - chrono::Duration::seconds(secs)),
+            ..entry_with_block(state, false)
+        };
+        let state = |entries: Vec<ClusterEntry>| PoolState {
+            clusters: entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, entry)| (format!("c{index}"), entry))
+                .collect(),
+            queue_depth: 0,
+        };
+
+        assert_eq!(oldest_quarantined_age_secs(&state(vec![]), now), 0);
+        let pool = state(vec![
+            at(ClusterState::Leased, Some(9_000)),
+            at(ClusterState::Quarantined, Some(600)),
+            at(ClusterState::Quarantined, Some(3_600)),
+            at(ClusterState::Quarantined, None),
+        ]);
+        assert_eq!(oldest_quarantined_age_secs(&pool, now), 3_600);
     }
 
     /// Guest-version guardrail: k8s ≤1.32 carries the ~23s fatal CSINode-init
@@ -1588,6 +1614,12 @@ async fn reconcile_profile(
     // A rising `quarantined` means teardown evidence is failing, which no
     // other dimension reveals.
     pool_size_set("quarantined", counts.quarantined);
+    crate::metrics::QUARANTINED
+        .with_label_values(&[name.as_str(), "instance"])
+        .set(counts.quarantined as i64);
+    crate::metrics::QUARANTINED_OLDEST_AGE_SECONDS
+        .with_label_values(&[name.as_str()])
+        .set(oldest_quarantined_age_secs(&pool_state, chrono::Utc::now()));
 
     // Surface hidden CPU over-reservation (issue #189): a pool that sets
     // `resources.limits` with empty `requests` makes the kubelet copy each
@@ -1755,13 +1787,40 @@ async fn reconcile_profile(
     };
 
     let patch = serde_json::json!({ "status": status });
-    profiles_api
+    let written = profiles_api
         .patch_status(
             &name,
             &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
-        .await?;
+        .await;
+    match written {
+        Ok(_) => {}
+        // The installed CRD predates `Exhausted` and its enum rejects it.
+        // Helm does not upgrade `crds/`, so this happens whenever the operator
+        // is upgraded before the CRDs are applied. Write the phase older
+        // builds report for the same state rather than freezing the whole
+        // pool status on every reconcile.
+        Err(kube::Error::Api(error))
+            if error.code == 422 && status.phase == Some(ClusterPoolPhase::Exhausted) =>
+        {
+            warn!(
+                profile = %name,
+                "ClusterPool CRD rejects phase Exhausted; reporting ScalingUp. Apply the chart's CRDs"
+            );
+            let mut fallback = status;
+            fallback.phase = Some(ClusterPoolPhase::ScalingUp);
+            let patch = serde_json::json!({ "status": fallback });
+            profiles_api
+                .patch_status(
+                    &name,
+                    &PatchParams::apply("kobe-operator"),
+                    &Patch::Merge(&patch),
+                )
+                .await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     // P0 observability: pool failure gauge + reason-change edge counter.
     // Emitted after the status patch so the gauge mirrors the value we just
@@ -1933,6 +1992,24 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     }
 }
 
+/// Seconds since the longest-quarantined member entered quarantine, or 0.
+/// A member without a parseable `stateSince` counts as just entered: the age
+/// is a lower bound, never invented.
+fn oldest_quarantined_age_secs(state: &PoolState, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    state
+        .clusters
+        .values()
+        .filter(|entry| entry.state == ClusterState::Quarantined)
+        .map(|entry| {
+            entry
+                .state_since
+                .map(|since| (now - since).num_seconds().max(0))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Count claims queued against `profile_name` — `Pending` leases that
 /// do not yet hold a cluster, i.e. demand nothing has been reserved for.
 ///
@@ -1957,30 +2034,50 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
 /// Best-effort: a failed LIST reports 0 rather than failing the
 /// reconcile. Under-reporting only delays scale-up to the next pass,
 /// whereas failing here would block every other pool action.
+///
+/// Also sets `kobe_quarantined{kind="lease"}` from the same LIST, so the
+/// gauge costs no extra request. A failed LIST leaves it at its last value.
 async fn count_pending_claims(ctx: &ProfileContext, profile_name: &str) -> u32 {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={profile_name}"));
     match leases_api.list(&lp).await {
-        Ok(leases) => leases
-            .iter()
-            .filter(|c| {
-                // A lease with no status yet has certainly not been
-                // reserved against, so it counts as demand.
-                c.status
-                    .as_ref()
-                    .map(|s| {
-                        s.phase == LeasePhase::Pending
-                            && s.cluster_name.is_none()
-                            && s.binding.is_none()
-                    })
-                    .unwrap_or(true)
-            })
-            .count() as u32,
+        Ok(leases) => {
+            let quarantined = leases
+                .iter()
+                .filter(|lease| {
+                    lease.status.as_ref().map(|status| &status.phase)
+                        == Some(&LeasePhase::Quarantined)
+                })
+                .count();
+            crate::metrics::QUARANTINED
+                .with_label_values(&[profile_name, "lease"])
+                .set(quarantined as i64);
+            count_queued(&leases.items)
+        }
         Err(e) => {
             warn!(profile = %profile_name, "Failed to list leases for queue depth: {e:?}");
             0
         }
     }
+}
+
+/// Leases that are queued demand; see [`count_pending_claims`].
+fn count_queued(leases: &[ClusterLease]) -> u32 {
+    leases
+        .iter()
+        .filter(|c| {
+            // A lease with no status yet has certainly not been
+            // reserved against, so it counts as demand.
+            c.status
+                .as_ref()
+                .map(|s| {
+                    s.phase == LeasePhase::Pending
+                        && s.cluster_name.is_none()
+                        && s.binding.is_none()
+                })
+                .unwrap_or(true)
+        })
+        .count() as u32
 }
 
 /// Resolve every `BootstrapConfig` referenced by `profile.spec.bootstraps`,

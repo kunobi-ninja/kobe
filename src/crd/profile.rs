@@ -1488,6 +1488,16 @@ pub enum ClusterPoolPhase {
     /// `queueDepth`, `leased` and `creating` to tell these apart. No
     /// consecutive failures.
     ScalingUp,
+    /// Nothing is Ready, every slot up to the capacity ceiling (`maxClusters`,
+    /// or `size` plus the fixed-pool headroom) is held by leases or
+    /// recycling members, and claims are queued. Transient: the queue moves
+    /// as soon as a lease ends. Quarantined members do not count toward this
+    /// state; a pool held by quarantine keeps its other phase and
+    /// `status.quarantined` shows why.
+    ///
+    /// Operators built before this phase existed cannot decode a pool that
+    /// reports it; see the rollback note in the troubleshooting guide.
+    Exhausted,
     /// Above `minReady` and shrinking toward it. Happens after
     /// `scaleDownAfter` reaps idle clusters, or while leases recycle and
     /// no refill is needed.
@@ -1509,7 +1519,16 @@ pub enum ClusterPoolPhase {
 pub struct ClusterPoolStatus {
     /// High-level phase summary. Derived from counts + backoff state each
     /// reconcile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Decoded leniently: a phase this build does not know (written by a newer
+    /// operator) reads as `None` instead of failing the whole object. A strict
+    /// decode would fail every typed `ClusterPool` list during a rolling
+    /// upgrade or rollback, and with it the pool watch and the lease API.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_known_pool_phase"
+    )]
     pub phase: Option<ClusterPoolPhase>,
 
     /// Number of idle clusters ready for claims.
@@ -1603,6 +1622,18 @@ pub struct ClusterPoolStatus {
     /// and reports phase `Failing`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<ClusterPoolCondition>,
+}
+
+/// Decode `status.phase`, mapping a value this build does not recognise to
+/// `None`. See [`ClusterPoolStatus::phase`].
+fn deserialize_known_pool_phase<'de, D>(
+    deserializer: D,
+) -> Result<Option<ClusterPoolPhase>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// A Kubernetes-style condition on a [`ClusterPool`]. Same shape as
@@ -2070,5 +2101,26 @@ mod tests {
             res(&[("memory", "4Gi")], &[]).gomaxprocs_from_cpu_limit(),
             None
         );
+    }
+
+    /// A phase written by a newer operator must not make this build fail to
+    /// decode the pool: a typed list fails as a whole on one bad item.
+    #[test]
+    fn pool_status_decodes_an_unknown_phase_as_none() {
+        let status: ClusterPoolStatus =
+            serde_json::from_value(serde_json::json!({ "phase": "SomeFuturePhase", "ready": 2 }))
+                .unwrap();
+        assert_eq!(status.phase, None);
+        assert_eq!(status.ready, 2);
+
+        let status: ClusterPoolStatus =
+            serde_json::from_value(serde_json::json!({ "phase": "Exhausted" })).unwrap();
+        assert_eq!(status.phase, Some(ClusterPoolPhase::Exhausted));
+
+        let status: ClusterPoolStatus =
+            serde_json::from_value(serde_json::json!({ "phase": null })).unwrap();
+        assert_eq!(status.phase, None);
+        let status: ClusterPoolStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(status.phase, None);
     }
 }

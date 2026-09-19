@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Pool not filling, queued leases, quarantine, sandbox 503s, and CLI reachability.
+description: Pool not filling, queued leases, quarantine and how to release it, sandbox 503s, and CLI reachability.
 ---
 
 # Troubleshooting
@@ -29,6 +29,8 @@ The API accepted the request; no Ready instance was free. `kobe_queue_depth` and
 
 - Fixed `size` pool: raise `size`, wait for a recycle, or wait for `spec.queueTimeout` (default 5m) to expire the waiter.
 - Scaling pool: `maxClusters` may already be hit, or `spec.scaling.queueTimeout` (default 5m) will expire the waiter.
+- Pool phase `Exhausted`: every cluster is leased. The lease binds when another one ends.
+- Lease message says the pool "is blocked by quarantined members": nothing binds until those members are cleared. See the next section.
 - AccessPolicy `maxConcurrentLeases` returns `429`, not a long Pending.
 
 ## `Quarantined`
@@ -38,6 +40,54 @@ Verified cleanup could not prove that every exact resource is gone. The instance
 Inspect the `ClusterInstance` and `ClusterLease` receipt before retrying cleanup. `ClusterLease.spec.cleanupMode` is write-once. `VerifiedDestroy` is eligible only for k3s with embedded SQLite; unsupported backends are rejected before bind.
 
 Do not delete ledger or receipt objects to "free" the slot. That is how you hand capacity back on no evidence.
+
+`kobe_quarantined{profile,kind}` counts quarantined leases and instances per pool. `kobe_quarantined_oldest_age_seconds` shows how long the oldest instance has been held. Quarantine has no timeout: a value that keeps growing will not fix itself.
+
+### Release a quarantined lease or instance
+
+Use this only when the evidence can never arrive, for example after the backend objects were removed by hand or the evidence store was lost. The release deletes the object without a verified teardown receipt. You are vouching that the tenant's data is gone.
+
+The annotation `kobe.kunobi.ninja/release-quarantine` releases one object. Its value must be that object's UID, so it cannot match a same-named replacement or a copied manifest.
+
+1. Confirm the backend resources are gone, or that you accept deleting them now:
+
+   ```sh
+   kubectl describe clusterinstance <instance> -n kobe-system
+   kubectl get clusterlease <lease> -n kobe-system -o yaml
+   ```
+
+2. Release the instance. The operator runs the ordinary backend delete, drops its finalizer, and the pool replaces it:
+
+   ```sh
+   kubectl annotate clusterinstance <instance> -n kobe-system \
+     kobe.kunobi.ninja/release-quarantine="$(kubectl get clusterinstance <instance> -n kobe-system -o jsonpath='{.metadata.uid}')"
+   ```
+
+3. Release the lease. The operator revokes its connect token, drops the receipt finalizer, and deletes it:
+
+   ```sh
+   kubectl annotate clusterlease <lease> -n kobe-system \
+     kobe.kunobi.ninja/release-quarantine="$(kubectl get clusterlease <lease> -n kobe-system -o jsonpath='{.metadata.uid}')"
+   ```
+
+Each release logs a `QUARANTINE OVERRIDE` warning, posts a `QuarantineReleased` event on the object, and increments `kobe_quarantine_releases_total`. Alert on that counter.
+
+The instance and the lease are released separately. Releasing only the lease leaves the instance quarantined and counting against `maxClusters`.
+
+A lease created for a Sandbox composition is not released this way. The operator posts `QuarantineReleaseRefused` and keeps it, because its owning `SandboxLease` retires it.
+
+## Rolling back past the `Exhausted` phase
+
+Operators released before the `Exhausted` pool phase fail to decode a pool whose `status.phase` is `Exhausted`, and one such pool fails their whole pool list. Before rolling back, clear the phase on each affected pool:
+
+```sh
+kubectl patch clusterpool <pool> -n kobe-system --subresource=status \
+  --type=json -p '[{"op":"remove","path":"/status/phase"}]'
+```
+
+The older operator writes its own phase on the next reconcile. The same can happen for a few seconds during a rolling upgrade, while an old replica is still running. Operators that know `Exhausted` read any phase they do not recognise as unset.
+
+If the operator is upgraded before the CRDs, the API server rejects `Exhausted`. The operator then reports `ScalingUp` and logs a warning. Apply the chart's CRDs, as in [Deploy](/docs/getting-started/deploy#crds-on-upgrade).
 
 ## Sandbox API returns 503
 
