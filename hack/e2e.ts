@@ -1085,7 +1085,11 @@ ${placement}
   template:
     defaultContainer: workspace
     runnerPath: /kobe-runner
-    containers:
+${placement.includes("management") ? `    files:
+      - secret: e2e-sandbox-files
+        key: ..token
+        path: /tmp/kobe-template-token
+` : ""}    containers:
       - name: workspace
         image: ${fixture.imageRef}
         command: ["/bin/sh", "-c"]
@@ -1109,10 +1113,18 @@ ${placement}
     tier: trusted-runc
   readiness:
     canary:
-      argv: ["/bin/sh", "-c", "test -x /kobe-runner"]
+      argv: ["/bin/sh", "-c", "test -x /kobe-runner${placement.includes("management") ? " && test $(cat /tmp/kobe-template-token) = template-file-proof && ! test -w /tmp/kobe-template-token && touch /tmp/kobe-parent-writable && rm /tmp/kobe-parent-writable" : ""}"]
       timeout: "30s"`;
 
   return `apiVersion: v1
+kind: Secret
+metadata:
+  name: e2e-sandbox-files
+  namespace: ${namespace}
+stringData:
+  ..token: template-file-proof
+---
+apiVersion: v1
 kind: Secret
 metadata:
   name: ${DEMO_OTHER_TOKEN_SECRET}

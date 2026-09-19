@@ -109,6 +109,10 @@ spec:
       - name: http
         container: workspace
         port: 8080
+    files:
+      - secret: pecorino-claude-oauth
+        key: credentials.json
+        path: /home/agent/.claude/.credentials.json
   isolation:
     tier: trusted-runc
   readiness:
@@ -124,6 +128,34 @@ Linux capabilities, disables privilege escalation, and applies the
 `RuntimeDefault` seccomp profile. Images must work as that non-root user and
 must not require writable root-owned paths. Canary `argv` is executed
 directly, without an implicit shell.
+
+## Secret files
+
+`template.files` mounts Kubernetes Secrets that already exist in the Sandbox
+Pod namespace into every container. Callers cannot add or override them. Every
+Sandbox from the pool gets the same files; they are part of the certified
+shape, not an exception to it.
+
+The Secret is referenced by Kubernetes name. Kobe does not create it or copy
+its bytes into the Pool. If the bytes come from 1Password, create the item
+first and point External Secrets at the item UUID (`remoteRef.key`), not the
+title. The Kubernetes Secret that lands in the cluster is what `files.secret`
+names. That Secret must be in the namespace where the Pods run: the Pool
+namespace for `placement.type: management`, or `kobe-sandbox` inside a child
+cluster.
+
+Each entry is one key at one absolute path, mounted read-only with `subPath`
+so the rest of the parent directory stays writable. Mode is `0444` so UID
+`65532` can read the file. A missing Secret fails Pod startup, so the pool
+stays uncertified.
+
+Declare at most 16 files with distinct, absolute paths. Paths cannot contain
+`.` or `..` segments, repeated slashes, or a trailing slash. Prepare any
+directories the tool needs to write in the image with ownership for UID
+`65532`. Tools cannot rewrite these mounted credential files.
+
+Rotating the Secret updates new Pods. Warm Sandboxes already running keep the
+bytes they started with until those Pods are recreated.
 
 ## Idle reclaim
 

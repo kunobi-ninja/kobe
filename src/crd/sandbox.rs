@@ -5,7 +5,9 @@
 //! callers can request only a pool, TTL, alias, and requester identity through a
 //! [`SandboxLease`]. Placement controllers translate that intent into upstream
 //! resources without accepting caller-provided namespaces, credentials, mounts,
-//! environment variables, PVCs, or runtime classes.
+//! environment variables, PVCs, or runtime classes. Administrators may declare
+//! Secret files on the pool template; those mounts are identical on every
+//! Sandbox and are part of the certified shape.
 
 use std::collections::BTreeSet;
 
@@ -277,6 +279,8 @@ impl SandboxPoolSpec {
             return Err(SandboxPoolValidationError::EmptyCanaryTimeout);
         }
 
+        self.template.validate_files()?;
+
         Ok(())
     }
 }
@@ -390,12 +394,21 @@ impl JsonSchema for SandboxPlacement {
     validation = Rule::new("!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.end - p.portRange.start < 8192)")
         .message("portRange may span at most 8192 ports")
 )]
+#[x_kube(
+    validation = Rule::new("!has(self.files) || self.files.all(f, self.files.filter(other, other.path == f.path).size() == 1)")
+        .message("each template file path may be declared only once")
+)]
+#[x_kube(
+    validation = Rule::new(r"!has(self.files) || self.files.all(f, !f.path.matches('(^|/)[.][.]?(/|$)'))")
+        .message("template file paths must not contain '.' or '..' segments")
+)]
 pub struct SandboxTemplateSpec {
     /// Container selected by default for execution operations.
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub default_container: String,
-    /// Complete bounded set of containers. Environment, mounts, security
-    /// context, service accounts, and arbitrary Pod fields are not exposed.
+    /// Complete bounded set of containers. Caller-provided environment, mounts,
+    /// security context, service accounts, and arbitrary Pod fields are not
+    /// exposed. Administrator-declared Secret files live on `files`.
     #[schemars(length(min = 1, max = 16))]
     pub containers: Vec<SandboxContainerSpec>,
     /// Ports that later access brokers may expose, each declared as one port
@@ -439,6 +452,21 @@ pub struct SandboxTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 255), pattern(r"^/[A-Za-z0-9._/-]*$"))]
     pub runner_path: Option<String>,
+
+    /// Administrator-declared Secret files mounted into every container.
+    ///
+    /// Each entry names a Kubernetes Secret that already exists in the Sandbox
+    /// Pod's namespace, one key in that Secret, and the absolute path where
+    /// that key appears as a file. Callers cannot add, remove, or override
+    /// these. Every Sandbox from the pool gets the same files, so they remain
+    /// part of the certified shape.
+    ///
+    /// The Secret is referenced by name only; Kobe never copies its bytes into
+    /// the Pool object. A missing Secret fails Pod startup and therefore pool
+    /// certification. Content rotation does not recreate warm Sandboxes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub files: Vec<SandboxTemplateFile>,
 }
 
 impl SandboxTemplateSpec {
@@ -471,6 +499,93 @@ impl SandboxTemplateSpec {
     pub fn requires_service(&self) -> bool {
         self.published_ports().next().is_some()
     }
+
+    fn validate_files(&self) -> Result<(), SandboxPoolValidationError> {
+        if self.files.len() > MAX_SANDBOX_TEMPLATE_FILES {
+            return Err(SandboxPoolValidationError::TooManyFiles(self.files.len()));
+        }
+
+        let mut paths = BTreeSet::new();
+        for file in &self.files {
+            if file.secret.trim().is_empty() {
+                return Err(SandboxPoolValidationError::EmptyFileSecret);
+            }
+            if !is_dns1123_subdomain(&file.secret) {
+                return Err(SandboxPoolValidationError::InvalidFileSecret(
+                    file.secret.clone(),
+                ));
+            }
+            if file.key.trim().is_empty() {
+                return Err(SandboxPoolValidationError::EmptyFileKey);
+            }
+            if !is_secret_key(&file.key) {
+                return Err(SandboxPoolValidationError::InvalidFileKey(file.key.clone()));
+            }
+            validate_file_path(&file.path)?;
+            if !paths.insert(file.path.as_str()) {
+                return Err(SandboxPoolValidationError::DuplicateFilePath(
+                    file.path.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One Secret key mounted as a file in every Sandbox container.
+///
+/// The Secret must exist in the namespace where Sandbox Pods run: the Pool
+/// namespace for management placement, `kobe-sandbox` inside a child cluster.
+/// Kobe does not create, copy, or rotate the Secret.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxTemplateFile {
+    /// Kubernetes Secret name in the Sandbox Pod namespace.
+    #[schemars(
+        length(min = 1, max = 253),
+        pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+    )]
+    pub secret: String,
+    /// Key inside the named Secret. Only this key is projected into the volume.
+    #[schemars(length(min = 1, max = 253), pattern("^[-._a-zA-Z0-9]+$"))]
+    pub key: String,
+    /// Absolute file path inside each container. Mounted with `subPath` so the
+    /// rest of the parent directory stays the container's writable filesystem.
+    #[schemars(length(min = 2, max = 4096), pattern(r"^/[^/\x00]+(/[^/\x00]+)*$"))]
+    pub path: String,
+}
+
+fn is_dns1123_subdomain(value: &str) -> bool {
+    (1..=253).contains(&value.len()) && value.split('.').all(is_dns1123_label)
+}
+
+fn is_dns1123_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+fn is_secret_key(key: &str) -> bool {
+    (1..=253).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn validate_file_path(path: &str) -> Result<(), SandboxPoolValidationError> {
+    if path.len() > 4096
+        || !path.starts_with('/')
+        || path[1..]
+            .split('/')
+            .any(|part| matches!(part, "" | "." | "..") || part.contains('\0'))
+    {
+        return Err(SandboxPoolValidationError::InvalidFilePath(path.into()));
+    }
+    Ok(())
 }
 
 /// One administrator-controlled container in a Sandbox template.
@@ -548,6 +663,13 @@ pub struct SandboxResourceCeiling {
 /// reviewer will see. That is the same trade the whole field makes — the
 /// administrator decides, and Kobe only insists the decision be visible.
 pub const MAX_PORT_RANGE_SPAN: u32 = 8192;
+
+/// Maximum administrator-declared Secret files on one pool template.
+///
+/// Enough for a handful of tool credentials (Claude, `gh`, Codex, …) and small
+/// enough that the certified Pod shape stays reviewable as a list, not a dump
+/// of the namespace's Secrets.
+pub const MAX_SANDBOX_TEMPLATE_FILES: usize = 16;
 
 /// One TCP port, or one contiguous band of them, declared safe for later
 /// lease-scoped forwarding.
@@ -1524,6 +1646,20 @@ pub enum SandboxPoolValidationError {
     EmptyCanaryArgv,
     #[error("readiness canary timeout must not be empty")]
     EmptyCanaryTimeout,
+    #[error("template files must not exceed {MAX_SANDBOX_TEMPLATE_FILES} entries, got {0}")]
+    TooManyFiles(usize),
+    #[error("template file secret name must not be empty")]
+    EmptyFileSecret,
+    #[error("template file secret name {0} is not a DNS-1123 subdomain")]
+    InvalidFileSecret(String),
+    #[error("template file key must not be empty")]
+    EmptyFileKey,
+    #[error("template file key {0} is not a valid Secret key")]
+    InvalidFileKey(String),
+    #[error("template file path {0} must be an absolute file path without '.' or '..' segments")]
+    InvalidFilePath(String),
+    #[error("template file path {0} is declared more than once")]
+    DuplicateFilePath(String),
 }
 
 #[cfg(test)]
@@ -1569,6 +1705,7 @@ mod tests {
                 }],
                 runner_path: None,
                 attach_command: None,
+                files: vec![],
             },
             isolation: SandboxIsolation::TrustedRunc {},
             readiness: SandboxReadinessRequirements {
@@ -2054,12 +2191,103 @@ mod tests {
         for rule in [
             "has(p.port) != has(p.portRange)",
             "p.portRange.start <= p.portRange.end",
+            "self.files.all(f, self.files.filter(other, other.path == f.path).size() == 1)",
+            "self.files.all(f, !f.path.matches",
         ] {
             assert!(
                 rules.contains(rule),
                 "the schema must carry the rule {rule}"
             );
         }
+    }
+
+    #[test]
+    fn template_files_accept_a_valid_secret_file() {
+        let mut spec = valid_pool_spec();
+        spec.template.files = vec![SandboxTemplateFile {
+            secret: "0199b3c0-7e12-7000-8000-5f1a2b3c4d5e".into(),
+            key: "credentials.json".into(),
+            path: "/home/agent/.claude/.credentials.json".into(),
+        }];
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn template_files_require_canonical_bounded_paths() {
+        for path in [
+            "", "/", "relative", "/a/", "/a//b", "/a/./b", "/a/../b", "/a/.", "/a/..", "/a\0b",
+        ] {
+            assert!(validate_file_path(path).is_err(), "accepted {path:?}");
+        }
+        assert!(validate_file_path(&format!("/{}", "a".repeat(4096))).is_err());
+        for path in ["/token", "/home/agent/.config/token", "/a/.../token"] {
+            assert!(validate_file_path(path).is_ok(), "rejected {path:?}");
+        }
+        let mut spec = valid_pool_spec();
+        spec.template.files = (0..=MAX_SANDBOX_TEMPLATE_FILES)
+            .map(|index| SandboxTemplateFile {
+                secret: "credentials".into(),
+                key: "token".into(),
+                path: format!("/token-{index}"),
+            })
+            .collect();
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::TooManyFiles(_))
+        ));
+    }
+
+    #[test]
+    fn template_files_reject_duplicate_paths_and_unsafe_paths() {
+        let mut spec = valid_pool_spec();
+        spec.template.files = vec![
+            SandboxTemplateFile {
+                secret: "0199b3c0-7e12-7000-8000-5f1a2b3c4d5e".into(),
+                key: "a".into(),
+                path: "/home/agent/.claude/.credentials.json".into(),
+            },
+            SandboxTemplateFile {
+                secret: "0199b3c0-7e12-7000-8000-5f1a2b3c4d5f".into(),
+                key: "token".into(),
+                path: "/home/agent/.claude/.credentials.json".into(),
+            },
+        ];
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::DuplicateFilePath(path))
+                if path == "/home/agent/.claude/.credentials.json"
+        ));
+
+        spec.template.files = vec![SandboxTemplateFile {
+            secret: "0199b3c0-7e12-7000-8000-5f1a2b3c4d5e".into(),
+            key: "credentials.json".into(),
+            path: "/home/agent/../etc/passwd".into(),
+        }];
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::InvalidFilePath(path))
+                if path == "/home/agent/../etc/passwd"
+        ));
+
+        spec.template.files = vec![SandboxTemplateFile {
+            secret: "0199b3c0-7e12-7000-8000-5f1a2b3c4d5e".into(),
+            key: "credentials.json".into(),
+            path: "/".into(),
+        }];
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::InvalidFilePath(_))
+        ));
+
+        spec.template.files = vec![SandboxTemplateFile {
+            secret: "Not_a_Secret".into(),
+            key: "credentials.json".into(),
+            path: "/home/agent/.claude/.credentials.json".into(),
+        }];
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::InvalidFileSecret(_))
+        ));
     }
 
     #[test]

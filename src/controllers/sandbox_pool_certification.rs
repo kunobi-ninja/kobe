@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, Node, PersistentVolume, PersistentVolumeClaim, Pod, PodSpec, Service,
-    ServicePort,
+    ServicePort, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -845,8 +845,64 @@ fn container_matches(expected: &Container, actual: &Container) -> bool {
         && expected.termination_message_policy == actual.termination_message_policy
         && empty(&actual.env)
         && empty(&actual.env_from)
-        && empty(&actual.volume_mounts)
+        && volume_mounts_match(&expected.volume_mounts, &actual.volume_mounts)
         && empty(&actual.volume_devices)
+}
+
+fn volume_mounts_match(
+    expected: &Option<Vec<VolumeMount>>,
+    actual: &Option<Vec<VolumeMount>>,
+) -> bool {
+    let mut expected = expected.clone().unwrap_or_default();
+    let mut actual = actual.clone().unwrap_or_default();
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let key = |mount: &VolumeMount| {
+        (
+            mount.name.clone(),
+            mount.mount_path.clone(),
+            mount.sub_path.clone(),
+        )
+    };
+    expected.sort_by_key(key);
+    actual.sort_by_key(key);
+    expected == actual
+}
+
+/// Compare every Secret field, including per-key modes and optional flags.
+/// Only list order may differ; undeclared volume sources are rejected.
+fn secret_volumes_match(expected: &Option<Vec<Volume>>, actual: &Option<Vec<Volume>>) -> bool {
+    fn normalized(volumes: &Option<Vec<Volume>>) -> Option<Vec<Volume>> {
+        let mut volumes = volumes.clone().unwrap_or_default();
+        for volume in &mut volumes {
+            let mut secret = volume.secret.clone()?;
+            let items = secret.items.as_mut()?;
+            items.sort_by(|a, b| (&a.key, &a.path, a.mode).cmp(&(&b.key, &b.path, b.mode)));
+            // Kubernetes may omit the false default when returning the object.
+            secret.optional = Some(secret.optional.unwrap_or(false));
+            let normalized = Volume {
+                name: volume.name.clone(),
+                secret: Some(secret),
+                ..Default::default()
+            };
+            let mut original = volume.clone();
+            original.secret = normalized.secret.clone();
+            if original != normalized {
+                return None;
+            }
+            *volume = normalized;
+        }
+        volumes.sort_by(|a, b| a.name.cmp(&b.name));
+        if volumes.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return None;
+        }
+        Some(volumes)
+    }
+    match (normalized(expected), normalized(actual)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    }
 }
 
 fn expected_pod_spec(pool: &SandboxPool, namespace: &str) -> Result<PodSpec, String> {
@@ -881,12 +937,14 @@ fn validate_pod_spec(expected: &PodSpec, actual: &PodSpec) -> Result<(), String>
         || actual.host_pid == Some(true)
         || actual.host_ipc == Some(true)
         || actual.share_process_namespace == Some(true)
-        || !empty(&actual.volumes)
         || !empty(&actual.init_containers)
         || !empty(&actual.ephemeral_containers)
     {
+        return Err("Sandbox Pod contains a prohibited host, init or ephemeral surface".into());
+    }
+    if !secret_volumes_match(&expected.volumes, &actual.volumes) {
         return Err(
-            "Sandbox Pod contains a prohibited host, volume, init or ephemeral surface".into(),
+            "Sandbox Pod volumes drifted from the administrator-declared secret files".into(),
         );
     }
     if expected.containers.len() != actual.containers.len()
@@ -3065,6 +3123,101 @@ mod tests {
         let error = validate_pod_spec(&expected, &path_drifted).unwrap_err();
         assert!(
             error.contains("drifted from the closed pool template"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pod_spec_certification_accepts_declared_secret_files_and_rejects_extras() {
+        let mut declared = pool(0);
+        declared.spec.template.files = vec![crate::crd::SandboxTemplateFile {
+            secret: "pecorino-claude-oauth".into(),
+            key: "credentials.json".into(),
+            path: "/home/agent/.claude/.credentials.json".into(),
+        }];
+        let expected = expected_pod_spec(&declared, "kobe-system").unwrap();
+        assert_eq!(expected.volumes.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            expected.containers[0].volume_mounts.as_ref().map(Vec::len),
+            Some(1)
+        );
+
+        let mut scheduled = expected.clone();
+        scheduled.node_name = Some("node-1".into());
+        validate_pod_spec(&expected, &scheduled).unwrap();
+
+        // Every field affecting what is mounted must match, not just the
+        // Secret name, key and destination path.
+        let mut drifted = scheduled.clone();
+        drifted.volumes.as_mut().unwrap()[0]
+            .secret
+            .as_mut()
+            .unwrap()
+            .optional = Some(true);
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.volumes.as_mut().unwrap()[0]
+            .secret
+            .as_mut()
+            .unwrap()
+            .items
+            .as_mut()
+            .unwrap()[0]
+            .mode = Some(0o777);
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.volumes.as_mut().unwrap()[0]
+            .secret
+            .as_mut()
+            .unwrap()
+            .secret_name = Some("other-credentials".into());
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.containers[0].volume_mounts.as_mut().unwrap()[0].sub_path_expr =
+            Some("$(TOKEN)".into());
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.containers[0].volume_mounts.as_mut().unwrap()[0].mount_propagation =
+            Some("Bidirectional".into());
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.containers[0].volume_mounts.as_mut().unwrap()[0].read_only = Some(false);
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+        let mut drifted = scheduled.clone();
+        drifted.volumes.as_mut().unwrap()[0].empty_dir = Some(Default::default());
+        assert!(validate_pod_spec(&expected, &drifted).is_err());
+
+        let mut extra = scheduled.clone();
+        extra.volumes.as_mut().unwrap().push(Volume {
+            name: "escape".into(),
+            host_path: Some(k8s_openapi::api::core::v1::HostPathVolumeSource {
+                path: "/etc".into(),
+                type_: None,
+            }),
+            ..Default::default()
+        });
+        let error = validate_pod_spec(&expected, &extra).unwrap_err();
+        assert!(
+            error.contains("volumes drifted from the administrator-declared secret files"),
+            "{error}"
+        );
+
+        let undeclared_expected = expected_pod_spec(&pool(0), "kobe-system").unwrap();
+        let mut sneaked = undeclared_expected.clone();
+        sneaked.node_name = Some("node-1".into());
+        sneaked.volumes = expected.volumes.clone();
+        sneaked.containers[0].volume_mounts = expected.containers[0].volume_mounts.clone();
+        let error = validate_pod_spec(&undeclared_expected, &sneaked).unwrap_err();
+        assert!(
+            error.contains("volumes drifted from the administrator-declared secret files"),
+            "{error}"
+        );
+
+        let mut host_network = scheduled;
+        host_network.host_network = Some(true);
+        let error = validate_pod_spec(&expected, &host_network).unwrap_err();
+        assert!(
+            error.contains("prohibited host, init or ephemeral surface"),
             "{error}"
         );
     }
