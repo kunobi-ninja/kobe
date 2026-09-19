@@ -247,6 +247,10 @@ RUN printf '%s\n' 'export PATH=/opt/kobe/node/bin:$PATH' \
 # `dumb` terminal. The `nproc` caveat and the `CARGO_BUILD_JOBS` /
 # `RUST_TEST_THREADS` detail live in the runner's docs, not in front of every
 # prompt.
+#
+# The second line is the one hint worth the space: a person who lands here
+# reaches for `sudo apt-get` first, and there is no root. Nix (below) is the
+# answer, and nothing else in the session would tell them so.
 RUN printf '%s\n' \
       'if [ -n "$KOBE_CPUS" ] && [ -t 1 ]; then' \
       '  if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then' \
@@ -255,6 +259,7 @@ RUN printf '%s\n' \
       "    _kobe_b=''; _kobe_r=''" \
       '  fi' \
       '  printf "%b\n" "${_kobe_b}kobe${_kobe_r} · sandbox · ${KOBE_CPUS} CPUs (cgroup quota)" >&2' \
+      '  printf "%s\n" "no root here · system packages: nix shell nixpkgs#<pkg>" >&2' \
       '  unset _kobe_b _kobe_r' \
       'fi' \
       > /etc/profile.d/kobe-cpu-quota.sh \
