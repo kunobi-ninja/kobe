@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, PodSecurityContext, PodSpec, ResourceRequirements,
-    SeccompProfile, SecurityContext,
+    Capabilities, Container, ContainerPort, KeyToPath, PodSecurityContext, PodSpec,
+    ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -25,7 +25,7 @@ use thiserror::Error;
 use crate::crd::{
     ResolvedSandboxPlacement, SandboxConditionStatus, SandboxLeasePhase, SandboxLeaseStatus,
     SandboxObjectReference, SandboxPool, SandboxPoolSpec, SandboxPoolValidationError,
-    SandboxResourceCeiling, SandboxTargetProvenance, SandboxTemplateSpec,
+    SandboxResourceCeiling, SandboxTargetProvenance, SandboxTemplateFile, SandboxTemplateSpec,
 };
 
 pub const AGENT_SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io/v1beta1";
@@ -221,12 +221,12 @@ pub enum SandboxPoolReadinessError {
 ///
 /// The projection is intentionally closed: it emits only declared containers,
 /// CPU/memory/ephemeral-storage resources, TCP ports, the administrator's
-/// RuntimeClass, and fixed Restricted-profile-compatible Pod/container
-/// security contexts. Every workload runs as Kobe's non-root UID/GID 65532,
-/// drops all capabilities, disables privilege escalation and service-account
-/// token/service-link injection, and uses RuntimeDefault seccomp. It cannot
-/// emit PVC templates, environment values, service accounts, arbitrary
-/// volumes, or caller metadata.
+/// RuntimeClass, fixed Restricted-profile-compatible Pod/container security
+/// contexts, and any administrator-declared Secret files. Every workload runs
+/// as Kobe's non-root UID/GID 65532, drops all capabilities, disables
+/// privilege escalation and service-account token/service-link injection, and
+/// uses RuntimeDefault seccomp. It cannot emit PVC templates, environment
+/// values, service accounts, arbitrary volumes, or caller metadata.
 pub fn build_sandbox_template(
     name: &str,
     namespace: &str,
@@ -235,6 +235,7 @@ pub fn build_sandbox_template(
 ) -> Result<DynamicObject, SandboxMappingError> {
     pool.validate()?;
     aggregate_resource_limits(&pool.template)?;
+    let (volumes, volume_mounts) = project_secret_files(&pool.template.files);
 
     let containers = pool
         .template
@@ -290,6 +291,7 @@ pub fn build_sandbox_template(
                 // kubelet's own default.
                 termination_message_path: Some(SANDBOX_TERMINATION_MESSAGE_PATH.to_string()),
                 termination_message_policy: Some(SANDBOX_TERMINATION_MESSAGE_POLICY.to_string()),
+                volume_mounts: (!volume_mounts.is_empty()).then(|| volume_mounts.clone()),
                 security_context: Some(SecurityContext {
                     allow_privilege_escalation: Some(false),
                     capabilities: Some(Capabilities {
@@ -315,6 +317,7 @@ pub fn build_sandbox_template(
         // until the Pod is gone, so a workload that ignores TERM must not hold
         // the slot for the 30s default.
         termination_grace_period_seconds: Some(SANDBOX_TERMINATION_GRACE_SECONDS),
+        volumes: (!volumes.is_empty()).then_some(volumes),
         security_context: Some(PodSecurityContext {
             run_as_group: Some(65_532),
             run_as_non_root: Some(true),
@@ -354,6 +357,81 @@ pub fn build_sandbox_template(
             }
         }),
     ))
+}
+
+/// Mode for Secret files inside the container. UID 65532 has to read them;
+/// the Pod has no `fsGroup`, and a 0400 root-owned file would be unreadable.
+/// World-readable is acceptable: the Sandbox is a single-user container.
+pub(crate) const SANDBOX_SECRET_FILE_MODE: i32 = 0o444;
+
+/// Project administrator-declared Secret files into one volume per Secret and
+/// one read-only `subPath` mount per file. `subPath` keeps the parent directory
+/// writable so a tool home like `~/.claude` is not replaced by a Secret volume.
+/// Generated projection paths keep Kubernetes volume paths separate from the
+/// administrator's Secret keys.
+pub(crate) fn project_secret_files(
+    files: &[SandboxTemplateFile],
+) -> (Vec<Volume>, Vec<VolumeMount>) {
+    if files.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut secret_order = Vec::new();
+    let mut items_by_secret: BTreeMap<&str, BTreeMap<&str, String>> = BTreeMap::new();
+    for file in files {
+        if !secret_order.contains(&file.secret.as_str()) {
+            secret_order.push(file.secret.as_str());
+        }
+        let items = items_by_secret.entry(file.secret.as_str()).or_default();
+        let path = format!("file-{}", items.len());
+        items.entry(file.key.as_str()).or_insert(path);
+    }
+
+    let mut volume_name_by_secret = BTreeMap::new();
+    let volumes = secret_order
+        .into_iter()
+        .enumerate()
+        .map(|(index, secret)| {
+            let name = format!("kobe-file-{index}");
+            volume_name_by_secret.insert(secret, name.clone());
+            let items = items_by_secret
+                .get(secret)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|(key, path)| KeyToPath {
+                            key: (*key).to_string(),
+                            path: path.clone(),
+                            mode: None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Volume {
+                name,
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret.to_string()),
+                    default_mode: Some(SANDBOX_SECRET_FILE_MODE),
+                    items: Some(items),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    let mounts = files
+        .iter()
+        .map(|file| VolumeMount {
+            name: volume_name_by_secret[file.secret.as_str()].clone(),
+            mount_path: file.path.clone(),
+            sub_path: Some(items_by_secret[file.secret.as_str()][file.key.as_str()].clone()),
+            read_only: Some(true),
+            ..Default::default()
+        })
+        .collect();
+
+    (volumes, mounts)
 }
 
 /// Render the upstream warm pool using the exact v1beta1
@@ -1718,7 +1796,8 @@ mod tests {
     use crate::crd::{
         SandboxCondition, SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary,
         SandboxIsolation, SandboxPlacement, SandboxPoolStatus, SandboxPortSpec,
-        SandboxReadinessRequirements, SandboxResourceQuantity, SandboxTransport,
+        SandboxReadinessRequirements, SandboxResourceQuantity, SandboxTemplateFile,
+        SandboxTransport,
     };
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -1758,6 +1837,7 @@ mod tests {
                 }],
                 runner_path: None,
                 attach_command: None,
+                files: vec![],
             },
             isolation: SandboxIsolation::Gvisor {
                 runtime_class_name: "runsc".into(),
@@ -2099,6 +2179,125 @@ mod tests {
                 .get("volumes")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn template_projection_emits_declared_secret_files() {
+        let mut spec = pool();
+        spec.template.files = vec![
+            SandboxTemplateFile {
+                secret: "pecorino-claude-oauth".into(),
+                key: "credentials.json".into(),
+                path: "/home/agent/.claude/.credentials.json".into(),
+            },
+            SandboxTemplateFile {
+                secret: "pecorino-github".into(),
+                key: "token".into(),
+                path: "/home/agent/.config/gh/token".into(),
+            },
+            SandboxTemplateFile {
+                secret: "pecorino-claude-oauth".into(),
+                key: "extra".into(),
+                path: "/home/agent/.claude/extra".into(),
+            },
+        ];
+        let value = serde_json::to_value(
+            build_sandbox_template("agents", "targets", &spec, Some(&owner())).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["volumes"],
+            serde_json::json!([
+                {
+                    "name": "kobe-file-0",
+                    "secret": {
+                        "secretName": "pecorino-claude-oauth",
+                        "defaultMode": 292,
+                        "optional": false,
+                        "items": [
+                            { "key": "credentials.json", "path": "file-0" },
+                            { "key": "extra", "path": "file-1" }
+                        ]
+                    }
+                },
+                {
+                    "name": "kobe-file-1",
+                    "secret": {
+                        "secretName": "pecorino-github",
+                        "defaultMode": 292,
+                        "optional": false,
+                        "items": [
+                            { "key": "token", "path": "file-0" }
+                        ]
+                    }
+                }
+            ])
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"],
+            serde_json::json!([
+                {
+                    "name": "kobe-file-0",
+                    "mountPath": "/home/agent/.claude/.credentials.json",
+                    "readOnly": true,
+                    "subPath": "file-0"
+                },
+                {
+                    "name": "kobe-file-1",
+                    "mountPath": "/home/agent/.config/gh/token",
+                    "readOnly": true,
+                    "subPath": "file-0"
+                },
+                {
+                    "name": "kobe-file-0",
+                    "mountPath": "/home/agent/.claude/extra",
+                    "readOnly": true,
+                    "subPath": "file-1"
+                }
+            ])
+        );
+        assert_eq!(value["spec"]["envVarsInjectionPolicy"], "Disallowed");
+        assert_eq!(value["spec"]["volumeClaimTemplatesPolicy"], "Disallowed");
+        assert!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]
+                .get("env")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn template_files_project_unusual_keys_and_share_repeated_keys_across_containers() {
+        let mut spec = pool();
+        let mut sidecar = spec.template.containers[0].clone();
+        sidecar.name = "sidecar".into();
+        spec.template.containers.push(sidecar);
+        spec.template.files = ["/home/agent/token", "/opt/token"]
+            .into_iter()
+            .map(|path| SandboxTemplateFile {
+                secret: "credentials".into(),
+                key: ".token".into(),
+                path: path.into(),
+            })
+            .collect();
+        let template = build_sandbox_template("agents", "targets", &spec, None).unwrap();
+        let pod: PodSpec =
+            serde_json::from_value(template.data["spec"]["podTemplate"]["spec"].clone()).unwrap();
+        let volumes = pod.volumes.unwrap();
+        assert_eq!(volumes.len(), 1);
+        let secret = volumes[0].secret.as_ref().unwrap();
+        let items = secret.items.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, ".token");
+        assert_eq!(items[0].path, "file-0");
+        assert_eq!(
+            pod.containers[0].volume_mounts,
+            pod.containers[1].volume_mounts
+        );
+        for mount in pod.containers[0].volume_mounts.as_ref().unwrap() {
+            assert_eq!(mount.sub_path.as_deref(), Some("file-0"));
+            assert_eq!(mount.read_only, Some(true));
+        }
     }
 
     /// Regression guard for #219: an unset termination-message path/policy
