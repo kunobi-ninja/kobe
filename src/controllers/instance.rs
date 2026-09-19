@@ -15,6 +15,7 @@ use kobe_state_machine::{
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher::Config;
 use kube::{Client, Resource, ResourceExt};
 use tokio_util::sync::CancellationToken;
@@ -190,7 +191,31 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
 
     info!("Starting instance controller");
 
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let claims: Api<CIDRClaim> = Api::namespaced(client.clone(), namespace);
+    // Each extra watch backs off on error (`watches_with` and `owns_with` do
+    // not). Bootstrap Jobs and CIDRClaims carry this controller's owner
+    // reference, so their progress wakes the instance instead of a poll.
     let controller = Controller::new(instances, Config::default())
+        .reconcile_on(instance_triggers(
+            leases,
+            Config::default(),
+            "ClusterLease",
+            lease_instance_trigger,
+        ))
+        .reconcile_on(instance_triggers(
+            jobs,
+            Config::default().labels(BOOTSTRAP_INSTANCE_LABEL),
+            "bootstrap Job",
+            |job: &Job| owning_instance(&job.metadata),
+        ))
+        .reconcile_on(instance_triggers(
+            claims,
+            Config::default(),
+            "CIDRClaim",
+            |claim: &CIDRClaim| owning_instance(&claim.metadata),
+        ))
         .run(reconcile_instance, error_policy, ctx)
         .for_each(|result| async move {
             match result {
@@ -245,7 +270,16 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
         velero: None,
     });
     info!("Starting isolated teardown receipt authority");
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    // The handoff with the lifecycle controller runs through the bound
+    // lease's status, so a lease change wakes its instance.
     let controller = Controller::new(instances, Config::default())
+        .reconcile_on(instance_triggers(
+            leases,
+            Config::default(),
+            "ClusterLease",
+            lease_instance_trigger,
+        ))
         .run(
             reconcile_receipt_authority,
             receipt_authority_error_policy,
@@ -260,6 +294,79 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
         _ = controller => {},
         _ = shutdown.cancelled() => info!("Teardown receipt authority shutting down"),
     }
+}
+
+/// Label every bootstrap Job carries, naming its instance.
+const BOOTSTRAP_INSTANCE_LABEL: &str = "kobe.kunobi.ninja/instance";
+
+/// Backstop while a bootstrap Job runs. The Job watch wakes the instance when
+/// it finishes.
+const BOOTSTRAP_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop while a CIDRClaim is Pending. The claim watch wakes the instance
+/// when IPAM binds it.
+const CIDR_CLAIM_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop for a teardown step waiting on the other controller's lease write.
+/// The lease watch delivers that write.
+const TEARDOWN_HANDOFF_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the lifecycle controller repeats its idempotent teardown deletes
+/// while the separate authority has not yet certified absence. Deleted
+/// footprint objects (PVs, datastore rows) are not watched.
+const TEARDOWN_DELETE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often the authority re-observes a manifest for absence. The footprint
+/// spans objects this controller does not watch (PVs, datastore state).
+const ABSENCE_REVERIFY: std::time::Duration = std::time::Duration::from_secs(10);
+/// Backstop while the authority waits to seal a creation manifest: capture
+/// depends on backend objects this controller does not watch.
+const MANIFEST_CAPTURE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The instance a ClusterLease is bound to, by `status.binding.instance.name`.
+/// Reconcile re-checks the UID; a stale name only costs one no-op pass.
+fn lease_instance_trigger(lease: &ClusterLease) -> Option<ObjectRef<ClusterInstance>> {
+    let name = &lease.status.as_ref()?.binding.as_ref()?.instance.name;
+    let reference = ObjectRef::new(name);
+    Some(match lease.namespace() {
+        Some(namespace) => reference.within(&namespace),
+        None => reference,
+    })
+}
+
+/// The ClusterInstance named by an object's controller owner reference.
+fn owning_instance(metadata: &ObjectMeta) -> Option<ObjectRef<ClusterInstance>> {
+    let owner = metadata.owner_references.as_ref()?.iter().find(|owner| {
+        owner.controller == Some(true)
+            && owner.kind == ClusterInstance::kind(&())
+            && owner.api_version == ClusterInstance::api_version(&())
+    })?;
+    let reference = ObjectRef::new(&owner.name);
+    Some(match metadata.namespace.as_deref() {
+        Some(namespace) => reference.within(namespace),
+        None => reference,
+    })
+}
+
+/// Reconcile requests for the instances `map` finds in a watched kind's
+/// events, deletes included.
+fn instance_triggers<K>(
+    api: Api<K>,
+    config: Config,
+    kind: &'static str,
+    map: fn(&K) -> Option<ObjectRef<ClusterInstance>>,
+) -> impl futures::Stream<Item = ObjectRef<ClusterInstance>> + Send + 'static
+where
+    K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+    K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    watcher(api, config)
+        .default_backoff()
+        .touched_objects()
+        .filter_map(move |object| async move {
+            let object = object
+                .inspect_err(|error| warn!(kind, error = %error, "instance trigger watch failed"))
+                .ok()?;
+            map(&object)
+        })
 }
 
 async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
@@ -297,8 +404,16 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
     if status.creation_manifest.is_some() && status.teardown_identities.is_empty() {
         capture_teardown_identities_once(&ctx, &instance, &name, &namespace, &status).await;
     }
+    // Nothing to attest yet. Once the manifest and identities are sealed,
+    // only an instance or lease change can move this forward, and both are
+    // watched. Sealing itself reads backend objects that are not.
+    let idle = if status.creation_manifest.is_some() && !status.teardown_identities.is_empty() {
+        Action::await_change()
+    } else {
+        Action::requeue(MANIFEST_CAPTURE_RETRY)
+    };
     let Some(binding) = status.binding.as_ref() else {
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        return Ok(idle);
     };
     if binding.cleanup_mode != CleanupMode::VerifiedDestroy
         || !matches!(
@@ -306,7 +421,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
             ClusterInstancePhase::Recycling | ClusterInstancePhase::Quarantined
         )
     {
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        return Ok(idle);
     }
     let Some(manifest) = status.creation_manifest.as_ref() else {
         return Ok(Action::requeue(std::time::Duration::from_secs(15)));
@@ -325,7 +440,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &namespace);
     let lease = leases.get(&binding.lease.name).await?;
     if !receipt_authority_reciprocal_binding_matches(&instance, &lease, binding) {
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        return Ok(Action::requeue(TEARDOWN_HANDOFF_BACKSTOP));
     }
     let backend_type = crate::crd::receipt_backend_type(&binding.backend.backend_type);
     let pending = match lease
@@ -379,7 +494,8 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
                 outcome: TeardownOutcome::InProgress,
             };
             record_teardown_receipt(&ctx, &lease, &pending, &namespace, None).await?;
-            return Ok(Action::requeue(std::time::Duration::from_secs(2)));
+            // This write wakes both controllers through the lease watch.
+            return Ok(Action::requeue(TEARDOWN_HANDOFF_BACKSTOP));
         }
     };
 
@@ -406,7 +522,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
         .await,
     );
     if TeardownReceipt::outcome_for(&checks) != TeardownOutcome::Verified {
-        return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        return Ok(Action::requeue(ABSENCE_REVERIFY));
     }
     let receipt = TeardownReceipt {
         schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
@@ -433,7 +549,8 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
         Some(&pending.attempt_id),
     )
     .await?;
-    Ok(Action::requeue(std::time::Duration::from_secs(2)))
+    // This write wakes both controllers through the lease watch.
+    Ok(Action::requeue(TEARDOWN_HANDOFF_BACKSTOP))
 }
 
 fn receipt_authority_error_policy<B: ClusterBackend>(
@@ -622,7 +739,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             instance = %name,
                             "CIDRClaim is Pending; waiting for IPAM controller"
                         );
-                        return Ok(Action::requeue(std::time::Duration::from_secs(2)));
+                        // The claim watch wakes this instance when IPAM
+                        // binds the claim.
+                        return Ok(Action::requeue(CIDR_CLAIM_BACKSTOP));
                     }
                     ClaimResolution::Conflict(msg) => {
                         warn!(
@@ -769,7 +888,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             },
                         )
                         .await?;
-                        Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                        // The bootstrap Job watch wakes this instance when
+                        // the Job finishes.
+                        Ok(Action::requeue(BOOTSTRAP_BACKSTOP))
                     }
                     Ok(None) => {
                         observe_instance_bootstrap(
@@ -2802,7 +2923,9 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         }
         None if receipt_authority_is_separate() => {
             debug!(instance = %name, "waiting for isolated authority to persist teardown attempt");
-            return Some(Ok(Action::requeue(std::time::Duration::from_secs(5))));
+            // The authority writes the attempt to the bound lease; the lease
+            // watch delivers it.
+            return Some(Ok(Action::requeue(TEARDOWN_HANDOFF_BACKSTOP)));
         }
         None => {
             let receipt = TeardownReceipt {
@@ -2887,8 +3010,10 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     if receipt_authority_is_separate() {
         // These destructive-side checks are not authority. The isolated,
         // read-only controller independently re-observes the sealed manifest
-        // and exact token UID before it publishes terminal evidence.
-        return Some(Ok(Action::requeue(std::time::Duration::from_secs(5))));
+        // and exact token UID before it publishes terminal evidence. Its
+        // receipt reaches this controller through the lease watch; the timer
+        // only repeats the idempotent deletes.
+        return Some(Ok(Action::requeue(TEARDOWN_DELETE_RETRY)));
     }
 
     let outcome = TeardownReceipt::outcome_for(&checks);
@@ -6279,5 +6404,95 @@ mod tests {
         let started = chrono::DateTime::parse_from_rfc3339(started).unwrap();
         let completed = chrono::DateTime::parse_from_rfc3339(&completed).unwrap();
         assert!(completed > started);
+    }
+
+    #[test]
+    fn a_lease_event_wakes_the_instance_it_is_bound_to() {
+        let lease: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": { "name": "lease-a", "namespace": "test-ns", "uid": "lease-a-uid" },
+            "spec": {
+                "poolRef": "test-profile",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "user@test.com" }
+            },
+            "status": {
+                "phase": "Released",
+                "binding": {
+                    "bindingId": "binding-a",
+                    "lease": { "name": "lease-a", "uid": "lease-a-uid" },
+                    "instance": { "name": "pool-test-1", "uid": "instance-uid", "observedGeneration": 1 },
+                    "pool": { "name": "test-profile", "uid": "test-profile-uid" },
+                    "backend": crate::crd::BackendProvenance::from_config(&BackendConfig::default()).unwrap(),
+                    "instanceSpecDigest": "0000000000000001",
+                    "cleanupMode": "VerifiedDestroy"
+                }
+            }
+        }))
+        .unwrap();
+        let reference = lease_instance_trigger(&lease).expect("bound lease maps");
+        assert_eq!(reference.name, "pool-test-1");
+        assert_eq!(reference.namespace.as_deref(), Some("test-ns"));
+
+        let mut unbound = lease;
+        unbound.status.as_mut().unwrap().binding = None;
+        assert!(lease_instance_trigger(&unbound).is_none());
+    }
+
+    #[test]
+    fn owned_objects_wake_their_controlling_instance_only() {
+        let owner = |kind: &str, controller: bool| {
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: kind.into(),
+                name: "pool-test-1".into(),
+                uid: "instance-uid".into(),
+                controller: Some(controller),
+                ..Default::default()
+            }
+        };
+        let metadata = |owners| ObjectMeta {
+            name: Some("pool-test-1-bootstrap".into()),
+            namespace: Some("test-ns".into()),
+            owner_references: Some(owners),
+            ..Default::default()
+        };
+
+        let reference = owning_instance(&metadata(vec![owner("ClusterInstance", true)]))
+            .expect("controller owner maps");
+        assert_eq!(reference.name, "pool-test-1");
+        assert_eq!(reference.namespace.as_deref(), Some("test-ns"));
+
+        assert!(owning_instance(&metadata(vec![owner("ClusterInstance", false)])).is_none());
+        assert!(owning_instance(&metadata(vec![owner("ClusterPool", true)])).is_none());
+        assert!(owning_instance(&ObjectMeta::default()).is_none());
+    }
+
+    /// Bootstrap Jobs are what the Job watch selects on; the label and the
+    /// owner reference must both be there.
+    #[test]
+    fn bootstrap_jobs_carry_the_watch_label_and_instance_owner() {
+        let instance: ClusterInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": { "name": "pool-test-1", "namespace": "test-ns", "uid": "instance-uid" },
+            "spec": {}
+        }))
+        .unwrap();
+        let plan = BootstrapJobPlan {
+            name: "seed".into(),
+            image: "busybox".into(),
+            image_pull_policy: None,
+            command: Vec::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let job = build_bootstrap_job(&instance, "test-ns", "pool-test-1-seed", &plan);
+        assert!(job.labels().contains_key(BOOTSTRAP_INSTANCE_LABEL));
+        assert_eq!(
+            owning_instance(&job.metadata).map(|reference| reference.name),
+            Some("pool-test-1".to_string())
+        );
     }
 }
