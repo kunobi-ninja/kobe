@@ -11629,6 +11629,7 @@ pub(crate) mod tests {
                     }],
                     runner_path: None,
                     attach_command: None,
+                    files: vec![],
                 },
                 isolation: SandboxIsolation::TrustedRunc {},
                 readiness: SandboxReadinessRequirements {

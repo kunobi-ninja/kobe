@@ -4,7 +4,7 @@
 // Unit tests prove that Kobe builds UID/resourceVersion/state-fenced JSON
 // Patches and emits the intended CEL. This test proves that a real API server
 // enforces both contracts, including one-winner admission cancellation. It
-// needs only the SandboxLease CRD and native admission/RBAC APIs, not Kobe or
+// needs the SandboxLease and SandboxPool CRDs and native admission/RBAC APIs, not Kobe or
 // the external Agent Sandbox runtime.
 
 const context = Bun.env.KOBE_SANDBOX_APISERVER_CONTEXT ?? Bun.argv[2];
@@ -1217,11 +1217,56 @@ async function testAdmissionCancellationCas(): Promise<void> {
 }
 
 await kubectl(["create", "namespace", namespace]);
+
+// Admission must retain valid file declarations and reject malformed ones
+// before any controller attempts to create a Pod.
+async function testTemplateFilesAdmission(): Promise<void> {
+	const file = { secret: "test-credentials", key: ".token", path: "/tmp/token" };
+	const pool = (files: typeof file[]) => ({
+		apiVersion: "kobe.kunobi.ninja/v1alpha1", kind: "SandboxPool",
+		metadata: { name: "file-contract", namespace },
+		spec: {
+			warmCapacity: 0, defaultTtl: "5m", maxTtl: "10m", provisioningTimeout: "5m",
+			placement: { type: "management" }, isolation: { tier: "trusted-runc" },
+			readiness: { canary: { argv: ["/bin/true"], timeout: "30s" } },
+			template: {
+				defaultContainer: "workspace", files,
+				containers: [{ name: "workspace", image: "registry.k8s.io/pause:3.10", resources: {
+					requests: { cpu: "10m", memory: "16Mi", ephemeralStorage: "16Mi" },
+					limits: { cpu: "100m", memory: "64Mi", ephemeralStorage: "64Mi" },
+				} }],
+			},
+		},
+	});
+	const probe = (files: typeof file[]) => kubectl(
+		["create", "--dry-run=server", "--validate=false", "-f", "-", "-o", "json"],
+		{ stdin: JSON.stringify(pool(files)), allowFailure: true },
+	);
+	const valid = await probe([file]);
+	assert(valid.exitCode === 0, `valid template.files rejected: ${valid.stderr}`);
+	assert(JSON.parse(valid.stdout).spec.template.files?.[0]?.key === file.key && JSON.parse(valid.stdout).spec.template.files?.[0]?.path === file.path && JSON.parse(valid.stdout).spec.template.files?.[0]?.secret === file.secret,
+		"API server pruned template.files");
+	for (const path of ["relative", "/", "/tmp/", "/tmp//token", "/tmp/./token", "/tmp/../token", "/tmp/.", "/tmp/..", "/tmp/\0token"]) {
+		const result = await probe([{ ...file, path }]);
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid path ${JSON.stringify(path)}: ${result.stderr}`);
+	}
+	for (const key of [".", "..", "..token"]) {
+		const result = await probe([{ ...file, key }]);
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted reserved key ${key}: ${result.stderr}`);
+	}
+	for (const files of [[file, file], Array.from({ length: 17 }, (_, i) => ({ ...file, path: `/tmp/token-${i}` }))]) {
+		const result = await probe(files);
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid file list: ${result.stderr}`);
+	}
+	info("template.files retained; invalid paths, duplicate destinations and oversized lists rejected");
+}
+
 try {
 	console.log(
 		`SandboxLease API-server contract (${context}, namespace ${namespace})`,
 	);
 	await testReleaseCauseCel();
+	await testTemplateFilesAdmission();
 	await testJsonPatchFences();
 	await testAdmissionCancellationCas();
 	await testAdmissionLedgerBoundary();

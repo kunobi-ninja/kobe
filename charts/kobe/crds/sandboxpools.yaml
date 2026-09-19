@@ -178,8 +178,9 @@ spec:
                     type: array
                   containers:
                     description: |-
-                      Complete bounded set of containers. Environment, mounts, security
-                      context, service accounts, and arbitrary Pod fields are not exposed.
+                      Complete bounded set of containers. Caller-provided environment, mounts,
+                      security context, service accounts, and arbitrary Pod fields are not
+                      exposed. Administrator-declared Secret files live on `files`.
                     items:
                       description: One administrator-controlled container in a Sandbox template.
                       properties:
@@ -373,6 +374,54 @@ spec:
                       type: object
                     maxItems: 64
                     type: array
+                  files:
+                    description: |-
+                      Administrator-declared Secret files mounted into every container.
+
+                      Each entry names a Kubernetes Secret that already exists in the Sandbox
+                      Pod's namespace, one key in that Secret, and the absolute path where
+                      that key appears as a file. Callers cannot add, remove, or override
+                      these. Every Sandbox from the pool gets the same files, so they remain
+                      part of the certified shape.
+
+                      The Secret is referenced by name only; Kobe never copies its bytes into
+                      the Pool object. A missing Secret fails Pod startup and therefore pool
+                      certification. Content rotation does not recreate warm Sandboxes.
+                    items:
+                      description: |-
+                        One Secret key mounted as a file in every Sandbox container.
+
+                        The Secret must exist in the namespace where Sandbox Pods run: the Pool
+                        namespace for management placement, `kobe-sandbox` inside a child cluster.
+                        Kobe does not create, copy, or rotate the Secret.
+                      properties:
+                        key:
+                          description: Key inside the named Secret. Only this key is projected into the volume.
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[-._a-zA-Z0-9]+$
+                          type: string
+                        path:
+                          description: |-
+                            Absolute file path inside each container. Mounted with `subPath` so the
+                            rest of the parent directory stays the container's writable filesystem.
+                          maxLength: 4096
+                          minLength: 2
+                          pattern: ^/[^/\x00]+(/[^/\x00]+)*$
+                          type: string
+                        secret:
+                          description: Kubernetes Secret name in the Sandbox Pod namespace.
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                      required:
+                      - key
+                      - path
+                      - secret
+                      type: object
+                    maxItems: 16
+                    type: array
                   runnerPath:
                     description: |-
                       Absolute path to `kobe-runner` inside `defaultContainer`, when the
@@ -414,6 +463,12 @@ spec:
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.start <= p.portRange.end)'
                 - message: portRange may span at most 8192 ports
                   rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, !has(p.portRange) || p.portRange.end - p.portRange.start < 8192)'
+                - message: each template file path may be declared only once
+                  rule: '!has(self.files) || self.files.all(f, self.files.filter(other, other.path == f.path).size() == 1)'
+                - message: template file paths must not contain '.' or '..' segments
+                  rule: '!has(self.files) || self.files.all(f, !f.path.matches(''(^|/)[.][.]?(/|$)''))'
+                - message: template file keys must not be '.' or start with '..'
+                  rule: '!has(self.files) || self.files.all(f, f.key != ''.'' && !f.key.startsWith(''..''))'
               transport:
                 default: direct
                 description: |-
