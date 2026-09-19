@@ -1,7 +1,6 @@
 //! `kobe-host-reaper` — privileged DaemonSet entrypoint.
 //! Runs an infinite sweep loop driven by the live-set ConfigMap and
-//! /var/lib/kobe/leases/. See spec at
-//! docs/superpowers/specs/2026-05-26-kobe-host-reaper-design.md
+//! /var/lib/kobe/leases/. See the `reaper` module docs for the sweep rules.
 //!
 //! # Module layout
 //!

@@ -221,7 +221,6 @@ impl std::fmt::Display for ExecutionState {
 
 // `crdgen` and the reaper binary import this module for its schemas without
 // evaluating lifecycle, so these are unused in those builds.
-#[allow(dead_code)]
 impl ExecutionState {
     /// Whether the outcome is settled.
     pub fn is_terminal(self) -> bool {
@@ -230,19 +229,9 @@ impl ExecutionState {
             Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Unknown
         )
     }
-
-    /// Whether this state means the command definitely did not run.
-    ///
-    /// Only `Queued` does. Everything else — including `Unknown` — may have
-    /// side effects, and that distinction is the whole reason a caller cannot
-    /// safely retry on their own.
-    pub fn definitely_did_not_run(self) -> bool {
-        self == Self::Queued
-    }
 }
 
 /// Why a state change was refused.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutionTransitionError {
     #[error("an execution in {from} is already settled and cannot become {to}")]
@@ -266,7 +255,6 @@ pub enum ExecutionTransitionError {
 /// Terminal is terminal. A settled execution that could move again would make
 /// every answer Kobe has already given about it provisional — including the
 /// ones a caller acted on.
-#[allow(dead_code)]
 pub fn transition_execution(
     from: ExecutionState,
     to: ExecutionState,
@@ -314,20 +302,6 @@ pub fn transition_execution(
     Ok(to)
 }
 
-/// The terminal state implied by an exit code.
-///
-/// Zero is success; anything else is a command that ran and said no. A
-/// non-zero exit is emphatically not a Kobe failure, and conflating them would
-/// make a caller's own failing test look like an infrastructure fault.
-#[allow(dead_code)]
-pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
-    if exit_code == 0 {
-        ExecutionState::Succeeded
-    } else {
-        ExecutionState::Failed
-    }
-}
-
 /// Canonical digest of one execution request.
 ///
 /// Covers everything that changes what runs. Two requests sharing an
@@ -356,7 +330,6 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// forwards no stdin digests exactly as it did before this parameter existed.
 /// That is what lets a Kobe rollout recognise the records its predecessor
 /// created, and is the same technique `container` and `detached` use.
-#[allow(dead_code)]
 pub fn request_digest(
     argv: &[String],
     cwd: Option<&str>,
@@ -378,7 +351,6 @@ pub fn request_digest(
 /// No stdin parameter, deliberately: a record from that era cannot have carried
 /// one, so a request that forwards stdin must never be recognised as a retry of
 /// it.
-#[allow(dead_code)]
 pub fn legacy_request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> String {
     request_digest_with_mode(argv, cwd, timeout, None, None, None)
 }
@@ -444,7 +416,6 @@ fn request_digest_with_mode(
 /// Same key, different digest: a different command under a reused key, which
 /// is a conflict rather than a new execution — silently running it would give
 /// the caller two commands where they asked for one.
-#[allow(dead_code)]
 pub fn reuse_verdict(
     existing: &SandboxExecutionSpec,
     lease_uid: &str,
@@ -462,7 +433,6 @@ pub fn reuse_verdict(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReuseVerdict {
     /// Return the original execution.
@@ -483,7 +453,6 @@ pub enum ReuseVerdict {
 /// Hashed rather than concatenated because an idempotency key is caller-
 /// supplied: it can be long, contain characters a Kubernetes name forbids, or
 /// be chosen to collide with another lease's.
-#[allow(dead_code)]
 pub fn execution_name(lease_uid: &str, idempotency_key: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -572,34 +541,6 @@ mod tests {
                 "{state} must not carry an exit code"
             );
             assert!(transition_execution(Running, state, None).is_ok());
-        }
-    }
-
-    /// A non-zero exit is the caller's result, not Kobe's failure.
-    ///
-    /// Conflating them makes somebody's own failing test look like an
-    /// infrastructure fault — and, worse, look retryable.
-    #[test]
-    fn a_non_zero_exit_is_a_result_not_a_fault() {
-        assert_eq!(state_for_exit_code(0), Succeeded);
-        for code in [1, 2, 127, 130, 255, -1, i32::MAX, i32::MIN] {
-            assert_eq!(state_for_exit_code(code), Failed, "exit {code}");
-        }
-    }
-
-    /// Only `Queued` proves a command did not run.
-    ///
-    /// This is the distinction a caller needs to decide whether retrying is
-    /// safe, and it is why `Unknown` exists at all: everything but `Queued`
-    /// may have had side effects.
-    #[test]
-    fn only_a_queued_execution_definitely_did_not_run() {
-        assert!(Queued.definitely_did_not_run());
-        for state in [Running, Succeeded, Failed, Cancelled, TimedOut, Unknown] {
-            assert!(
-                !state.definitely_did_not_run(),
-                "{state} may have had side effects"
-            );
         }
     }
 

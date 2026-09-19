@@ -70,7 +70,6 @@ pub struct CapiBackendProvenance {
 // `lease_binding` — look dead in that compilation unit. Scoped to this impl
 // rather than the whole module so genuine dead code in `instance.rs` still
 // surfaces under `-D warnings`.
-#[allow(dead_code)]
 impl BackendProvenance {
     /// Build immutable dispatch provenance from a pool backend configuration.
     /// Serialization failure is returned rather than replaced with a default:

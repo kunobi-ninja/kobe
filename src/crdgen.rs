@@ -1,5 +1,8 @@
 use kube::CustomResourceExt;
 
+// crdgen only renders schemas, so most CRD helpers the operator uses are
+// unreachable from this binary.
+#[allow(dead_code, unused_imports)]
 mod crd;
 
 fn main() {

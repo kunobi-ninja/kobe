@@ -26,7 +26,7 @@ use crate::crd::{
 };
 use crate::crd::{
     CreationManifestResource, DatastoreProvenance, StorageVolumeProvenance, TeardownCheck,
-    TeardownCreationManifest, TeardownSubject,
+    TeardownCreationManifest,
 };
 
 /// Backend-observed portion of a sealed creation manifest.
@@ -373,21 +373,6 @@ impl ClusterBackend for BackendDispatch {
         }
     }
 
-    async fn delete_verified(
-        &self,
-        name: &str,
-        namespace: &str,
-        plan: &[TeardownSubject],
-    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
-        match self {
-            Self::K3s(b) => b.delete_verified(name, namespace, plan).await,
-            Self::K0s(b) => b.delete_verified(name, namespace, plan).await,
-            Self::Capi(b) => b.delete_verified(name, namespace, plan).await,
-            Self::Vkobe(b) => b.delete_verified(name, namespace, plan).await,
-            Self::Vcluster(b) => b.delete_verified(name, namespace, plan).await,
-        }
-    }
-
     async fn delete_verified_manifest(
         &self,
         name: &str,
@@ -683,12 +668,6 @@ impl BackendFactory {
             ))),
         }
     }
-
-    /// Get the underlying Kubernetes client.
-    #[allow(dead_code)]
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
 }
 
 /// A guest cluster whose control-plane (or agent) Pods cannot be scheduled.
@@ -752,17 +731,6 @@ pub struct GuestPodCrash {
     pub last_log_tail: Option<String>,
 }
 
-/// Backend-agnostic interface for managing virtual cluster lifecycles.
-///
-/// Implementations handle the actual cluster provisioning. The profile and
-/// claim controllers interact only through this trait, keeping them decoupled
-/// from the underlying technology.
-// Declared ahead of the k3s provider that implements it and the controller
-// that calls it, so nothing constructs or invokes this yet. Same pattern as the
-// `teardown` module in `src/crd`. The alternative — landing the contract and
-// the provider together — is the several-thousand-line PR this split exists to
-// avoid.
-#[allow(dead_code)]
 /// A backend was asked for verified teardown and cannot provide it.
 ///
 /// Distinct from an ordinary error: nothing failed, the capability simply does
@@ -772,6 +740,11 @@ pub struct GuestPodCrash {
 #[error("backend does not implement verified teardown")]
 pub struct VerifiedDestroyUnsupported;
 
+/// Backend-agnostic interface for managing virtual cluster lifecycles.
+///
+/// Implementations handle the actual cluster provisioning. The profile and
+/// claim controllers interact only through this trait, keeping them decoupled
+/// from the underlying technology.
 pub trait ClusterBackend: Send + Sync {
     /// Create a virtual cluster with the given name and config.
     ///
@@ -804,38 +777,16 @@ pub trait ClusterBackend: Send + Sync {
         namespace: &str,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
-    /// Delete a virtual cluster and return **evidence** that its footprint is
-    /// gone, rather than evidence that a DELETE request was accepted.
-    ///
-    /// Deliberately a separate method with a default body instead of a changed
-    /// `delete` signature: the four backends that cannot produce evidence keep
-    /// compiling untouched and refuse honestly, rather than being mechanically
-    /// updated to return a receipt they cannot substantiate. A backend that
-    /// "implements" verified teardown by returning success it did not observe
-    /// is worse than one that says it cannot.
-    ///
-    /// `plan` lists what this instance actually created, so the provider knows
-    /// which subjects it must account for and which never existed. Returning
-    /// [`CheckResult::Unknown`] for anything it cannot observe is correct and
-    /// expected — that quarantines the capacity instead of releasing it.
-    #[allow(dead_code)]
-    fn delete_verified(
-        &self,
-        name: &str,
-        namespace: &str,
-        plan: &[TeardownSubject],
-    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
-    {
-        let _ = (name, namespace, plan);
-        async { Err(VerifiedDestroyUnsupported) }
-    }
-
     /// Verified teardown against the immutable concrete creation manifest.
+    ///
+    /// The default refuses with [`VerifiedDestroyUnsupported`]. A backend that
+    /// cannot observe its footprint must not return an empty, clean-looking
+    /// check list; returning [`CheckResult::Unknown`] for anything it cannot
+    /// observe quarantines the capacity instead of releasing it.
     /// Backends must not derive scope from teardown-time observations. The
     /// `attempt_id` was persisted before the first destructive side effect and
     /// must remain unchanged across retries; backends use it for deterministic
     /// crash-safe tombstones and attempt-bound external evidence.
-    #[allow(dead_code)]
     fn delete_verified_manifest(
         &self,
         name: &str,
@@ -853,7 +804,6 @@ pub trait ClusterBackend: Send + Sync {
     /// boundary used by the isolated receipt authority. `attempt_id` is the
     /// immutable receipt attempt persisted before deletion, so external
     /// evidence cannot be replayed from another teardown attempt.
-    #[allow(dead_code)]
     fn verify_absent_manifest(
         &self,
         name: &str,
@@ -877,7 +827,6 @@ pub trait ClusterBackend: Send + Sync {
     ///
     /// Returning an empty list means "this backend has no such identities",
     /// which is correct for every backend that cannot produce evidence anyway.
-    #[allow(dead_code)]
     fn capture_teardown_identities(
         &self,
         name: &str,
@@ -893,7 +842,6 @@ pub trait ClusterBackend: Send + Sync {
     /// can implement it must return an error on any missing UID, failed live
     /// lookup, unbound volume, or otherwise uncertain fact; callers leave the
     /// manifest absent and verified-destroy placement remains ineligible.
-    #[allow(dead_code)]
     fn capture_creation_footprint(
         &self,
         name: &str,
@@ -908,7 +856,6 @@ pub trait ClusterBackend: Send + Sync {
     /// A live lookup failure, UID/spec drift, lost datastore, or changed storage
     /// policy must reject placement rather than create a lease already doomed
     /// to quarantine.
-    #[allow(dead_code)]
     fn validate_creation_manifest_for_bind(
         &self,
         name: &str,
@@ -924,7 +871,6 @@ pub trait ClusterBackend: Send + Sync {
     /// Checked before binding so a receipt-required lease is refused up front,
     /// rather than discovering mid-teardown that no evidence is possible and
     /// stranding the lease in quarantine through no fault of the caller.
-    #[allow(dead_code)]
     fn supports_verified_destroy(&self) -> bool {
         false
     }
@@ -1941,13 +1887,13 @@ mod tests {
             !backend.supports_verified_destroy(),
             "capability must be opt-in"
         );
-        let outcome = backend
-            .delete_verified("pool-x-0", "test-ns", &[TeardownSubject::ServerStatefulSet])
-            .await;
-        assert_eq!(
-            outcome,
-            Err(VerifiedDestroyUnsupported),
-            "an unimplemented backend must not return an empty (clean-looking) check list"
+        let footprint = backend
+            .capture_creation_footprint("pool-x-0", "test-ns", &ClusterConfig::default())
+            .await
+            .expect("default footprint capture does not fail");
+        assert!(
+            footprint.is_none(),
+            "an unimplemented backend must not seal a creation manifest"
         );
     }
 

@@ -292,7 +292,7 @@ async fn run() -> anyhow::Result<()> {
     // Wait for our CRDs to be established before starting controllers.
     wait_for_crds(&client).await?;
 
-    info!("Available backends: k3s, k0s, vkobe, capi");
+    info!("Available backends: k3s, k0s, vcluster, capi, vkobe");
 
     // Optional shared PostgreSQL datastore for k3s and k0s backends.
     // `POSTGRES_URL_DIR` (a mounted Secret) enables credential hot-reload on

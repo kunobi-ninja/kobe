@@ -10,11 +10,6 @@
 //! - [`generate_kcm_kubeconfig`] -- build a KCM kubeconfig with embedded client certs
 //! - [`create_pki_secret`] -- generate PKI + KCM kubeconfig and store in a K8s Secret
 
-// This module is shared between the pool-operator and kobe-sync binaries.
-// Each binary uses a different subset of the API, so allow dead_code to
-// avoid false positives.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};

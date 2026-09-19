@@ -36,9 +36,6 @@ pub struct LeaseCreateCommand<'a> {
 pub(crate) struct LeaseAcceptedResponse {
     pub(crate) id: String,
     phase: String,
-    #[serde(default, rename = "resourceKind")]
-    #[allow(dead_code)]
-    resource_kind: Option<String>,
     #[serde(alias = "pool")]
     pub(crate) profile: String,
     #[serde(default)]

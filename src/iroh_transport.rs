@@ -56,11 +56,6 @@ use tracing::warn;
 /// misreading a stream.
 pub const KOBE_SANDBOX_ALPN: &[u8] = b"kobe-sandbox/1";
 
-/// Longest to wait for the endpoint to come online (home relay selected)
-/// before a session attempt fails explicitly rather than hanging.
-#[allow(dead_code)] // used by callers that dial after bind (CLI, future session helpers)
-pub const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// How long a minted ticket is valid before the accept loop drops it.
 ///
 /// Matches [`crate::api::sandbox_transport::STREAM_SETUP_TIMEOUT`]: a caller
@@ -188,8 +183,7 @@ pub fn require_iroh_available(
 
 /// Bind the operator endpoint: N0 preset, kobe ALPN, configured relays.
 ///
-/// Returns once bound; callers that need a home relay before accepting
-/// sessions should additionally await [`wait_online`].
+/// Returns once bound.
 pub async fn bind_endpoint(config: &IrohTransportConfig) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(N0)
         .alpns(vec![KOBE_SANDBOX_ALPN.to_vec()])
@@ -198,18 +192,6 @@ pub async fn bind_endpoint(config: &IrohTransportConfig) -> Result<Endpoint> {
         builder = builder.secret_key(key.clone());
     }
     builder.bind().await.context("bind iroh operator endpoint")
-}
-
-/// Wait until the endpoint is online (usable for dial/accept), or time out.
-///
-/// An endpoint that never comes online must fail the session explicitly —
-/// the failure contract for admission (#101) has no room for a hang.
-#[allow(dead_code)] // CLI dials wait on its own endpoint; operator accept does not.
-pub async fn wait_online(endpoint: &Endpoint) -> Result<()> {
-    tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online())
-        .await
-        .context("iroh endpoint did not come online in time")?;
-    Ok(())
 }
 
 impl IrohOperatorConfig {

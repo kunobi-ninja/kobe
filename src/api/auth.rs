@@ -31,7 +31,6 @@ pub struct AuthIdentity {
     /// Identity string formatted per the provider's identityTemplate.
     pub identity: String,
     /// Raw issuer for logging/debugging.
-    #[allow(dead_code)]
     pub issuer: String,
     /// Resolved authorization policy for this identity.
     pub policy: crate::api::policy::Policy,

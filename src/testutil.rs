@@ -62,7 +62,6 @@ struct MockInner {
     healthy: Mutex<bool>,
     kubeconfig: Mutex<String>,
     ready: Mutex<bool>,
-    readiness_error: Mutex<Option<String>>,
 }
 
 /// A hand-written test double for [`ClusterBackend`].
@@ -91,7 +90,6 @@ impl MockBackend {
                 healthy: Mutex::new(true),
                 kubeconfig: Mutex::new("mock-kubeconfig".to_string()),
                 ready: Mutex::new(true),
-                readiness_error: Mutex::new(None),
             }),
         }
     }
@@ -116,12 +114,6 @@ impl MockBackend {
     /// Set the boolean returned by `check_readiness_gate`.
     pub fn set_readiness(&self, ready: bool) {
         *self.inner.ready.lock().unwrap() = ready;
-    }
-
-    /// Make subsequent `check_readiness_gate` calls return an error.
-    #[allow(dead_code)]
-    pub fn fail_readiness(&self, msg: &str) {
-        *self.inner.readiness_error.lock().unwrap() = Some(msg.to_string());
     }
 
     // -- introspection helpers --
@@ -214,9 +206,6 @@ impl ClusterBackend for MockBackend {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
             });
-        if let Some(msg) = self.inner.readiness_error.lock().unwrap().as_ref() {
-            anyhow::bail!("{msg}");
-        }
         Ok(*self.inner.ready.lock().unwrap())
     }
 
@@ -245,7 +234,6 @@ impl ClusterBackend for MockBackend {
 /// error`, which surfaces as `RustlsTls(NoValidNativeRootCA)` and fails
 /// whichever wiremock-backed tests happened to build a client at that
 /// moment.
-#[allow(dead_code)]
 pub fn mock_k8s_client(server: &wiremock::MockServer) -> kube::Client {
     // kube 4 made `Config` non-exhaustive, so build it and set the fields we need.
     let mut config = kube::Config::new(server.uri().parse().unwrap());

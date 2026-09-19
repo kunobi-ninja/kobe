@@ -841,7 +841,6 @@ fn parse_host_url(url: &str) -> Result<(String, u16, ServerName<'static>)> {
 // Headers that an upstream connection-management response might carry
 // but that we DON'T want to relay back to the client during upgrade.
 // Hyper owns the framing of the outgoing connection.
-#[allow(dead_code)]
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
     for h in [
         hyper::header::CONNECTION,
@@ -858,7 +857,6 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 
 // Quiet the dead-code lint on `HeaderValue` import — only used through
 // the typed builder API above, but keeping the import documents intent.
-#[allow(dead_code)]
 fn _hv_unused(v: HeaderValue) -> HeaderValue {
     v
 }

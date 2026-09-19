@@ -225,17 +225,18 @@ pub enum DatastoreProvenance {
 /// structural property, so the schema keeps the fields optional and the
 /// controller's [`TeardownCreationManifest::validate`] enforces the exact
 /// mode-specific contract before the manifest is trusted.
+// Schema-only shadow types: never constructed, only rendered by `JsonSchema`.
+#[allow(dead_code)]
 #[derive(JsonSchema)]
 #[schemars(rename_all = "camelCase")]
-#[allow(dead_code)]
 enum DatastoreProvenanceModeSchema {
     EmbeddedSqlite,
     ExternalPostgres,
 }
 
+#[allow(dead_code)]
 #[derive(JsonSchema)]
 #[schemars(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct DatastoreProvenanceSchema {
     mode: DatastoreProvenanceModeSchema,
     /// SHA-256 of the non-secret connection location (scheme, host and port).
@@ -1224,19 +1225,6 @@ pub enum VerifiedDestroyIneligible {
     UnverifiableStorage,
     #[error("external datastore identity was not recorded, so its absence cannot be proven")]
     DatastoreProvenanceMissing,
-}
-
-impl VerifiedDestroyIneligible {
-    /// Bounded reason code for status, events, and metrics.
-    pub const fn reason_code(&self) -> &'static str {
-        match self {
-            Self::UnsupportedBackend => "unsupported_backend",
-            Self::KubeletSharedMount => "kubelet_shared_mount",
-            Self::DiagnosticsEnabled => "diagnostics_enabled",
-            Self::UnverifiableStorage => "unverifiable_storage",
-            Self::DatastoreProvenanceMissing => "datastore_provenance_missing",
-        }
-    }
 }
 
 /// Whether a k3s cluster configuration can produce a verifiable receipt.

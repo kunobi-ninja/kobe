@@ -15,6 +15,8 @@
 //! and/or a ConfigMap, and runs until terminated.
 
 mod kobe_sync;
+// Shared with the operator binary, which uses the Secret-creation half.
+#[allow(dead_code)]
 mod pki;
 
 use std::sync::Arc;

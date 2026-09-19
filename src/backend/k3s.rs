@@ -1309,8 +1309,7 @@ impl K3sBackend {
             });
         }
 
-        // Kubelet shared mount (CSI passthrough). See issue #98 and
-        // docs/superpowers/specs/2026-05-21-k3s-csi-kubelet-mount-propagation-design.md.
+        // Kubelet shared mount (CSI passthrough). See issue #98.
         let mut env: Vec<EnvVar> = vec![];
         if let Some((mount, env_var)) =
             kubelet_shared_mount_attachments(config.kubelet_shared_mount.as_ref(), |c| c.server)
@@ -4318,8 +4317,8 @@ impl ClusterBackend for K3sBackend {
     }
 
     /// Tear down and prove the exact immutable creation manifest absent.
-    /// The manifest-less [`ClusterBackend::delete_verified`] default remains
-    /// unsupported so no caller can reconstruct a narrower scope at teardown.
+    /// There is no manifest-less variant, so no caller can reconstruct a
+    /// narrower scope at teardown.
     async fn delete_verified_manifest(
         &self,
         name: &str,
@@ -4578,18 +4577,6 @@ mod tests {
                 role_oid: "16385".into(),
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn verified_destroy_refuses_a_manifestless_scope() {
-        let server = MockServer::start().await;
-        let backend = K3sBackend::new(mock_client(&server), Default::default());
-        assert_eq!(
-            backend
-                .delete_verified("c1", "test-ns", &[TeardownSubject::ServerStatefulSet],)
-                .await,
-            Err(VerifiedDestroyUnsupported)
-        );
     }
 
     // =================================================================
