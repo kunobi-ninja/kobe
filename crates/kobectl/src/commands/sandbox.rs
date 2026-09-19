@@ -318,18 +318,44 @@ pub async fn exec(
     };
 
     let mut signals = sync.then(ShutdownSignals::arm).transpose()?;
-    let result = exec_once(
-        &config,
-        lease,
-        argv,
-        cwd,
-        timeout,
-        stdin.as_deref(),
-        &new_idempotency_key(),
-        detach || sync,
-        output,
-    )
-    .await?;
+    let key = new_idempotency_key();
+    let request_started = std::cell::Cell::new(false);
+    let start = async {
+        request_started.set(true);
+        exec_once(
+            &config,
+            lease,
+            argv,
+            cwd,
+            timeout,
+            stdin.as_deref(),
+            &key,
+            detach || sync,
+            output,
+        )
+        .await
+    };
+    tokio::pin!(start);
+    let result = if let Some(signals) = signals.as_mut() {
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                if request_started.get() {
+                    // Keep the original keyed request alive briefly so a signal
+                    // cannot discard an execution ID already being returned.
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut start).await {
+                        Ok(Ok(result)) => cancel_interrupted_exec(&config, lease, &result.id).await,
+                        Ok(Err(error)) => eprintln!("kobe: interrupted execution start: {error}; remote cancellation is unconfirmed"),
+                        Err(_) => eprintln!("kobe: execution start did not return an ID within 10s; the command may still run until its deadline"),
+                    }
+                }
+                return Ok(signal.exit_code());
+            }
+            result = &mut start => result?,
+        }
+    } else {
+        start.await?
+    };
     if let Some(signals) = signals.as_mut() {
         return follow_exec(&config, lease, &result.id, signals).await;
     }
@@ -395,18 +421,31 @@ async fn follow_exec(
     tokio::select! {
         biased;
         signal = signals.recv() => {
-            let cancel = execution_request(config, lease, execution, reqwest::Method::DELETE);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), cancel).await {
-                Ok(Ok(result)) if execution_is_terminal(&result.state) => {}
-                Ok(Ok(result)) => eprintln!("kobe: {execution} is still {}; inspect with kobe logs {lease} --execution {execution} --follow", result.state),
-                Ok(Err(error)) => eprintln!("kobe: could not cancel {execution}: {error}; retry with kobe cancel {lease} --execution {execution}"),
-                Err(_) => eprintln!("kobe: cancellation timed out for {execution}; retry with kobe cancel {lease} --execution {execution}"),
-            }
+            cancel_interrupted_exec(config, lease, execution).await;
             Ok(signal.exit_code())
         }
         result = follow => result.with_context(|| format!(
             "could not follow execution {execution}; resume with kobe logs {lease} --execution {execution} --follow, or stop it with kobe cancel {lease} --execution {execution}"
         )),
+    }
+}
+
+/// Cancellation is bounded and non-interactive; an unconfirmed response is
+/// reported without releasing the caller's lease.
+async fn cancel_interrupted_exec(config: &ResolvedConfig, lease: &str, execution: &str) {
+    let cancel = execution_request(config, lease, execution, reqwest::Method::DELETE);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), cancel).await {
+        Ok(Ok(result)) if execution_is_terminal(&result.state) => {}
+        Ok(Ok(result)) => eprintln!(
+            "kobe: {execution} is still {}; inspect with kobe logs {lease} --execution {execution} --follow",
+            result.state
+        ),
+        Ok(Err(error)) => eprintln!(
+            "kobe: could not cancel {execution}: {error}; retry with kobe cancel {lease} --execution {execution}"
+        ),
+        Err(_) => eprintln!(
+            "kobe: cancellation timed out for {execution}; retry with kobe cancel {lease} --execution {execution}"
+        ),
     }
 }
 

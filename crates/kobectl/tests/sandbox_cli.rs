@@ -1922,6 +1922,41 @@ fn exec_sync_log_failure_reports_how_to_recover_without_starting_another_command
 }
 
 #[test]
+fn exec_sync_interrupt_during_start_recovers_the_id_and_cancels_once() {
+    let (stage_tx, stage_rx) = mpsc::channel();
+    let reply_gate = gate();
+    let server_gate = Arc::clone(&reply_gate);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&cancelled);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                stage_tx.send(()).unwrap();
+                wait_gate(&server_gate);
+                reply(stream, 202, &[], &execution_body("Running", None));
+            }
+            ("DELETE", "/v1/sandbox-leases/sandbox-test/executions/sbxe-test") => {
+                assert!(!observed.swap(true, Ordering::SeqCst));
+                reply(stream, 200, &[], &execution_body("Cancelled", None));
+            }
+            _ => panic!("interrupted start must go straight to cancellation: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--sync", "--", "build"],
+    );
+    stage_rx.recv_timeout(WAIT).unwrap();
+    signal(&child, libc::SIGTERM);
+    thread::sleep(Duration::from_millis(100));
+    open(&reply_gate);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(143));
+    assert!(cancelled.load(Ordering::SeqCst));
+}
+
+#[test]
 fn exec_sync_interrupt_cancels_the_execution_and_keeps_the_lease() {
     let (stage_tx, stage_rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
