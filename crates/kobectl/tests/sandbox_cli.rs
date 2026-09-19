@@ -1797,6 +1797,173 @@ fn log_window(state: &str, stdout: Value, stderr: Value) -> String {
 }
 
 #[test]
+fn exec_sync_flushes_before_completion_and_returns_the_remote_exit_code_once() {
+    let second_gate = gate();
+    let gate_for_server = Arc::clone(&second_gate);
+    let (stage_tx, stage_rx) = mpsc::channel();
+    let calls = Arc::new(Mutex::new(0usize));
+    let observed = Arc::clone(&calls);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&request.body).unwrap()["detach"],
+                    true
+                );
+                reply(stream, 202, &[], &execution_body("Running", None));
+            }
+            ("GET", "/v1/sandbox-leases/sandbox-test/executions/sbxe-test") => {
+                reply(stream, 200, &[], &execution_body("Failed", Some(37)))
+            }
+            ("GET", path) if path.contains("/logs?") => {
+                let mut calls = observed.lock().unwrap();
+                *calls += 1;
+                let body = if *calls == 1 {
+                    assert!(path.ends_with("stdoutOffset=0&stderrOffset=0"));
+                    log_window(
+                        "Running",
+                        json!({"data":"out-1\n","nextOffset":6,"more":false,"truncated":false}),
+                        json!({"data":"err-1\n","nextOffset":6,"more":false,"truncated":false}),
+                    )
+                } else {
+                    assert!(path.ends_with("stdoutOffset=6&stderrOffset=6"));
+                    stage_tx.send(()).unwrap();
+                    wait_gate(&gate_for_server);
+                    log_window(
+                        "Failed",
+                        json!({"data":"out-2\n","nextOffset":12,"more":false,"truncated":false}),
+                        json!({"data":"err-2\n","nextOffset":12,"more":false,"truncated":false}),
+                    )
+                };
+                reply(stream, 200, &[], &body);
+            }
+            _ => panic!("unexpected sync request: {request:?}"),
+        }
+    });
+    let (_directory, mut child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--sync", "--", "build"],
+    );
+    let stdout = child.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line_tx.send(line).unwrap();
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        rest
+    });
+    stage_rx.recv_timeout(WAIT).unwrap();
+    let first = line_rx.recv_timeout(Duration::from_secs(1));
+    open(&second_gate);
+    let output = wait_output(child);
+    assert_eq!(
+        first.unwrap(),
+        "out-1\n",
+        "output must arrive while the command is still running"
+    );
+    assert_eq!(reader.join().unwrap(), "out-2\n");
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "err-1\nerr-2\n");
+    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(*calls.lock().unwrap(), 2);
+}
+
+#[test]
+fn exec_sync_rejects_json_before_starting_a_command() {
+    let server = Server::start(move |request, stream| {
+        assert_eq!(
+            (request.method.as_str(), request.path.as_str()),
+            ("GET", "/v1/leases")
+        );
+        reply(stream, 200, &[], &sandbox_inventory());
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--sync", "--output", "json", "--", "build"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(125));
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(body.to_string().contains("--sync requires text output"));
+}
+
+#[test]
+fn exec_sync_log_failure_reports_how_to_recover_without_starting_another_command() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                reply(stream, 202, &[], &execution_body("Running", None))
+            }
+            ("GET", path) if path.contains("/logs?") => {
+                reply(stream, 503, &[], "temporarily unavailable")
+            }
+            _ => panic!("unexpected recovery request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--sync", "--", "build"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("kobe logs sandbox-test --execution sbxe-test --follow"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("kobe cancel sandbox-test --execution sbxe-test"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn exec_sync_interrupt_cancels_the_execution_and_keeps_the_lease() {
+    let (stage_tx, stage_rx) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&cancelled);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                reply(stream, 202, &[], &execution_body("Running", None))
+            }
+            ("GET", path) if path.contains("/logs?") => {
+                reply(
+                    stream,
+                    200,
+                    &[],
+                    &log_window(
+                        "Running",
+                        json!({"data":"","nextOffset":0,"more":false,"truncated":false}),
+                        json!({"data":"","nextOffset":0,"more":false,"truncated":false}),
+                    ),
+                );
+                let _ = stage_tx.send(());
+            }
+            ("DELETE", "/v1/sandbox-leases/sandbox-test/executions/sbxe-test") => {
+                observed.store(true, Ordering::SeqCst);
+                reply(stream, 200, &[], &execution_body("Cancelled", None));
+            }
+            _ => panic!("sync must never release its lease: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--sync", "--", "build"],
+    );
+    stage_rx.recv_timeout(WAIT).unwrap();
+    signal(&child, libc::SIGINT);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(130));
+    assert!(cancelled.load(Ordering::SeqCst));
+}
+
+#[test]
 fn logs_follow_separates_streams_drains_terminal_stalls_and_preserves_offsets() {
     let shared = Arc::new(Mutex::new(LogState::default()));
     let observed = Arc::clone(&shared);

@@ -201,6 +201,9 @@ enum Commands {
         /// execution that started it.
         #[arg(long)]
         detach: bool,
+        /// Show stdout and stderr as the command runs, then return its exit code (text only)
+        #[arg(long, conflicts_with = "detach")]
+        sync: bool,
         /// The command to run, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -585,6 +588,9 @@ enum SandboxAction {
         /// execution that started it.
         #[arg(long)]
         detach: bool,
+        /// Show stdout and stderr as the command runs, then return its exit code (text only)
+        #[arg(long, conflicts_with = "detach")]
+        sync: bool,
         /// The command. Everything after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -882,6 +888,7 @@ async fn main() -> anyhow::Result<()> {
             timeout,
             stdin,
             detach,
+            sync,
             command,
         } => {
             let lease =
@@ -895,6 +902,7 @@ async fn main() -> anyhow::Result<()> {
                     timeout,
                     stdin,
                     detach,
+                    sync,
                     command,
                 },
                 target,
@@ -1206,6 +1214,7 @@ async fn dispatch_resource_action(
             timeout,
             stdin,
             detach,
+            sync,
             command,
         } => {
             commands::sandbox::exec(
@@ -1215,6 +1224,7 @@ async fn dispatch_resource_action(
                 timeout.as_deref(),
                 stdin,
                 detach,
+                sync,
                 target,
                 endpoint,
                 output,
