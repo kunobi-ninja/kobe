@@ -52,6 +52,7 @@
 use std::collections::HashMap;
 
 use crate::crd::ClusterPool;
+use crate::metrics::RecycleReason;
 
 /// Hash of the cluster spec at creation time, used to detect drift.
 ///
@@ -295,7 +296,7 @@ pub fn resolved_upgrade_policy(profile: &ClusterPool, min_ready: u32) -> Resolve
 }
 
 /// Tracks the state of each cluster in a profile's pool.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterState {
     /// Being created, not yet ready.
     Creating,
@@ -306,7 +307,6 @@ pub enum ClusterState {
     /// Failed health check, being recycled.
     Unhealthy,
     /// Being deleted and recreated.
-    #[allow(dead_code)]
     Recycling,
     /// Teardown could not be proven complete.
     ///
@@ -402,89 +402,22 @@ impl ClusterEntry {
 pub enum PoolAction {
     /// Create a new cluster with this name.
     Create(String),
-    /// Delete this cluster (scale down or recycle).
-    Delete(String),
-    /// Mark this cluster as unhealthy for recycling.
-    #[allow(dead_code)]
-    MarkUnhealthy(String),
+    /// Recycle this cluster. The reason says which step of
+    /// [`compute_pool_actions`] chose it and labels
+    /// `kobe_instance_recycles_total`.
+    Delete(String, RecycleReason),
 }
 
-/// Compute the desired `PoolAction`s for one reconcile pass.
+/// Members a fixed-size pool (no `scaling` block) may hold above `spec.size`.
 ///
-/// Pure: takes immutable state and `now`, returns a list of actions
-/// the controller will issue. No I/O. The reconciler in
-/// `controllers::profile` owns all side effects.
-///
-/// # Order of evaluation
-///
-/// Each step's outcome feeds the next via local counters, but each
-/// step only inspects `state` and the running `actions` list — no
-/// global state.
-///
-/// 1. **Unhealthy → `Delete`** (unbounded).
-///    Broken instances contribute zero capacity; removing them is
-///    pure win and never violates any floor. Not gated by
-///    `max_recycling`, the failure backoff, or the upgrade policy.
-///
-/// 2. **Backoff early-return.**
-///    If `backoff_active`, drift recycling and scale-up are both
-///    suppressed (Deleting drifted Ready when we can't create the
-///    replacement would just bleed capacity). Unhealthy `Delete`s
-///    from step 1 still ship — they don't consume create budget.
-///
-/// 3. **Drifted Creating → `Delete` (immediate, unbounded).**
-///    A Creating instance with a stamped `spec_hash != current_hash`
-///    contributes zero ready capacity; letting it finish on the old
-///    version just wastes the create cost. Skipped when the entry
-///    has no stamped hash yet (initial-status patch race).
-///
-/// 4. **Drifted Ready → `Delete` (rolling, capped).**
-///    At most `policy.max_recycling` per reconcile. Each Delete is
-///    gated on the post-Delete `ready_clean` count still being
-///    `>= policy.min_ready_during_upgrade`. Recycle order is
-///    `state_since` ascending — the oldest Ready first. The required
-///    `ready_clean` headroom is what `policy.max_surge` purchases via
-///    the scale-up step below: surge runs FIRST in earlier reconciles,
-///    landing fresh `ready_clean` instances that this step can then
-///    recycle without dipping under the floor.
-///
-/// 5. **Stuck Creating timeout (configurable, default 10 min).**
-///    `Delete` Creating instances whose `state_since` is older than
-///    the timeout. Independent of drift — covers the case where a
-///    Creating is *clean* (current hash) but the bootstrap is wedged.
-///    Deduplicated against step 3 (no double-Delete).
-///
-/// 6. **Scale-up.**
-///    Refill toward `min_ready`, plus up to `policy.max_surge` extras
-///    when there is at least one drifted Ready remaining (the surge
-///    only fires when there is drift to absorb; otherwise the warm
-///    target stays at `min_ready` and a fresh pool boot doesn't
-///    overshoot). Capped by `MAX_BURST` per reconcile and by
-///    `max_clusters`. Also gated by `backoff_active`.
-///
-/// 7. **Scale-down.**
-///    SKIPPED entirely while a drift upgrade is in progress (any
-///    drifted Ready or drifted Creating remaining). Without this
-///    gate, a fresh replacement that just landed would be reaped as
-///    "excess idle past min_ready" the moment `ready_clean` exceeds
-///    `min_ready` — destroying exactly the capacity the surge was
-///    meant to provide. When no drift remains, scale-down resumes
-///    its usual idle-trim behavior.
-///
-/// # Invariants pinned by tests
-///
-/// - Every reconcile preserves `ready_clean >= policy.min_ready_during_upgrade`
-///   (modulo entry conditions where the floor was already violated).
-/// - At most `policy.max_recycling` Deletes against drifted Ready
-///   per call.
-/// - Unhealthy Deletes are never bounded by `max_recycling`.
-/// - Leased instances are never Deleted, regardless of drift.
-/// - `backoff_active` suppresses drift recycle AND scale-up
-///   symmetrically.
-///
-/// See [`UpgradePolicy`](crate::crd::UpgradePolicy) for the knobs and
-/// `docs/guides/upgrade-policy.md` for the operator-facing tuning
-/// guide.
+/// A fixed pool keeps `size` Ready members warm, but its total also includes
+/// Leased, Creating, Recycling, Unhealthy and Quarantined members. A ceiling
+/// of exactly `size` would stop refills as soon as one member was leased, so
+/// the pool would drain to zero under load. The headroom lets it replace
+/// leased and recycling members while still bounding a runaway create loop.
+/// Pools that need a precise ceiling set `scaling.maxClusters` instead.
+pub const FIXED_POOL_HEADROOM: u32 = 10;
+
 /// Resolve the per-pool stuck-Creating timeout. Falls back to the
 /// operator's pre-CRD default of 10 minutes when the field is missing
 /// (no `scaling` block) or malformed (`parse_duration` returns None).
@@ -570,6 +503,86 @@ fn entry_drift_eligible(
     }
 }
 
+/// Compute the desired `PoolAction`s for one reconcile pass.
+///
+/// Pure: takes immutable state and `now`, returns a list of actions
+/// the controller will issue. No I/O. The reconciler in
+/// `controllers::profile` owns all side effects.
+///
+/// # Order of evaluation
+///
+/// Each step's outcome feeds the next via local counters, but each
+/// step only inspects `state` and the running `actions` list — no
+/// global state.
+///
+/// 1. **Unhealthy → `Delete`** (unbounded).
+///    Broken instances contribute zero capacity; removing them is
+///    pure win and never violates any floor. Not gated by
+///    `max_recycling`, the failure backoff, or the upgrade policy.
+///
+/// 2. **Backoff early-return.**
+///    If `backoff_active`, drift recycling and scale-up are both
+///    suppressed (Deleting drifted Ready when we can't create the
+///    replacement would just bleed capacity). Unhealthy `Delete`s
+///    from step 1 still ship — they don't consume create budget.
+///
+/// 3. **Drifted Creating → `Delete` (immediate, unbounded).**
+///    A Creating instance with a stamped `spec_hash != current_hash`
+///    contributes zero ready capacity; letting it finish on the old
+///    version just wastes the create cost. Skipped when the entry
+///    has no stamped hash yet (initial-status patch race).
+///
+/// 4. **Drifted Ready → `Delete` (rolling, capped).**
+///    At most `policy.max_recycling` per reconcile. Each Delete is
+///    gated on the post-Delete `ready_clean` count still being
+///    `>= policy.min_ready_during_upgrade`. Recycle order is
+///    `state_since` ascending — the oldest Ready first. The required
+///    `ready_clean` headroom is what `policy.max_surge` purchases via
+///    the scale-up step below: surge runs FIRST in earlier reconciles,
+///    landing fresh `ready_clean` instances that this step can then
+///    recycle without dipping under the floor.
+///
+/// 5. **Stuck Creating timeout (configurable, default 10 min).**
+///    `Delete` Creating instances whose `state_since` is older than
+///    the timeout. Independent of drift — covers the case where a
+///    Creating is *clean* (current hash) but the bootstrap is wedged.
+///    Deduplicated against step 3 (no double-Delete).
+///
+/// 6. **Scale-up.**
+///    Refill toward `min_ready`, plus up to `policy.max_surge` extras
+///    when there is at least one drifted Ready remaining (the surge
+///    only fires when there is drift to absorb; otherwise the warm
+///    target stays at `min_ready` and a fresh pool boot doesn't
+///    overshoot). Capped by `MAX_BURST` per reconcile and by
+///    `max_clusters`. Also gated by `backoff_active`.
+///
+/// 7. **Scale-down.**
+///    SKIPPED entirely while a drift upgrade is in progress (any
+///    drifted Ready or drifted Creating remaining). Without this
+///    gate, a fresh replacement that just landed would be reaped as
+///    "excess idle past min_ready" the moment `ready_clean` exceeds
+///    `min_ready` — destroying exactly the capacity the surge was
+///    meant to provide. When no drift remains, scale-down resumes
+///    its usual idle-trim behavior.
+///
+/// Each `Delete` carries the [`RecycleReason`] of the step that chose it.
+/// A fixed pool (no `scaling` block) has a ceiling of `size +`
+/// [`FIXED_POOL_HEADROOM`] and never scales down.
+///
+/// # Invariants pinned by tests
+///
+/// - Every reconcile preserves `ready_clean >= policy.min_ready_during_upgrade`
+///   (modulo entry conditions where the floor was already violated).
+/// - At most `policy.max_recycling` Deletes against drifted Ready
+///   per call.
+/// - Unhealthy Deletes are never bounded by `max_recycling`.
+/// - Leased instances are never Deleted, regardless of drift.
+/// - `backoff_active` suppresses drift recycle AND scale-up
+///   symmetrically.
+///
+/// See [`UpgradePolicy`](crate::crd::UpgradePolicy) for the knobs and
+/// `docs/guides/upgrade-policy.md` for the operator-facing tuning
+/// guide.
 pub fn compute_pool_actions(
     profile: &ClusterPool,
     state: &PoolState,
@@ -594,25 +607,31 @@ pub fn compute_pool_actions(
     // cleanup handle that proves whether the tenant's data is actually gone.
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Unhealthy {
-            actions.push(PoolAction::Delete(name.clone()));
+            actions.push(PoolAction::Delete(name.clone(), RecycleReason::Unhealthy));
             deleting.insert(name.clone());
         }
     }
 
     // Determine the warm-target ceiling now so the policy resolver and
     // the rest of the function share the same `min_ready`.
-    let (min_ready, max_clusters, _scale_up_threshold, scale_down_after) =
-        if let Some(scaling) = &spec.scaling {
-            (
-                scaling.min_ready,
-                scaling.max_clusters,
-                scaling.scale_up_threshold,
-                parse_duration(&scaling.scale_down_after),
-            )
-        } else {
-            // Fixed pool: size is both min and max ready.
-            (spec.size, spec.size + 10, 0, None) // no scale-down for fixed pools
-        };
+    //
+    // `scaling.scaleUpThreshold` is not read: it is reserved and has no
+    // effect (see its CRD description).
+    let (min_ready, max_clusters, scale_down_after) = if let Some(scaling) = &spec.scaling {
+        (
+            scaling.min_ready,
+            scaling.max_clusters,
+            parse_duration(&scaling.scale_down_after),
+        )
+    } else {
+        // Fixed pool: `size` is the warm target, the ceiling leaves
+        // `FIXED_POOL_HEADROOM` on top of it, and there is no scale-down.
+        (
+            spec.size,
+            spec.size.saturating_add(FIXED_POOL_HEADROOM),
+            None,
+        )
+    };
 
     // Queued claims raise the warm target, but only for pools that opted
     // into autoscaling. A fixed pool's contract is `spec.size` exactly,
@@ -672,7 +691,10 @@ pub fn compute_pool_actions(
                 && now - since > creating_timeout
             {
                 emit_stuck_creating(&metric_profile, stuck_creating_reason(entry));
-                actions.push(PoolAction::Delete(name.clone()));
+                actions.push(PoolAction::Delete(
+                    name.clone(),
+                    RecycleReason::CreatingTimeout,
+                ));
                 deleting.insert(name.clone());
             }
         }
@@ -699,7 +721,7 @@ pub fn compute_pool_actions(
                 "Drifted Creating: recycling without waiting for timeout"
             );
             emit_stuck_creating(&metric_profile, crate::metrics::StuckCreatingReason::Drift);
-            actions.push(PoolAction::Delete(name.clone()));
+            actions.push(PoolAction::Delete(name.clone(), RecycleReason::SpecDrift));
             deleting.insert(name.clone());
         }
     }
@@ -788,7 +810,7 @@ pub fn compute_pool_actions(
     };
 
     let mut remaining_ready = counts.ready;
-    for (name, _entry) in drifted_ready.iter().take(policy.max_recycling as usize) {
+    for (name, entry) in drifted_ready.iter().take(policy.max_recycling as usize) {
         if remaining_ready <= policy.min_ready_during_upgrade {
             // Floor would be violated. Wait for the surge create
             // (step 6) to land on a future reconcile and bump
@@ -805,7 +827,20 @@ pub fn compute_pool_actions(
             cluster = %name,
             "Drifted Ready: rolling recycle"
         );
-        actions.push(PoolAction::Delete((*name).clone()));
+        // A member that is only here for PKI expiry (#19) is labelled as
+        // such; any hash drift wins, since that is what an operator changed.
+        let reason = if !entry_drift_eligible(
+            entry.spec_hash.as_ref(),
+            entry.state_since,
+            &current_hash,
+            now,
+        ) && entry.cert_expiring()
+        {
+            RecycleReason::CertExpiry
+        } else {
+            RecycleReason::SpecDrift
+        };
+        actions.push(PoolAction::Delete((*name).clone(), reason));
         deleting.insert((*name).clone());
         remaining_ready -= 1;
     }
@@ -826,7 +861,10 @@ pub fn compute_pool_actions(
             && now - since > creating_timeout
         {
             emit_stuck_creating(&metric_profile, stuck_creating_reason(entry));
-            actions.push(PoolAction::Delete(name.clone()));
+            actions.push(PoolAction::Delete(
+                name.clone(),
+                RecycleReason::CreatingTimeout,
+            ));
             deleting.insert(name.clone());
         }
     }
@@ -912,7 +950,7 @@ pub fn compute_pool_actions(
             if let Some(idle_since) = entry.idle_since
                 && now - idle_since > idle_max
             {
-                actions.push(PoolAction::Delete(name.clone()));
+                actions.push(PoolAction::Delete(name.clone(), RecycleReason::ScaleDown));
                 deleted_excess += 1;
             }
         }
@@ -1087,14 +1125,29 @@ fn backoff_active(profile: &ClusterPool, now: chrono::DateTime<chrono::Utc>) -> 
 pub const FAILING_THRESHOLD: u32 = 3;
 
 /// Compute the high-level `ClusterPoolPhase` for the pool given its current
-/// counts, backoff state, and config.
+/// counts, queued demand, backoff state, and config.
 ///
-/// Ordering of checks matters: `Failing` takes precedence over `Backoff`,
-/// since a sustained failure is the stronger signal even when a backoff
-/// window is active.
+/// Checks run in this order, first match wins:
+///
+/// 1. `Failing`: sustained provision failures.
+/// 2. `Backoff`: inside a retry window after a failure.
+/// 3. `Idle`: scale-to-zero pool with nothing in it.
+/// 4. `ScalingDown`: above `minReady` and recycling.
+/// 5. `Healthy`: at or above `minReady`. Leased members alone do not make
+///    a pool healthy: with nothing Ready, a pool below `minReady` or with
+///    claims queued is not at target.
+/// 6. `ScalingUp`: everything else. This includes an exhausted pool (every
+///    member leased, claims waiting, no room to create); `queueDepth`,
+///    `leased` and `creating` in the status tell that case apart.
+///
+/// Quarantined members replace `Idle` and `Healthy` with `Quarantined`: a
+/// pool holding capacity whose teardown could not be proven is never
+/// reported as healthy or empty. They do not hide the more specific phases
+/// above; `status.quarantined` still carries the count.
 pub fn compute_pool_phase(
     profile: &ClusterPool,
     counts: &StateCounts,
+    queue_depth: u32,
     consecutive_failures: u32,
     next_attempt_at: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
@@ -1107,17 +1160,11 @@ pub fn compute_pool_phase(
         .as_ref()
         .map(|s| s.min_ready)
         .unwrap_or(profile.spec.size);
+    let quarantined = counts.quarantined > 0;
 
     // Sustained failure beats transient backoff beats everything else.
     if consecutive_failures >= FAILING_THRESHOLD {
         return ClusterPoolPhase::Failing;
-    }
-
-    // Quarantine is a pool-level health condition, not ordinary churn. Even a
-    // pool with other Ready/Leased members must not present as Healthy while it
-    // is retaining capacity whose teardown could not be proven.
-    if counts.quarantined > 0 {
-        return ClusterPoolPhase::Quarantined;
     }
 
     // Active backoff window: waiting for retry.
@@ -1135,26 +1182,35 @@ pub fn compute_pool_phase(
         && counts.creating == 0
         && counts.recycling == 0
         && counts.unhealthy == 0
-        // Quarantined members are NOT idle: their backend resources still
-        // exist and are being held deliberately. Reporting Idle here would
-        // tell an operator the pool is empty while it is actually holding
-        // capacity it could not prove it destroyed.
-        && counts.quarantined == 0
         && min_ready == 0
     {
-        return ClusterPoolPhase::Idle;
+        // Quarantined members are NOT idle: their backend resources still
+        // exist and are being held deliberately.
+        return if quarantined {
+            ClusterPoolPhase::Quarantined
+        } else {
+            ClusterPoolPhase::Idle
+        };
     }
 
     // Cooling: above target AND actively shrinking. Catches idle-reap
     // from `scaleDownAfter`. Leases recycling while at-or-below target
-    // stays Healthy / Warming.
+    // stays Healthy / ScalingUp.
     if counts.ready > min_ready && counts.recycling > 0 {
         return ClusterPoolPhase::ScalingDown;
     }
 
-    // At or above target and serving / holding steady.
-    if counts.ready >= min_ready.max(1) || counts.leased > 0 {
-        return ClusterPoolPhase::Healthy;
+    // At or above target. A scale-to-zero pool serving leases with no
+    // queue is also at target; one with claims queued and nothing Ready
+    // is not.
+    let at_target = counts.ready >= min_ready.max(1)
+        || (counts.leased > 0 && counts.ready >= min_ready && queue_depth == 0);
+    if at_target {
+        return if quarantined {
+            ClusterPoolPhase::Quarantined
+        } else {
+            ClusterPoolPhase::Healthy
+        };
     }
 
     // Below target, creating now or about to, no failures.
@@ -1964,7 +2020,7 @@ mod tests {
         );
 
         assert!(
-            !actions.iter().any(|a| matches!(a, PoolAction::Delete(_))),
+            !actions.iter().any(|a| matches!(a, PoolAction::Delete(..))),
             "a queued claim is counted against this Ready cluster, so scale-down \
              must not reap it — got {actions:?}"
         );
@@ -2207,7 +2263,7 @@ mod tests {
         // 2 ready, min_ready=1, one idle >30m → delete 1
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(deletes.len(), 1);
     }
@@ -2274,7 +2330,7 @@ mod tests {
         // Both idle only 5m, threshold is 30m — no deletes
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(deletes.len(), 0);
     }
@@ -2347,10 +2403,10 @@ mod tests {
         // Only the Ready (unclaimed) cluster should be deleted.
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(deletes.len(), 1);
-        if let PoolAction::Delete(name) = &deletes[0] {
+        if let PoolAction::Delete(name, _) = &deletes[0] {
             assert_eq!(name, "pool-test-profile-1");
         }
     }
@@ -2566,7 +2622,7 @@ mod tests {
 
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(deletes.len(), 0);
     }
@@ -2690,7 +2746,7 @@ mod tests {
              surging here leaks capacity that can never drain. got {actions:?}"
         );
         assert!(
-            !actions.iter().any(|a| matches!(a, PoolAction::Delete(_))),
+            !actions.iter().any(|a| matches!(a, PoolAction::Delete(..))),
             "maxRecycling: 0 must not recycle anything. got {actions:?}"
         );
     }
@@ -2976,22 +3032,55 @@ mod tests {
     #[test]
     fn test_phase_healthy_when_at_target() {
         let p = profile_with_min_ready(2);
-        let phase = compute_pool_phase(&p, &counts(2, 0, 0, 0), 0, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(2, 0, 0, 0), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Healthy);
     }
 
     #[test]
-    fn test_phase_healthy_when_serving_below_target() {
+    fn test_phase_not_healthy_when_every_member_is_leased_below_target() {
         let p = profile_with_min_ready(2);
-        // ready=0 but leased=1 — pool is working even if warm buffer is empty.
-        let phase = compute_pool_phase(&p, &counts(0, 1, 0, 0), 0, None, chrono::Utc::now());
+        // ready=0, leased=1, nothing creating: the next claim has nothing to
+        // bind. Leased members alone must not read as Healthy.
+        let phase = compute_pool_phase(&p, &counts(0, 1, 0, 0), 0, 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_not_healthy_when_claims_queue_with_nothing_ready() {
+        // Scale-to-zero pool serving a lease is Healthy while nothing waits...
+        let p = profile_with_min_ready(0);
+        let phase = compute_pool_phase(&p, &counts(0, 1, 0, 0), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Healthy);
+        // ...but not once claims queue behind it with nothing Ready.
+        let phase = compute_pool_phase(&p, &counts(0, 1, 0, 0), 2, 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_quarantine_does_not_hide_backoff_or_scaling_up() {
+        let p = profile_with_min_ready(2);
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        let quarantined = |ready, leased, creating| StateCounts {
+            quarantined: 1,
+            ..counts(ready, leased, creating, 0)
+        };
+
+        let phase = compute_pool_phase(&p, &quarantined(0, 0, 0), 0, 1, Some(&future), now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Backoff);
+
+        let phase = compute_pool_phase(&p, &quarantined(0, 1, 1), 0, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+
+        // Where the pool would otherwise be Healthy, quarantine shows.
+        let phase = compute_pool_phase(&p, &quarantined(2, 0, 0), 0, 0, None, now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Quarantined);
     }
 
     #[test]
     fn test_phase_warming_when_creating() {
         let p = profile_with_min_ready(2);
-        let phase = compute_pool_phase(&p, &counts(0, 0, 1, 0), 0, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(0, 0, 1, 0), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
     }
 
@@ -2999,14 +3088,14 @@ mod tests {
     fn test_phase_warming_on_first_arrival() {
         let p = profile_with_min_ready(1);
         // Nothing yet, no failures, minReady > 0.
-        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
     }
 
     #[test]
     fn test_phase_idle_when_scale_to_zero_steady() {
         let p = profile_with_min_ready(0);
-        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Idle);
     }
 
@@ -3014,7 +3103,7 @@ mod tests {
     fn test_phase_cooling_when_above_target_and_recycling() {
         let p = profile_with_min_ready(1);
         // 3 ready, 1 being recycled (scale-down reaping an idle one).
-        let phase = compute_pool_phase(&p, &counts(3, 0, 0, 1), 0, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(3, 0, 0, 1), 0, 0, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingDown);
     }
 
@@ -3023,7 +3112,7 @@ mod tests {
         let p = profile_with_min_ready(1);
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
-        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 1, Some(&future), now);
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, 1, Some(&future), now);
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Backoff);
     }
 
@@ -3033,7 +3122,7 @@ mod tests {
         let now = chrono::Utc::now();
         let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
         // 3 failures beats backoff window check.
-        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 3, Some(&future), now);
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, 3, Some(&future), now);
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
     }
 
@@ -3046,7 +3135,7 @@ mod tests {
         // Note: with current ordering, Failing beats Healthy when counter >= 3.
         // That's intentional — a stale counter is a bug in compute_backoff_state,
         // not something phase computation should paper over. Document the ordering.
-        let phase = compute_pool_phase(&p, &counts(1, 0, 0, 0), 5, None, chrono::Utc::now());
+        let phase = compute_pool_phase(&p, &counts(1, 0, 0, 0), 0, 5, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
     }
 
@@ -3107,6 +3196,155 @@ mod tests {
         }
     }
 
+    /// Every `Delete` carries the reason of the step that chose it, so
+    /// `kobe_instance_recycles_total` can tell drift from health failures
+    /// and timeouts.
+    #[test]
+    fn delete_actions_carry_the_reason_that_chose_them() {
+        // max_recycling=2 and floor 0 so both drift and cert members roll.
+        let profile = make_profile_with_upgrade(4, 2, 1, Some(0));
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
+        let now = chrono::Utc::now();
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            make_entry(ClusterState::Unhealthy),
+        );
+        let mut stuck = clean_entry(ClusterState::Creating, current.clone());
+        stuck.state_since = Some(now - chrono::Duration::hours(1));
+        clusters.insert("pool-test-profile-2".into(), stuck);
+        clusters.insert(
+            "pool-test-profile-3".into(),
+            drifted_entry(ClusterState::Ready, 1000),
+        );
+        let mut expiring = clean_entry(ClusterState::Ready, current.clone());
+        expiring.state_since = Some(now - chrono::Duration::seconds(500));
+        expiring.cert_horizon_secs = Some(86_400);
+        clusters.insert("pool-test-profile-4".into(), expiring);
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+            None,
+        );
+        let reasons: HashMap<&str, RecycleReason> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n, r) => Some((n.as_str(), *r)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            reasons.get("pool-test-profile-1"),
+            Some(&RecycleReason::Unhealthy)
+        );
+        assert_eq!(
+            reasons.get("pool-test-profile-2"),
+            Some(&RecycleReason::CreatingTimeout)
+        );
+        assert_eq!(
+            reasons.get("pool-test-profile-3"),
+            Some(&RecycleReason::SpecDrift)
+        );
+        assert_eq!(
+            reasons.get("pool-test-profile-4"),
+            Some(&RecycleReason::CertExpiry)
+        );
+    }
+
+    /// An idle-trim Delete is labelled as a scale-down, not as drift.
+    #[test]
+    fn scale_down_delete_is_labelled_scale_down() {
+        let profile = make_profile(
+            1,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 1,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+        let mut clusters = HashMap::new();
+        for i in 0..2 {
+            let mut entry = make_entry(ClusterState::Ready);
+            entry.idle_since = Some(now - chrono::Duration::hours(1));
+            clusters.insert(format!("pool-test-profile-{i}"), entry);
+        }
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+            None,
+        );
+        let reasons: Vec<RecycleReason> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(_, r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, vec![RecycleReason::ScaleDown]);
+    }
+
+    /// A fixed pool's ceiling is `size + FIXED_POOL_HEADROOM`: it refills
+    /// while members are leased, and stops once that many members exist.
+    #[test]
+    fn fixed_pool_ceiling_is_size_plus_headroom() {
+        let profile = make_profile(2, None);
+        let mut clusters = HashMap::new();
+        for i in 0..(2 + FIXED_POOL_HEADROOM - 1) {
+            clusters.insert(
+                format!("pool-test-profile-{i}"),
+                make_entry(ClusterState::Leased),
+            );
+        }
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+        let creates = |state: &PoolState| {
+            compute_pool_actions(
+                &profile,
+                state,
+                chrono::Utc::now(),
+                &test_render_ctx(),
+                &Default::default(),
+                None,
+            )
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .count()
+        };
+        assert_eq!(creates(&state), 1, "one slot left under the ceiling");
+
+        let mut full = state.clone();
+        full.clusters.insert(
+            "pool-test-profile-99".into(),
+            make_entry(ClusterState::Leased),
+        );
+        assert_eq!(creates(&full), 0, "at size + headroom the pool stops");
+    }
+
     /// Pool with 4 drifted Ready, `max_recycling=1`, floor=2:
     /// exactly 1 Delete per reconcile (the rate cap), with surge to
     /// keep capacity above the floor. Bypasses scale-up's MAX_BURST
@@ -3136,7 +3374,7 @@ mod tests {
 
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(
             deletes.len(),
@@ -3176,7 +3414,7 @@ mod tests {
         );
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         let creates: Vec<_> = actions
             .iter()
@@ -3223,7 +3461,7 @@ mod tests {
         assert_eq!(
             actions_t0
                 .iter()
-                .filter(|a| matches!(a, PoolAction::Delete(_)))
+                .filter(|a| matches!(a, PoolAction::Delete(..)))
                 .count(),
             0,
             "T0: no Delete — original drifted Ready is the only available capacity"
@@ -3257,7 +3495,7 @@ mod tests {
         let deletes_t1: Vec<_> = actions_t1
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.as_str()),
+                PoolAction::Delete(n, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
@@ -3304,7 +3542,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.as_str()),
+                PoolAction::Delete(n, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
@@ -3355,7 +3593,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -3400,7 +3638,7 @@ mod tests {
         // Genuinely empty scale-to-zero pool: Idle is correct.
         let empty = StateCounts::default();
         assert_eq!(
-            compute_pool_phase(&profile, &empty, 0, None, chrono::Utc::now()),
+            compute_pool_phase(&profile, &empty, 0, 0, None, chrono::Utc::now()),
             crate::crd::ClusterPoolPhase::Idle
         );
 
@@ -3410,7 +3648,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            compute_pool_phase(&profile, &holding, 0, None, chrono::Utc::now()),
+            compute_pool_phase(&profile, &holding, 0, 0, None, chrono::Utc::now()),
             crate::crd::ClusterPoolPhase::Quarantined,
             "Healthy/Idle must never coexist with unreclaimed capacity"
         );
@@ -3426,7 +3664,7 @@ mod tests {
     #[test]
     fn quarantined_capacity_counts_against_the_pool_ceiling() {
         // An AUTOSCALED pool whose hard ceiling is one member, and whose one
-        // member is quarantined. (A fixed pool deliberately allows `size + 10`
+        // member is quarantined. (A fixed pool allows `FIXED_POOL_HEADROOM`
         // headroom, so its ceiling is not the binding constraint here.)
         let profile = make_profile(
             1,
@@ -3502,7 +3740,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -3555,7 +3793,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.as_str()),
+                PoolAction::Delete(n, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
@@ -3622,7 +3860,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.as_str()),
+                PoolAction::Delete(n, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
@@ -3673,7 +3911,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.as_str()),
+                PoolAction::Delete(n, _) => Some(n.as_str()),
                 _ => None,
             })
             .collect();
@@ -3753,7 +3991,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -3799,7 +4037,7 @@ mod tests {
         );
         let deletes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .filter(|a| matches!(a, PoolAction::Delete(..)))
             .collect();
         assert_eq!(
             deletes.len(),
@@ -3852,7 +4090,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -3910,7 +4148,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -4035,7 +4273,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -4096,7 +4334,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -4173,7 +4411,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -4256,7 +4494,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -4335,7 +4573,7 @@ mod tests {
         let deletes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                PoolAction::Delete(n) => Some(n.clone()),
+                PoolAction::Delete(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();

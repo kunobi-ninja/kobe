@@ -48,35 +48,14 @@ pub struct ProfileContext {
 mod quarantine_tests {
     use super::*;
 
-    /// Quarantined capacity must never present as leasable. `ClusterState` has
-    /// no Quarantined variant yet, so this pins the interim mapping: whatever it
-    /// maps to, it must not be `Ready` or `Leased`, or unproven capacity would
-    /// be handed to the next caller.
+    /// Quarantined capacity must never present as leasable: it must not map
+    /// to `Ready` or `Leased`, or unproven capacity would be handed to the
+    /// next caller.
     #[test]
     fn quarantined_never_maps_to_usable_capacity() {
         let state = cluster_state_from_phase(&ClusterInstancePhase::Quarantined);
         assert_ne!(state, ClusterState::Ready);
         assert_ne!(state, ClusterState::Leased);
-    }
-
-    /// The reverse mapping must never *produce* Quarantined, because that would
-    /// mean in-memory pool state could invent a quarantine that no teardown
-    /// evidence supports.
-    #[test]
-    fn pool_state_cannot_invent_a_quarantine() {
-        for state in [
-            ClusterState::Creating,
-            ClusterState::Ready,
-            ClusterState::Leased,
-            ClusterState::Unhealthy,
-            ClusterState::Recycling,
-        ] {
-            assert_ne!(
-                cluster_phase_from_state(&state),
-                ClusterInstancePhase::Quarantined,
-                "{state:?} must not round-trip into Quarantined"
-            );
-        }
     }
 }
 
@@ -763,149 +742,222 @@ mod cluster_instance_tests {
         );
     }
 
-    /// A lease that binds mid-reconcile must not be undone by the
-    /// end-of-reconcile status sync.
-    ///
-    /// `reconcile_profile` builds `pool_state` and then does seconds of
-    /// work — bootstrap resolution, per-instance cert reads, a backend
-    /// health probe, creates and deletes. A lease can bind in that
-    /// window: `reserve_ready_instance` sets `phase: Leased` and a
-    /// `leaseRef`. The sync then writes `phase` back from the STALE
-    /// in-memory entry while reading `leaseRef` fresh, leaving the
-    /// instance `Ready` on disk with a live lease attached.
-    ///
-    /// That state is sticky, and `compute_pool_actions` has no lease
-    /// awareness at all — so the next reconcile can drift-recycle or
-    /// idle-scale-down a cluster a tenant is actively holding, breaking
-    /// the invariant its own doc-comment states ("Leased instances are
-    /// never Deleted, regardless of drift").
-    ///
-    /// Same class as the `spec_hash` guard a few lines below it: stale
-    /// in-memory state must not clobber a fresher on-disk value.
-    #[tokio::test]
-    async fn status_sync_does_not_revert_an_instance_that_took_a_lease_mid_reconcile() {
-        let (ctx, server) = test_profile_context().await;
-        let name = "pool-test-profile-0";
-        // What `reserve_ready_instance` stamps atomically with the
-        // reservation. The 2-minute orphan-reclaim grace is measured
-        // against it, so it must survive this sync.
-        let fresh_state_since = chrono::Utc::now().to_rfc3339();
+    const INSTANCE_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-profile-0";
 
-        // On disk the lease controller has already bound this instance.
+    /// Serve `status` as the fresh on-disk instance and record every status
+    /// PATCH body sent back.
+    async fn mount_instance(
+        server: &MockServer,
+        status: serde_json::Value,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+        let body = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": "pool-test-profile-0",
+                "namespace": "test-ns",
+                "uid": "instance-uid",
+                "resourceVersion": "20"
+            },
+            "spec": { "poolRef": { "name": "test-profile" } },
+            "status": status
+        });
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{name}"
-            )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterInstance",
-                "metadata": {
-                    "name": name,
-                    "namespace": "test-ns",
-                    "uid": "instance-uid",
-                    "resourceVersion": "20"
-                },
-                "spec": { "poolRef": { "name": "test-profile" } },
-                "status": {
-                    "phase": "Leased",
-                    "leaseRef": { "name": "lease-abc123def456" },
-                    "stateSince": fresh_state_since,
-                    "provisioned": true,
-                    "bootstrapped": true,
-                    "activeBootstrap": "fresh-bootstrap",
-                    "healthFailures": 7,
-                    "specHash": "fresh-spec-hash",
-                    "message": "fresh instance-controller message"
-                }
-            })))
-            .mount(&server)
+            .and(path(INSTANCE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(server)
             .await;
-
-        // Capture whatever the sync patches back.
         let patched = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let sink = patched.clone();
         Mock::given(method("PATCH"))
-            .and(path(format!(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{name}/status"
-            )))
+            .and(path(format!("{INSTANCE_PATH}/status")))
             .respond_with(move |req: &wiremock::Request| {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) {
                     sink.lock().unwrap().push(v);
                 }
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "ClusterInstance",
-                    "metadata": { "name": name, "namespace": "test-ns" },
-                    "spec": { "poolRef": { "name": "test-profile" } },
-                    "status": { "phase": "Leased" }
-                }))
+                ResponseTemplate::new(200).set_body_json(body.clone())
             })
-            .mount(&server)
+            .mount(server)
             .await;
+        patched
+    }
 
-        // The in-memory view is from before the bind: still Ready, and
-        // carrying an idle timestamp the bind has since cleared.
-        let mut entry = crate::pool::manager::ClusterEntry {
-            state: ClusterState::Ready,
-            idle_since: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
-            health_failures: 0,
-            state_since: None,
-            spec_hash: None,
-            scheduling_blocked: false,
-            crashlooping: false,
-            crash_message: None,
-            cert_horizon_secs: None,
-        };
-        // Deliberately STALE, matching the rest of this pre-bind snapshot.
-        // Stamping it `now` here would mask the reservation race below.
-        entry.state_since = Some(chrono::Utc::now() - chrono::Duration::hours(2));
-        let mut clusters = HashMap::new();
-        clusters.insert(name.to_string(), entry);
-        let pool_state = PoolState {
-            clusters,
-            queue_depth: 0,
-        };
+    fn writes_to(ops: &serde_json::Value, target: &str) -> bool {
+        ops.as_array().unwrap().iter().any(|op| {
+            op["op"] != "test"
+                && op["path"]
+                    .as_str()
+                    .is_some_and(|p| p == target || p.starts_with(&format!("{target}/")))
+        })
+    }
 
-        sync_cluster_instance_statuses(&ctx.client, "test-ns", &pool_state).await;
+    /// The end-of-reconcile write must never revert a transition another
+    /// controller made after the pool snapshot.
+    ///
+    /// The snapshot says Ready. Since then the instance controller failed
+    /// the health check and moved it to Recycling, after which it deletes
+    /// the backend. The pool used to copy the snapshot phase back, turning
+    /// it into a leasable Ready instance with no backend. Now the only
+    /// thing it may write at the end of a reconcile is a missing
+    /// `specHash`.
+    #[tokio::test]
+    async fn end_of_reconcile_write_never_reverts_a_newer_phase() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({
+                "phase": "Recycling",
+                "stateSince": "2026-04-13T10:05:00Z",
+                "provisioned": true
+            }),
+        )
+        .await;
+
+        backfill_spec_hashes(
+            &ctx.client,
+            "test-ns",
+            &[("pool-test-profile-0".to_string(), "hash-new".to_string())],
+        )
+        .await;
 
         let writes = patched.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1, "the fresh status should be patched once");
-        for body in &writes {
-            let status = body
-                .as_array()
-                .and_then(|operations| {
-                    operations
-                        .iter()
-                        .find(|operation| operation["path"] == "/status")
-                })
-                .map(|operation| &operation["value"])
-                .expect("full status operation");
-            assert_eq!(
-                status["phase"], "Leased",
-                "the sync reverted a leased instance to Ready while its leaseRef was set"
-            );
-            assert_eq!(
-                status["stateSince"].as_str(),
-                Some(fresh_state_since.as_str()),
-                "the reservation's fresh stateSince must survive — the 2-minute \
-                 orphan-reclaim grace is measured against it, and a stale value \
-                 makes it instantly elapsed so the reclaimer can take a live \
-                 reservation away from a binding lease. body: {body}"
-            );
-            assert!(
-                status
-                    .get("idleSince")
-                    .is_none_or(serde_json::Value::is_null),
-                "a leased instance must not be given back a stale idleSince — it \
-                 re-arms idle scale-down against a cluster in use. body: {body}"
-            );
-            assert_eq!(status["provisioned"], true);
-            assert_eq!(status["bootstrapped"], true);
-            assert_eq!(status["activeBootstrap"], "fresh-bootstrap");
-            assert_eq!(status["healthFailures"], 7);
-            assert_eq!(status["specHash"], "fresh-spec-hash");
-            assert_eq!(status["message"], "fresh instance-controller message");
-        }
+        assert_eq!(writes.len(), 1, "the missing hash is still backfilled");
+        let ops = &writes[0];
+        assert!(
+            !writes_to(ops, "/status/phase")
+                && !writes_to(ops, "/status/stateSince")
+                && !writes_to(ops, "/status/idleSince"),
+            "the pool must not write phase or timers at end of reconcile: {ops}"
+        );
+        assert!(
+            ops.as_array().unwrap().iter().any(|op| op["op"] == "add"
+                && op["path"] == "/status/specHash"
+                && op["value"] == "hash-new"),
+            "expected a specHash add, got: {ops}"
+        );
+    }
+
+    /// A hash already on disk is never replaced by the backfill.
+    #[tokio::test]
+    async fn spec_hash_backfill_leaves_an_existing_hash_alone() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({ "phase": "Creating", "specHash": "hash-on-disk" }),
+        )
+        .await;
+
+        backfill_spec_hashes(
+            &ctx.client,
+            "test-ns",
+            &[("pool-test-profile-0".to_string(), "hash-other".to_string())],
+        )
+        .await;
+
+        assert!(patched.lock().unwrap().is_empty());
+    }
+
+    /// A recycle decided against a stale snapshot must not land.
+    ///
+    /// The pool picked this member while it was Ready; by the time the
+    /// status write runs, the instance controller has already moved it on.
+    #[tokio::test]
+    async fn recycle_mark_skips_an_instance_that_moved_on_since_the_snapshot() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({ "phase": "Unhealthy", "stateSince": "2026-04-13T10:05:00Z" }),
+        )
+        .await;
+
+        let wrote = mark_instance_recycling(
+            &ctx.client,
+            "test-ns",
+            "pool-test-profile-0",
+            ClusterState::Ready,
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote);
+        assert!(patched.lock().unwrap().is_empty());
+    }
+
+    /// A lease that reserved the instance after the snapshot owns it now.
+    /// Recycling it would take a cluster away from a tenant.
+    #[tokio::test]
+    async fn recycle_mark_skips_an_instance_that_took_a_lease_mid_reconcile() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({
+                "phase": "Leased",
+                "leaseRef": { "name": "lease-abc123def456" },
+                "stateSince": chrono::Utc::now().to_rfc3339()
+            }),
+        )
+        .await;
+
+        let wrote = mark_instance_recycling(
+            &ctx.client,
+            "test-ns",
+            "pool-test-profile-0",
+            ClusterState::Ready,
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote);
+        assert!(patched.lock().unwrap().is_empty());
+    }
+
+    /// The recycle write is fenced on the phase it read and touches only the
+    /// fields the pool owns for that transition.
+    #[tokio::test]
+    async fn recycle_mark_tests_the_from_phase_and_writes_only_its_own_fields() {
+        let (ctx, server) = test_profile_context().await;
+        let patched = mount_instance(
+            &server,
+            serde_json::json!({
+                "phase": "Ready",
+                "idleSince": "2026-04-13T10:01:00Z",
+                "stateSince": "2026-04-13T10:00:00Z",
+                "provisioned": true,
+                "healthFailures": 2,
+                "specHash": "hash-old"
+            }),
+        )
+        .await;
+
+        let wrote = mark_instance_recycling(
+            &ctx.client,
+            "test-ns",
+            "pool-test-profile-0",
+            ClusterState::Ready,
+        )
+        .await
+        .unwrap();
+
+        assert!(wrote);
+        let writes = patched.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        let ops = writes[0].as_array().unwrap();
+        let has = |op: &str, path: &str| {
+            ops.iter()
+                .find(|o| o["op"] == op && o["path"] == path)
+                .map(|o| o["value"].clone())
+        };
+        assert_eq!(has("test", "/metadata/uid"), Some("instance-uid".into()));
+        assert_eq!(has("test", "/metadata/resourceVersion"), Some("20".into()));
+        assert_eq!(has("test", "/status/phase"), Some("Ready".into()));
+        assert_eq!(has("replace", "/status/phase"), Some("Recycling".into()));
+        assert!(has("add", "/status/stateSince").is_some());
+        assert!(has("remove", "/status/idleSince").is_some());
+        assert!(
+            ops.iter().all(|o| o["path"] != "/status"),
+            "must not replace the whole status: {ops:?}"
+        );
     }
 
     /// Queue depth must count *unmet* demand only.
@@ -914,7 +966,9 @@ mod cluster_instance_tests {
     /// instance reserved for it — the lease controller recognises that
     /// state and repairs it to `Bound`. Counting it as queued demand
     /// during the reserve → patch-status window makes the pool
-    /// provision a replacement for a claim that is already served.
+    /// provision a replacement for a claim that is already served. The same
+    /// holds for a `Pending` lease that has written `status.binding` but not
+    /// yet `clusterName`.
     #[tokio::test]
     async fn queue_depth_excludes_pending_leases_that_already_hold_a_cluster() {
         let (ctx, server) = test_profile_context().await;
@@ -939,6 +993,24 @@ mod cluster_instance_tests {
                 "status": { "phase": phase, "clusterName": cluster }
             })
         };
+        // Reserved an instance and is waiting to bind it: `binding` is set,
+        // `clusterName` is not (it is only written at Bound).
+        let mut reserving = lease("reserving", "Pending", serde_json::json!(null));
+        reserving["status"]["binding"] = serde_json::json!({
+            "bindingId": "binding-1",
+            "lease": { "name": "reserving", "uid": "lease-uid" },
+            "instance": {
+                "name": "pool-test-profile-2",
+                "uid": "instance-uid",
+                "observedGeneration": 1
+            },
+            "pool": { "name": "test-profile", "uid": "pool-uid" },
+            "backend": {
+                "type": "k3s",
+                "configDigest": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "instanceSpecDigest": "002a000000000000"
+        });
 
         Mock::given(method("GET"))
             .and(path(
@@ -954,6 +1026,8 @@ mod cluster_instance_tests {
                         "Pending",
                         serde_json::json!("pool-test-profile-0"),
                     ),
+                    // Reserved via binding, mid-bind. Not demand.
+                    reserving,
                     // Bound and Expired are not demand either.
                     lease("bound", "Bound", serde_json::json!("pool-test-profile-1")),
                     lease("expired", "Expired", serde_json::json!(null)),
@@ -1309,6 +1383,9 @@ async fn reconcile_profile(
               "Pool creates paused: backend datastore is degraded");
     }
 
+    // Instances created this reconcile, with the hash they were stamped
+    // with, so a lost initial status write can be backfilled below.
+    let mut created: Vec<(String, String)> = Vec::new();
     for action in &actions {
         match action {
             PoolAction::Create(cluster_name) => {
@@ -1331,6 +1408,13 @@ async fn reconcile_profile(
                     render_fingerprint.as_deref(),
                 )
                 .await?;
+                let spec_hash = crate::pool::profile_spec_hash(
+                    &profile,
+                    &ctx.render_ctx,
+                    &bootstrap_specs,
+                    render_fingerprint.as_deref(),
+                );
+                created.push((cluster_name.clone(), spec_hash.clone()));
                 pool_state.clusters.insert(
                     cluster_name.clone(),
                     ClusterEntry {
@@ -1338,12 +1422,7 @@ async fn reconcile_profile(
                         idle_since: None,
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
-                        spec_hash: Some(crate::pool::profile_spec_hash(
-                            &profile,
-                            &ctx.render_ctx,
-                            &bootstrap_specs,
-                            render_fingerprint.as_deref(),
-                        )),
+                        spec_hash: Some(spec_hash),
                         // Freshly created — it hasn't had a chance to report a
                         // scheduling block or crashloop yet; build_pool_state
                         // recomputes both from status.message next reconcile.
@@ -1354,41 +1433,39 @@ async fn reconcile_profile(
                     },
                 );
             }
-            PoolAction::Delete(cluster_name) => {
-                info!(profile = %name, cluster = %cluster_name, "Deleting cluster");
-                if let Some(entry) = pool_state.clusters.get_mut(cluster_name) {
-                    entry.state = ClusterState::Recycling;
-                }
-                // `PoolAction::Delete` bundles scale-down, drift-recycle,
-                // and post-lease recycle without a reason axis on the
-                // action itself; we tag everything as `SpecDrift` here
-                // because that's the most common cause and also what an
-                // operator sees in `kobectl get clusterinstance` (the
-                // spec_hash mismatched). When `PoolAction` gains a
-                // typed reason, this label can be split apart.
-                crate::metrics::INSTANCE_RECYCLES_TOTAL
-                    .with_label_values(&[
-                        name.as_str(),
-                        crate::metrics::RecycleReason::SpecDrift.as_str(),
-                    ])
-                    .inc();
-                let _ = patch_cluster_instance_status(
-                    &ctx.client,
-                    &ns,
-                    cluster_name,
-                    ProfileInstanceStatusUpdate {
-                        phase: ClusterInstancePhase::Recycling,
-                        idle_since: None,
-                        state_since: Some(chrono::Utc::now().to_rfc3339()),
-                        spec_hash_if_missing: None,
-                    },
-                )
-                .await;
-            }
-            PoolAction::MarkUnhealthy(cluster_name) => {
-                warn!(profile = %name, cluster = %cluster_name, "Marking cluster unhealthy");
-                if let Some(entry) = pool_state.clusters.get_mut(cluster_name) {
-                    entry.state = ClusterState::Unhealthy;
+            PoolAction::Delete(cluster_name, reason) => {
+                info!(
+                    profile = %name, cluster = %cluster_name, reason = reason.as_str(),
+                    "Recycling cluster"
+                );
+                // The snapshot state this decision was made against. The
+                // status write below only lands if the instance is still in
+                // it, so a transition another controller made since the
+                // snapshot is never overwritten.
+                let Some(expected) = pool_state.clusters.get(cluster_name).map(|e| e.state) else {
+                    continue;
+                };
+                match mark_instance_recycling(&ctx.client, &ns, cluster_name, expected).await {
+                    Ok(true) => {
+                        crate::metrics::INSTANCE_RECYCLES_TOTAL
+                            .with_label_values(&[name.as_str(), reason.as_str()])
+                            .inc();
+                        if let Some(entry) = pool_state.clusters.get_mut(cluster_name) {
+                            entry.state = ClusterState::Recycling;
+                        }
+                    }
+                    Ok(false) => {
+                        debug!(
+                            profile = %name, cluster = %cluster_name,
+                            "Skipping recycle: instance changed since the pool snapshot"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            profile = %name, cluster = %cluster_name, error = %err,
+                            "Failed to mark cluster Recycling; next reconcile will retry"
+                        );
+                    }
                 }
             }
         }
@@ -1398,7 +1475,7 @@ async fn reconcile_profile(
         .write()
         .await
         .insert(name.clone(), pool_state.clone());
-    sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
+    backfill_spec_hashes(&ctx.client, &ns, &created).await;
 
     // Phase metrics here only need the base state taxonomy — pass
     // `None` for `current_hash` so the drift-aware buckets stay 0.
@@ -1554,6 +1631,7 @@ async fn reconcile_profile(
     let phase = crate::pool::manager::compute_pool_phase(
         &profile,
         &counts,
+        queue_depth,
         backoff.consecutive_failures,
         backoff.next_attempt_at.as_deref(),
         now,
@@ -1689,16 +1767,7 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     for instance in &instances {
         let cluster_name = instance.name_any();
         let status = instance.status.clone().unwrap_or_default();
-        // Ready means claimable only when both reciprocal reservation handles
-        // are absent. If either survives a stale status write, fail closed in
-        // pool accounting so the member is neither advertised nor recycled.
-        let state = if status.phase == ClusterInstancePhase::Ready
-            && (status.lease_ref.is_some() || status.binding.is_some())
-        {
-            ClusterState::Quarantined
-        } else {
-            cluster_state_from_phase(&status.phase)
-        };
+        let state = pool_state_from_status(&status);
 
         // #189: a Creating instance whose backend reported its guest Pods are
         // Unschedulable stamps a known prefix on `status.message`. Surface it
@@ -1769,12 +1838,18 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
 /// Count claims queued against `profile_name` — `Pending` leases that
 /// do not yet hold a cluster, i.e. demand nothing has been reserved for.
 ///
-/// The `cluster_name` check is load-bearing, not defensive.
-/// `Pending` + an assigned `clusterName` is a real, expected state: it is
-/// the window between `reserve_ready_instance` claiming an instance and
-/// the lease's status patch landing, and the lease controller repairs it
-/// to `Bound` on sight. Such a claim is already served, so counting it
-/// as demand would make the pool provision a second cluster for it.
+/// A `Pending` lease is already served, and must not count, when it
+/// carries either handle of a reservation:
+///
+/// - `status.binding`: the lease reserved an instance and is waiting to
+///   bind it. `clusterName` is only set at `Bound`, so without this check
+///   every reservation in flight is counted as demand.
+/// - `status.clusterName`: the window between `reserve_ready_instance`
+///   claiming an instance and the lease's status patch landing, which the
+///   lease controller repairs to `Bound` on sight.
+///
+/// Counting either as demand would make the pool provision a second
+/// cluster for the same claim.
 ///
 /// Feeds both the warm target in [`crate::pool::manager::compute_pool_actions`]
 /// (so a scale-to-zero pool provisions on demand) and the pool's
@@ -1795,7 +1870,11 @@ async fn count_pending_claims(ctx: &ProfileContext, profile_name: &str) -> u32 {
                 // reserved against, so it counts as demand.
                 c.status
                     .as_ref()
-                    .map(|s| s.phase == LeasePhase::Pending && s.cluster_name.is_none())
+                    .map(|s| {
+                        s.phase == LeasePhase::Pending
+                            && s.cluster_name.is_none()
+                            && s.binding.is_none()
+                    })
                     .unwrap_or(true)
             })
             .count() as u32,
@@ -2024,7 +2103,7 @@ async fn ensure_cluster_instance(
         // Retried on optimistic 409s: the instance controller routinely wins
         // the first status write right after CREATE, and losing that race
         // must not skip this patch — `created_with` is written here and
-        // nowhere else (the periodic sync backfills only `spec_hash`), and a
+        // nowhere else (the post-create backfill writes only `spec_hash`), and a
         // pool-managed instance without backend provenance is refused
         // deletion fail-closed, wedging recycle permanently.
         let mut attempts = 0;
@@ -2096,27 +2175,129 @@ async fn ensure_cluster_instance(
     Ok(())
 }
 
-/// Fields the profile controller is allowed to reconcile on an instance.
+/// The pool's view of an instance, derived from its status.
 ///
-/// Every other status field belongs to the instance or lease controller and
-/// must be copied from the fresh, resourceVersion-fenced read below. Keeping
-/// this intent typed prevents a stale pool snapshot from rolling back
-/// provisioning, bootstrap, health, capability, or teardown state.
-struct ProfileInstanceStatusUpdate {
-    phase: ClusterInstancePhase,
-    idle_since: Option<String>,
-    state_since: Option<String>,
-    spec_hash_if_missing: Option<String>,
+/// `Ready` counts as claimable only when both reciprocal reservation handles
+/// are absent. If either survives a stale status write, the member fails
+/// closed as `Quarantined` so it is neither advertised nor recycled.
+fn pool_state_from_status(status: &ClusterInstanceStatus) -> ClusterState {
+    if status.phase == ClusterInstancePhase::Ready
+        && (status.lease_ref.is_some() || status.binding.is_some())
+    {
+        ClusterState::Quarantined
+    } else {
+        cluster_state_from_phase(&status.phase)
+    }
 }
 
-async fn patch_cluster_instance_status(
+/// Move an instance to `Recycling` for a [`PoolAction::Delete`].
+///
+/// This is the only phase the pool controller writes on an existing
+/// instance. Every other transition belongs to the instance or lease
+/// controller. The pool decided to recycle against a snapshot taken
+/// seconds earlier, so the write only lands if a fresh read still shows
+/// the instance in `expected` with no lease handle. The JSON patch then
+/// tests the uid, resourceVersion and phase it read, and changes only
+/// `phase`, `stateSince` and `idleSince`.
+///
+/// Returns `Ok(false)` without writing when the instance has moved on (for
+/// example the instance controller already sent it to `Recycling` after a
+/// failed health check, or a lease reserved it). The next reconcile
+/// re-evaluates it from fresh state.
+async fn mark_instance_recycling(
     client: &Client,
     namespace: &str,
     cluster_name: &str,
-    update: ProfileInstanceStatusUpdate,
+    expected: ClusterState,
+) -> Result<bool, kube::Error> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let attempt = async {
+            let instance = instances_api.get(cluster_name).await?;
+            let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+                kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
+            })?;
+            let rv = instance.resource_version().ok_or_else(|| {
+                kube::Error::Service(Box::new(std::io::Error::other(
+                    "instance has no resourceVersion",
+                )))
+            })?;
+            let status = instance.status.clone().unwrap_or_default();
+            let lease_held = status.lease_ref.is_some() || status.binding.is_some();
+            if lease_held || pool_state_from_status(&status) != expected {
+                return Ok(false);
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut ops = vec![
+                serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+                serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": rv }),
+            ];
+            if instance.status.is_some() {
+                ops.push(serde_json::json!({
+                    "op": "test", "path": "/status/phase", "value": status.phase
+                }));
+                ops.push(serde_json::json!({
+                    "op": "replace", "path": "/status/phase",
+                    "value": ClusterInstancePhase::Recycling
+                }));
+                ops.push(serde_json::json!({
+                    "op": "add", "path": "/status/stateSince", "value": now
+                }));
+                if status.idle_since.is_some() {
+                    ops.push(serde_json::json!({ "op": "remove", "path": "/status/idleSince" }));
+                }
+            } else {
+                let status = ClusterInstanceStatus {
+                    phase: ClusterInstancePhase::Recycling,
+                    state_since: Some(now),
+                    ..Default::default()
+                };
+                ops.push(serde_json::json!({ "op": "add", "path": "/status", "value": status }));
+            }
+            instances_api
+                .patch_status(
+                    cluster_name,
+                    &PatchParams::default(),
+                    &Patch::<()>::Json(crate::controllers::lease::json_patch(
+                        serde_json::Value::Array(ops),
+                    )),
+                )
+                .await?;
+            Ok::<bool, kube::Error>(true)
+        }
+        .await;
+        match attempt {
+            Err(ref error)
+                if crate::controllers::lease::optimistic_conflict(error) && attempts < 5 =>
+            {
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Stamp `spec_hash` on an instance whose status does not have one yet.
+///
+/// Writes nothing else, and nothing at all if a hash is already present,
+/// so it can never replace or erase provenance written by anyone else.
+async fn backfill_spec_hash(
+    client: &Client,
+    namespace: &str,
+    cluster_name: &str,
+    spec_hash: &str,
 ) -> Result<(), kube::Error> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
     let instance = instances_api.get(cluster_name).await?;
+    if instance
+        .status
+        .as_ref()
+        .is_some_and(|s| s.spec_hash.is_some())
+    {
+        return Ok(());
+    }
     let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
         kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
     })?;
@@ -2125,21 +2306,19 @@ async fn patch_cluster_instance_status(
             "instance has no resourceVersion",
         )))
     })?;
-    let mut status = instance.status.unwrap_or_default();
-    let lease_held = status.lease_ref.is_some() || status.binding.is_some();
-    let quarantined = status.phase == ClusterInstancePhase::Quarantined;
-    if !lease_held && !quarantined {
-        status.phase = update.phase;
-        status.idle_since = update.idle_since;
-        status.state_since = update.state_since;
-    }
-    if status.spec_hash.is_none() {
-        status.spec_hash = update.spec_hash_if_missing;
-    }
+    let write = if instance.status.is_some() {
+        serde_json::json!({ "op": "add", "path": "/status/specHash", "value": spec_hash })
+    } else {
+        let status = ClusterInstanceStatus {
+            spec_hash: Some(spec_hash.to_string()),
+            ..Default::default()
+        };
+        serde_json::json!({ "op": "add", "path": "/status", "value": status })
+    };
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "add", "path": "/status", "value": status }
+        write
     ]));
     instances_api
         .patch_status(
@@ -2229,66 +2408,28 @@ async fn collect_and_emit_cert_expiry(
     per_instance
 }
 
-async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_state: &PoolState) {
-    for (cluster_name, entry) in &pool_state.clusters {
-        // A lease can bind between `pool_state` being built and this sync
-        // running — `reconcile_profile` does seconds of I/O in between. In
-        // that window `entry` is stale: it still says Ready, while the
-        // instance on disk is Leased with a `leaseRef`.
-        //
-        // Writing the stale phase back would leave the instance Ready on
-        // disk with a live lease attached, and that state is sticky (the
-        // instance controller's Ready arm never re-derives phase from
-        // `lease_ref`). `compute_pool_actions` has no lease awareness at
-        // all, so the next reconcile could drift-recycle or idle-scale-down
-        // a cluster a tenant is holding — breaking the invariant stated on
-        // that function: "Leased instances are never Deleted, regardless of
-        // drift". Restoring a stale `idle_since` compounds it by re-arming
-        // the idle timer against a cluster in use.
-        //
-        // So while the instance holds a lease, the lease controller owns
-        // its phase and idle timer: preserve what is on disk rather than
-        // overwriting from memory. Same rule as `spec_hash` below — stale
-        // in-memory state must not clobber a fresher on-disk value.
-        // Either reciprocal handle fences the instance out of the warm pool.
-        // In particular, an invalid/legacy binding must remain unavailable
-        // even if its display-only leaseRef is missing or stale.
-        // The helper performs the ownership decision against its own fresh
-        // GET. This snapshot contributes only profile-owned intent.
-        let phase = cluster_phase_from_state(&entry.state);
-        let idle_since = entry.idle_since.map(|ts| ts.to_rfc3339());
-        // `state_since` is part of the same atomic reservation write, and it is
-        // load-bearing, not cosmetic. The two-phase bind leaves the lease
-        // `Pending` with no `clusterName` between reserving the instance and
-        // patching the lease, so `evaluate_leased_instance` sees
-        // `reservation_orphaned == true` during every NORMAL bind. The only
-        // thing stopping it from releasing the reservation there is the
-        // two-minute `reservation_grace_elapsed` check against this field —
-        // which is exactly why `reserve_ready_instance` stamps it `now`.
-        //
-        // Writing the stale in-memory value back would make that grace
-        // instantly elapsed and let the reclaimer take a live reservation away
-        // from a binding lease. That path only became reachable once this
-        // function started preserving `Leased` (before, the instance was
-        // reverted to `Ready` and the leased arm never ran) — so preserving
-        // phase without preserving this timestamp would trade one bug for a
-        // worse one.
-        let state_since = entry.state_since.map(|ts| ts.to_rfc3339());
-
-        let _ = patch_cluster_instance_status(
-            client,
-            namespace,
-            cluster_name,
-            ProfileInstanceStatusUpdate {
-                phase,
-                idle_since,
-                state_since,
-                // The helper fills this only when the fresh status still has
-                // no hash, so an older snapshot cannot erase or replace it.
-                spec_hash_if_missing: entry.spec_hash.clone(),
-            },
-        )
-        .await;
+/// Backfill `spec_hash` on instances created this reconcile.
+///
+/// [`ensure_cluster_instance`] writes the initial status right after
+/// CREATE and retries lost races, but it can still give up. Without a hash
+/// the instance is drift-blind until the unstamped grace elapses, so this
+/// gives it one more try with the hash it was created for.
+///
+/// This is the only end-of-reconcile status write the pool controller
+/// makes. Phase, `idleSince` and `stateSince` belong to the instance and
+/// lease controllers: copying them from the pool snapshot could revert a
+/// newer transition, such as a health-failed `Ready → Recycling` whose
+/// backend is then deleted, back to a leasable `Ready`. The pool writes
+/// only its own intent, in [`mark_instance_recycling`].
+async fn backfill_spec_hashes(client: &Client, namespace: &str, created: &[(String, String)]) {
+    for (cluster_name, spec_hash) in created {
+        if let Err(err) = backfill_spec_hash(client, namespace, cluster_name, spec_hash).await {
+            warn!(
+                cluster = %cluster_name,
+                error = %err,
+                "Failed to backfill spec_hash on a new instance"
+            );
+        }
     }
 }
 
@@ -2537,17 +2678,6 @@ fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
         // deleted unconditionally by the pool manager, which would destroy the
         // cleanup handle and let the ordinary recycle path resume.
         ClusterInstancePhase::Quarantined => ClusterState::Quarantined,
-    }
-}
-
-fn cluster_phase_from_state(state: &ClusterState) -> ClusterInstancePhase {
-    match state {
-        ClusterState::Creating => ClusterInstancePhase::Creating,
-        ClusterState::Ready => ClusterInstancePhase::Ready,
-        ClusterState::Leased => ClusterInstancePhase::Leased,
-        ClusterState::Recycling => ClusterInstancePhase::Recycling,
-        ClusterState::Unhealthy => ClusterInstancePhase::Unhealthy,
-        ClusterState::Quarantined => ClusterInstancePhase::Quarantined,
     }
 }
 

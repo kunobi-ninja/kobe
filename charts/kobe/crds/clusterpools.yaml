@@ -772,6 +772,11 @@ spec:
                 description: |-
                   Desired number of warm (idle + creating) clusters in the pool.
                   Ignored when `scaling` is set — use `scaling.min_ready` instead.
+
+                  A fixed-size pool may hold up to `size + 10` members in total
+                  (leased, creating and recycling included) so it can refill while
+                  members are leased. It never scales down. Set `scaling.maxClusters`
+                  for a precise ceiling.
                 format: uint32
                 minimum: 0.0
                 type: integer

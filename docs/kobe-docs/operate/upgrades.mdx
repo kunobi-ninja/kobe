@@ -74,7 +74,7 @@ Do not set `maxSurge: 0` together with `minReadyDuringUpgrade >= size`: the recy
 
 ## Watching
 
-`kobe_instance_recycles_total{reason="spec_drift"}` increments per drift Delete:
+`kobe_instance_recycles_total{reason="spec_drift"}` increments per drift Delete. A member recycled only because its certificates are close to expiry counts as `reason="cert_expiry"` instead:
 
 ```promql
 rate(kobe_instance_recycles_total{reason="spec_drift"}[5m])

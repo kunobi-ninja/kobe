@@ -33,7 +33,7 @@ The API accepted the request; no Ready instance was free. `kobe_queue_depth` and
 
 ## `Quarantined`
 
-Verified cleanup could not prove that every exact resource is gone. The instance stays unavailable and still counts against pool capacity. The pool phase is `Quarantined`, never `Healthy`.
+Verified cleanup could not prove that every exact resource is gone. The instance stays unavailable and still counts against pool capacity. The pool phase reads `Quarantined` instead of `Healthy` or `Idle`.
 
 Inspect the `ClusterInstance` and `ClusterLease` receipt before retrying cleanup. `ClusterLease.spec.cleanupMode` is write-once. `VerifiedDestroy` is eligible only for k3s with embedded SQLite; unsupported backends are rejected before bind.
 

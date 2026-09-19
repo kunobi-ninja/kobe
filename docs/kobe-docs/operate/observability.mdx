@@ -39,7 +39,7 @@ telemetry:
 | Reconcile health | `kobe_reconciliations_total`, `kobe_pool_reconcile_duration_seconds` |
 | IPAM | `kobe_ipam_bind_duration_seconds` |
 
-`reason` on `kobe_instance_recycles_total` is a closed set: `spec_drift`, `bootstrap_failed`, `health_failed`, `lease_released`, `kobestore_degraded`, `ipam_conflict`, `manual`. Not every value is emitted yet; dashboards can still list the full set.
+`reason` on `kobe_instance_recycles_total` is a closed set: `spec_drift`, `cert_expiry`, `creating_timeout`, `unhealthy`, `scale_down`, `bootstrap_failed`, `health_failed`, `lease_released`, `kobestore_degraded`, `ipam_conflict`, `manual`. Not every value is emitted yet; dashboards can still list the full set.
 
 ## Suggested alerts
 

@@ -280,11 +280,21 @@ pub static IPAM_BIND_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// freezes the label-value vocabulary so dashboards / alerts can
 /// reference all reasons stably.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecycleReason {
     /// `profile_spec_hash` differs — pool spec / render context /
     /// referenced bootstraps changed.
     SpecDrift,
+    /// The instance's PKI is inside the recycle-before-expiry horizon
+    /// and its spec is otherwise current (#19).
+    CertExpiry,
+    /// The instance sat in `Creating` past the pool's `creatingTimeout`.
+    CreatingTimeout,
+    /// The instance was `Unhealthy` or `Failed` when the pool evaluated it.
+    Unhealthy,
+    /// Idle past `scaleDownAfter` while the pool held more Ready members
+    /// than it needs.
+    ScaleDown,
     /// Bootstrap Job hit `BackoffLimitExceeded` or its pod exited
     /// non-zero.
     BootstrapFailed,
@@ -310,6 +320,10 @@ impl RecycleReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SpecDrift => "spec_drift",
+            Self::CertExpiry => "cert_expiry",
+            Self::CreatingTimeout => "creating_timeout",
+            Self::Unhealthy => "unhealthy",
+            Self::ScaleDown => "scale_down",
             Self::BootstrapFailed => "bootstrap_failed",
             Self::HealthFailed => "health_failed",
             Self::LeaseReleased => "lease_released",
