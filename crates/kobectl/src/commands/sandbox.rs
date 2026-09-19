@@ -271,6 +271,10 @@ fn read_stdin_payload(source: &mut impl std::io::Read) -> Result<Vec<u8>> {
 /// Returns the exit code the process should use, so the caller decides when to
 /// exit rather than this function calling `exit` from inside a library path.
 ///
+/// With `sync`, text output follows the durable log offsets while the command
+/// runs. The final status supplies the exit code without replaying output.
+/// SIGINT/SIGTERM request cancellation of that execution, leaving its lease.
+///
 /// With `forward_stdin`, this process's own stdin is read to EOF and handed to
 /// the remote process. That is how a secret reaches a Sandbox without being
 /// typed into the argv: the exec argv becomes a URL the target apiserver
@@ -287,6 +291,7 @@ pub async fn exec(
     timeout: Option<&str>,
     forward_stdin: bool,
     detach: bool,
+    sync: bool,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
@@ -296,6 +301,10 @@ pub async fn exec(
 
     if argv.is_empty() {
         anyhow::bail!("a command is required: kobe exec <lease> -- <argv...>");
+    }
+
+    if sync && (detach || matches!(output, OutputFormat::Json)) {
+        anyhow::bail!("--sync requires text output and cannot be combined with --detach");
     }
 
     // Read before the request is built, so a refusal costs no idempotency key
@@ -308,18 +317,48 @@ pub async fn exec(
         None
     };
 
-    let result = exec_once(
-        &config,
-        lease,
-        argv,
-        cwd,
-        timeout,
-        stdin.as_deref(),
-        &new_idempotency_key(),
-        detach,
-        output,
-    )
-    .await?;
+    let mut signals = sync.then(ShutdownSignals::arm).transpose()?;
+    let key = new_idempotency_key();
+    let request_started = std::cell::Cell::new(false);
+    let start = async {
+        request_started.set(true);
+        exec_once(
+            &config,
+            lease,
+            argv,
+            cwd,
+            timeout,
+            stdin.as_deref(),
+            &key,
+            detach || sync,
+            output,
+        )
+        .await
+    };
+    tokio::pin!(start);
+    let result = if let Some(signals) = signals.as_mut() {
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                if request_started.get() {
+                    // Keep the original keyed request alive briefly so a signal
+                    // cannot discard an execution ID already being returned.
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut start).await {
+                        Ok(Ok(result)) => cancel_interrupted_exec(&config, lease, &result.id).await,
+                        Ok(Err(error)) => eprintln!("kobe: interrupted execution start: {error}; remote cancellation is unconfirmed"),
+                        Err(_) => eprintln!("kobe: execution start did not return an ID within 10s; the command may still run until its deadline"),
+                    }
+                }
+                return Ok(signal.exit_code());
+            }
+            result = &mut start => result?,
+        }
+    } else {
+        start.await?
+    };
+    if let Some(signals) = signals.as_mut() {
+        return follow_exec(&config, lease, &result.id, signals).await;
+    }
     // An execution that already finished, or a server that ignored `detach`
     // and waited, has a real result; report it like any other exec.
     if detach && is_still_running(&result.state) {
@@ -353,6 +392,93 @@ pub async fn exec(
     let code = exit_code_for(&result);
     emit(&config, lease, &result, None, output)?;
     Ok(code)
+}
+
+/// Follow both logs to EOF before reading the terminal result. Offset reads
+/// provide reconnect safety and bounded memory even for long builds.
+async fn follow_exec(
+    config: &ResolvedConfig,
+    lease: &str,
+    execution: &str,
+    signals: &mut ShutdownSignals,
+) -> Result<i32> {
+    let follow = async {
+        execution_logs(config, lease, execution, true, OutputFormat::Text).await?;
+        loop {
+            let mut result =
+                execution_request(config, lease, execution, reqwest::Method::GET).await?;
+            if execution_is_terminal(&result.state) {
+                // Logs were already emitted, including truncation warnings.
+                result.stdout = None;
+                result.stderr = None;
+                result.truncated = false;
+                emit(config, lease, &result, None, OutputFormat::Text)?;
+                return Ok::<i32, anyhow::Error>(exit_code_for(&result));
+            }
+            tokio::time::sleep(LOGS_FOLLOW_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            cancel_interrupted_exec(config, lease, execution).await;
+            Ok(signal.exit_code())
+        }
+        result = follow => result.with_context(|| format!(
+            "could not follow execution {execution}; resume with kobe logs {lease} --execution {execution} --follow, or stop it with kobe cancel {lease} --execution {execution}"
+        )),
+    }
+}
+
+/// Cancellation is bounded and non-interactive; an unconfirmed response is
+/// reported without releasing the caller's lease.
+async fn cancel_interrupted_exec(config: &ResolvedConfig, lease: &str, execution: &str) {
+    let cancel = execution_request(config, lease, execution, reqwest::Method::DELETE);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), cancel).await {
+        Ok(Ok(result)) if execution_is_terminal(&result.state) => {}
+        Ok(Ok(result)) => eprintln!(
+            "kobe: {execution} is still {}; inspect with kobe logs {lease} --execution {execution} --follow",
+            result.state
+        ),
+        Ok(Err(error)) => eprintln!(
+            "kobe: could not cancel {execution}: {error}; retry with kobe cancel {lease} --execution {execution}"
+        ),
+        Err(_) => eprintln!(
+            "kobe: cancellation timed out for {execution}; retry with kobe cancel {lease} --execution {execution}"
+        ),
+    }
+}
+
+/// Read or cancel a known execution without opening authentication prompts.
+async fn execution_request(
+    config: &ResolvedConfig,
+    lease: &str,
+    execution: &str,
+    method: reqwest::Method,
+) -> Result<ExecutionResponse> {
+    let path = format!("/v1/sandbox-leases/{lease}/executions/{execution}");
+    let token = get_auth_header_noninteractive(config, method.as_str(), &path, b"").await?;
+    let response = with_auth(
+        authed_client().request(method, format!("{}{path}", config.endpoint)),
+        &token,
+    )
+    .send()
+    .await
+    .reaching(config)?;
+    let status = response.status();
+    let payload = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "execution request failed (HTTP {status}): {}",
+            payload.trim()
+        );
+    }
+    let result: ExecutionResponse =
+        serde_json::from_str(&payload).context("could not parse execution result")?;
+    if result.id != execution {
+        anyhow::bail!("execution result did not match the requested id");
+    }
+    Ok(result)
 }
 
 /// Whether an execution has not produced a result yet.

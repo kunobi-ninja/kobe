@@ -81,6 +81,20 @@ kobe exec sandbox-a1b2c3d4e5f60718293a4b5c -- /agent status
 kobe exec sandbox-a1b2c3d4e5f60718293a4b5c --cwd /work --timeout 5m -- ./build.sh
 ```
 
+Use `--sync` to see stdout and stderr while a long command runs:
+
+```bash
+kobe exec nixiso --sync -- /bin/bash /tmp/iso-kobe-remote.sh
+```
+
+Kobe follows the execution logs, flushes each update to its original stream,
+and exits with the remote command's code. Ctrl-C requests cancellation of the
+command and keeps the lease. If the connection fails, the error includes the
+execution ID and commands to resume logs or cancel it.
+
+Without `--sync`, output is printed when the command finishes. `--sync` is for
+text output and cannot be combined with `--detach` or `--output json`.
+
 `argv` is sent **as-is**. There is no shell, so there are no quoting rules of
 Kobe's own to learn — and no way for an argument to become a shell operator:
 
