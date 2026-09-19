@@ -27,7 +27,6 @@ pub const TEARDOWN_EVIDENCE_PRODUCER_LABEL: &str = "kobe.kunobi.ninja/teardown-e
 /// fail-closed admission policy supplies producer authentication; these hashes
 /// make a restart prove that an existing object still names the exact lease UID
 /// and attempt it is about without putting arbitrary input into label values.
-#[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
 pub fn verified_teardown_evidence_labels(
     lease_uid: &str,
     attempt_id: &str,
@@ -143,7 +142,6 @@ pub enum TeardownAcknowledgedProofKind {
 }
 
 // `crdgen` compiles this module without controller consumers.
-#[allow(dead_code)]
 impl TeardownAcknowledgedProof {
     pub fn receipt(receipt_token: String, evidence: TeardownEvidenceReference) -> Self {
         Self {
@@ -169,7 +167,6 @@ impl VerifiedTeardownEvidence {
     /// `attempt_id`: its deterministic name and identity labels, in
     /// `namespace`, not being deleted, and owned by nothing that could
     /// garbage-collect it. Content is checked separately by each caller.
-    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
     pub fn is_evidence_for(&self, namespace: &str, lease_uid: &str, attempt_id: &str) -> bool {
         let name = verified_teardown_evidence_name(lease_uid, attempt_id);
         let labels = verified_teardown_evidence_labels(lease_uid, attempt_id);
@@ -187,7 +184,6 @@ impl VerifiedTeardownEvidence {
     }
 
     /// Whether `reference` pins exactly this object version.
-    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
     pub fn is_referenced_by(&self, reference: &TeardownEvidenceReference) -> bool {
         self.metadata.name.as_deref() == Some(reference.name.as_str())
             && self.metadata.uid.as_deref() == Some(reference.uid.as_str())
@@ -199,7 +195,6 @@ impl VerifiedTeardownEvidence {
 
 /// Deterministic name for one lease teardown attempt. The human-readable lease
 /// name is intentionally not authority; both exact UIDs/nonces feed the hash.
-#[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
 pub fn verified_teardown_evidence_name(lease_uid: &str, attempt_id: &str) -> String {
     let digest = Sha256::digest(format!("{lease_uid}\0{attempt_id}").as_bytes());
     let encoded = hex::encode(digest);

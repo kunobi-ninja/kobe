@@ -27,10 +27,8 @@ pub(crate) enum BindingResolveMode {
 #[derive(Debug)]
 pub(crate) struct ResolvedLeaseBinding {
     pub lease: ClusterLease,
-    /// `#[allow(dead_code)]`: callers work off the validated `binding`, but the
-    /// resolved object stays part of the tuple so a caller needing live
+    /// The resolved instance stays part of the tuple so a caller needing live
     /// instance state does not re-fetch it unvalidated.
-    #[allow(dead_code)]
     pub instance: ClusterInstance,
     pub pool: ClusterPool,
     pub binding: LeaseBinding,

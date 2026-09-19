@@ -18,13 +18,13 @@ pub enum BackendType {
     /// Use Cluster API (CAPI) with a pluggable infrastructure provider.
     #[serde(rename = "capi")]
     Capi,
-    /// Use the in-house vkobe virtual cluster runtime (deprecated — see
-    /// `docs/architecture/virtual-cluster-strategy.md` for migration path
-    /// to the `vcluster` backend).
+    /// Use the in-house vkobe virtual cluster runtime. On hold: existing
+    /// pools keep working, and new density pools should use `vcluster`. See
+    /// `docs/kobe-docs/how-it-works/runtime-strategy.mdx`.
     #[serde(rename = "vkobe")]
     Vkobe,
     /// Use upstream loft-sh/vcluster (Apache 2.0) as the virtual cluster
-    /// runtime. Replaces the in-house vkobe backend. The operator deploys
+    /// runtime. Preferred over vkobe for new density pools. The operator deploys
     /// a vcluster instance per `ClusterInstance` via the official Helm
     /// chart, into a dedicated per-instance namespace.
     #[serde(rename = "vcluster")]
@@ -348,8 +348,7 @@ pub struct VclusterConfig {
 /// out-of-band janitor (per-node `tmpreaper` rule or a DaemonSet that
 /// prunes paths older than a TTL).
 ///
-/// See `docs/superpowers/specs/2026-05-21-k3s-csi-kubelet-mount-propagation-design.md`
-/// and issue kunobi-ninja/kobe#98.
+/// See issue kunobi-ninja/kobe#98.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KubeletSharedMountConfig {
@@ -378,7 +377,6 @@ impl ClusterPool {
     /// This is identity only. Callers building against admitted configuration
     /// also pin `metadata.generation`; teardown must not, because generations
     /// only move forward and any edit would strand bound capacity (#222).
-    #[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
     pub fn is_recorded_pool(&self, namespace: &str, name: &str, uid: &str) -> bool {
         self.metadata.namespace.as_deref() == Some(namespace)
             && self.metadata.name.as_deref() == Some(name)
@@ -526,13 +524,7 @@ pub struct ClusterConfig {
     /// (CRD spec round-trip, `kobe config import/export`, the
     /// operator's reconciliation Patch) — it lives only inside an
     /// in-memory `ResolvedInstanceConfig`.
-    // `#[allow(dead_code)]` keeps the `crdgen` binary happy: it imports
-    // this struct purely to walk the JSON schema and never reads
-    // runtime-only fields, so clippy flags this as dead from crdgen's
-    // perspective. The operator binary DOES read the field, so the
-    // attribute is just shielding the cross-binary visibility quirk.
     #[serde(skip)]
-    #[allow(dead_code)]
     pub allocated_network: Option<crate::crd::ClusterInstanceNetwork>,
 
     /// Resource requirements applied to each container the backend creates
@@ -551,7 +543,6 @@ pub struct ClusterConfig {
     /// `#[serde(skip)]` keeps it out of the CRD schema — users still set
     /// limits via the pool-level [`ClusterPoolSpec::resources`] field.
     #[serde(skip)]
-    #[allow(dead_code)]
     pub resources: Option<ResourceRequirements>,
 
     /// Name of the `ClusterPool` that owns this instance — operator-
@@ -570,7 +561,6 @@ pub struct ClusterConfig {
     /// `resources`: kept out of every wire format; lives only inside
     /// in-memory `ResolvedInstanceConfig`.
     #[serde(skip)]
-    #[allow(dead_code)]
     pub pool_name: Option<String>,
 }
 
@@ -620,7 +610,6 @@ impl NodeTaint {
     /// what a user typed and breaks `kubectl taint` removal matching.
     // crdgen binary only consumes the CRD schema, never the impl — without this
     // it warns dead_code in that build target while the operator does use it.
-    #[allow(dead_code)]
     pub fn to_kubelet_arg(&self) -> String {
         match &self.value {
             Some(v) => format!("{}={}:{}", self.key, v, self.effect),
@@ -855,7 +844,6 @@ impl ResourceRequirements {
     /// reserved 16 cores/cluster and silently saturated the nodes. Callers
     /// surface these keys (warn + meter) so the hidden reservation is
     /// visible before it wedges the cluster.
-    #[allow(dead_code)]
     pub fn limits_without_requests(&self) -> Vec<String> {
         self.limits
             .keys()
@@ -869,7 +857,6 @@ impl ResourceRequirements {
     /// `requests` (mirroring the kubelet's limit→request default). Makes the
     /// otherwise-implicit reservation auditable instead of relying on silent
     /// kube behavior.
-    #[allow(dead_code)]
     pub fn effective_requests(&self) -> BTreeMap<String, String> {
         let mut effective = self.requests.clone();
         for (key, limit) in &self.limits {
@@ -883,7 +870,6 @@ impl ResourceRequirements {
     /// Effective CPU request in millicores — the value Kubernetes reserves
     /// per pod — or `None` when neither a CPU request nor limit is set.
     /// Drives `kobe_pool_effective_cpu_request_millicores`.
-    #[allow(dead_code)]
     pub fn effective_cpu_millicores(&self) -> Option<i64> {
         self.effective_requests()
             .get("cpu")
@@ -894,7 +880,6 @@ impl ResourceRequirements {
     /// per pod — or `None` when neither a memory request nor limit is set.
     /// Drives `kobe_pool_effective_memory_request_bytes` (sibling of
     /// [`Self::effective_cpu_millicores`]).
-    #[allow(dead_code)]
     pub fn effective_memory_bytes(&self) -> Option<i64> {
         self.effective_requests()
             .get("memory")
@@ -914,7 +899,6 @@ impl ResourceRequirements {
     /// timeout, panicking the k3s server (`CrashLoopBackOff`, kobe #189).
     /// Pinning `GOMAXPROCS` to the quota (what uber's automaxprocs does)
     /// removes the oversubscription. Floored so Go never exceeds the quota.
-    #[allow(dead_code)]
     pub fn gomaxprocs_from_cpu_limit(&self) -> Option<i64> {
         let millicores = parse_cpu_millicores(self.limits.get("cpu")?)?;
         Some((millicores / 1000).max(1))
@@ -930,11 +914,6 @@ impl ResourceRequirements {
     /// kubelet's implicit limit→request copy becomes explicit: kobe owns
     /// the reserved value and it is auditable in the rendered pod spec
     /// rather than materializing silently inside the cluster (issue #189).
-    // `#[allow(dead_code)]` keeps the `crdgen` binary happy: it imports
-    // this module purely to walk the JSON schema and never invokes
-    // runtime-only methods (same reason `allocated_network` carries the
-    // attribute one struct up).
-    #[allow(dead_code)]
     pub fn to_k8s(&self) -> Option<k8s_openapi::api::core::v1::ResourceRequirements> {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -966,7 +945,6 @@ impl ResourceRequirements {
 /// and decimal exponents) using integer math so valid but uncommon forms do
 /// not get reported as `0`. Values above the gauge range saturate at
 /// `i64::MAX`; unparseable or negative input returns `None`.
-#[allow(dead_code)]
 fn parse_cpu_millicores(s: &str) -> Option<i64> {
     let (mantissa, fractional_digits, suffix) = split_quantity(s)?;
     let value = match suffix {
@@ -995,7 +973,6 @@ fn parse_cpu_millicores(s: &str) -> Option<i64> {
 /// scale by `1024^n`, decimal `k`/`M`/`G`/`T`/`P`/`E` and `e`/`E`-exponent forms
 /// by `10^n`, plain integers are bytes. Values above the gauge range saturate at
 /// `i64::MAX`; unparseable, non-finite, or negative input returns `None`.
-#[allow(dead_code)]
 fn parse_memory_bytes(s: &str) -> Option<i64> {
     let (mantissa, fractional_digits, suffix) = split_quantity(s)?;
     let value = match suffix {

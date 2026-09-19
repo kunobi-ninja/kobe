@@ -278,7 +278,8 @@ pub static IPAM_BIND_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// `Manual` will gain emitters in follow-up PRs as those code paths
 /// adopt the typed-reason pattern. Declaring the full set up front
 /// freezes the label-value vocabulary so dashboards / alerts can
-/// reference all reasons stably.
+/// reference all reasons stably. The set is documented in
+/// `docs/kobe-docs/operate/observability.mdx`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum RecycleReason {
@@ -323,53 +324,30 @@ impl RecycleReason {
 /// Why a bootstrap Job failed. Smaller surface than recycle reasons
 /// because we only see this for instances whose bootstrap actually
 /// got attempted.
-///
-/// `#[allow(dead_code)]`: as with `RecycleReason`, the full set is
-/// declared up front to stabilise the label vocabulary; classifying
-/// `BackoffLimit` more finely (`ExitNonZero` vs `Timeout`, etc.)
-/// requires reading the failed Job's pod's last-state which lands
-/// in a follow-up.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum BootstrapFailureReason {
     /// Job's `backoffLimit` exhausted (the catch-all that everything
     /// becomes if not classified more specifically before the Job
     /// gives up).
     BackoffLimit,
-    /// Bootstrap pod exited non-zero (e.g. `flux install` returned
-    /// error). Distinct from BackoffLimit because we observed the
-    /// exit before the Job declared failure.
-    ExitNonZero,
-    /// Bootstrap Job ran longer than its `activeDeadlineSeconds`.
-    Timeout,
-    /// Backend (`vkobe` apiserver, etc.) was unreachable when the
-    /// Bootstrap pod tried to apply manifests.
-    BackendUnavailable,
 }
 
 impl BootstrapFailureReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BackoffLimit => "backoff_limit",
-            Self::ExitNonZero => "exit_nonzero",
-            Self::Timeout => "timeout",
-            Self::BackendUnavailable => "backend_unavailable",
         }
     }
 }
 
 /// Outcome of a `ClusterInstance` create attempt — terminal state of
 /// the create-time path, not the long-running phase.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum InstanceCreateOutcome {
     /// Instance reached `phase=Ready`.
     Ready,
     /// Instance reached `phase=Failed`.
     Failed,
-    /// Instance was recycled before reaching Ready (e.g. spec changed
-    /// while it was still Creating).
-    Recycled,
 }
 
 impl InstanceCreateOutcome {
@@ -377,21 +355,15 @@ impl InstanceCreateOutcome {
         match self {
             Self::Ready => "ready",
             Self::Failed => "failed",
-            Self::Recycled => "recycled",
         }
     }
 }
 
 /// IPAM claim lifecycle outcomes for the counter axis.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum IpamClaimOutcome {
     Bound,
     Conflict,
-    /// CIDRPool was deleted while the claim was Bound; the claim
-    /// transitioned to `Lost` (only possible if we re-introduce
-    /// `CIDRPool` as a CRD; today it's hardcoded so this is reserved).
-    Lost,
 }
 
 impl IpamClaimOutcome {
@@ -399,7 +371,6 @@ impl IpamClaimOutcome {
         match self {
             Self::Bound => "bound",
             Self::Conflict => "conflict",
-            Self::Lost => "lost",
         }
     }
 }
@@ -468,10 +439,9 @@ pub static INSTANCE_CREATES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// high-cardinality (it embeds indexes, pool names, free-form guidance) so it
 /// can NEVER be a label value.
 ///
-/// `#[allow(dead_code)]`: the full vocabulary is frozen up front so dashboards
-/// / alerts can reference every class stably. The profile controller currently
-/// emits only `Capacity` and `Other`; the remaining variants are reserved
-/// vocabulary, not a promise of live emitters.
+/// The full vocabulary is frozen up front so dashboards / alerts can
+/// reference every class stably. The profile controller currently emits only
+/// `Capacity` and `Other`; its tests and `from_reason` use the rest.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolFailureClass {
@@ -551,7 +521,6 @@ impl PoolFailureClass {
 /// Why a backend resource operation (create/delete) failed, classified from a
 /// `kube::Error` into a bounded set so the operator never labels with a raw
 /// kube error message. See [`classify_kube_error`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendOpErrorReason {
     /// 403 / Forbidden — missing RBAC grant (e.g. the PDB delete that 403'd
@@ -583,7 +552,6 @@ impl BackendOpErrorReason {
 }
 
 /// Why an instance stuck in `Creating` got recycled.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StuckCreatingReason {
     /// The configured creating-timeout elapsed while still `Creating`.
@@ -591,16 +559,9 @@ pub enum StuckCreatingReason {
     /// Spec drifted while the instance was mid-`Creating` (stamped hash no
     /// longer matches the pool's current hash).
     Drift,
-    /// The guest server/agent Pods can't be scheduled (Pending +
-    /// `PodScheduled=False, reason=Unschedulable`, e.g. "Insufficient cpu").
-    /// This is NOT a recycle reason — it labels the *backpressure* path where
-    /// the instance is deliberately held (next_attempt_at extended) instead of
-    /// being Deleted, because respawning would only create more unschedulable
-    /// Pods.
-    Unschedulable,
     /// The guest server/agent container is genuinely crashlooping
     /// (`CrashLoopBackOff`, or `restartCount >= 2` with a non-zero
-    /// `lastState.terminated` exit). Unlike `Unschedulable` this DOES recycle
+    /// `lastState.terminated` exit). This recycles
     /// on the existing creating-timeout (respawning a crashlooper is the
     /// established remediation, #197); the variant exists only to label the
     /// recycle so a crash-driven wedge is distinguishable from a plain timeout.
@@ -612,7 +573,6 @@ impl StuckCreatingReason {
         match self {
             Self::Timeout => "timeout",
             Self::Drift => "drift",
-            Self::Unschedulable => "unschedulable",
             Self::CrashLooping => "crashlooping",
         }
     }
@@ -620,7 +580,6 @@ impl StuckCreatingReason {
 
 /// Role of a guest-cluster pod, derived from its existing name/label shape so
 /// OOM-kill counts stay bounded instead of carrying the raw pod name.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestPodRole {
     /// k3s/k0s control-plane server (`*-server-N`).
@@ -668,7 +627,6 @@ impl GuestPodRole {
 
 /// Outcome of a connect-proxy request, classified at every return path so a
 /// single low-cardinality counter (~7 series) makes rejections visible.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectOutcome {
     /// Request forwarded successfully (buffered response or upgrade tunnel
@@ -973,13 +931,9 @@ pub static CONNECT_PROXY_REQUEST_OUTCOME_TOTAL: LazyLock<IntCounterVec> = LazyLo
 /// Why a lease could not (yet) be satisfied — a bounded label vocabulary so a
 /// hung `Pending` lease becomes alertable without high-cardinality strings.
 /// Shared by the `create_lease` 503 pre-flight and the lease controller's
-/// no-Ready-cluster branch so both classify identically.
-///
-/// `#[allow(dead_code)]`: the full set is frozen up front so dashboards / alerts
-/// can reference every reason stably; not every variant is reachable from every
-/// emission site (e.g. `Warming` is the create-path "healthy-but-empty" case,
-/// which the controller branch never emits because it only runs once Pending).
-#[allow(dead_code)]
+/// no-Ready-cluster branch so both classify identically. `Warming` is only
+/// emitted by the create path: the controller branch runs once a lease is
+/// already Pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseUnsatisfiableReason {
     /// Pool phase is `Failing` — sustained provision failures; this pool will
@@ -1839,7 +1793,6 @@ mod tests {
     fn stuck_creating_reason_as_str() {
         assert_eq!(StuckCreatingReason::Timeout.as_str(), "timeout");
         assert_eq!(StuckCreatingReason::Drift.as_str(), "drift");
-        assert_eq!(StuckCreatingReason::Unschedulable.as_str(), "unschedulable");
         assert_eq!(StuckCreatingReason::CrashLooping.as_str(), "crashlooping");
     }
 

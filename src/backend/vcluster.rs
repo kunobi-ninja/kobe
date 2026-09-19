@@ -182,9 +182,8 @@ fn normalize_distro_version(version: &str) -> String {
 
 /// Default vcluster Helm chart version pinned by the operator.
 ///
-/// Bumped in lock-step with our integration tests against vcluster
-/// upstream. See `docs/architecture/virtual-cluster-strategy.md` for
-/// the validation matrix.
+/// Bump it together with the vcluster conformance leg in CI, which is the
+/// only test that runs this chart against a real cluster.
 const DEFAULT_CHART_VERSION: &str = "0.34.0";
 
 /// Helm repository alias the operator uses internally.
@@ -708,7 +707,6 @@ impl ClusterBackend for VclusterBackend {
     }
 }
 
-#[allow(dead_code)]
 const _: Duration = Duration::from_secs(0); // keep the `Duration` import live for future timeouts
 
 #[cfg(test)]

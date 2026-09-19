@@ -39,15 +39,6 @@ pub fn save(state: &SessionState) -> Result<PathBuf> {
     base::save(PRODUCT, state)
 }
 
-/// Remove the current shell's session file. No-op if it doesn't exist.
-/// Currently used only by tests; exposed as `pub` so a future
-/// `kobe config logout-target` (or similar) can reuse it without
-/// re-deriving the path.
-#[allow(dead_code)]
-pub fn clear() -> Result<()> {
-    base::clear(PRODUCT)
-}
-
 /// Sweep session files whose owning shell PID has exited.
 pub fn gc_dead_sessions() {
     base::gc_dead_sessions(PRODUCT);
