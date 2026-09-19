@@ -1046,29 +1046,16 @@ fn stdin_bytes_arrive_exactly_as_they_were_sent() {
     assert_eq!(read_stream(&scratch, "sbxe-stdin-bytes", "stdout"), raw);
 }
 
-/// A maximal payload survives the whole handover intact.
-///
-/// The bytes cross two pipes — `start` to the supervisor, supervisor to the
-/// command — and the first read is exact rather than "until EOF". A payload at
-/// the documented ceiling is where a short read or a partial write would
-/// actually show up, and where it would show up as a corrupted credential
-/// rather than an obvious failure.
+/// The real runner forwards and retains more than the former input/output caps.
 #[test]
-fn a_maximal_stdin_payload_arrives_whole() {
+fn unlimited_stdin_and_output_survive_above_all_old_byte_ceilings() {
     let scratch = Scratch::new();
     // Non-repeating, so a duplicated or dropped block cannot pass unnoticed.
-    let payload: Vec<u8> = (0..kobe_runner::protocol::MAX_STDIN_BYTES)
+    let payload: Vec<u8> = (0..(9 * 1024 * 1024))
         .map(|index| (index % 251) as u8)
         .collect();
 
-    start_with_stdin(
-        &scratch,
-        "sbxe-stdin-max",
-        &["/bin/cat"],
-        &payload,
-        30,
-        1 << 20,
-    );
+    start_with_stdin(&scratch, "sbxe-stdin-max", &["/bin/cat"], &payload, 30, 0);
 
     let report = settled(&scratch, "sbxe-stdin-max", Duration::from_secs(30));
     assert_eq!(report.state, RunnerState::Succeeded, "{report:?}");
@@ -1085,7 +1072,7 @@ fn a_maximal_stdin_payload_arrives_whole() {
 #[test]
 fn stdin_nobody_reads_never_blocks_the_supervisor() {
     let scratch = Scratch::new();
-    let bulk = vec![b'x'; kobe_runner::protocol::MAX_STDIN_BYTES];
+    let bulk = vec![b'x'; 2 * 1024 * 1024];
 
     start_with_stdin(
         &scratch,
@@ -1179,45 +1166,55 @@ fn the_runner_itself_never_writes_stdin_to_the_spool() {
     assert!(inspected > 0, "the execution wrote nothing at all");
 }
 
-/// Stdin past the documented bound is refused, and reserves nothing.
-///
-/// Refused rather than trimmed: half a token is still a secret, and a command
-/// that received half of its input would fail somewhere a long way from the
-/// request that caused it. Refusing before the reservation is what keeps the
-/// caller's id reusable.
+/// An explicit output cap still truncates and reports the truncation.
 #[test]
-fn oversized_stdin_is_refused_before_anything_is_reserved() {
+fn explicit_output_limit_truncates_large_input_echo_without_stopping_it() {
     let scratch = Scratch::new();
-    let too_much = vec![b'x'; kobe_runner::protocol::MAX_STDIN_BYTES + 1];
-
-    let reply = start_with_stdin(
+    let payload = vec![b'x'; 2 * 1024 * 1024];
+    start_with_stdin(
         &scratch,
-        "sbxe-stdin-too-big",
+        "sbxe-explicit-cap",
         &["/bin/cat"],
-        &too_much,
+        &payload,
         20,
         4096,
     );
-    assert!(
-        matches!(
-            reply,
-            Reply::Error {
-                code: kobe_runner::protocol::RunnerErrorCode::InvalidRequest
-            }
-        ),
-        "expected an invalid request, got {reply:?}"
+    let report = settled(&scratch, "sbxe-explicit-cap", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Succeeded);
+    assert!(report.stdout_truncated);
+    assert_eq!(
+        read_stream(&scratch, "sbxe-explicit-cap", "stdout"),
+        payload[..4096]
     );
+}
 
-    // Nothing was reserved, so the id is still free rather than occupied by a
-    // command that could never have run.
-    let reply = status(&scratch, "sbxe-stdin-too-big");
+/// Session metrics expose usage and opt-in configuration without starting a shell.
+#[test]
+fn session_metrics_show_zero_default_and_validate_configuration() {
+    let scratch = Scratch::new();
+    let dir = scratch.path().join("sessions");
+    let args = ["session", "--dir", dir.to_str().unwrap(), "metrics"];
+    let output = runner(&scratch, &args)
+        .env_remove("KOBE_SESSION_MAX_SESSIONS")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("kobe_runner_sessions 0\n"));
+    assert!(text.contains("kobe_runner_session_limit 0\n"));
+    let output = runner(&scratch, &args)
+        .env("KOBE_SESSION_MAX_SESSIONS", "37")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     assert!(
-        matches!(
-            reply,
-            Reply::Error {
-                code: kobe_runner::protocol::RunnerErrorCode::NotFound
-            }
-        ),
-        "expected not found, got {reply:?}"
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("kobe_runner_session_limit 37\n")
     );
+    let output = runner(&scratch, &args)
+        .env("KOBE_SESSION_MAX_SESSIONS", "invalid")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 }

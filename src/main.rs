@@ -13,6 +13,7 @@ mod receipt_authority;
 mod sandbox;
 mod sandbox_access_ledger;
 mod sandbox_ledger;
+mod sandbox_limits;
 mod sandbox_runtime;
 mod telemetry;
 mod velero;
@@ -210,13 +211,9 @@ async fn run() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
-    let stream_max_bytes_env = match std::env::var("KOBE_SANDBOX_STREAM_MAX_BYTES") {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(err) => anyhow::bail!("invalid KOBE_SANDBOX_STREAM_MAX_BYTES: {err}"),
-    };
+    sandbox_limits::initialize()?;
     let sandbox_stream_max_bytes =
-        crate::api::sandbox_transport::parse_max_stream_bytes(stream_max_bytes_env.as_deref())?;
+        (sandbox_limits::get().stream_bytes != 0).then_some(sandbox_limits::get().stream_bytes);
     // Iroh P2P data-plane endpoint (#197). Config is refused at STARTUP for the
     // same reason as the Agent Sandbox mode above: a misconfigured relay must
     // fail boot, not the first iroh session. Default is the public relay;

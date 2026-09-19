@@ -5010,8 +5010,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled,
@@ -5047,8 +5049,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -5143,8 +5147,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -5694,8 +5700,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -5794,8 +5802,10 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -5896,8 +5906,10 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -6008,8 +6020,10 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -6095,8 +6109,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -6210,8 +6226,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,
@@ -6578,8 +6596,10 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
-            sandbox_admission_limiter: Default::default(),
-            cluster_admission_limiter: Default::default(),
+            sandbox_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
+            cluster_admission_limiter:
+                crate::api::sandbox_rate_limit::AdmissionRateLimiter::with_burst(10),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_stream_max_bytes: None,
             sandbox_enabled: true,

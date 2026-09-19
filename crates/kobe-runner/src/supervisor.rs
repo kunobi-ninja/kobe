@@ -42,9 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{
-    ExecutionReport, LogStream, MAX_STDIN_BYTES, RunnerState, StartRequest, reason,
-};
+use crate::protocol::{ExecutionReport, LogStream, RunnerState, StartRequest, reason};
 use crate::spool::{Spool, now_unix_ms};
 
 /// How often the supervisor looks at the world.
@@ -376,12 +374,6 @@ fn read_stdin(
     let Some(length) = stdin_bytes else {
         return Ok(None);
     };
-    if length > MAX_STDIN_BYTES {
-        // The same ceiling Kobe and `start` enforce. A supervisor is only ever
-        // launched by `start`, so reaching this means the argv was tampered
-        // with — and allocating whatever it asked for is not the response.
-        return Err(std::io::Error::other("stdin length exceeds the bound"));
-    }
     let mut bytes = vec![0u8; length];
     source.read_exact(&mut bytes)?;
     Ok(Some(bytes))
@@ -674,7 +666,11 @@ fn pump<R: Read + Send + 'static>(
                 Ok(0) | Err(_) => break,
                 Ok(read) => read,
             };
-            let room = cap.saturating_sub(written);
+            let room = if cap == 0 {
+                u64::MAX
+            } else {
+                cap.saturating_sub(written)
+            };
             if room == 0 {
                 truncated.store(true, Ordering::SeqCst);
                 // Read on regardless. Discarding is what keeps the command

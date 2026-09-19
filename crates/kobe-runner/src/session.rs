@@ -58,12 +58,26 @@ use crate::protocol::is_valid_id;
 /// nothing about a session outlives the container.
 pub const DEFAULT_SESSIONS_DIR: &str = "/var/run/kobe/sessions";
 
-/// Most sessions one container may hold.
-///
-/// Each one is a shell and a screen buffer that nothing reaps until it exits
-/// or the Sandbox ends. A loop that attaches under fresh names would otherwise
-/// fill the Pod's memory one idle shell at a time.
-pub const MAX_SESSIONS: usize = 16;
+/// Optional ceiling for persistent sessions in this container. Unset or zero
+/// means unlimited. Set in the SandboxPool container environment.
+pub fn max_sessions() -> io::Result<u64> {
+    match std::env::var("KOBE_SESSION_MAX_SESSIONS") {
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Ok(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => value
+            .parse()
+            .map_err(|_| io::Error::other("invalid KOBE_SESSION_MAX_SESSIONS")),
+        _ => Err(io::Error::other("invalid KOBE_SESSION_MAX_SESSIONS")),
+    }
+}
+
+/// Emit current session usage in Prometheus text format for an exec collector.
+pub fn metrics(dir: &Path) -> io::Result<String> {
+    Ok(format!(
+        "# TYPE kobe_runner_sessions gauge\nkobe_runner_sessions {}\n# TYPE kobe_runner_session_limit gauge\nkobe_runner_session_limit {}\n",
+        list(dir).len(),
+        max_sessions()?
+    ))
+}
 
 /// Largest frame either side sends or accepts.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -333,13 +347,26 @@ fn connect_or_start(
     name: &str,
     argv: &[String],
 ) -> io::Result<(UnixStream, Option<Child>)> {
+    std::fs::create_dir_all(dir)?;
+    let admission = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".admission.lock"))?;
+    // Closing the file releases the lock. Rust opens it close-on-exec, so the
+    // session server cannot inherit and retain its parent's admission lock.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&admission), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let socket = socket_path(dir, name);
     if let Ok(stream) = UnixStream::connect(&socket) {
         return Ok((stream, None));
     }
-    if list(dir).len() >= MAX_SESSIONS {
+    let limit = max_sessions()?;
+    if limit != 0 && list(dir).len() as u64 >= limit {
         return Err(io::Error::other(format!(
-            "this sandbox already holds {MAX_SESSIONS} sessions"
+            "this sandbox already holds {limit} sessions"
         )));
     }
     let server = spawn_server(dir, name, argv)?;

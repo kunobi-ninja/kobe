@@ -248,6 +248,8 @@ impl StreamRegistry {
             .get(&principal_key)
             .copied()
             .unwrap_or_default();
+        crate::sandbox_limits::observe("streams_per_lease", lease_count as u64 + 1);
+        crate::sandbox_limits::observe("streams_per_principal", principal_count as u64 + 1);
         if lease_count >= lease_limit || principal_count >= principal_limit {
             let outcome = if lease_count >= lease_limit {
                 "refused_lease_limit"
@@ -454,26 +456,10 @@ fn decrement_principal_count(state: &mut RegistryState, principal_key: &str) {
     }
 }
 
-/// How many operations one lease may have in flight across all replicas.
-///
-/// A lease is one Sandbox with one container. Concurrency beyond a handful is
-/// not a caller doing something reasonable faster — it is a caller turning
-/// their lease into a way to occupy the operator's worker pool, and every
-/// in-flight operation holds a connection to the target cluster.
-///
-/// The protected API-server access gate enforces the global bound. The local
-/// registry repeats it as defense in depth and to prevent one process from
-/// consuming more sockets while its distributed deregistration is delayed.
+// Explicit bounded test fixtures. Production uses operator configuration.
+#[cfg(test)]
 pub const MAX_STREAMS_PER_LEASE: usize = 8;
-
-/// Aggregate operations one authenticated principal may hold globally.
-///
-/// The per-lease limit alone is not a principal limit: a caller with many
-/// leases could multiply it until every target connection and API worker was
-/// occupied. This bound is intentionally larger than the per-lease allowance
-/// so a normal caller can work across several Sandboxes without being able to
-/// grow without limit. A principal CAS record in the protected ledger enforces
-/// the bound across replicas; the local counter is an additional process cap.
+#[cfg(test)]
 pub const MAX_STREAMS_PER_PRINCIPAL: usize = 32;
 
 /// Register one operation for this lease, or refuse because it is at its limit.
@@ -491,8 +477,8 @@ pub async fn register_bounded(
             lease_uid,
             identity,
             kind,
-            MAX_STREAMS_PER_LEASE,
-            MAX_STREAMS_PER_PRINCIPAL,
+            crate::sandbox_limits::capacity(crate::sandbox_limits::get().streams_per_lease),
+            crate::sandbox_limits::capacity(crate::sandbox_limits::get().streams_per_principal),
         )
         .await
 }
@@ -808,6 +794,30 @@ mod tests {
     /// that is admitted must show up as open and only stop being open when the
     /// guard is dropped, or "how many sessions are live" is a number that
     /// drifts upward forever.
+    async fn register_with_fixture_limits(
+        registry: &Arc<StreamRegistry>,
+        lease: &str,
+        identity: &StreamIdentity,
+        kind: &'static str,
+    ) -> Option<StreamGuard> {
+        registry.try_register(lease, identity, kind, 8, 32).await
+    }
+
+    #[tokio::test]
+    async fn default_registration_can_exceed_both_old_concurrency_ceilings() {
+        let registry = StreamRegistry::new();
+        let identity = principal_identity("unlimited");
+        let mut guards = Vec::new();
+        for _ in 0..64 {
+            guards.push(
+                super::register_bounded(&registry, "lease", &identity, "test")
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(registry.live_count("lease").await, 64);
+    }
+
     #[tokio::test]
     async fn an_admitted_stream_is_counted_open_until_its_guard_drops() {
         let registry = StreamRegistry::new();
@@ -1187,13 +1197,13 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..MAX_STREAMS_PER_LEASE {
             guards.push(
-                register_bounded(&registry, "lease-a", &alice, "test")
+                register_with_fixture_limits(&registry, "lease-a", &alice, "test")
                     .await
                     .expect("under the limit"),
             );
         }
         assert!(
-            register_bounded(&registry, "lease-a", &alice, "test")
+            register_with_fixture_limits(&registry, "lease-a", &alice, "test")
                 .await
                 .is_none(),
             "the limit must actually bind"
@@ -1201,7 +1211,7 @@ mod tests {
         // Another lease is unaffected: the limit is per-lease, so one busy
         // caller cannot lock everybody else out.
         assert!(
-            register_bounded(&registry, "lease-b", &bob, "test")
+            register_with_fixture_limits(&registry, "lease-b", &bob, "test")
                 .await
                 .is_some()
         );
@@ -1215,7 +1225,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(
-            register_bounded(&registry, "lease-a", &alice, "test")
+            register_with_fixture_limits(&registry, "lease-a", &alice, "test")
                 .await
                 .is_some()
         );
@@ -1237,7 +1247,7 @@ mod tests {
                 let registry = registry.clone();
                 let identity = identity.clone();
                 tokio::spawn(async move {
-                    register_bounded(&registry, "lease-a", &identity, "test").await
+                    register_with_fixture_limits(&registry, "lease-a", &identity, "test").await
                 })
             })
             .collect();
@@ -1268,7 +1278,13 @@ mod tests {
                 let registry = registry.clone();
                 let alice = alice.clone();
                 tokio::spawn(async move {
-                    register_bounded(&registry, &format!("lease-{index}"), &alice, "test").await
+                    register_with_fixture_limits(
+                        &registry,
+                        &format!("lease-{index}"),
+                        &alice,
+                        "test",
+                    )
+                    .await
                 })
             })
             .collect();
@@ -1287,7 +1303,7 @@ mod tests {
 
         let bob = principal_identity("bob");
         assert!(
-            register_bounded(&registry, "bob-lease", &bob, "test")
+            register_with_fixture_limits(&registry, "bob-lease", &bob, "test")
                 .await
                 .is_some(),
             "one saturated principal must not lock another out"
@@ -1303,7 +1319,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(
-            register_bounded(&registry, "alice-replacement", &alice, "test")
+            register_with_fixture_limits(&registry, "alice-replacement", &alice, "test")
                 .await
                 .is_some(),
             "dropping a guard must return its principal slot"

@@ -101,6 +101,26 @@ spec:
               value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
             - name: KOBE_SANDBOX_STREAM_MAX_BYTES
               value: {{ .Values.agentSandbox.streamMaxBytes | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_STREAM_IDLE_SECONDS
+              value: {{ .Values.agentSandbox.streamIdleSeconds | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_STREAM_DURATION_SECONDS
+              value: {{ .Values.agentSandbox.streamDurationSeconds | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_MAX_EXECUTIONS_PER_LEASE
+              value: {{ .Values.agentSandbox.maxExecutionsPerLease | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_MAX_STREAMS_PER_LEASE
+              value: {{ .Values.agentSandbox.maxStreamsPerLease | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_MAX_STREAMS_PER_PRINCIPAL
+              value: {{ .Values.agentSandbox.maxStreamsPerPrincipal | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_OUTPUT_MAX_BYTES
+              value: {{ .Values.agentSandbox.outputMaxBytes | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_STDIN_MAX_BYTES
+              value: {{ .Values.agentSandbox.stdinMaxBytes | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_LOG_MAX_LINES
+              value: {{ .Values.agentSandbox.logMaxLines | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_LEGACY_EXEC_SECONDS
+              value: {{ .Values.agentSandbox.legacyExecSeconds | default 0 | int64 | quote }}
+            - name: KOBE_SANDBOX_ADMISSION_BURST
+              value: {{ .Values.agentSandbox.admissionBurst | default 0 | int64 | quote }}
             # Iroh P2P data-plane relay selection (#197): public | disabled |
             # comma-separated relay URLs. Always set so the operator never
             # inherits a relay choice from a compiled-in default silently.

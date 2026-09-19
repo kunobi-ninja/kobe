@@ -1379,6 +1379,69 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .unwrap()
 });
 
+/// Admission traffic is counted even when rate enforcement is disabled.
+pub static SANDBOX_ADMISSION_ATTEMPTS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "kobe_sandbox_admission_attempts_total",
+        "Admission attempts observed by this operator replica"
+    )
+    .unwrap()
+});
+
+/// Live cumulative traffic across both directions of Sandbox connections.
+pub static SANDBOX_STREAM_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "kobe_sandbox_stream_bytes_total",
+        "Bytes relayed by Sandbox streams across both directions"
+    )
+    .unwrap()
+});
+
+/// Configured usage ceilings. Zero means enforcement is disabled.
+pub static SANDBOX_USAGE_LIMIT: LazyLock<prometheus::GaugeVec> = LazyLock::new(|| {
+    prometheus::register_gauge_vec!(
+        "kobe_sandbox_usage_limit",
+        "Configured Sandbox ceiling; zero means unlimited",
+        &["resource"]
+    )
+    .unwrap()
+});
+
+/// Usage samples taken during operations, including unlimited operations.
+/// Units are named in the resource label (bytes, seconds, lines or counts).
+pub static SANDBOX_USAGE_OBSERVED: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_sandbox_usage_observed",
+        "Observed Sandbox usage by resource and its unit",
+        &["resource"],
+        vec![
+            1.0,
+            8.0,
+            16.0,
+            32.0,
+            256.0,
+            2000.0,
+            16384.0,
+            65536.0,
+            1048576.0,
+            8388608.0,
+            536870912.0,
+            2147483648.0,
+            17179869184.0
+        ]
+    )
+    .unwrap()
+});
+
+pub static SANDBOX_USAGE_REJECTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_sandbox_usage_limit_exceeded_total",
+        "Sandbox observations exceeding an explicitly configured ceiling",
+        &["resource"]
+    )
+    .unwrap()
+});
+
 /// Sandbox stream registrations, by operation and how they ended up.
 ///
 /// `kind` is the caller-facing operation (`attach`, `session`,

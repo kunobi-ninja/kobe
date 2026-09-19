@@ -897,3 +897,24 @@ for (const bytes of ["-1", "1.5", "bad", "9007199254740992"]) {
 		`invalid stream byte ceiling ${bytes} was accepted`,
 	);
 }
+
+const usageSettings = {
+    streamIdleSeconds: "KOBE_SANDBOX_STREAM_IDLE_SECONDS",
+    streamDurationSeconds: "KOBE_SANDBOX_STREAM_DURATION_SECONDS",
+    maxExecutionsPerLease: "KOBE_SANDBOX_MAX_EXECUTIONS_PER_LEASE",
+    maxStreamsPerLease: "KOBE_SANDBOX_MAX_STREAMS_PER_LEASE",
+    maxStreamsPerPrincipal: "KOBE_SANDBOX_MAX_STREAMS_PER_PRINCIPAL",
+    outputMaxBytes: "KOBE_SANDBOX_OUTPUT_MAX_BYTES",
+    stdinMaxBytes: "KOBE_SANDBOX_STDIN_MAX_BYTES",
+    logMaxLines: "KOBE_SANDBOX_LOG_MAX_LINES",
+    legacyExecSeconds: "KOBE_SANDBOX_LEGACY_EXEC_SECONDS",
+    admissionBurst: "KOBE_SANDBOX_ADMISSION_BURST",
+};
+const explicitUsage = await helm("external", "kobe", "kobe-system",
+    Object.keys(usageSettings).flatMap((key) => ["--set", `agentSandbox.${key}=42`]));
+for (const [key, env] of Object.entries(usageSettings)) {
+    for (const yaml of [disabledYaml, externalYaml, managedYaml]) {
+        invariant(yaml.includes(`name: ${env}\n              value: "0"`), `${key} must default to disabled`);
+    }
+    invariant(explicitUsage.includes(`name: ${env}\n              value: "42"`), `${key} was not forwarded to the operator`);
+}
