@@ -109,7 +109,11 @@ spec:
                     properties:
                       goldenTemplates:
                         default: false
-                        description: Enable golden images via PostgreSQL template databases.
+                        description: |-
+                          Reserved; has no effect. Nothing clones clusters from template
+                          databases yet. A pool that sets this to `true` gets
+                          `ConfigSupported=False` and creates no new members, so the setting is
+                          never silently accepted. Leave it unset or `false`.
                         type: boolean
                       secretKey:
                         default: connection-url
@@ -854,6 +858,42 @@ spec:
           status:
             nullable: true
             properties:
+              conditions:
+                description: |-
+                  Pool conditions. Currently emitted: `ConfigSupported`, which is
+                  `False` with reason `UnsupportedFields` when the pool sets fields its
+                  backend ignores. While it is `False` the pool creates no new members
+                  and reports phase `Failing`.
+                items:
+                  description: |-
+                    A Kubernetes-style condition on a [`ClusterPool`]. Same shape as
+                    [`crate::crd::ClusterInstanceCondition`].
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        RFC3339 of the last `status` change. Kept across reconciles while the
+                        status is unchanged.
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable detail.
+                      type: string
+                    reason:
+                      description: Machine-readable reason, e.g. `UnsupportedFields`.
+                      type: string
+                    status:
+                      description: 'One of: `True`, `False`, `Unknown`.'
+                      type: string
+                    type:
+                      description: Condition name, e.g. `ConfigSupported`.
+                      type: string
+                  required:
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
               consecutiveFailures:
                 default: 0
                 description: |-

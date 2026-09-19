@@ -40,6 +40,12 @@ const MANAGED_BY: &str = "kobe-operator";
 ///
 /// The CAPI provider controller reconciles these resources and produces a
 /// `{name}-kubeconfig` Secret following CAPI conventions.
+/// Optional pool spec fields this backend reads. See
+/// [`super::unsupported_pool_fields`].
+/// Empty: `create` ignores `ClusterConfig` and takes everything from
+/// `spec.backend.capi`.
+pub(crate) const HONORED_POOL_FIELDS: &[super::PoolSpecField] = &[];
+
 #[derive(Clone)]
 pub struct CapiBackend {
     /// Kubernetes client for the host cluster.
@@ -959,5 +965,33 @@ mod tests {
 
     fn base64_encode(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)
+    }
+}
+
+#[cfg(test)]
+mod pool_spec_coverage_tests {
+    use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
+    use crate::crd::BackendType;
+
+    /// CAPI takes its whole configuration from `spec.backend.capi`.
+    #[test]
+    fn capi_refuses_every_optional_cluster_field() {
+        let spec = pool_spec_requesting_every_field(BackendType::Capi);
+        assert_eq!(
+            unsupported_pool_fields(&spec),
+            vec![
+                "cluster.servers",
+                "cluster.agents",
+                "cluster.serverArgs",
+                "cluster.persistence",
+                "cluster.expose",
+                "cluster.taints",
+                "cluster.placement",
+                "cluster.clusterDomain",
+                "cluster.registryMirrors",
+                "cluster.kubeletSharedMount",
+                "backend.datastore.goldenTemplates",
+            ]
+        );
     }
 }

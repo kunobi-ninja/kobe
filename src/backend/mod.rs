@@ -670,6 +670,134 @@ impl BackendFactory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pool spec coverage — which optional pool fields each backend honors
+// ---------------------------------------------------------------------------
+
+/// An optional pool spec field that some backends honor and others ignore.
+///
+/// Each backend module declares the fields it reads next to the code that
+/// reads them (`HONORED_POOL_FIELDS`), and [`unsupported_pool_fields`] checks a
+/// pool against that list. `cluster.version` is not listed: the schema
+/// requires it on every pool, so a backend that ignores it cannot reject it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolSpecField {
+    /// `cluster.servers` other than 1.
+    Servers,
+    /// `cluster.agents` greater than 0.
+    Agents,
+    /// Non-empty `cluster.serverArgs`.
+    ServerArgs,
+    Persistence,
+    Expose,
+    /// Any `cluster.taints`, including `[]` (which suppresses defaults).
+    Taints,
+    Placement,
+    ClusterDomain,
+    RegistryMirrors,
+    KubeletSharedMount,
+    /// `backend.datastore.goldenTemplates: true`. No backend reads it.
+    GoldenTemplates,
+}
+
+impl PoolSpecField {
+    /// Path of the field in `ClusterPool.spec`, as a user writes it.
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Servers => "cluster.servers",
+            Self::Agents => "cluster.agents",
+            Self::ServerArgs => "cluster.serverArgs",
+            Self::Persistence => "cluster.persistence",
+            Self::Expose => "cluster.expose",
+            Self::Taints => "cluster.taints",
+            Self::Placement => "cluster.placement",
+            Self::ClusterDomain => "cluster.clusterDomain",
+            Self::RegistryMirrors => "cluster.registryMirrors",
+            Self::KubeletSharedMount => "cluster.kubeletSharedMount",
+            Self::GoldenTemplates => "backend.datastore.goldenTemplates",
+        }
+    }
+}
+
+/// Fields the pool asks for, in declaration order. A field left at its
+/// no-op value (`servers: 1`, `agents: 0`, empty `serverArgs`, omitted
+/// options) asks for nothing, so every backend can accept it.
+fn requested_pool_fields(spec: &crate::crd::ClusterPoolSpec) -> Vec<PoolSpecField> {
+    let c = &spec.cluster;
+    let golden = spec
+        .backend
+        .datastore
+        .as_ref()
+        .is_some_and(|d| d.golden_templates);
+    [
+        (PoolSpecField::Servers, c.servers != 1),
+        (PoolSpecField::Agents, c.agents.is_some_and(|n| n > 0)),
+        (PoolSpecField::ServerArgs, !c.server_args.is_empty()),
+        (PoolSpecField::Persistence, c.persistence.is_some()),
+        (PoolSpecField::Expose, c.expose.is_some()),
+        (PoolSpecField::Taints, c.taints.is_some()),
+        (PoolSpecField::Placement, c.placement.is_some()),
+        (PoolSpecField::ClusterDomain, c.cluster_domain.is_some()),
+        (PoolSpecField::RegistryMirrors, c.registry_mirrors.is_some()),
+        (
+            PoolSpecField::KubeletSharedMount,
+            c.kubelet_shared_mount.is_some(),
+        ),
+        (PoolSpecField::GoldenTemplates, golden),
+    ]
+    .into_iter()
+    .filter_map(|(field, requested)| requested.then_some(field))
+    .collect()
+}
+
+/// Spec paths the pool sets that its backend would ignore.
+///
+/// Empty means every requested field takes effect. The profile controller
+/// refuses to create members for a pool with a non-empty result and reports
+/// it as `ConfigSupported=False`.
+pub fn unsupported_pool_fields(spec: &crate::crd::ClusterPoolSpec) -> Vec<&'static str> {
+    let honored: &[PoolSpecField] = match spec.backend.backend_type {
+        BackendType::K3s => k3s::HONORED_POOL_FIELDS,
+        BackendType::K0s => k0s::HONORED_POOL_FIELDS,
+        BackendType::Vcluster => vcluster::HONORED_POOL_FIELDS,
+        BackendType::Capi => capi::HONORED_POOL_FIELDS,
+        BackendType::Vkobe => vkobe::honored_pool_fields(spec.backend.vkobe.as_ref()),
+    };
+    requested_pool_fields(spec)
+        .into_iter()
+        .filter(|field| !honored.contains(field))
+        .map(PoolSpecField::path)
+        .collect()
+}
+
+/// A pool spec that requests every [`PoolSpecField`], for the per-backend
+/// coverage tests.
+#[cfg(test)]
+pub(crate) fn pool_spec_requesting_every_field(
+    backend_type: BackendType,
+) -> crate::crd::ClusterPoolSpec {
+    let spec = serde_json::json!({
+        "backend": {
+            "type": backend_type,
+            "datastore": { "secretRef": "pg", "goldenTemplates": true },
+        },
+        "cluster": {
+            "version": "v1.33.1",
+            "servers": 3,
+            "agents": 2,
+            "serverArgs": ["--foo"],
+            "persistence": {},
+            "expose": { "exposeType": "NodePort" },
+            "taints": [],
+            "placement": {},
+            "clusterDomain": "example.local",
+            "registryMirrors": { "docker.io": ["https://mirror.example"] },
+            "kubeletSharedMount": {},
+        },
+    });
+    serde_json::from_value(spec).expect("pool spec requesting every field")
+}
+
 /// A guest cluster whose control-plane (or agent) Pods cannot be scheduled.
 ///
 /// Returned by [`ClusterBackend::detect_scheduling_blocked`] when an
@@ -1871,6 +1999,38 @@ mod tests {
     use base64::Engine;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Fields at their no-op values ask for nothing, so even a backend that
+    /// reads none of `spec.cluster` accepts them.
+    #[test]
+    fn no_op_field_values_are_accepted_by_every_backend() {
+        for backend_type in [
+            BackendType::K3s,
+            BackendType::K0s,
+            BackendType::Vcluster,
+            BackendType::Capi,
+            BackendType::Vkobe,
+        ] {
+            let spec: crate::crd::ClusterPoolSpec = serde_json::from_value(serde_json::json!({
+                "backend": {
+                    "type": backend_type,
+                    "datastore": { "secretRef": "pg", "goldenTemplates": false },
+                },
+                "cluster": {
+                    "version": "v1.33.1",
+                    "servers": 1,
+                    "agents": 0,
+                    "serverArgs": [],
+                },
+            }))
+            .expect("pool spec");
+            assert!(
+                unsupported_pool_fields(&spec).is_empty(),
+                "{backend_type:?}: {:?}",
+                unsupported_pool_fields(&spec)
+            );
+        }
+    }
 
     /// A backend that has not implemented verified teardown must REFUSE, not
     /// quietly succeed.

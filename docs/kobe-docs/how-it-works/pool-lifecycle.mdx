@@ -76,7 +76,7 @@ status:
 
 | Phase | Meaning |
 |---|---|
-| `Failing` | Three or more provision failures in a row. Needs an operator. |
+| `Failing` | Three or more provision failures in a row, or the pool sets fields its backend ignores (`ConfigSupported=False`, see [Unsupported fields](/docs/pools/backends#unsupported-fields)). Needs an operator. |
 | `Backoff` | A provision failed; the pool is waiting before it retries. |
 | `Idle` | Scale-to-zero pool with nothing in it. |
 | `ScalingDown` | Above the warm target and recycling idle clusters. |

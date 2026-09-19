@@ -266,6 +266,12 @@ const HELM_REPO_URL: &str = "https://charts.loft.sh";
 const HELM_INSTALL_TIMEOUT_SECS: u64 = 300;
 
 /// Backend that manages vcluster instances via Helm.
+/// Optional pool spec fields this backend reads. See
+/// [`super::unsupported_pool_fields`].
+/// Empty: vcluster reads only `cluster.version`. Everything else is set
+/// through the chart values in `spec.backend.vcluster.values`.
+pub(crate) const HONORED_POOL_FIELDS: &[super::PoolSpecField] = &[];
+
 #[derive(Clone)]
 pub struct VclusterBackend {
     client: Client,
@@ -1720,6 +1726,34 @@ mod tests {
         assert!(
             !desc.contains("exit"),
             "must not claim an exit status: {desc}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_spec_coverage_tests {
+    use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
+    use crate::crd::BackendType;
+
+    /// vcluster reads only `cluster.version`; chart values carry the rest.
+    #[test]
+    fn vcluster_refuses_every_optional_cluster_field() {
+        let spec = pool_spec_requesting_every_field(BackendType::Vcluster);
+        assert_eq!(
+            unsupported_pool_fields(&spec),
+            vec![
+                "cluster.servers",
+                "cluster.agents",
+                "cluster.serverArgs",
+                "cluster.persistence",
+                "cluster.expose",
+                "cluster.taints",
+                "cluster.placement",
+                "cluster.clusterDomain",
+                "cluster.registryMirrors",
+                "cluster.kubeletSharedMount",
+                "backend.datastore.goldenTemplates",
+            ]
         );
     }
 }

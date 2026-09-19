@@ -13,7 +13,7 @@ Use k3s unless you have a reason not to. It is the only backend that implements 
 
 | Capability | k3s | k0s | vcluster | CAPI | vkobe (on hold) |
 |---|---|---|---|---|---|
-| `spec.cluster` fields honored | All | All except `kubeletSharedMount` and `registryMirrors` | `version` only | None (uses `spec.backend.capi`) | None (uses `spec.backend.vkobe`) |
+| `spec.cluster` fields honored | All | All except `kubeletSharedMount` and `registryMirrors` | `version` only | None (uses `spec.backend.capi`) | None (uses `spec.backend.vkobe`); `serverArgs` only without that block |
 | Shared PostgreSQL datastore | Yes | Yes | No | No | No (uses `KobeStore`) |
 | `VerifiedDestroy` cleanup | Yes, with conditions | No | No | No | No |
 | Drift detection after operator upgrades | Yes | No | No | No | No |
@@ -24,11 +24,38 @@ Use k3s unless you have a reason not to. It is the only backend that implements 
 
 What each row means:
 
-- **`spec.cluster` fields honored.** Fields a backend ignores are accepted without an error. On vcluster, `servers`, `agents`, `persistence`, `expose`, `taints`, `placement`, and `resources` have no effect; set chart values through `spec.backend.vcluster.values` instead. CAPI takes its whole configuration from `spec.backend.capi`.
+- **`spec.cluster` fields honored.** A pool that sets a field its backend ignores stops creating members. Its status shows `phase: Failing` and a `ConfigSupported` condition with reason `UnsupportedFields` that lists the fields. Existing members keep running and keep serving leases, and are not recycled for the spec change. Remove the fields, or move to a backend that supports them, and the pool resumes. See [Unsupported fields](#unsupported-fields).
 - **`VerifiedDestroy` cleanup.** A lease with `cleanupMode: VerifiedDestroy` is refused before binding on every backend except k3s. On k3s it has further conditions; see [Pool lifecycle](/docs/how-it-works/pool-lifecycle#quarantined).
 - **Drift detection after operator upgrades.** Every backend recycles idle members when the pool spec changes. Only k3s also notices when a new operator version would render a different pod spec for the same pool spec. On other backends, idle members keep the old rendering until they are recycled for another reason.
 - **Scheduling-blocked and crashloop detection.** When a k3s member is stuck in `Creating` because its pods cannot be scheduled or keep crashing, the operator says so in `status.message` and in metrics, and holds off respawning unschedulable pods. Other backends report only the creating timeout.
 - **CI conformance.** "Non-gating" means the leg runs but a failure does not fail the workflow. CAPI has no in-tree test provider.
+
+### Unsupported fields
+
+The operator checks each pool against what its backend reads. A field counts as set when it asks for something:
+
+- `servers` other than `1`, or `agents` above `0`
+- a non-empty `serverArgs`
+- any `persistence`, `expose`, `taints` (including `[]`), `placement`, `clusterDomain`, `registryMirrors` or `kubeletSharedMount`
+- `backend.datastore.goldenTemplates: true`, which no backend reads yet
+
+`cluster.version` is required on every pool and is never flagged, although CAPI and vkobe ignore it. `spec.resources` is outside this check.
+
+A blocked vcluster pool looks like this:
+
+```yaml
+status:
+  phase: Failing
+  conditions:
+    - type: ConfigSupported
+      status: "False"
+      reason: UnsupportedFields
+      message: "backend vcluster ignores cluster.servers, cluster.placement; remove them or pick a backend that supports them. No new members are created until then."
+```
+
+With no Ready member, new leases against the pool are refused with `pool_exhausted` instead of queueing for a cluster that will never come.
+
+> **Changed behaviour.** Earlier releases accepted these fields and silently ignored them. A pool that carried one kept provisioning clusters that did not match its spec. After upgrading, such a pool stops creating members until the field is removed.
 
 ## k3s (default)
 
@@ -49,7 +76,7 @@ spec:
 
 k3s and k0s can use a shared PostgreSQL datastore instead of embedded SQLite. Each cluster gets its own database and role on that server.
 
-`goldenTemplates` is accepted but has no effect today: the operator does not clone clusters from template databases. The [golden image path](/docs/operate/golden-images) is not validated either.
+`goldenTemplates` is reserved. The operator does not clone clusters from template databases, so a pool that sets it to `true` is blocked as an [unsupported field](#unsupported-fields). The [golden image path](/docs/operate/golden-images) is not validated either.
 
 ```yaml
 spec:
@@ -57,7 +84,6 @@ spec:
     type: k3s
     datastore:
       secretRef: kobe-postgres-secret    # Secret with key "connection-url"
-      goldenTemplates: true
 ```
 
 The referenced Secret must contain a `connection-url` key with a valid PostgreSQL DSN.
@@ -78,7 +104,7 @@ spec:
 
 The CAPI backend delegates cluster provisioning to any Cluster API infrastructure provider. kobe creates the necessary CAPI `Cluster` and infrastructure CRDs, then waits for the cluster to reach `Ready` state before adding it to the warm pool.
 
-CAPI ignores `spec.cluster`. Everything it creates comes from `spec.backend.capi`. There is no CAPI leg in kobe's CI, so test it against your provider before relying on it.
+CAPI ignores `spec.cluster` apart from the required `version`, and blocks a pool that sets any other field in it. Everything it creates comes from `spec.backend.capi`. There is no CAPI leg in kobe's CI, so test it against your provider before relying on it.
 
 ```yaml
 spec:
@@ -113,7 +139,7 @@ spec:
               enabled: true
 ```
 
-**Pool spec coverage.** vcluster reads only `cluster.version` from `spec.cluster`. Configure everything else through `values`.
+**Pool spec coverage.** vcluster reads only `cluster.version` from `spec.cluster`. Configure everything else through `values`. Setting another `spec.cluster` field blocks the pool; see [Unsupported fields](#unsupported-fields).
 
 **Kubernetes version.** `cluster.version` selects the guest Kubernetes release. vcluster uses it verbatim as the image tag on `ghcr.io/loft-sh/kubernetes`, so it must name a published tag — `v`-prefixed with a full patch version, e.g. `v1.32.3`. A leading `v` is added if you omit it. Leave `cluster.version` empty to take the chart's own default.
 
