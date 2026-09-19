@@ -10073,6 +10073,11 @@ fn sandbox_lease_trigger(sandbox: &DynamicObject) -> Option<ObjectRef<SandboxLea
 }
 
 /// Map a claimed Sandbox Pod to the leases whose recorded Claim it belongs to.
+///
+/// A Pod whose Claim UID no lease records (a Claim replaced before its UID was
+/// checkpointed) wakes every releasing lease instead. Few leases are releasing
+/// at once, and each pass re-checks exact identity, so the cost is a handful of
+/// reconciles rather than a missed release.
 fn pod_lease_triggers(pod: &Pod, leases: &[Arc<SandboxLease>]) -> Vec<ObjectRef<SandboxLease>> {
     let Some(claim_uid) = pod
         .labels()
@@ -10081,7 +10086,7 @@ fn pod_lease_triggers(pod: &Pod, leases: &[Arc<SandboxLease>]) -> Vec<ObjectRef<
     else {
         return Vec::new();
     };
-    leases
+    let recorded: Vec<_> = leases
         .iter()
         .filter(|lease| {
             lease
@@ -10090,6 +10095,17 @@ fn pod_lease_triggers(pod: &Pod, leases: &[Arc<SandboxLease>]) -> Vec<ObjectRef<
                 .and_then(|status| status.target.as_ref())
                 .and_then(|target| target.sandbox_claim.as_ref())
                 .is_some_and(|claim| &claim.uid == claim_uid)
+        })
+        .map(|lease| ObjectRef::from_obj(lease.as_ref()))
+        .collect();
+    if !recorded.is_empty() {
+        return recorded;
+    }
+    leases
+        .iter()
+        .filter(|lease| {
+            lease.status.as_ref().map(|status| status.phase)
+                == Some(crate::crd::SandboxLeasePhase::Releasing)
         })
         .map(|lease| ObjectRef::from_obj(lease.as_ref()))
         .collect()
@@ -14217,7 +14233,26 @@ pub(crate) mod tests {
             pod_lease_triggers(&pod(Some(&claim_uid)), &leases),
             vec![ObjectRef::from_obj(&lease)]
         );
-        assert!(pod_lease_triggers(&pod(Some("someone-else")), &leases).is_empty());
+        // An unrecorded Claim UID wakes the releasing leases, not nothing.
+        let mut ready = lease.clone();
+        ready.metadata.name = Some("sandbox-ready".into());
+        ready.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Ready;
+        ready
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim
+            .as_mut()
+            .unwrap()
+            .uid = "ready-claim-uid".into();
+        let with_ready = vec![Arc::new(ready), Arc::new(lease.clone())];
+        assert_eq!(
+            pod_lease_triggers(&pod(Some("unrecorded")), &with_ready),
+            vec![ObjectRef::from_obj(&lease)]
+        );
         assert!(pod_lease_triggers(&pod(None), &leases).is_empty());
     }
 
