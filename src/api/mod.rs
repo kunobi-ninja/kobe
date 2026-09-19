@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cluster_admission;
 pub mod connect;
 pub mod policy;
 pub mod routes;

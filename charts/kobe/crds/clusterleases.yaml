@@ -75,6 +75,20 @@ spec:
                       Identity string (e.g. "repo:org/repo:ref:refs/heads/main" for GitHub,
                       or user ID for Clerk).
                     type: string
+                  issuer:
+                    description: |-
+                      Token issuer that authenticated the requester. Same ownership rule as
+                      `provider`: enforced when present, ignored on older leases.
+                    nullable: true
+                    type: string
+                  provider:
+                    description: |-
+                      Stable ID of the configured authentication provider that admitted the
+                      lease. Stamped by the API on leases created since this field existed.
+                      When present, only a caller authenticated by the same provider owns the
+                      lease; leases without it fall back to identity-only ownership.
+                    nullable: true
+                    type: string
                   type:
                     description: 'Type of requester: "{provider}:{role}" (e.g. "github-actions:ci", "clerk:admin").'
                     type: string

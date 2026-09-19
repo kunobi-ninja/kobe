@@ -106,6 +106,18 @@ pub struct Requester {
     /// Identity string (e.g. "repo:org/repo:ref:refs/heads/main" for GitHub,
     /// or user ID for Clerk).
     pub identity: String,
+
+    /// Stable ID of the configured authentication provider that admitted the
+    /// lease. Stamped by the API on leases created since this field existed.
+    /// When present, only a caller authenticated by the same provider owns the
+    /// lease; leases without it fall back to identity-only ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Token issuer that authenticated the requester. Same ownership rule as
+    /// `provider`: enforced when present, ignored on older leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -573,6 +585,8 @@ mod json_safety_tests {
         let r = Requester {
             requester_type: "github-actions:ci".into(),
             identity: "repo:org/repo".into(),
+            provider: None,
+            issuer: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
