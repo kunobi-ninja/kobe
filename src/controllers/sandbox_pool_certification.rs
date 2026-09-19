@@ -683,6 +683,56 @@ pub(super) fn warm_pool_status_is_current(warm_pool: &DynamicObject) -> bool {
     })
 }
 
+/// Whether every live warm member that is not Ready was created within
+/// `max_age` of `now`.
+///
+/// An adoption refill replaces the adopted member with a brand-new Sandbox, so
+/// its only unready members are young. A member that crashed, lost its node or
+/// stopped passing readiness is an old Sandbox that went unready; that is a
+/// degraded pool, not a refill. A member without a creation time counts as
+/// old.
+pub(super) fn unready_warm_members_are_fresh(
+    sandboxes: &[DynamicObject],
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: chrono::Duration,
+) -> bool {
+    sandboxes
+        .iter()
+        .filter(|sandbox| {
+            sandbox.metadata.deletion_timestamp.is_none() && !dynamic_ready_at_generation(sandbox)
+        })
+        .all(|sandbox| {
+            sandbox
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .and_then(|created| {
+                    chrono::DateTime::parse_from_rfc3339(&created.0.to_string()).ok()
+                })
+                .is_some_and(|created| now - created.with_timezone(&chrono::Utc) < max_age)
+        })
+}
+
+/// List the WarmPool's members and apply [`unready_warm_members_are_fresh`].
+pub(super) async fn warm_pool_refill_members_are_fresh(
+    client: &Client,
+    namespace: &str,
+    warm_pool: &DynamicObject,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: chrono::Duration,
+) -> Result<bool, kube::Error> {
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &sandbox_resource());
+    let selector = format!(
+        "{WARM_POOL_LABEL}={}",
+        upstream_name_hash(&warm_pool.name_any())
+    );
+    let listed = sandboxes
+        .list(&ListParams::default().labels(&selector))
+        .await?;
+    Ok(unready_warm_members_are_fresh(&listed.items, now, max_age))
+}
+
 fn object_has_controller_uid(meta: &ObjectMeta, owner_uids: &[String]) -> bool {
     meta.owner_references.as_ref().is_some_and(|owners| {
         owners.iter().any(|owner| {
