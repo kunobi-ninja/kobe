@@ -1226,7 +1226,7 @@ async function testTemplateFilesAdmission(): Promise<void> {
 		apiVersion: "kobe.kunobi.ninja/v1alpha1", kind: "SandboxPool",
 		metadata: { name: "file-contract", namespace },
 		spec: {
-			warmCapacity: 0, defaultTtl: "5m", maxTtl: "10m",
+			warmCapacity: 0, defaultTtl: "5m", maxTtl: "10m", provisioningTimeout: "5m",
 			placement: { type: "management" }, isolation: { tier: "trusted-runc" },
 			readiness: { canary: { argv: ["/bin/true"], timeout: "30s" } },
 			template: {
