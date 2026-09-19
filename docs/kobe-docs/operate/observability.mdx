@@ -38,6 +38,8 @@ telemetry:
 | Health probes | `kobe_health_checks_total{result}` |
 | Reconcile health | `kobe_reconciliations_total`, `kobe_pool_reconcile_duration_seconds` |
 | IPAM | `kobe_ipam_bind_duration_seconds` |
+| Is anything quarantined, and for how long? | `kobe_quarantined{profile,kind}`, `kobe_quarantined_oldest_age_seconds` |
+| Did someone release a quarantine by hand? | `kobe_quarantine_releases_total{profile,kind}` |
 
 `reason` on `kobe_instance_recycles_total` is a closed set: `spec_drift`, `cert_expiry`, `creating_timeout`, `unhealthy`, `scale_down`, `bootstrap_failed`, `health_failed`, `lease_released`, `kobestore_degraded`, `ipam_conflict`, `manual`. Not every value is emitted yet; dashboards can still list the full set.
 
@@ -53,6 +55,18 @@ Queue not draining:
 
 ```promql
 kobe_lease_oldest_pending_age_seconds > 300
+```
+
+Quarantine that is not clearing on its own (see [Troubleshooting](/docs/operate/troubleshooting#release-a-quarantined-lease-or-instance)):
+
+```promql
+kobe_quarantined_oldest_age_seconds > 3600
+```
+
+Any manual quarantine release:
+
+```promql
+increase(kobe_quarantine_releases_total[1h]) > 0
 ```
 
 Drift recycle during an upgrade (see [Upgrades](/docs/operate/upgrades)):
