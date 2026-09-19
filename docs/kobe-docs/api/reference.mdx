@@ -23,11 +23,11 @@ signature.
 | `GET` | `/v1/pools` | Required | List available pools |
 | `GET` | `/v1/pools/:name` | Required | Get a specific pool's status |
 | `GET` | `/v1/pools/:name/leases` | Required | List leases for a specific pool |
-| `POST` | `/v1/sandbox-leases` | Required | Compatibility alias for `POST /v1/leases` |
+| `POST` | `/v1/sandbox-leases` | Required | Deprecated alias for `POST /v1/leases` |
 | `GET` | `/v1/sandbox-leases` | Required | List your Sandbox leases |
-| `GET` | `/v1/sandbox-leases/:id` | Required | Get one Sandbox lease |
-| `PATCH` | `/v1/sandbox-leases/:id` | Required | Extend a Sandbox lease TTL |
-| `DELETE` | `/v1/sandbox-leases/:id` | Required | Request Sandbox release |
+| `GET` | `/v1/sandbox-leases/:id` | Required | Deprecated alias for `GET /v1/leases/:id` |
+| `PATCH` | `/v1/sandbox-leases/:id` | Required | Deprecated alias for `PATCH /v1/leases/:id` |
+| `DELETE` | `/v1/sandbox-leases/:id` | Required | Deprecated alias for `DELETE /v1/leases/:id` |
 | `GET` | `/v1/sandbox-leases/:id/logs` | Required | Read the Sandbox log tail |
 | `POST` | `/v1/sandbox-leases/:id/executions` | Required | Run or reserve an idempotent execution |
 | `GET` | `/v1/sandbox-leases/:id/executions/:execution` | Required | Read execution state |
@@ -38,6 +38,105 @@ signature.
 | `GET` | `/v1/status` | Optional | Endpoint status, auth methods, pool summary |
 | `GET` | `/healthz` | None | Liveness probe |
 | `GET` | `/metrics` | None | Prometheus metrics |
+
+The `:id` in `/v1/leases/:id` is a lease id or one of your aliases, for both
+lease kinds. See [Addressing a lease](#addressing-a-lease).
+
+---
+
+## Errors
+
+Every error from a `/v1` lease or pool route has one JSON shape:
+
+```json
+{
+  "error": "Concurrent lease limit (5) reached",
+  "detail": "You have 5 active leases",
+  "reason": "quota_exhausted"
+}
+```
+
+`error` is for people. `detail` is optional, client-actionable text. `reason`
+is a stable machine-readable code; branch on it, not on `error`. It is omitted
+where no bounded reason exists, so treat a missing `reason` as "unclassified".
+The same condition reports the same code for Cluster and Sandbox leases.
+
+Every `429` carries a `reason`, which is how a client tells a hard limit from
+throttling:
+
+| `reason` | Status | Retry |
+|---|---|---|
+| `quota_exhausted` | 429 | No. Release a lease first. No `Retry-After`. |
+| `rate_limited` | 429 | Yes, after `Retry-After`. Per-principal admission budget. |
+| `server_busy` | 429 | Yes, after `Retry-After`. The API replica is at its request ceiling. |
+
+The other codes:
+
+| `reason` | Status | Retry |
+|---|---|---|
+| `not_found` | 404 | No. Also returned for another caller's lease. |
+| `invalid_request` | 400 | No. Fix the request. |
+| `alias_taken` | 409 | No. Release or extend the lease holding the alias. |
+| `idempotency_conflict` | 409 | No. The key was used for a different request. |
+| `ambiguous_alias` | 409 | No. Address the lease by id. |
+| `wrong_resource_kind` | 409 | No. The pool name exists as both kinds. |
+| `not_ready` | 409 | Yes, once the lease is `Bound` or `Ready`. |
+| `extension_budget_exhausted` | 409 | No. |
+| `max_ttl_ceiling` | 409 | No. |
+| `max_idle_ceiling` | 409 | No (Sandbox pools with `maxIdle`). |
+| `expiry_derivation_mismatch` | 409 | No. |
+| `policy_unresolvable` | 409 | No. The lease's AccessPolicy no longer resolves. |
+| `conflict_retryable` | 409 | Yes. The lease changed under the request; read it and retry. |
+| `teardown_quarantined` | 409 | No. An operator must resolve cleanup. |
+| `admission_busy` | 503 | Yes, after `Retry-After`. Nothing was created. |
+| `pool_exhausted`, `capacity_blocked`, `degraded` | 503 | Only after the pool recovers. |
+| `warming` | 202 | Not an error: the lease is queued. |
+| `expired` | 410 or 409 | No. Request a new lease. |
+| `target_unresolved` | 409 | Yes, after placement completes. |
+| `provenance_incomplete`, `pool_unresolvable` | 503 | Operator attention. |
+| `not_declared`, `port_name_covers_range` | 400 | No. |
+| `backend_error` | 503 | Yes, transient. |
+
+Execution and stream routes add `execution_limit_exhausted`,
+`concurrency_limit`, `lease_ended`, `iroh_transport`, `direct_transport`,
+`runner_missing`, `runner_unreachable`, `runner_unreadable`,
+`runner_forgot_execution`, `runner_id_conflict`, `runner_rejected_request` and
+`runner_internal_error`.
+
+<Callout type="info">
+  Servers before this release sent some of these errors with no `reason`,
+  answered some `404`s with an empty body, and answered a refused Cluster extend
+  with `400`. A client that must support older servers should fall back to the
+  status code when `reason` is missing.
+</Callout>
+
+## Addressing a lease
+
+`GET`, `PATCH` and `DELETE /v1/leases/:id`, and the Sandbox operations under
+`/v1/leases/:id/...`, accept either:
+
+- a lease id (`lease-…` for Cluster, `sandbox-…` for Sandbox), or
+- the `alias` of one of your active leases, of either kind.
+
+Aliases are scoped to the caller. An alias that matches none of your active
+leases returns `404 not_found`. One that matches an active lease of each kind
+returns `409 ambiguous_alias`; use the id.
+
+## Field naming
+
+Existing field names are kept so current clients keep working. The rule is
+per response:
+
+| Response | Field style |
+|---|---|
+| Lease objects: `POST`/`GET /v1/leases`, `GET /v1/leases/:id`, the `/v1/sandbox-leases` equivalents | snake_case (`expires_at`, `queue_position`, `effective_ttl`, `cluster_name`, `provisioning_deadline`), except `resourceKind` |
+| Admission handoff fields on a Sandbox create: `statusUrl` | camelCase, next to the snake_case lease fields |
+| Extend: `PATCH /v1/leases/:id` | Both `expires_at` and `expiresAt` for both kinds. Sandbox also returns `extensionsCount`, `maxExtensions` and `runningExecutions`. |
+| Pools, executions, `/v1/status` | camelCase |
+| Errors | `error`, `detail`, `reason` |
+
+Request bodies accept both spellings where they differ: `extend_ttl` or
+`extendTtl`, `profile` or `pool`.
 
 ---
 
@@ -161,8 +260,8 @@ Once bound, `GET /v1/leases/:id` returns:
 | `400` | Invalid profile name, alias, TTL, or metadata |
 | `403` | Profile not allowed for your identity |
 | `404` | No pool with that name |
-| `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`), the alias is held by another active lease, or the `idempotencyKey` was used for a different request |
-| `429` | Concurrent lease limit reached (no `Retry-After`), or server overloaded (`Retry-After: 1`; retry) |
+| `409` | The name exists as both a Cluster pool and a Sandbox pool (`reason: wrong_resource_kind`), the alias is held by another active lease (`alias_taken`), or the `idempotencyKey` was used for a different request (`idempotency_conflict`) |
+| `429` | Concurrent lease limit reached (`quota_exhausted`, no `Retry-After`), admission rate limit hit (`rate_limited`, `Retry-After`), or server overloaded (`server_busy`, `Retry-After: 1`) |
 | `503` | The pool cannot satisfy a lease now, another create for the same caller is still being admitted (`reason: admission_busy`; retry), or the create timed out (retry with the same `idempotencyKey`) |
 
 > **Lease ownership after upgrading.** Cluster leases now record the provider
@@ -171,7 +270,15 @@ Once bound, `GET /v1/leases/:id` returns:
 > earlier Kobe version have no provider or issuer recorded and stay owned by
 > identity alone until they end.
 
-`POST /v1/sandbox-leases` is a compatibility alias for this same create. Prefer
+Cluster creates are rate limited per principal with the same budget as
+Sandbox creates: a burst of 10, then one attempt every two seconds, per API
+replica. Every attempt that passes validation spends a token, including one
+that is later refused for quota. A throttled attempt gets `429`,
+`reason: rate_limited` and `Retry-After`, and costs the Kubernetes API nothing.
+`kobe lease` and `kobe with-lease` wait and retry it with the same
+`idempotencyKey`.
+
+`POST /v1/sandbox-leases` is a deprecated alias for this same create. Prefer
 `POST /v1/leases`. Kind-specific verbs (`exec`, `logs`, `attach`, `port-forward`,
 `executions`) are also served under `/v1/leases/:id/...`.
 
@@ -214,7 +321,15 @@ Returns the full lease, including `kubeconfig` once the phase is `Bound`.
 ```
 
 Possible values for `phase`: `Pending`, `Bound`, `Released`, `Expired`,
-`Recycling`, `Quarantined`.
+`Recycling`, `Quarantined`. A Sandbox id or alias returns the Sandbox lease
+shape described under [`GET /v1/sandbox-leases/:id`](#get-v1sandbox-leasesid).
+
+An unknown id, an alias that matches nothing, and another caller's lease all
+return the same `404`:
+
+```json
+{ "error": "Lease not found", "reason": "not_found" }
+```
 
 ---
 
@@ -222,7 +337,7 @@ Possible values for `phase`: `Pending`, `Bound`, `Released`, `Expired`,
 
 Releases a lease immediately. The cluster is destroyed and a fresh replacement
 is queued. Returns `204 No Content`. A lease already in `Quarantined` returns
-`409 Conflict` with reason `TeardownQuarantined`; release cannot downgrade or
+`409 Conflict` with reason `teardown_quarantined`; release cannot downgrade or
 discard incomplete cleanup evidence.
 
 ---
@@ -243,9 +358,30 @@ Extends a lease TTL. Only allowed up to `maxExtensions` times per lease (configu
 
 ```json
 {
-  "expires_at": "2026-04-09T16:00:00Z"
+  "expires_at": "2026-04-09T16:00:00Z",
+  "expiresAt": "2026-04-09T16:00:00Z"
 }
 ```
+
+`expiresAt` carries the same value as `expires_at`, so one client parses the
+Cluster and Sandbox extend answers the same way. A Sandbox id or alias is
+extended as described under
+[`PATCH /v1/sandbox-leases/:id`](#patch-v1sandbox-leasesid).
+
+**Errors**
+
+| Status | `reason` | Meaning |
+|---|---|---|
+| `400` | `invalid_request` | The duration does not parse |
+| `404` | `not_found` | No such lease for this caller |
+| `409` | `not_ready` | The lease is not `Bound` |
+| `409` | `extension_budget_exhausted` | `maxExtensions` already used |
+| `409` | `max_ttl_ceiling` | The new expiry would pass `boundAt + maxTtl` |
+| `409` | `policy_unresolvable` | No AccessPolicy resolves the lease's requester type |
+| `409` | `conflict_retryable` | Another write changed the lease first; read it and retry |
+
+Before this release, the refusals above returned `400` with no `reason`, and a
+lost concurrent write returned `500`.
 
 ---
 
@@ -358,12 +494,8 @@ credentials. Responses never contain a management or child-cluster kubeconfig.
 
 ### Sandbox error reasons
 
-Every Sandbox denial body is `{ "error": string, "detail"?: string,
-"reason"?: string }`. `reason` carries a bounded machine-readable code — the
-same condition reports the same code on the cluster and Sandbox paths (a
-quarantined release is `teardown_quarantined` everywhere) — so an agent or
-script can branch on *why* without parsing free text. It is omitted where no
-bounded reason exists. The closed set:
+Sandbox routes use the shared [error body](#errors). The codes most specific
+to Sandbox leases:
 
 | `reason` | Retryable |
 |---|---|
@@ -385,7 +517,7 @@ bounded reason exists. The closed set:
 
 ### `POST /v1/sandbox-leases`
 
-Compatibility alias for `POST /v1/leases`. Prefer `/v1/leases`. This path
+Deprecated alias for `POST /v1/leases`. Prefer `/v1/leases`. This path
 still accepts the Sandbox body (`pool`, `idempotencyKey`) and still returns
 `Location: /v1/sandbox-leases/:id`. A Cluster pool name is admitted as a
 Cluster lease rather than rejected.
@@ -454,8 +586,8 @@ the connection failed before headers, the same keyed POST may be repeated.
 | `400` | Invalid pool name, alias, or TTL |
 | `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
 | `404` | An allowed SandboxPool does not exist |
-| `409` | Alias is already active, an idempotency key is bound to different intent, or the pool name is ambiguous across kinds |
-| `429` | Sandbox concurrency limit reached, or the per-principal admission rate limit was hit |
+| `409` | Alias is already active (`alias_taken`), an idempotency key is bound to different intent, or the pool name is ambiguous across kinds (`wrong_resource_kind`) |
+| `429` | Sandbox concurrency limit reached (`quota_exhausted`), or the per-principal admission rate limit was hit (`rate_limited`) |
 | `503` | Pool configuration or Kubernetes admission cannot be verified |
 
 Admission is rate limited per principal, independently of the concurrency
@@ -474,8 +606,9 @@ its Sandbox pool scope. Requester identity and target credentials are omitted.
 
 ### `GET /v1/sandbox-leases/:id`
 
-Returns the typed lifecycle state for an owned lease. A lease belonging to
-another identity returns `404`.
+Deprecated alias for `GET /v1/leases/:id`, which also accepts an alias. Returns
+the typed lifecycle state for an owned lease. A lease belonging to another
+identity returns the same `404 not_found` body as a missing one.
 
 Possible phases are `Pending`, `Provisioning`, `Ready`, `Releasing`, `Released`,
 `Expired`, and `Quarantined`. `Quarantined` means cleanup is uncertain and the
@@ -494,7 +627,7 @@ kubeconfigs.
 
 ### `PATCH /v1/sandbox-leases/:id`
 
-Extends the runtime TTL of a `Ready` lease. The body takes `extendTtl` (or
+Deprecated alias for `PATCH /v1/leases/:id`. Extends the runtime TTL of a `Ready` lease. The body takes `extendTtl` (or
 `extend_ttl`, so one body shape works against the cluster endpoint too):
 
 ```json
@@ -504,7 +637,12 @@ Extends the runtime TTL of a `Ready` lease. The body takes `extendTtl` (or
 The response reports the new expiry and the remaining budget:
 
 ```json
-{ "expiresAt": "2026-08-10T01:32:00Z", "extensionsCount": 1, "maxExtensions": 2 }
+{
+  "expiresAt": "2026-08-10T01:32:00Z",
+  "expires_at": "2026-08-10T01:32:00Z",
+  "extensionsCount": 1,
+  "maxExtensions": 2
+}
 ```
 
 When the lease has running executions that still stop before the new expiry,
@@ -524,7 +662,7 @@ changed concurrently — the last is safe to retry against the current lease.
 
 ### `DELETE /v1/sandbox-leases/:id`
 
-Requires the independent Sandbox `release` verb. For an admitted active lease,
+Deprecated alias for `DELETE /v1/leases/:id`. Requires the independent Sandbox `release` verb. For an admitted active lease,
 the API records server-owned release intent and returns `204 No Content`; it
 does not write lifecycle status. The placement controller observes that intent,
 moves the lease to `Releasing`, revokes access, and verifies cleanup.

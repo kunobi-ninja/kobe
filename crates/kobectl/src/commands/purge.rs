@@ -9,7 +9,7 @@ use super::state::{
     endpoint_kubeconfigs, find_orphan_kubeconfigs, forget_endpoint_kubeconfigs, forget_kubeconfig,
     local_kubeconfig_candidates, remove_kubeconfig,
 };
-use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
+use super::{OutputFormat, print_json, send_lease_request};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,15 +62,10 @@ pub async fn purge(
     }
 
     let endpoint = config.endpoint.as_str();
-    let client = authed_client();
     let mut released = Vec::new();
     for lease in &active_leases {
-        let path = release_path(lease);
-        let token = get_auth_header(&config, "DELETE", &path, b"").await?;
-        let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
-            .send()
-            .await
-            .reaching(&config)?;
+        let response =
+            send_lease_request(&config, reqwest::Method::DELETE, &lease.id, None).await?;
         match response.status().as_u16() {
             200..=299 | 404 => {
                 if !lease.is_sandbox() {
@@ -127,14 +122,6 @@ pub async fn purge(
     }
 
     Ok(())
-}
-
-fn release_path(lease: &LeaseSummary) -> String {
-    if lease.is_sandbox() {
-        format!("/v1/sandbox-leases/{}", lease.id)
-    } else {
-        format!("/v1/leases/{}", lease.id)
-    }
 }
 
 /// Remove only kubeconfigs whose lease no longer exists server-side. Active
@@ -416,32 +403,21 @@ mod tests {
         }));
     }
 
+    /// Every release goes to the canonical path first. Only a Sandbox id
+    /// keeps the older path, for servers before v0.41.0 that 404 it there.
     #[test]
-    fn purge_dispatches_release_by_resource_kind() {
-        let cluster = LeaseSummary {
-            id: "lease-cluster".to_string(),
-            phase: "Bound".to_string(),
-            resource_kind: "Cluster".to_string(),
-            capabilities: vec!["release".to_string()],
-            profile: "ci".to_string(),
-            cluster_name: None,
-            expires_at: None,
-            queue_position: 0,
-            requester: None,
-            kubeconfig_path: None,
-            alias: None,
-            metadata: None,
-            transport: None,
-            iroh: None,
-        };
-        let sandbox = LeaseSummary {
-            id: "sandbox-agent".to_string(),
-            resource_kind: "Sandbox".to_string(),
-            profile: "agents".to_string(),
-            ..cluster.clone()
-        };
-        assert_eq!(release_path(&cluster), "/v1/leases/lease-cluster");
-        assert_eq!(release_path(&sandbox), "/v1/sandbox-leases/sandbox-agent");
+    fn purge_releases_on_the_canonical_path_first() {
+        assert_eq!(
+            super::super::lease_request_paths("lease-cluster"),
+            vec!["/v1/leases/lease-cluster"]
+        );
+        assert_eq!(
+            super::super::lease_request_paths("sandbox-agent"),
+            vec![
+                "/v1/leases/sandbox-agent",
+                "/v1/sandbox-leases/sandbox-agent"
+            ]
+        );
     }
 
     #[test]

@@ -93,13 +93,19 @@ pub enum RunnerCallFailure {
 impl RunnerCallFailure {
     /// Bounded reason code for the durable record.
     pub fn reason_code(&self) -> &'static str {
+        self.api_reason().as_str()
+    }
+
+    /// The reason carried in the caller's error body.
+    pub(crate) fn api_reason(&self) -> crate::api::error::ApiErrorReason {
+        use crate::api::error::ApiErrorReason as R;
         match self {
-            Self::Unreachable => "runner_unreachable",
-            Self::Unreadable => "runner_unreadable",
-            Self::Refused(RunnerErrorCode::NotFound) => "runner_forgot_execution",
-            Self::Refused(RunnerErrorCode::Conflict) => "runner_id_conflict",
-            Self::Refused(RunnerErrorCode::InvalidRequest) => "runner_rejected_request",
-            Self::Refused(RunnerErrorCode::Internal) => "runner_internal_error",
+            Self::Unreachable => R::RunnerUnreachable,
+            Self::Unreadable => R::RunnerUnreadable,
+            Self::Refused(RunnerErrorCode::NotFound) => R::RunnerForgotExecution,
+            Self::Refused(RunnerErrorCode::Conflict) => R::RunnerIdConflict,
+            Self::Refused(RunnerErrorCode::InvalidRequest) => R::RunnerRejectedRequest,
+            Self::Refused(RunnerErrorCode::Internal) => R::RunnerInternalError,
         }
     }
 

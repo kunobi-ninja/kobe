@@ -22,6 +22,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use super::auth::AuthIdentity;
+use super::error::{ApiError, ApiErrorReason};
 use super::policy::{clamp_sandbox_ttl, format_duration, is_sandbox_allowed, policy_for};
 use super::routes::AppState;
 use super::sandbox_rate_limit::RateLimitDecision;
@@ -284,9 +285,9 @@ fn execution_denied(
     );
     let status = error.http_status();
     if status == StatusCode::NOT_FOUND {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
-    sandbox_error_with_reason(status, error.to_string(), None, error.reason_code())
+    sandbox_error_with_reason(status, error.to_string(), None, error.api_reason())
 }
 
 /// Reserve and run one durable, idempotent command.
@@ -313,7 +314,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
 
     let (lease, target) =
@@ -752,7 +753,7 @@ async fn run_with_runner<B: ClusterBackend>(
                 failure.http_status(),
                 failure.to_string(),
                 None,
-                failure.reason_code(),
+                failure.api_reason(),
             );
         }
     };
@@ -868,7 +869,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
                 failure.http_status(),
                 failure.to_string(),
                 None,
-                failure.reason_code(),
+                failure.api_reason(),
             );
         }
         None => {
@@ -946,7 +947,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
                 failure.http_status(),
                 failure.to_string(),
                 None,
-                failure.reason_code(),
+                failure.api_reason(),
             );
         }
         Err(WaitRunnerFailure::Revoked(cancelled)) => {
@@ -1070,7 +1071,7 @@ async fn wait_output_response<B: ClusterBackend>(
                 failure.http_status(),
                 failure.to_string(),
                 None,
-                failure.reason_code(),
+                failure.api_reason(),
             );
         }
         None => {
@@ -1325,7 +1326,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
     // Ownership of the LEASE is what authorises reading its executions. An
     // execution name alone must never be enough: they are derived from a caller's
@@ -1445,7 +1446,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
             };
             (StatusCode::OK, Json(execution_response(&record, None))).into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => crate::api::error::execution_not_found(),
         Err(error) => execution_denied(&identity, &id, &error),
     }
 }
@@ -1509,7 +1510,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
 
     let (lease, target) =
@@ -1532,7 +1533,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     .await
     {
         Ok(Some(record)) => record,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return crate::api::error::execution_not_found(),
         Err(error) => return execution_denied(&identity, &id, &error),
     };
 
@@ -1670,7 +1671,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                     failure.http_status(),
                     failure.to_string(),
                     None,
-                    failure.reason_code(),
+                    failure.api_reason(),
                 );
             }
             None => {
@@ -1785,7 +1786,7 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
     let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
@@ -1829,7 +1830,7 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
         Ok(Some(record)) => {
             (StatusCode::OK, Json(execution_response(&record, None))).into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => crate::api::error::execution_not_found(),
         Err(error) => execution_denied(&identity, &id, &error),
     }
 }
@@ -1883,7 +1884,7 @@ async fn cancel_runner<B: ClusterBackend>(
     {
         Ok(Some(record)) => record,
         Ok(None) => {
-            return RunnerCancellation::Handled(StatusCode::NOT_FOUND.into_response());
+            return RunnerCancellation::Handled(crate::api::error::execution_not_found());
         }
         Err(error) => {
             return RunnerCancellation::Handled(execution_denied(identity, id, &error));
@@ -1910,7 +1911,7 @@ async fn cancel_runner<B: ClusterBackend>(
                 identity,
                 id,
                 "execution-cancel",
-                "runner_missing",
+                ApiErrorReason::RunnerMissing,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Runner-supervised execution termination could not be confirmed",
             ));
@@ -1920,7 +1921,7 @@ async fn cancel_runner<B: ClusterBackend>(
                 identity,
                 id,
                 "execution-cancel",
-                "runner_missing",
+                ApiErrorReason::RunnerMissing,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Runner-supervised execution termination could not be confirmed",
             ));
@@ -2048,7 +2049,7 @@ async fn cancel_runner<B: ClusterBackend>(
                 failure.http_status(),
                 failure.to_string(),
                 None,
-                failure.reason_code(),
+                failure.api_reason(),
             ))
         }
     }
@@ -2340,7 +2341,7 @@ fn stream_registration_denied(
             identity,
             id,
             operation,
-            "concurrency_limit",
+            ApiErrorReason::ConcurrencyLimit,
             StatusCode::TOO_MANY_REQUESTS,
             "Too many concurrent Sandbox operations",
         ),
@@ -2348,7 +2349,7 @@ fn stream_registration_denied(
             identity,
             id,
             operation,
-            "lease_ended",
+            ApiErrorReason::LeaseEnded,
             StatusCode::CONFLICT,
             "Sandbox lease stopped permitting access",
         ),
@@ -2356,7 +2357,7 @@ fn stream_registration_denied(
             identity,
             id,
             operation,
-            "backend_error",
+            ApiErrorReason::BackendError,
             StatusCode::SERVICE_UNAVAILABLE,
             "Sandbox lease could not be revalidated",
         ),
@@ -2437,7 +2438,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
 
     require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await?;
     if !is_valid_k8s_name(id) {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(crate::api::error::lease_not_found());
     }
 
     let (lease, target) =
@@ -2773,7 +2774,7 @@ async fn refuse_websocket_on_iroh_pool<B: ClusterBackend>(
                 Some(format!(
                     "POST /v1/sandbox-leases/{id}/session for a dial ticket"
                 )),
-                "iroh_transport",
+                ApiErrorReason::IrohTransport,
             ))
         }
         Ok(_) => Ok(()),
@@ -2857,7 +2858,7 @@ async fn sandbox_session<B: ClusterBackend>(
             StatusCode::CONFLICT,
             "SandboxPool uses direct transport",
             Some("open the WebSocket attach or port-forward URL".into()),
-            "direct_transport",
+            ApiErrorReason::DirectTransport,
         );
     }
     let Some(endpoint) = state.iroh_endpoint.clone() else {
@@ -3046,7 +3047,7 @@ async fn sandbox_exec<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
 
     let (lease, target) =
@@ -3187,7 +3188,7 @@ async fn sandbox_logs<B: ClusterBackend>(
         return response;
     }
     if !is_valid_k8s_name(&id) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
 
     let (lease, target) =
@@ -3300,7 +3301,7 @@ fn access_denied_with(
     identity: &AuthIdentity,
     lease: &str,
     operation: &'static str,
-    reason: &'static str,
+    reason: ApiErrorReason,
     status: StatusCode,
     message: &'static str,
 ) -> Response {
@@ -3309,7 +3310,7 @@ fn access_denied_with(
         lease = %lease,
         operation,
         outcome = "denied",
-        reason,
+        reason = reason.as_str(),
         "Sandbox access"
     );
     sandbox_error_with_reason(status, message, None, reason)
@@ -3331,10 +3332,11 @@ fn access_denied(
     );
     let status = denied.http_status();
     if status == StatusCode::NOT_FOUND {
-        // No body: a message would distinguish "not yours" from "not there".
-        return StatusCode::NOT_FOUND.into_response();
+        // The generic body only: the specific message would distinguish "not
+        // yours" from "not there".
+        return crate::api::error::lease_not_found();
     }
-    sandbox_error_with_reason(status, denied.to_string(), None, denied.reason_code())
+    sandbox_error_with_reason(status, denied.to_string(), None, denied.api_reason())
 }
 
 /// Caller-safe lease intent. Unknown fields are rejected so a caller cannot
@@ -3529,43 +3531,8 @@ pub(crate) struct SandboxLeaseSummary {
     pub iroh: Option<crate::iroh_transport::IrohDial>,
 }
 
-/// Error body for every Sandbox route denial.
-///
-/// `reason` carries the bounded machine-readable code the server already
-/// computed for logs and audit records, so an agent can branch on *why*
-/// without parsing free text — mirroring the cluster API's
-/// `ErrorResponse.reason`. It is omitted where no bounded reason exists; the
-/// closed set served today:
-///
-/// | reason | HTTP | retryable |
-/// |---|---|---|
-/// | `not_found` | 404 | no |
-/// | `not_ready` | 409/503 | yes, once Ready or placed |
-/// | `expired` | 410/409 | no — request a new lease |
-/// | `target_unresolved` | 409 | yes, after placement completes |
-/// | `provenance_incomplete` | 503 | operator attention |
-/// | `pool_unresolvable` | 503 | operator attention |
-/// | `not_declared` | 400 | no |
-/// | `ambiguous_alias` | 409 | no — disambiguate |
-/// | `backend_error` | 503 | yes, transient |
-/// | `extension_budget_exhausted` | 409 | no |
-/// | `max_ttl_ceiling` | 409 | no |
-/// | `expiry_derivation_mismatch` | 409 | no |
-/// | `conflict_retryable` | 409 | yes, against current state |
-/// | `teardown_quarantined` | 409 | no — operator must resolve cleanup |
-/// | `wrong_resource_kind` | 409 | no — this name is a Cluster pool |
-/// | `runner_*` / `execution_*` codes | varies | per their meaning below |
-#[derive(Debug, Serialize)]
-struct SandboxErrorResponse {
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-    /// Bounded machine-readable denial reason. Omitted unless set by a path
-    /// that knows one; never free text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'static str>,
-}
-
+/// Every Sandbox route answers errors with [`ApiError`], the same body the
+/// Cluster routes use; [`ApiErrorReason`] lists the codes.
 /// Stable, non-retry handle returned when this process cannot finish deciding
 /// whether the exact durable lease was admitted or cancelled.
 ///
@@ -3584,15 +3551,12 @@ struct SandboxAdmissionPendingResponse {
 }
 
 fn sandbox_error(status: StatusCode, error: impl Into<String>, detail: Option<String>) -> Response {
-    (
-        status,
-        Json(SandboxErrorResponse {
-            error: error.into(),
-            detail,
-            reason: None,
-        }),
-    )
-        .into_response()
+    ApiError {
+        error: error.into(),
+        detail,
+        reason: None,
+    }
+    .into_response_with(status)
 }
 
 /// [`sandbox_error`] for paths that have computed a bounded denial reason.
@@ -3600,17 +3564,14 @@ fn sandbox_error_with_reason(
     status: StatusCode,
     error: impl Into<String>,
     detail: Option<String>,
-    reason: &'static str,
+    reason: ApiErrorReason,
 ) -> Response {
-    (
-        status,
-        Json(SandboxErrorResponse {
-            error: error.into(),
-            detail,
-            reason: Some(reason),
-        }),
-    )
-        .into_response()
+    ApiError {
+        error: error.into(),
+        detail,
+        reason: Some(reason),
+    }
+    .into_response_with(status)
 }
 
 fn sandbox_infra_error(message: &'static str, err: impl std::fmt::Display) -> Response {
@@ -3794,27 +3755,6 @@ fn pending_sandbox_lease_response(
     }
 }
 
-/// 429 that tells the caller when to come back.
-///
-/// Without `Retry-After` a throttled client has no signal but "no", and the
-/// only strategy left is to poll — which is the load the throttle was raised
-/// against. The value is rounded *up* and floored at one second: advertising a
-/// wait shorter than the real one converts one rejection into two.
-fn sandbox_throttled(error: String, retry_after: std::time::Duration) -> Response {
-    let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
-    let mut response = sandbox_error(
-        StatusCode::TOO_MANY_REQUESTS,
-        error,
-        Some(format!("Retry in {seconds}s")),
-    );
-    if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::RETRY_AFTER, value);
-    }
-    response
-}
-
 #[tracing::instrument(skip_all)]
 pub(crate) async fn create_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -3904,7 +3844,7 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
                     request.pool
                 ),
                 Some("Pool names must be unique across resource kinds".into()),
-                "wrong_resource_kind",
+                ApiErrorReason::WrongResourceKind,
             );
         }
         Ok(
@@ -3951,8 +3891,8 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
             retry_after_secs = retry_after.as_secs_f64(),
             "Sandbox admission throttled for this principal"
         );
-        return sandbox_throttled(
-            "Sandbox admission rate limit reached for this principal".into(),
+        return crate::api::error::rate_limited(
+            "Sandbox admission rate limit reached for this principal",
             retry_after,
         );
     }
@@ -4510,13 +4450,14 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
                     error,
                 );
             }
-            return sandbox_error(
+            return sandbox_error_with_reason(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
                     "Concurrent Sandbox lease limit ({}) reached",
                     grant.max_concurrent_leases
                 ),
                 None,
+                ApiErrorReason::QuotaExhausted,
             );
         }
         Ok(Err(AdmissionReservationError::AliasTaken)) => {
@@ -4534,13 +4475,14 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
                     error,
                 );
             }
-            return sandbox_error(
+            return sandbox_error_with_reason(
                 StatusCode::CONFLICT,
                 format!(
                     "Sandbox lease alias '{}' is already active",
                     request.alias.as_deref().unwrap_or_default()
                 ),
                 None,
+                ApiErrorReason::AliasTaken,
             );
         }
         Ok(Err(err)) => {
@@ -4875,7 +4817,7 @@ pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
     let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
         Ok(Some(lease)) => lease,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return crate::api::error::lease_not_found(),
         Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
     };
     let policy = policy_for(&identity);
@@ -4917,6 +4859,10 @@ pub(crate) struct ExtendSandboxLeaseRequest {
 #[serde(rename_all = "camelCase")]
 struct ExtendSandboxLeaseResponse {
     expires_at: String,
+    /// `expiresAt` again, in the Cluster extend answer's snake_case spelling,
+    /// so `PATCH /v1/leases/{id}` answers `expires_at` for both kinds.
+    #[serde(rename = "expires_at")]
+    expires_at_snake: String,
     extensions_count: u32,
     max_extensions: u32,
     /// Running executions whose deadline stays before the new expiry. An
@@ -4999,7 +4945,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
         Ok(Some(lease)) => lease,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return crate::api::error::lease_not_found(),
         Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
     };
     let policy = policy_for(&identity);
@@ -5024,7 +4970,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
             StatusCode::CONFLICT,
             "Sandbox lease is not Ready",
             Some(format!("current phase: {}", status.phase)),
-            "not_ready",
+            ApiErrorReason::NotReady,
         );
     }
 
@@ -5071,7 +5017,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
             StatusCode::CONFLICT,
             "Sandbox lease has already expired",
             Some("request a new lease instead of extending an elapsed one".into()),
-            "expired",
+            ApiErrorReason::Expired,
         );
     }
     // The ceiling is the LOWER of the caller's grant and the pool's own
@@ -5142,7 +5088,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
             StatusCode::CONFLICT,
             "Sandbox expiry does not match its derivation",
             Some("refusing to extend a lease whose expiry was written out of band".into()),
-            "expiry_derivation_mismatch",
+            ApiErrorReason::ExpiryDerivationMismatch,
         );
     }
 
@@ -5159,7 +5105,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
                 "{} of {} already used",
                 status.extensions_count, grant.max_extensions
             )),
-            "extension_budget_exhausted",
+            ApiErrorReason::ExtensionBudgetExhausted,
         );
     }
 
@@ -5179,10 +5125,10 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     // requested at creation - which is what made reusing the `lease` verb
     // defensible in the first place.
     let (ceiling, reason) = match max_idle {
-        Some(idle) => (chrono::Utc::now() + idle, "max_idle_ceiling"),
+        Some(idle) => (chrono::Utc::now() + idle, ApiErrorReason::MaxIdleCeiling),
         None => (
             ready_at + grant.max_ttl.min(pool_max_ttl),
-            "max_ttl_ceiling",
+            ApiErrorReason::MaxTtlCeiling,
         ),
     };
     if new_expiry > ceiling {
@@ -5237,7 +5183,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
                 StatusCode::CONFLICT,
                 "Sandbox lease changed during extension",
                 Some("retry the extension against the current lease".into()),
-                "conflict_retryable",
+                ApiErrorReason::ConflictRetryable,
             );
         }
         return sandbox_infra_error("Failed to extend Sandbox lease", err);
@@ -5254,6 +5200,7 @@ pub(crate) async fn extend_sandbox_lease<B: ClusterBackend>(
     (
         StatusCode::OK,
         Json(ExtendSandboxLeaseResponse {
+            expires_at_snake: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             expires_at: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             extensions_count: next_count,
             max_extensions: grant.max_extensions,
@@ -5303,7 +5250,7 @@ pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
         attempt += 1;
         let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
             Ok(Some(lease)) => lease,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => return crate::api::error::lease_not_found(),
             Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
         };
         let policy = policy_for(&identity);
@@ -5328,7 +5275,7 @@ pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
                 StatusCode::CONFLICT,
                 "Sandbox cleanup is quarantined",
                 Some("Cleanup remains uncertain; capacity has not been released".into()),
-                "teardown_quarantined",
+                ApiErrorReason::TeardownQuarantined,
             );
         }
         if matches!(
@@ -5447,7 +5394,7 @@ pub(crate) async fn release_sandbox_lease<B: ClusterBackend>(
                         StatusCode::CONFLICT,
                         "Sandbox lease changed during release",
                         Some("retry the release against the current lease".into()),
-                        "conflict_retryable",
+                        ApiErrorReason::ConflictRetryable,
                     );
                 }
                 info!(
@@ -8425,6 +8372,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -9912,6 +9860,11 @@ mod tests {
                     .is_none(),
                 "attempt {index} is within the burst and must reach the ledger, not the throttle"
             );
+            assert_eq!(
+                response_json(response).await["reason"],
+                "quota_exhausted",
+                "attempt {index}: a quota refusal names itself so clients do not retry it"
+            );
         }
 
         let throttled = attempt().await;
@@ -9923,6 +9876,7 @@ mod tests {
                 .is_some(),
             "the throttled attempt must tell the caller when to come back"
         );
+        assert_eq!(response_json(throttled).await["reason"], "rate_limited");
 
         let creates = server
             .received_requests()
@@ -10169,6 +10123,69 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert!(body.get("runningExecutions").is_none());
+        assert_eq!(
+            body["expires_at"], body["expiresAt"],
+            "PATCH /v1/leases/{{id}} answers `expires_at` for both lease kinds"
+        );
+    }
+
+    /// `GET /v1/leases/<alias>` reaches the Sandbox lease, the same lease
+    /// `/v1/leases/<alias>/exec` already resolves.
+    #[tokio::test]
+    async fn canonical_get_resolves_a_sandbox_alias() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let mut lease = lease_json("sandbox-aliased", "alice@example.com", "Ready");
+        lease["spec"]["alias"] = serde_json::json!("dev");
+        lease["metadata"]["labels"][SANDBOX_ALIAS_LABEL] = serde_json::json!("dev");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/dev",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "not found", "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(vec![lease.clone()])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-aliased",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .mount(&server)
+            .await;
+
+        let response = crate::api::routes::get_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path("dev".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "sandbox-aliased");
+        assert_eq!(body["resourceKind"], "Sandbox");
     }
 
     #[tokio::test]
@@ -14262,6 +14279,11 @@ mod tests {
         )
         .await;
         assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(get_response).await,
+            serde_json::json!({ "error": "Lease not found", "reason": "not_found" }),
+            "a 404 carries the one generic body, whoever owns the lease"
+        );
 
         let release_response = release_sandbox_lease::<crate::testutil::MockBackend>(
             State(test_state(&server)),

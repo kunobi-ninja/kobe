@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cluster_admission;
 pub mod connect;
+pub(crate) mod error;
 pub mod policy;
 pub mod routes;
 pub mod sandbox;

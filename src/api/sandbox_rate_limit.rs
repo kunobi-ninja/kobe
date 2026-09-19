@@ -1,4 +1,11 @@
-//! Per-principal rate limiting for the Sandbox admission path.
+//! Per-principal rate limiting for lease admission.
+//!
+//! Sandbox and Cluster lease creation each hold one [`AdmissionRateLimiter`]
+//! in `AppState`. The reasoning below was written for Sandbox admission, whose
+//! refused attempts are the most expensive, and holds for Cluster admission
+//! too: a refused Cluster create still reads the pool, takes the principal's
+//! admission lock and lists their leases. A throttled attempt of either kind
+//! answers `429` with `reason: rate_limited` and `Retry-After`.
 //!
 //! ## Why this is not the concurrency limit
 //!

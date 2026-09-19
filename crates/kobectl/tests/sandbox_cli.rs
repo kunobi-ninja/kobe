@@ -336,7 +336,10 @@ fn run_server(
         } else if request.method == "POST" && request.path.ends_with("/executions") {
             current.executions += 1;
             reply(stream, 200, &[], &execution_body(&state, exit_code));
-        } else if request.method == "DELETE" && request.path.starts_with("/v1/sandbox-leases/") {
+        } else if request.method == "DELETE"
+            && (request.path.starts_with("/v1/sandbox-leases/")
+                || request.path.starts_with("/v1/leases/sandbox-"))
+        {
             current.deleted = true;
             reply(stream, release_status, &[], "");
         } else {
@@ -531,7 +534,7 @@ fn flat_release_resolves_a_sandbox_alias_before_dispatch() {
                 }])
                 .to_string(),
             ),
-            ("DELETE", "/v1/sandbox-leases/sandbox-test") => reply(stream, 204, &[], ""),
+            ("DELETE", "/v1/leases/sandbox-test") => reply(stream, 204, &[], ""),
             _ => panic!("release must resolve the alias before dispatch: {request:?}"),
         }
     });
@@ -667,7 +670,7 @@ fn flat_extend_and_purge_route_both_resource_kinds() {
     let extend_server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/leases") => reply(stream, 200, &[], &sandbox_inventory()),
-            ("PATCH", "/v1/sandbox-leases/sandbox-test") => reply(
+            ("PATCH", "/v1/leases/sandbox-test") => reply(
                 stream,
                 200,
                 &[],
@@ -696,8 +699,7 @@ fn flat_extend_and_purge_route_both_resource_kinds() {
     let purge_server = Server::start(move |request, stream| {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/leases") => reply(stream, 200, &[], &mixed_inventory("ci")),
-            ("DELETE", "/v1/leases/lease-cluster")
-            | ("DELETE", "/v1/sandbox-leases/sandbox-test") => {
+            ("DELETE", "/v1/leases/lease-cluster") | ("DELETE", "/v1/leases/sandbox-test") => {
                 observed.lock().unwrap().push(request.path);
                 reply(stream, 204, &[], "");
             }
@@ -714,7 +716,7 @@ fn flat_extend_and_purge_route_both_resource_kinds() {
     assert_eq!(purged["releasedLeases"].as_array().unwrap().len(), 2);
     let deleted = deleted.lock().unwrap();
     assert!(deleted.contains(&"/v1/leases/lease-cluster".to_string()));
-    assert!(deleted.contains(&"/v1/sandbox-leases/sandbox-test".to_string()));
+    assert!(deleted.contains(&"/v1/leases/sandbox-test".to_string()));
 }
 
 #[test]

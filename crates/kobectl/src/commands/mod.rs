@@ -617,6 +617,55 @@ pub(crate) fn with_auth(
     }
 }
 
+/// Paths one lease operation is tried on, in order.
+///
+/// `/v1/leases/{id}` serves both kinds since server v0.41.0. A server before
+/// that routes it to Cluster leases only and answers a Sandbox id with 404, so
+/// a Sandbox id keeps `/v1/sandbox-leases/{id}` as a fallback.
+pub(crate) fn lease_request_paths(lease_id: &str) -> Vec<String> {
+    let mut paths = vec![format!("/v1/leases/{lease_id}")];
+    if extend::is_sandbox_lease(lease_id) {
+        paths.push(format!("/v1/sandbox-leases/{lease_id}"));
+    }
+    paths
+}
+
+/// Send `method` for one lease on its canonical path, falling back as
+/// [`lease_request_paths`] describes when the server answers 404.
+///
+/// Each attempt is signed for its own path. A JSON `body`, when given, is sent
+/// with every attempt.
+pub(crate) async fn send_lease_request(
+    config: &ResolvedConfig,
+    method: reqwest::Method,
+    lease_id: &str,
+    body: Option<&[u8]>,
+) -> anyhow::Result<reqwest::Response> {
+    let paths = lease_request_paths(lease_id);
+    let client = authed_client();
+    let mut attempts = paths.iter().peekable();
+    loop {
+        let path = attempts.next().expect("at least one lease path");
+        // Body signing is not yet supported server-side; sign with an empty
+        // body (matches `lease_create`).
+        let token = get_auth_header(config, method.as_str(), path, b"").await?;
+        let mut request = with_auth(
+            client.request(method.clone(), format!("{}{path}", config.endpoint)),
+            &token,
+        );
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_vec());
+        }
+        let response = request.send().await.reaching(config)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && attempts.peek().is_some() {
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
 /// The auth method types a `/v1/status` body advertises, in order and without
 /// repeats. `None` when the body has no method list at all.
 ///

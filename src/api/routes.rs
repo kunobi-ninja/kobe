@@ -22,6 +22,7 @@ use crate::api::connect::{
     BackendAccess, backend_access_from_kubeconfig, build_backend_tls_config,
     build_connect_kubeconfig, ensure_lease_connect_token, validate_lease_connect_token,
 };
+use crate::api::error::{ApiError, ApiErrorReason};
 use crate::api::policy::{self, format_duration, is_pool_allowed, is_sandbox_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
@@ -75,6 +76,9 @@ pub struct AppState<B: ClusterBackend> {
     /// nothing; see [`crate::api::sandbox_rate_limit`] for why it is charged
     /// per attempt rather than per admitted lease.
     pub sandbox_admission_limiter: crate::api::sandbox_rate_limit::AdmissionRateLimiter,
+    /// The same per-principal budget for Cluster lease creation. A separate
+    /// instance so a burst of one kind does not spend the other's budget.
+    pub cluster_admission_limiter: crate::api::sandbox_rate_limit::AdmissionRateLimiter,
     /// Process-wide shutdown signal. Admission resolution selects on this so
     /// an ambiguous Kubernetes response cannot hold Axum graceful shutdown
     /// open indefinitely. The durable SandboxLease remains the handoff to the
@@ -353,14 +357,14 @@ async fn concurrency_limit(
     let _permit = match sem.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
-            // Retry-After marks this 429 as transient. The lease-quota 429
-            // carries none, and clients use that to tell the two apart.
+            // Retry-After and `server_busy` mark this 429 as transient. The
+            // lease-quota 429 carries `quota_exhausted` and no Retry-After.
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: "Server is under heavy load".to_string(),
                     detail: Some("Too many concurrent requests, please retry".to_string()),
-                    reason: None,
+                    reason: Some(ApiErrorReason::ServerBusy),
                 }),
             )
                 .into_response();
@@ -456,7 +460,7 @@ pub(crate) struct CreateLeaseRequest {
 }
 
 impl CreateLeaseRequest {
-    fn pool_name(&self) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    fn pool_name(&self) -> Result<String, (StatusCode, Json<ApiError>)> {
         let profile = self
             .profile
             .as_deref()
@@ -470,19 +474,19 @@ impl CreateLeaseRequest {
         match (profile, pool) {
             (Some(profile), Some(pool)) if profile != pool => Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: "profile and pool must name the same pool".to_string(),
                     detail: None,
-                    reason: None,
+                    reason: Some(ApiErrorReason::InvalidRequest),
                 }),
             )),
             (Some(name), _) | (_, Some(name)) => Ok(name.to_string()),
             (None, None) => Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: "Pool name is required".to_string(),
                     detail: Some("Provide `profile` or `pool`".to_string()),
-                    reason: None,
+                    reason: Some(ApiErrorReason::InvalidRequest),
                 }),
             )),
         }
@@ -652,9 +656,16 @@ struct ExtendLeaseRequest {
     extend_ttl: String,
 }
 
+/// Cluster extend answer.
+///
+/// `expires_at` is this endpoint's historical spelling. `expiresAt` carries the
+/// same value so one client parses both kinds: the Sandbox extend answer, which
+/// `PATCH /v1/leases/{sandbox-id}` returns, is camelCase and carries both too.
 #[derive(Serialize)]
 struct ExtendLeaseResponse {
     expires_at: String,
+    #[serde(rename = "expiresAt")]
+    expires_at_camel: String,
 }
 
 #[derive(Serialize)]
@@ -689,54 +700,6 @@ struct ProfileResponse {
     quarantined: u32,
     queue_depth: u32,
     policy: PoolPolicyResponse,
-}
-
-/// Bounded, machine-readable reason for a lease-creation rejection (#189), so a
-/// client can branch on *why* without parsing the human `error` string. Only
-/// the lease pre-flight path sets it today; everything else leaves it None.
-#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-enum ErrorReason {
-    /// Pool phase is `Failing` — it will not satisfy the lease without
-    /// operator attention.
-    PoolExhausted,
-    /// Pool is in a backoff window with no schedulable headroom.
-    CapacityBlocked,
-    /// Pool is otherwise degraded.
-    Degraded,
-    /// Healthy-but-empty warm pool: still coming up. (Carried on a 202, not a
-    /// 503 — the lease is expected to bind shortly.)
-    Warming,
-    /// Release was refused because verified teardown remains quarantined.
-    TeardownQuarantined,
-    /// The pool name exists as the other resource kind (Cluster vs Sandbox).
-    WrongResourceKind,
-    /// Another create for the same caller held the admission lock for the
-    /// whole wait budget. Nothing was created; retry after `Retry-After`.
-    AdmissionBusy,
-}
-
-impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
-    fn from(r: crate::metrics::LeaseUnsatisfiableReason) -> Self {
-        use crate::metrics::LeaseUnsatisfiableReason as R;
-        match r {
-            R::PoolExhausted => Self::PoolExhausted,
-            R::CapacityBlocked => Self::CapacityBlocked,
-            R::Degraded => Self::Degraded,
-            R::Warming => Self::Warming,
-        }
-    }
-}
-
-#[derive(Serialize, Default)]
-struct ErrorResponse {
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-    /// Bounded machine-readable reason (#189). Omitted unless set by the lease
-    /// pre-flight path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<ErrorReason>,
 }
 
 fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
@@ -962,7 +925,7 @@ fn infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -
     warn!(error = %err, "{message}");
     (
         status,
-        Json(ErrorResponse {
+        Json(ApiError {
             error: message.to_string(),
             detail: None,
             reason: None,
@@ -1025,7 +988,7 @@ fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Respons
         "Rejecting lease create: pool cannot satisfy it ({message})"
     );
 
-    let body = Json(ErrorResponse {
+    let body = Json(ApiError {
         error: "Pool cannot satisfy a new lease".to_string(),
         detail: Some(message),
         reason: Some(reason.into()),
@@ -1312,13 +1275,13 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     if !is_valid_k8s_name(&profile) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Invalid profile name".to_string(),
                 detail: Some(
                     "Profile name must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
                         .to_string(),
                 ),
-                reason: None,
+                reason: Some(ApiErrorReason::InvalidRequest),
             }),
         )
             .into_response();
@@ -1329,10 +1292,10 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Invalid lease metadata".to_string(),
                 detail: Some(detail),
-                reason: None,
+                reason: Some(ApiErrorReason::InvalidRequest),
             }),
         )
             .into_response();
@@ -1352,12 +1315,12 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         Ok(CreatePoolKind::Ambiguous) => {
             return (
                 StatusCode::CONFLICT,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: format!(
                         "Pool name '{profile}' is ambiguous across Cluster and Sandbox resources"
                     ),
                     detail: Some("Pool names must be unique across resource kinds".to_string()),
-                    reason: Some(ErrorReason::WrongResourceKind),
+                    reason: Some(ApiErrorReason::WrongResourceKind),
                 }),
             )
                 .into_response();
@@ -1365,10 +1328,10 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         Ok(CreatePoolKind::Missing) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: format!("Pool '{profile}' not found"),
                     detail: None,
-                    reason: None,
+                    reason: Some(ApiErrorReason::NotFound),
                 }),
             )
                 .into_response();
@@ -1377,10 +1340,10 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
             if req.metadata.is_some() {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
+                    Json(ApiError {
                         error: "Sandbox leases do not accept metadata".to_string(),
                         detail: None,
-                        reason: None,
+                        reason: Some(ApiErrorReason::InvalidRequest),
                     }),
                 )
                     .into_response();
@@ -1405,7 +1368,7 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     if !is_pool_allowed(&profile, &policy) {
         return (
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: format!("Profile '{profile}' not allowed for your identity type"),
                 detail: None,
                 reason: None,
@@ -1422,13 +1385,13 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Invalid lease alias".to_string(),
                 detail: Some(
                     "Alias must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
                         .to_string(),
                 ),
-                reason: None,
+                reason: Some(ApiErrorReason::InvalidRequest),
             }),
         )
             .into_response();
@@ -1440,13 +1403,13 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: "Invalid TTL format".to_string(),
                     detail: Some(format!(
                         "Could not parse '{}'. Use format like '30m', '1h', '2h30m'",
                         ttl_str
                     )),
-                    reason: None,
+                    reason: Some(ApiErrorReason::InvalidRequest),
                 }),
             )
                 .into_response();
@@ -1461,12 +1424,12 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
     if effective_ttl.num_seconds() <= 0 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "TTL too short".to_string(),
                 detail: Some(format!(
                     "Requested TTL '{ttl_str}' resolves to a zero-length lease; request at least 1 second"
                 )),
-                reason: None,
+                reason: Some(ApiErrorReason::InvalidRequest),
             }),
         )
             .into_response();
@@ -1479,15 +1442,35 @@ pub(crate) async fn create_lease<B: ClusterBackend>(
         Err(detail) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
+                Json(ApiError {
                     error: "Invalid lease create idempotency key".to_string(),
                     detail: Some(detail.to_string()),
-                    reason: None,
+                    reason: Some(ApiErrorReason::InvalidRequest),
                 }),
             )
                 .into_response();
         }
     };
+
+    // Charged per attempt, before the pool read, the admission lock and the
+    // lease LIST, exactly like Sandbox admission: a caller at their quota
+    // cannot retry for free, because each refused attempt still costs those. A keyed retry after a lost
+    // response pays too; it gets its lease back once `Retry-After` elapses.
+    // See `crate::api::sandbox_rate_limit`.
+    if let crate::api::sandbox_rate_limit::RateLimitDecision::Throttled { retry_after } = state
+        .cluster_admission_limiter
+        .charge(&cluster_principal_hash(&identity))
+    {
+        warn!(
+            identity = %identity.identity,
+            retry_after_secs = retry_after.as_secs_f64(),
+            "Cluster admission throttled for this principal"
+        );
+        return crate::api::error::rate_limited(
+            "Cluster admission rate limit reached for this principal",
+            retry_after,
+        );
+    }
 
     // #189 pre-flight: GET the target pool and refuse up-front when it cannot
     // satisfy the lease, instead of creating a ClusterLease that only gives up
@@ -1766,29 +1749,25 @@ async fn list_leases<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn get_lease<B: ClusterBackend>(
+pub(crate) async fn get_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
-        return crate::api::sandbox::get_sandbox_lease(State(state), identity, Path(id)).await;
-    }
+    let id = match resolve_lease_target(&state, &identity, &id).await {
+        Ok(LeaseTarget::Sandbox(id)) => {
+            return crate::api::sandbox::get_sandbox_lease(State(state), identity, Path(id)).await;
+        }
+        Ok(LeaseTarget::Cluster(id)) => id,
+        Err(response) => return response,
+    };
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match leases_api.get(&id).await {
         Ok(lease) => {
             if !owns_cluster_lease(&lease.spec.requester, &identity) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: "Lease not found".to_string(),
-                        detail: None,
-                        reason: None,
-                    }),
-                )
-                    .into_response();
+                return crate::api::error::lease_not_found();
             }
 
             let mut status = lease.status.clone().unwrap_or_default();
@@ -1851,14 +1830,14 @@ async fn get_lease<B: ClusterBackend>(
                             // trip availability alerting and retry loops).
                             return (
                                 StatusCode::BAD_REQUEST,
-                                Json(ErrorResponse {
+                                Json(ApiError {
                                     error: "Failed to determine public connect endpoint"
                                         .to_string(),
                                     detail: Some(
                                         "The request did not include a usable Host header"
                                             .to_string(),
                                     ),
-                                    reason: None,
+                                    reason: Some(ApiErrorReason::InvalidRequest),
                                 }),
                             )
                                 .into_response();
@@ -1900,15 +1879,7 @@ async fn get_lease<B: ClusterBackend>(
             )
                 .into_response()
         }
-        Err(kube::Error::Api(ref ae)) if ae.code == 404 => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Lease not found".to_string(),
-                detail: None,
-                reason: None,
-            }),
-        )
-            .into_response(),
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => crate::api::error::lease_not_found(),
         Err(e) => infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e),
     }
 }
@@ -2576,15 +2547,20 @@ async fn release_lease<B: ClusterBackend>(
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
-    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
-        return crate::api::sandbox::release_sandbox_lease(State(state), identity, Path(id)).await;
-    }
+    let id = match resolve_lease_target(&state, &identity, &id).await {
+        Ok(LeaseTarget::Sandbox(id)) => {
+            return crate::api::sandbox::release_sandbox_lease(State(state), identity, Path(id))
+                .await;
+        }
+        Ok(LeaseTarget::Cluster(id)) => id,
+        Err(response) => return response,
+    };
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     let lease = match leases_api.get(&id).await {
         Ok(c) => c,
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
-            return StatusCode::NOT_FOUND.into_response();
+            return crate::api::error::lease_not_found();
         }
         Err(e) => {
             return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
@@ -2592,7 +2568,7 @@ async fn release_lease<B: ClusterBackend>(
     };
 
     if !owns_cluster_lease(&lease.spec.requester, &identity) {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     }
 
     let status = lease.status.clone().unwrap_or_default();
@@ -2600,13 +2576,13 @@ async fn release_lease<B: ClusterBackend>(
     if status.phase == LeasePhase::Quarantined {
         return (
             StatusCode::CONFLICT,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Lease is quarantined".to_string(),
                 detail: Some(
                     "Verified teardown evidence is incomplete; release cannot downgrade it"
                         .to_string(),
                 ),
-                reason: Some(ErrorReason::TeardownQuarantined),
+                reason: Some(ApiErrorReason::TeardownQuarantined),
             }),
         )
             .into_response();
@@ -2624,7 +2600,7 @@ async fn release_lease<B: ClusterBackend>(
     // another requester; a merge patch would release theirs. The `test` ops
     // make the API server reject that instead.
     let (Some(uid), Some(rv)) = (lease.metadata.uid.as_deref(), lease.resource_version()) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return crate::api::error::lease_not_found();
     };
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
@@ -2639,7 +2615,7 @@ async fn release_lease<B: ClusterBackend>(
         // A failed precondition means the object we authorized is no longer the
         // object on the server. Report it as gone rather than retrying blindly.
         if crate::controllers::lease::optimistic_conflict(&e) {
-            return StatusCode::NOT_FOUND.into_response();
+            return crate::api::error::lease_not_found();
         }
         return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2689,55 +2665,48 @@ async fn extend_lease<B: ClusterBackend>(
     Path(id): Path<String>,
     Json(req): Json<ExtendLeaseRequest>,
 ) -> Response {
-    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(&id) {
-        return crate::api::sandbox::extend_sandbox_lease(
-            State(state),
-            identity,
-            Path(id),
-            Json(crate::api::sandbox::ExtendSandboxLeaseRequest {
-                extend_ttl: req.extend_ttl,
-            }),
-        )
-        .await;
-    }
+    let id = match resolve_lease_target(&state, &identity, &id).await {
+        Ok(LeaseTarget::Sandbox(id)) => {
+            return crate::api::sandbox::extend_sandbox_lease(
+                State(state),
+                identity,
+                Path(id),
+                Json(crate::api::sandbox::ExtendSandboxLeaseRequest {
+                    extend_ttl: req.extend_ttl,
+                }),
+            )
+            .await;
+        }
+        Ok(LeaseTarget::Cluster(id)) => id,
+        Err(response) => return response,
+    };
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
     // Carry the UID of the object we authorized into the mutation, so the
     // extend cannot land on a same-named lease created after this check.
-    let authorized_uid = match leases_api.get(&id).await {
-        Ok(lease) => {
-            if !owns_cluster_lease(&lease.spec.requester, &identity) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: "Lease not found".to_string(),
-                        detail: None,
-                        reason: None,
-                    }),
-                )
-                    .into_response();
-            }
-            match lease.metadata.uid.clone() {
-                Some(uid) => uid,
-                None => {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-            }
-        }
+    let lease = match leases_api.get(&id).await {
+        Ok(lease) if owns_cluster_lease(&lease.spec.requester, &identity) => lease,
+        Ok(_) => return crate::api::error::lease_not_found(),
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "Lease not found".to_string(),
-                    detail: None,
-                    reason: None,
-                }),
-            )
-                .into_response();
+            return crate::api::error::lease_not_found();
         }
         Err(e) => {
             return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
     };
+    let Some(authorized_uid) = lease.metadata.uid.clone() else {
+        return crate::api::error::lease_not_found();
+    };
+
+    let max_ttl = state
+        .authenticator
+        .policy_for_requester_type(&lease.spec.requester.requester_type)
+        .await
+        .map(|policy| policy.max_ttl);
+    if let Some((status, error)) =
+        cluster_extend_refusal(&lease, &req.extend_ttl, max_ttl, chrono::Utc::now())
+    {
+        return error.into_response_with(status);
+    }
 
     match extend_lease_ttl(
         &state.client,
@@ -2752,24 +2721,202 @@ async fn extend_lease<B: ClusterBackend>(
         Ok(new_expiry) => (
             StatusCode::OK,
             Json(ExtendLeaseResponse {
+                expires_at_camel: new_expiry.clone(),
                 expires_at: new_expiry,
             }),
         )
             .into_response(),
-        Err(crate::controllers::lease::LeaseError::Lifecycle(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: e.to_string(),
-                detail: None,
-                reason: None,
-            }),
-        )
-            .into_response(),
+        // `cluster_extend_refusal` already answered every refusal the lease we
+        // read could produce. One that still reaches the controller means the
+        // lease changed between the two reads, so the caller should re-read
+        // and decide again.
+        Err(crate::controllers::lease::LeaseError::Lifecycle(e)) => ApiError::new(e.to_string())
+            .reason(ApiErrorReason::ConflictRetryable)
+            .into_response_with(StatusCode::CONFLICT),
+        // A failed `test` op: another extend or a phase change won the write.
+        Err(crate::controllers::lease::LeaseError::Kube(e))
+            if crate::controllers::lease::optimistic_conflict(&e) =>
+        {
+            ApiError::new("Lease changed while extending; nothing was applied")
+                .detail("Read the lease again and retry against its current state")
+                .reason(ApiErrorReason::ConflictRetryable)
+                .into_response_with(StatusCode::CONFLICT)
+        }
         Err(crate::controllers::lease::LeaseError::Kube(e)) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to extend lease",
             e,
         ),
+    }
+}
+
+/// Why a Cluster extend must be refused, decided from the lease the handler
+/// already read.
+///
+/// Mirrors the checks in [`extend_lease_ttl`] so each refusal gets its own
+/// status and [`ApiErrorReason`], matching the Sandbox extend endpoint:
+/// `409 not_ready`, `409 extension_budget_exhausted`, `409 max_ttl_ceiling`,
+/// `409 policy_unresolvable` and `400 invalid_request`. `max_ttl` is `None`
+/// when no policy resolves the lease's requester type.
+fn cluster_extend_refusal(
+    lease: &ClusterLease,
+    extend_by: &str,
+    max_ttl: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(StatusCode, ApiError)> {
+    let status = lease.status.clone().unwrap_or_default();
+    let refuse = |code: StatusCode, reason: ApiErrorReason, error: String| {
+        Some((code, ApiError::new(error).reason(reason)))
+    };
+    if status.phase != LeasePhase::Bound {
+        return refuse(
+            StatusCode::CONFLICT,
+            ApiErrorReason::NotReady,
+            format!(
+                "Cannot extend TTL: lease is not in Bound phase (current: {})",
+                status.phase
+            ),
+        );
+    }
+    if status.extensions_count >= status.max_extensions {
+        return refuse(
+            StatusCode::CONFLICT,
+            ApiErrorReason::ExtensionBudgetExhausted,
+            format!("Maximum extensions ({}) reached", status.max_extensions),
+        );
+    }
+    let Some(extension) = parse_duration(extend_by) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            ApiErrorReason::InvalidRequest,
+            format!("Invalid duration: {extend_by}"),
+        );
+    };
+    let Some(max_ttl) = max_ttl else {
+        return refuse(
+            StatusCode::CONFLICT,
+            ApiErrorReason::PolicyUnresolvable,
+            "Cannot extend TTL: no policy resolves this lease's requester type".to_string(),
+        );
+    };
+    let parse = |value: Option<&String>| {
+        value
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    };
+    // Same fallbacks as `extend_lease_ttl`: a missing expiry counts from now,
+    // and a missing `bound_at` is left for the controller to refuse.
+    let new_expiry = parse(status.expires_at.as_ref()).unwrap_or(now) + extension;
+    if let Some(bound_at) = parse(status.bound_at.as_ref()) {
+        let max_expiry = bound_at + max_ttl;
+        if new_expiry > max_expiry {
+            return Some((
+                StatusCode::CONFLICT,
+                ApiError::new(format!(
+                    "Extension would exceed maximum TTL ({})",
+                    format_duration(&max_ttl)
+                ))
+                .detail(format!("maximum expiry is {}", max_expiry.to_rfc3339()))
+                .reason(ApiErrorReason::MaxTtlCeiling),
+            ));
+        }
+    }
+    None
+}
+
+/// What a `/v1/leases/{id}` path segment names for this caller.
+enum LeaseTarget {
+    Cluster(String),
+    Sandbox(String),
+}
+
+/// Whether `value` has the shape of a server-minted Cluster lease id:
+/// `lease-` followed by 12 lowercase hex digits (see [`create_lease`]).
+fn looks_like_cluster_lease_id(value: &str) -> bool {
+    value.strip_prefix("lease-").is_some_and(|rest| {
+        rest.len() == 12
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Resolve the `{id}` of `GET`, `PATCH` and `DELETE /v1/leases/{id}` to one
+/// lease of either kind.
+///
+/// Server-minted ids of both kinds are taken as-is, so the common path costs
+/// nothing extra. Any other value is first tried as a Cluster lease name the
+/// caller owns, then as an alias of one of the caller's live leases of either
+/// kind. This is the same alias rule the `/v1/leases/{id}/exec` family uses,
+/// so a name that works for one operation works for all of them.
+///
+/// Aliases are scoped to the caller. An alias that matches nothing is a 404
+/// with the same body as an unknown id; one that matches a live lease of each
+/// kind is a `409 ambiguous_alias`, never a guess.
+async fn resolve_lease_target<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+) -> Result<LeaseTarget, Response> {
+    if state.sandbox_enabled && crate::api::sandbox_access::looks_like_lease_id(id) {
+        return Ok(LeaseTarget::Sandbox(id.to_string()));
+    }
+    if looks_like_cluster_lease_id(id) || !is_valid_k8s_name(id) {
+        return Ok(LeaseTarget::Cluster(id.to_string()));
+    }
+
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    match leases_api.get_opt(id).await {
+        Ok(Some(lease)) if owns_cluster_lease(&lease.spec.requester, identity) => {
+            return Ok(LeaseTarget::Cluster(id.to_string()));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get lease",
+                e,
+            ));
+        }
+    }
+
+    let mut matches: Vec<LeaseTarget> = match list_owned_leases(&leases_api, identity).await {
+        Ok(owned) => owned
+            .iter()
+            .filter(|lease| lease_is_active(lease) && lease_alias(lease).as_deref() == Some(id))
+            .map(|lease| LeaseTarget::Cluster(lease.name_any()))
+            .collect(),
+        Err(e) => {
+            return Err(infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve lease alias",
+                e,
+            ));
+        }
+    };
+    if state.sandbox_enabled {
+        match crate::api::sandbox::leases_with_alias(&state.client, &state.namespace, id, identity)
+            .await
+        {
+            Ok(names) => matches.extend(names.into_iter().map(LeaseTarget::Sandbox)),
+            Err(e) => {
+                return Err(infra_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to resolve lease alias",
+                    e,
+                ));
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(crate::api::error::lease_not_found()),
+        1 => Ok(matches.pop().expect("length checked")),
+        _ => Err(ApiError::new(format!(
+            "Alias '{id}' matches more than one of your active leases"
+        ))
+        .detail("Address the lease by its id")
+        .reason(ApiErrorReason::AmbiguousAlias)
+        .into_response_with(StatusCode::CONFLICT)),
     }
 }
 
@@ -2782,10 +2929,10 @@ async fn get_diagnostics<B: ClusterBackend>(
     if crate::api::sandbox_access::looks_like_lease_id(&id) {
         return (
             StatusCode::CONFLICT,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Diagnostics are a Cluster lease capability".to_string(),
                 detail: Some("This id is a Sandbox lease".to_string()),
-                reason: Some(ErrorReason::WrongResourceKind),
+                reason: Some(ApiErrorReason::WrongResourceKind),
             }),
         )
             .into_response();
@@ -2795,7 +2942,7 @@ async fn get_diagnostics<B: ClusterBackend>(
     match leases_api.get(&id).await {
         Ok(lease) => {
             if !owns_cluster_lease(&lease.spec.requester, &identity) {
-                return StatusCode::NOT_FOUND.into_response();
+                return crate::api::error::lease_not_found();
             }
 
             let status = lease.status.unwrap_or_default();
@@ -2819,16 +2966,16 @@ async fn get_diagnostics<B: ClusterBackend>(
                 };
                 (
                     StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
+                    Json(ApiError {
                         error: message.to_string(),
                         detail: None,
-                        reason: None,
+                        reason: Some(ApiErrorReason::NotFound),
                     }),
                 )
                     .into_response()
             }
         }
-        Err(kube::Error::Api(ref ae)) if ae.code == 404 => StatusCode::NOT_FOUND.into_response(),
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => crate::api::error::lease_not_found(),
         Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to look up lease",
@@ -2932,12 +3079,12 @@ async fn get_pool<B: ClusterBackend>(
     match (cluster_allowed, sandbox_allowed) {
         (Some(_), Some(_)) => (
             StatusCode::CONFLICT,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: format!(
                     "Pool name '{name}' is ambiguous across Cluster and Sandbox resources"
                 ),
                 detail: Some("Pool names must be unique across resource kinds".to_string()),
-                reason: None,
+                reason: Some(ApiErrorReason::WrongResourceKind),
             }),
         )
             .into_response(),
@@ -2952,10 +3099,10 @@ async fn get_pool<B: ClusterBackend>(
         }
         (None, None) => (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
+            Json(ApiError {
                 error: "Pool not found".to_string(),
                 detail: None,
-                reason: None,
+                reason: Some(ApiErrorReason::NotFound),
             }),
         )
             .into_response(),
@@ -3668,12 +3815,12 @@ async fn admit_cluster_lease(
             return Err(Box::new(
                 (
                     StatusCode::CONFLICT,
-                    Json(ErrorResponse {
+                    Json(ApiError {
                         error:
                             "Lease create idempotency key is already bound to a different request"
                                 .to_string(),
                         detail: None,
-                        reason: None,
+                        reason: Some(ApiErrorReason::IdempotencyConflict),
                     }),
                 )
                     .into_response(),
@@ -3683,13 +3830,13 @@ async fn admit_cluster_lease(
             return Err(Box::new(
                 (
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(ErrorResponse {
+                    Json(ApiError {
                         error: format!(
                             "Concurrent lease limit ({}) reached",
                             policy.max_concurrent_leases
                         ),
                         detail: Some(format!("You have {active} active leases")),
-                        reason: None,
+                        reason: Some(ApiErrorReason::QuotaExhausted),
                     }),
                 )
                     .into_response(),
@@ -3700,12 +3847,12 @@ async fn admit_cluster_lease(
             return Err(Box::new(
                 (
                     StatusCode::CONFLICT,
-                    Json(ErrorResponse {
+                    Json(ApiError {
                         error: format!("Alias '{alias}' is already in use by an active lease"),
                         detail: Some(format!(
                             "Lease '{holder}' already holds this alias; release it or extend that lease instead"
                         )),
-                        reason: None,
+                        reason: Some(ApiErrorReason::AliasTaken),
                     }),
                 )
                     .into_response(),
@@ -3760,7 +3907,7 @@ async fn recover_timed_out_create(
 fn create_timed_out_response() -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
+        Json(ApiError {
             error: "Timed out creating the lease".to_string(),
             detail: Some(
                 "The API server did not confirm the create in time; retry with the same idempotencyKey"
@@ -3782,10 +3929,10 @@ fn create_timed_out_response() -> Response {
 fn admission_busy_response() -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
+        Json(ApiError {
             error: "Another lease request for this identity is being admitted".to_string(),
             detail: Some("No lease was created; retry shortly".to_string()),
-            reason: Some(ErrorReason::AdmissionBusy),
+            reason: Some(ApiErrorReason::AdmissionBusy),
         }),
     )
         .into_response();
@@ -4477,6 +4624,327 @@ mod tests {
         assert_eq!(claim_high.spec.priority, 200);
     }
 
+    // --- Error shape, extend refusals, alias resolution, rate limit ---------
+
+    fn extendable_cluster_lease(
+        name: &str,
+        phase: &str,
+        extensions_count: u32,
+        max_extensions: u32,
+    ) -> ClusterLease {
+        let mut value = lease_object_json(name, &test_identity().identity, phase, None);
+        value["status"]["boundAt"] =
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339());
+        value["status"]["extensionsCount"] = serde_json::json!(extensions_count);
+        value["status"]["maxExtensions"] = serde_json::json!(max_extensions);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn refusal(
+        lease: &ClusterLease,
+        by: &str,
+        max_ttl: Option<chrono::Duration>,
+    ) -> Option<(StatusCode, Option<ApiErrorReason>)> {
+        cluster_extend_refusal(lease, by, max_ttl, chrono::Utc::now())
+            .map(|(status, error)| (status, error.reason))
+    }
+
+    #[test]
+    fn cluster_extend_refusals_match_the_sandbox_statuses_and_reasons() {
+        let hours = |h| Some(chrono::Duration::hours(h));
+        let bound = extendable_cluster_lease("l", "Bound", 0, 2);
+        assert_eq!(refusal(&bound, "30m", hours(4)), None);
+        assert_eq!(
+            refusal(
+                &extendable_cluster_lease("l", "Bound", 2, 2),
+                "30m",
+                hours(4)
+            ),
+            Some((
+                StatusCode::CONFLICT,
+                Some(ApiErrorReason::ExtensionBudgetExhausted)
+            ))
+        );
+        assert_eq!(
+            refusal(
+                &extendable_cluster_lease("l", "Pending", 0, 2),
+                "30m",
+                hours(4)
+            ),
+            Some((StatusCode::CONFLICT, Some(ApiErrorReason::NotReady)))
+        );
+        assert_eq!(
+            refusal(&bound, "soon", hours(4)),
+            Some((
+                StatusCode::BAD_REQUEST,
+                Some(ApiErrorReason::InvalidRequest)
+            ))
+        );
+        // Bound 30m ago, expiring in 1h: +1h lands at bound+2h30m.
+        assert_eq!(
+            refusal(&bound, "1h", hours(2)),
+            Some((StatusCode::CONFLICT, Some(ApiErrorReason::MaxTtlCeiling)))
+        );
+        assert_eq!(
+            refusal(&bound, "30m", None),
+            Some((
+                StatusCode::CONFLICT,
+                Some(ApiErrorReason::PolicyUnresolvable)
+            ))
+        );
+    }
+
+    async fn mount_cluster_lease(server: &wiremock::MockServer, lease: &ClusterLease) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("{CLUSTER_LEASES}/{}", lease.name_any())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .mount(server)
+            .await;
+    }
+
+    async fn extend_via_handler(
+        state: AppState<crate::testutil::MockBackend>,
+        id: &str,
+        by: &str,
+    ) -> Response {
+        extend_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path(id.to_string()),
+            Json(ExtendLeaseRequest {
+                extend_ttl: by.to_string(),
+            }),
+        )
+        .await
+    }
+
+    /// Was `400` with no reason; now the same `409` the Sandbox endpoint uses.
+    #[tokio::test]
+    async fn cluster_extend_with_no_budget_left_is_409_extension_budget_exhausted() {
+        let (state, server) = preflight_state().await;
+        let lease = extendable_cluster_lease("lease-0123456789ab", "Bound", 2, 2);
+        mount_cluster_lease(&server, &lease).await;
+
+        let response = extend_via_handler(state, "lease-0123456789ab", "30m").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "extension_budget_exhausted");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != http::Method::PATCH),
+            "a refused extend writes nothing"
+        );
+    }
+
+    /// A concurrent writer that wins the JSON-patch `test` is a conflict the
+    /// caller can retry, not a server fault.
+    #[tokio::test]
+    async fn cluster_extend_that_loses_the_patch_race_is_409_conflict_retryable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (state, server) = preflight_state().await;
+        let policy: crate::crd::access_policy::AccessPolicy =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "test" },
+                "spec": {
+                    "auth": { "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": ["test"],
+                        "algorithms": ["RS256"]
+                    }},
+                    "rules": [{ "pools": ["*"], "maxTtl": "4h",
+                                "maxConcurrentLeases": 5, "maxExtensions": 2 }]
+                }
+            }))
+            .unwrap();
+        state
+            .authenticator
+            .update_policies(vec![policy], std::collections::HashMap::new())
+            .await;
+        let mut lease = extendable_cluster_lease("lease-0123456789ab", "Bound", 0, 2);
+        lease.spec.requester.requester_type = "test".to_string();
+        mount_cluster_lease(&server, &lease).await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{CLUSTER_LEASES}/lease-0123456789ab/status")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "the server rejected our request due to an error in our request",
+                "reason": "Invalid", "code": 422
+            })))
+            .mount(&server)
+            .await;
+
+        let response = extend_via_handler(state, "lease-0123456789ab", "30m").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["reason"], "conflict_retryable");
+    }
+
+    async fn mount_alias_lookup(
+        server: &wiremock::MockServer,
+        alias: &str,
+        cluster: Vec<serde_json::Value>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("{CLUSTER_LEASES}/{alias}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "not found", "reason": "NotFound", "code": 404
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASES))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(cluster)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn aliased_cluster_lease(name: &str, alias: &str, phase: &str) -> serde_json::Value {
+        let mut value = lease_object_json(name, &test_identity().identity, phase, None);
+        value["metadata"]["labels"] = serde_json::json!({ ALIAS_LABEL: alias });
+        value
+    }
+
+    #[tokio::test]
+    async fn canonical_get_resolves_a_cluster_alias() {
+        let (mut state, server) = preflight_state().await;
+        state.sandbox_enabled = false;
+        mount_alias_lookup(
+            &server,
+            "dev",
+            vec![
+                aliased_cluster_lease("lease-000000000001", "dev", "Released"),
+                aliased_cluster_lease("lease-000000000002", "dev", "Pending"),
+            ],
+        )
+        .await;
+        let live: ClusterLease = serde_json::from_value(aliased_cluster_lease(
+            "lease-000000000002",
+            "dev",
+            "Pending",
+        ))
+        .unwrap();
+        mount_cluster_lease(&server, &live).await;
+
+        let response = get_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("dev".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["id"], "lease-000000000002");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_alias_is_a_json_404() {
+        let (mut state, server) = preflight_state().await;
+        state.sandbox_enabled = false;
+        mount_alias_lookup(&server, "nope", Vec::new()).await;
+
+        let response = release_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("nope".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({ "error": "Lease not found", "reason": "not_found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_on_two_live_leases_is_refused_not_guessed() {
+        let (mut state, server) = preflight_state().await;
+        state.sandbox_enabled = false;
+        mount_alias_lookup(
+            &server,
+            "dev",
+            vec![
+                aliased_cluster_lease("lease-000000000001", "dev", "Bound"),
+                aliased_cluster_lease("lease-000000000002", "dev", "Pending"),
+            ],
+        )
+        .await;
+
+        let response = get_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("dev".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response_json(response).await["reason"], "ambiguous_alias");
+    }
+
+    #[test]
+    fn only_the_minted_shape_skips_alias_resolution() {
+        assert!(looks_like_cluster_lease_id("lease-0123456789ab"));
+        for alias in [
+            "lease-dev",
+            "lease-0123456789AB",
+            "dev",
+            "lease-0123456789abc",
+        ] {
+            assert!(!looks_like_cluster_lease_id(alias), "{alias}");
+        }
+    }
+
+    /// Cluster creation spends the same per-principal budget Sandbox admission
+    /// does, and a throttled attempt costs the API server nothing.
+    #[tokio::test]
+    async fn cluster_create_is_rate_limited_per_principal_with_retry_after() {
+        let (state, server) = preflight_state().await;
+        mount_missing_sandbox_pool(&server, "e2e-basic").await;
+        healthy_pool_mock().mount(&server).await;
+        while state
+            .cluster_admission_limiter
+            .charge(&cluster_principal_hash(&test_identity()))
+            == crate::api::sandbox_rate_limit::RateLimitDecision::Allowed
+        {}
+        let before = server.received_requests().await.unwrap().len();
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: Some("e2e-basic".to_string()),
+                ..CreateLeaseRequest::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get("retry-after").is_some());
+        assert_eq!(response_json(response).await["reason"], "rate_limited");
+        let after = server.received_requests().await.unwrap();
+        assert!(
+            after[before..].iter().all(|request| {
+                !request.url.path().ends_with("/clusterleases")
+                    && !request.url.path().contains("/coordination.k8s.io/")
+            }),
+            "a throttled create must not list leases or take the admission lock"
+        );
+    }
+
     // --- Router / handler tests using tower::ServiceExt::oneshot ---
 
     use tower::ServiceExt;
@@ -4500,6 +4968,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled,
             iroh_endpoint: None,
@@ -4535,6 +5004,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -4629,6 +5099,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5178,6 +5649,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5276,6 +5748,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5376,6 +5849,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5486,6 +5960,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5571,6 +6046,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -5684,6 +6160,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -6050,6 +6527,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            cluster_admission_limiter: Default::default(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
             iroh_endpoint: None,
@@ -6438,6 +6916,8 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get("retry-after").is_none());
+        assert_eq!(response_json(response).await["reason"], "quota_exhausted");
         let requests = server.received_requests().await.unwrap();
         assert!(!requests.iter().any(|request| {
             request.url.path().ends_with("/clusterleases")
