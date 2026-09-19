@@ -113,6 +113,23 @@ The image also ships Node 24 with the Codex and Claude Code CLIs, on `PATH` for
 `kobe exec` and for SSH login shells. No credentials are baked in: each lease
 signs in its own user. The CLIs track their latest release at image build time.
 
+Nix is installed for the workload user, with `nix-command` and `flakes`
+enabled. Run tools the image does not carry with `nix shell`:
+
+```bash
+kobe exec <lease> -- nix shell nixpkgs#hello -c hello
+```
+
+For builds that need headers and libraries, define them in your project's
+`flake.nix` development shell and use `nix develop`. `nix shell` adds executables
+to `PATH`; it does not configure compiler or linker search paths.
+
+There is no Nix daemon and no root. The Nix build sandbox is off, because a
+Sandbox container cannot create user namespaces, so builds inside one lease are
+not isolated from each other. `/nix` lives in the container's writable layer:
+it counts against the pool's `ephemeral-storage` limit and is gone when the
+lease ends. Size that limit for what your projects build.
+
 The same image carries a desktop: the [Tauri 2 Linux system prerequisites](https://v2.tauri.app/start/prerequisites/#linux),
 software rendering, Xvfb, Openbox, noVNC, Firefox, and a visible terminal.
 Callers: [Desktop](/docs/getting-started/desktop). Firefox is registered for
