@@ -83,6 +83,9 @@ pub struct SandboxContext {
     pub runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
     /// Exact chart identity required for managed child bootstrap references.
     pub managed_runtime_identity: Option<crate::sandbox_runtime::ManagedRuntimeIdentity>,
+    /// The lease controller's cache of SandboxLeases, used for pool accounting
+    /// once it has synced. `None` in tests: accounting then LISTs.
+    lease_store: Option<kube::runtime::reflector::Store<SandboxLease>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,11 +203,13 @@ enum ExecutionCleanupAdvance {
     Continue,
     Checkpointed,
     DestroyTarget,
-    Retry,
+    /// Requeue after this long.
+    Retry(std::time::Duration),
     Quarantine(QuarantineReason),
 }
 
-/// Re-list execution cleanup state after one durable child-resource mutation.
+/// Re-list execution cleanup state after the bounded same-pass drain stopped
+/// while cleanup was still checkpointing.
 ///
 /// The lifecycle controller watches [`SandboxLease`] objects, not the access
 /// ledger Lease or [`crate::crd::SandboxExecution`] records mutated by cleanup.
@@ -213,6 +218,15 @@ enum ExecutionCleanupAdvance {
 fn execution_cleanup_checkpoint_action() -> Action {
     Action::requeue(std::time::Duration::from_secs(1))
 }
+
+/// Requeue after a failed or contended execution-cleanup step. The step logs
+/// its own error.
+const EXECUTION_CLEANUP_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Re-check a `Creating` execution reservation whose record is not visible
+/// yet. Its writer normally binds it within a second or two, so this is short;
+/// an error-length wait here held every release behind an in-flight exec.
+const EXECUTION_CREATION_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fallback re-check of a management footprint that is still present. The
 /// lease controller watches the Claim, Sandbox and Pod, so their removal
@@ -257,15 +271,17 @@ async fn close_and_drain_access(
 const EXECUTION_DRAIN_MAX_STEPS: usize = 64;
 const EXECUTION_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Retire a released lease's execution records once its target is proven
-/// absent, running cleanup until it stops making progress, within bounds.
+/// Run execution cleanup until it stops making progress, within bounds.
 ///
-/// Each cleanup call makes at most one durable mutation and re-reads the
-/// manifest and records before the next, so repeating it here keeps that
-/// invariant. Returning after each step instead cost a requeue per record,
-/// which held a released lease's quota for minutes when it had many failed
-/// or lost executions.
-async fn drain_executions_after_target_absence<F, Fut>(
+/// Used both before the target is proven absent (cancelling and retiring
+/// runner groups before credentials and the Claim go) and after (retiring the
+/// records that waited for that proof). Each cleanup call makes at most one
+/// durable mutation and re-reads the manifest and records before the next, so
+/// repeating it here keeps that invariant. Only the final outcome escapes:
+/// nothing past execution cleanup runs until it reports `Clean`. Returning
+/// after each step instead cost a requeue per record, which held a released
+/// lease's quota for minutes when it had many failed or lost executions.
+async fn drain_execution_cleanup<F, Fut>(
     lease: &SandboxLease,
     ctx: &SandboxContext,
     mut step: F,
@@ -292,7 +308,7 @@ where
         }
     };
     if steps > 0 {
-        info!(lease = %lease.name_any(), steps, "retired Sandbox execution records after target absence");
+        info!(lease = %lease.name_any(), steps, "advanced Sandbox execution cleanup");
     }
     outcome
 }
@@ -311,7 +327,10 @@ fn execution_cleanup_advance(
             ExecutionCleanupAdvance::DestroyTarget
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
-            ExecutionCleanupAdvance::Retry
+            ExecutionCleanupAdvance::Retry(EXECUTION_CLEANUP_RETRY)
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+            ExecutionCleanupAdvance::Retry(EXECUTION_CREATION_RETRY)
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
             ExecutionCleanupAdvance::Quarantine(reason)
@@ -493,6 +512,89 @@ async fn ensure_upstream_pool_objects(
 
 const POOL_READY_CONDITION: &str = "Ready";
 const POOL_CERTIFICATION_PENDING_REASON: &str = "CertificationPending";
+const POOL_REFILLING_CONDITION: &str = "WarmPoolRefilling";
+const POOL_REFILLING_REASON: &str = "WarmPoolRefilling";
+
+/// How long a certified pool keeps `Ready=True` while its WarmPool refills.
+///
+/// Adopting a warm Sandbox into a Claim lowers `readyReplicas` until upstream
+/// starts a replacement. Dropping Ready for that window made admission answer
+/// 503 to leases the pool could serve. A refill that takes longer than this is
+/// treated as a degraded pool, and certification is withheld as before.
+const POOL_REFILL_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Steady backstop for a pool whose certification is settled. Template,
+/// WarmPool and certification Claim changes trigger reconciles directly.
+const POOL_STEADY_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Re-check interval while a certification attempt waits on something the
+/// pool controller does not watch, such as teardown-fence propagation.
+const POOL_CERTIFICATION_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Decide whether an already-certified pool is in a normal refill, and if so
+/// since when.
+///
+/// A normal refill is exactly this: the pool's current `Ready` is True for its
+/// current generation with a `Certified` receipt whose fingerprint still
+/// matches the live Template and WarmPool; no certification protocol is in
+/// flight; the WarmPool has observed its current generation, asks for
+/// `warmCapacity` replicas, and reports no more than that, but fewer Ready;
+/// and the shortfall started less than [`POOL_REFILL_GRACE`] ago. The start is
+/// the `WarmPoolRefilling` condition's transition time, or `now` for a new
+/// refill. Anything else (a spec change, a replaced object, a surplus, or a
+/// refill that outlasts the grace) returns `None` and takes the full
+/// certification gate.
+///
+/// Holding Ready skips the per-pass population re-validation for the window.
+/// The final Claim gate still re-validates the pool live before any tenant
+/// Claim is created, so a lease admitted during a refill waits there.
+fn certified_pool_refill_started(
+    pool: &SandboxPool,
+    observation: &WarmPoolObservation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if certification_protocol_in_flight(pool)
+        || crate::sandbox::require_current_sandbox_pool_ready(pool).is_err()
+    {
+        return None;
+    }
+    let status = pool.status.as_ref()?;
+    let receipt = status.certification.as_ref()?;
+    let fingerprint = crate::controllers::sandbox_pool_certification::certification_fingerprint(
+        pool,
+        &observation.template,
+        &observation.warm_pool,
+    )
+    .ok()?;
+    let capacity = pool.spec.warm_capacity;
+    let desired = observation
+        .warm_pool
+        .data
+        .pointer("/spec/replicas")
+        .and_then(serde_json::Value::as_u64);
+    if receipt.fingerprint != fingerprint
+        || !crate::controllers::sandbox_pool_certification::warm_pool_status_is_current(
+            &observation.warm_pool,
+        )
+        || desired != Some(u64::from(capacity))
+        || observation.replicas > capacity
+        || observation.ready_replicas >= capacity
+    {
+        return None;
+    }
+    let started = status
+        .conditions
+        .iter()
+        .find(|condition| {
+            condition.condition_type == POOL_REFILLING_CONDITION
+                && condition.status == SandboxConditionStatus::True
+        })
+        .and_then(|condition| condition.last_transition_time.as_deref())
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| time.with_timezone(&chrono::Utc))
+        .unwrap_or(now);
+    (now < started + POOL_REFILL_GRACE).then_some(started)
+}
 
 #[derive(Debug, Clone)]
 struct WarmPoolObservation {
@@ -718,14 +820,15 @@ async fn observe_management_pool(
 ///
 /// The name label is intentionally not authoritative: a deleted-and-recreated
 /// pool has the same label, and older objects may be missing it. UID filtering
-/// over the complete namespace list keeps replacement capacity separate.
-fn pool_allocation_counts(
-    leases: impl IntoIterator<Item = SandboxLease>,
+/// over every lease in the namespace keeps replacement capacity separate.
+fn pool_allocation_counts<L: std::borrow::Borrow<SandboxLease>>(
+    leases: impl IntoIterator<Item = L>,
     pool_uid: &str,
 ) -> Result<(u32, u32), SandboxPlacementError> {
     let mut allocated = 0u32;
     let mut quarantined = 0u32;
     for lease in leases {
+        let lease = lease.borrow();
         if lease.spec.pool_ref.uid != pool_uid
             || lease
                 .annotations()
@@ -797,13 +900,18 @@ fn pool_status(
         }
         _ => Some(chrono::Utc::now().to_rfc3339()),
     };
+    // A refill hold re-adds its own condition; every other outcome ends it,
+    // so the next refill starts a fresh grace window.
     let mut conditions: Vec<_> = pool
         .status
         .as_ref()
         .map(|status| status.conditions.clone())
         .unwrap_or_default()
         .into_iter()
-        .filter(|condition| condition.condition_type != POOL_READY_CONDITION)
+        .filter(|condition| {
+            condition.condition_type != POOL_READY_CONDITION
+                && condition.condition_type != POOL_REFILLING_CONDITION
+        })
         .collect();
     conditions.push(SandboxCondition {
         condition_type: POOL_READY_CONDITION.into(),
@@ -893,25 +1001,37 @@ pub async fn reconcile_pool(
         .uid()
         .filter(|uid| !uid.is_empty())
         .ok_or_else(|| SandboxPlacementError::Invalid(format!("SandboxPool {name} has no UID")))?;
-    let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
-    let lease_list = match leases.list(&ListParams::default()).await {
-        Ok(leases) => leases,
-        Err(error) => {
-            let previous = pool.status.clone().unwrap_or_default();
-            let status = pool_status(
-                &pool,
-                0,
-                previous.allocated,
-                previous.quarantined,
-                false,
-                "LeaseAccountingUnavailable",
-                "Exact-UID lease accounting is unavailable; pool certification is withheld",
-            )?;
-            patch_pool_status_fenced(&ctx, &pool, &status).await?;
-            return Err(error.into());
+    // Accounting reads the lease controller's synced cache when there is one.
+    // Pool reconciles now follow WarmPool and Claim events, so a LIST of every
+    // lease on each pass would grow with pool activity.
+    let cached = ctx.lease_store.as_ref().and_then(|store| {
+        futures::FutureExt::now_or_never(store.wait_until_ready())
+            .is_some_and(|ready| ready.is_ok())
+            .then(|| store.state())
+    });
+    let (allocated, quarantined) = match cached {
+        Some(leases) => pool_allocation_counts(leases.iter().map(Arc::as_ref), &pool_uid)?,
+        None => {
+            let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+            match leases.list(&ListParams::default()).await {
+                Ok(leases) => pool_allocation_counts(leases, &pool_uid)?,
+                Err(error) => {
+                    let previous = pool.status.clone().unwrap_or_default();
+                    let status = pool_status(
+                        &pool,
+                        0,
+                        previous.allocated,
+                        previous.quarantined,
+                        false,
+                        "LeaseAccountingUnavailable",
+                        "Exact-UID lease accounting is unavailable; pool certification is withheld",
+                    )?;
+                    patch_pool_status_fenced(&ctx, &pool, &status).await?;
+                    return Err(error.into());
+                }
+            }
         }
     };
-    let (allocated, quarantined) = pool_allocation_counts(lease_list, &pool_uid)?;
 
     if let SandboxPlacement::ChildCluster { cluster_pool_ref } = &pool.spec.placement {
         let cluster_pools: Api<crate::crd::ClusterPool> =
@@ -964,7 +1084,9 @@ pub async fn reconcile_pool(
             return Ok(Action::await_change());
         }
         debug!(pool = %name, "reconciled fail-closed child SandboxPool eligibility");
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        // ClusterPool changes trigger a reconcile; this covers the bootstrap
+        // objects the pool controller does not watch.
+        return Ok(Action::requeue(POOL_STEADY_RECHECK));
     }
 
     let owner = pool.controller_owner_ref(&()).ok_or_else(|| {
@@ -1007,6 +1129,48 @@ pub async fn reconcile_pool(
             return Err(error);
         }
     };
+    // A certified pool whose WarmPool is only refilling after an adoption keeps
+    // its Ready condition; see `certified_pool_refill_started`.
+    let now = chrono::Utc::now();
+    if let Some(started) = certified_pool_refill_started(&pool, &observation, now) {
+        let mut status = pool_status(
+            &pool,
+            observation.ready_replicas,
+            allocated,
+            quarantined,
+            true,
+            POOL_REFILLING_REASON,
+            &format!(
+                "Certified; WarmPool is refilling ({}/{} Ready)",
+                observation.ready_replicas, pool.spec.warm_capacity
+            ),
+        )?;
+        status.conditions.push(SandboxCondition {
+            condition_type: POOL_REFILLING_CONDITION.into(),
+            status: SandboxConditionStatus::True,
+            reason: POOL_REFILLING_REASON.into(),
+            message: format!(
+                "Ready is kept for up to {}s while the WarmPool replaces adopted members",
+                POOL_REFILL_GRACE.num_seconds()
+            ),
+            observed_generation: pool.metadata.generation,
+            last_transition_time: Some(started.to_rfc3339()),
+        });
+        if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
+            debug!(pool = %name, "SandboxPool refill status write lost a race");
+            return Ok(Action::await_change());
+        }
+        debug!(pool = %name, ready = observation.ready_replicas, "certified SandboxPool is refilling");
+        // Come back when the grace ends, in case the WarmPool never recovers
+        // and so never sends the event that would end the hold.
+        let grace_left = (started + POOL_REFILL_GRACE - now)
+            .to_std()
+            .unwrap_or_default();
+        return Ok(Action::requeue(
+            (grace_left + std::time::Duration::from_millis(100)).min(POOL_STEADY_RECHECK),
+        ));
+    }
+
     // The full-capacity gate applies only to STARTING (or re-validating) a
     // certification. Mid-protocol the arms drain the pool to zero and restore
     // it by design, so their own barriers — not this gate — decide progress.
@@ -1052,9 +1216,14 @@ pub async fn reconcile_pool(
     };
     // Creating a Claim or fence is the sole mutation for that reconcile. Its
     // returned identity is deliberately checkpointed by the next strong GET.
+    // The Claim's own event usually arrives first; the fence has no watch.
     if mutated {
         return Ok(Action::requeue(std::time::Duration::from_secs(1)));
     }
+    let waiting_on_unwatched = progress_status.as_ref().is_some_and(|certification| {
+        certification.phase == crate::crd::SandboxPoolCertificationPhase::CanaryPassed
+            || certification_phase_is_in_flight(&certification.phase)
+    });
     let mut status = pool_status(
         &pool,
         ready,
@@ -1071,7 +1240,11 @@ pub async fn reconcile_pool(
     }
 
     debug!(pool = %name, certified, "reconciled management SandboxPool certification");
-    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+    Ok(Action::requeue(if waiting_on_unwatched {
+        POOL_CERTIFICATION_RECHECK
+    } else {
+        POOL_STEADY_RECHECK
+    }))
 }
 
 /// Reconcile one admitted `SandboxLease` into exactly one `SandboxClaim`.
@@ -1608,7 +1781,8 @@ pub async fn reconcile_lease(
                 outcome = outcome.reason_code(),
                 "readiness canary did not pass; TTL clock has not started"
             );
-            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+            let ready_for = claim_ready_since(&claim).map(|since| chrono::Utc::now() - since);
+            return Ok(Action::requeue(readiness_canary_retry_delay(ready_for)));
         }
         status.conditions = with_condition_for_status(
             &status,
@@ -1788,7 +1962,72 @@ pub async fn reconcile_lease(
         info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
     }
 
-    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+    Ok(Action::requeue(ready_lease_requeue(
+        expires_at.with_timezone(&chrono::Utc),
+        chrono::Utc::now(),
+    )))
+}
+
+/// Steady re-check interval for a Ready lease.
+const READY_LEASE_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When to look at a Ready lease again: the steady interval, or just after its
+/// expiry if that comes first.
+///
+/// Expiry is noticed by a reconcile, not by a timer of its own. With a flat
+/// 30s interval a lease could run up to 30s past its TTL before release began.
+/// The small margin makes sure the pass lands after the deadline, where
+/// `release_reason` sees it as elapsed.
+fn ready_lease_requeue(
+    expires_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::time::Duration {
+    const PAST_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+    let remaining = (expires_at - now).to_std().unwrap_or_default();
+    (remaining + PAST_DEADLINE).min(READY_LEASE_RECHECK)
+}
+
+/// When the upstream Claim's `Ready` condition last turned True.
+fn claim_ready_since(claim: &DynamicObject) -> Option<chrono::DateTime<chrono::Utc>> {
+    claim
+        .data
+        .pointer("/status/conditions")?
+        .as_array()?
+        .iter()
+        .find(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some("Ready")
+                && condition.get("status").and_then(|value| value.as_str()) == Some("True")
+        })?
+        .get("lastTransitionTime")?
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+/// Longest wait between readiness canary attempts.
+const READINESS_CANARY_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait before re-running a readiness canary that did not pass.
+///
+/// A Sandbox usually starts answering within seconds of its Claim turning
+/// Ready, so a flat 10s retry added most of that wait to every lease. Retries
+/// back off 1, 2, 4 and 8 seconds, then hold at 10. The attempt is derived from
+/// how long the Claim has been Ready, so nothing extra is persisted and a
+/// controller restart does not reset the schedule. Without a usable timestamp
+/// the old flat interval applies.
+fn readiness_canary_retry_delay(ready_for: Option<chrono::Duration>) -> std::time::Duration {
+    let Some(elapsed) = ready_for.and_then(|elapsed| elapsed.to_std().ok()) else {
+        return READINESS_CANARY_MAX_RETRY;
+    };
+    // Attempts land at roughly 0, 1, 3, 7 and 15 seconds after Ready.
+    let delay = match elapsed.as_secs() {
+        0 => 1,
+        1..=2 => 2,
+        3..=6 => 4,
+        7..=14 => 8,
+        _ => return READINESS_CANARY_MAX_RETRY,
+    };
+    std::time::Duration::from_secs(delay).min(READINESS_CANARY_MAX_RETRY)
 }
 
 /// Why a lease is being torn down, if it is.
@@ -3631,6 +3870,16 @@ enum TargetFootprintCheck {
     Quarantine(QuarantineReason),
 }
 
+/// Retry a footprint check after an API error, logging the error. The caller
+/// only sees the check name, and a stuck release used to leave nothing else.
+fn transient_footprint_check(
+    check: &'static str,
+    error: &dyn std::fmt::Display,
+) -> TargetFootprintCheck {
+    warn!(check, error = %error, "Sandbox footprint check failed; retrying");
+    TargetFootprintCheck::Retry(check)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExactObjectAbsence {
     Absent,
@@ -3727,7 +3976,7 @@ async fn missing_service_provenance_is_allowed(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             TargetFootprintCheck::Quarantine(QuarantineReason::ServiceRequirementPoolMissing)
         }
-        Err(_) => TargetFootprintCheck::Retry("service_requirement_lookup_transient"),
+        Err(error) => transient_footprint_check("service_requirement_lookup_transient", &error),
     }
 }
 
@@ -3844,9 +4093,10 @@ async fn checkpoint_management_descendants(
                 QuarantineReason::ClaimAbsenceUnverifiable,
             ));
         }
-        Err(_) => {
-            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+        Err(error) => {
+            return ManagementDescendantCheckpoint::Check(transient_footprint_check(
                 "claim_lookup_transient",
+                &error,
             ));
         }
     };
@@ -3873,9 +4123,10 @@ async fn checkpoint_management_descendants(
                 QuarantineReason::SandboxAbsenceUnverifiable,
             ));
         }
-        Err(_) => {
-            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+        Err(error) => {
+            return ManagementDescendantCheckpoint::Check(transient_footprint_check(
                 "sandbox_lookup_transient",
+                &error,
             ));
         }
     };
@@ -3960,9 +4211,10 @@ async fn checkpoint_management_descendants(
                     QuarantineReason::ServiceAbsenceUnverifiable,
                 ));
             }
-            Err(_) => {
-                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+            Err(error) => {
+                return ManagementDescendantCheckpoint::Check(transient_footprint_check(
                     "service_lookup_transient",
+                    &error,
                 ));
             }
         }
@@ -3987,9 +4239,10 @@ async fn checkpoint_management_descendants(
                     QuarantineReason::PodEnumerationUnverifiable,
                 ));
             }
-            Err(_) => {
-                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+            Err(error) => {
+                return ManagementDescendantCheckpoint::Check(transient_footprint_check(
                     "pod_enumeration_transient",
+                    &error,
                 ));
             }
         };
@@ -4058,7 +4311,15 @@ async fn exact_object_absence(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             ExactObjectAbsence::Unverifiable
         }
-        Err(_) => ExactObjectAbsence::Transient,
+        Err(error) => {
+            warn!(
+                kind = %reference.kind,
+                name = %reference.name,
+                error = %error,
+                "could not read a recorded Sandbox object; retrying its absence check"
+            );
+            ExactObjectAbsence::Transient
+        }
     }
 }
 
@@ -4115,7 +4376,7 @@ async fn exact_owned_storage_is_absent(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return TargetFootprintCheck::Quarantine(QuarantineReason::PvcEnumerationUnverifiable);
         }
-        Err(_) => return TargetFootprintCheck::Retry("pvc_enumeration_transient"),
+        Err(error) => return transient_footprint_check("pvc_enumeration_transient", &error),
     };
     let pvc_uids: Vec<_> = owned
         .iter()
@@ -4138,7 +4399,7 @@ async fn exact_owned_storage_is_absent(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return TargetFootprintCheck::Quarantine(QuarantineReason::PvEnumerationUnverifiable);
         }
-        Err(_) => return TargetFootprintCheck::Retry("pv_enumeration_transient"),
+        Err(error) => return transient_footprint_check("pv_enumeration_transient", &error),
     };
 
     if owned.is_empty() && associated_volumes == 0 {
@@ -4213,7 +4474,7 @@ async fn claim_labelled_sandboxes_absent(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             TargetFootprintCheck::Quarantine(QuarantineReason::SandboxEnumerationUnverifiable)
         }
-        Err(_) => TargetFootprintCheck::Retry("sandbox_enumeration_transient"),
+        Err(error) => transient_footprint_check("sandbox_enumeration_transient", &error),
     }
 }
 
@@ -4262,7 +4523,7 @@ async fn exact_owned_objects_absent(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             TargetFootprintCheck::Quarantine(unverifiable)
         }
-        Err(_) => TargetFootprintCheck::Retry(transient),
+        Err(error) => transient_footprint_check(transient, &error),
     }
 }
 
@@ -4286,7 +4547,7 @@ async fn unresolved_sandbox_children_absent(
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return TargetFootprintCheck::Quarantine(unverifiable);
         }
-        Err(_) => return TargetFootprintCheck::Retry(transient),
+        Err(error) => return transient_footprint_check(transient, &error),
     };
     for owner in objects.items.iter().filter_map(|object| {
         object
@@ -4331,7 +4592,7 @@ async fn unresolved_sandbox_children_absent(
             Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
                 return TargetFootprintCheck::Quarantine(unverifiable);
             }
-            Err(_) => return TargetFootprintCheck::Retry(transient),
+            Err(error) => return transient_footprint_check(transient, &error),
         }
     }
     TargetFootprintCheck::Verified
@@ -4635,7 +4896,9 @@ async fn pre_create_footprint_absent(
             return TargetFootprintCheck::Quarantine(QuarantineReason::PreCreateChildHandlePresent);
         }
         Err(kube::Error::Api(error)) if error.code == 404 => {}
-        Err(_) => return TargetFootprintCheck::Retry("pre_create_child_handle_unreadable"),
+        Err(error) => {
+            return transient_footprint_check("pre_create_child_handle_unreadable", &error);
+        }
     }
 
     // Same management-side scans the admission-only proof performs: the
@@ -4899,22 +5162,24 @@ async fn drive_release(
     // new bind/spawn from racing either path.
     if ctx.access_ledger_enabled && !child_placed && !footprint_absence_proven(&status) {
         match execution_cleanup_advance(
-            crate::api::sandbox_executions::cleanup_lease_executions(
-                &ctx.client,
-                &ctx.namespace,
-                &ctx.reservation_namespace,
-                lease,
-                &ctx.client,
-                &ctx.shutdown,
-            )
+            drain_execution_cleanup(lease, ctx, || {
+                crate::api::sandbox_executions::cleanup_lease_executions(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.client,
+                    &ctx.shutdown,
+                )
+            })
             .await,
         ) {
             ExecutionCleanupAdvance::Continue | ExecutionCleanupAdvance::DestroyTarget => {}
             ExecutionCleanupAdvance::Checkpointed => {
                 return Ok(execution_cleanup_checkpoint_action());
             }
-            ExecutionCleanupAdvance::Retry => {
-                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            ExecutionCleanupAdvance::Retry(after) => {
+                return Ok(Action::requeue(after));
             }
             ExecutionCleanupAdvance::Quarantine(reason) => {
                 return quarantine_lease(lease, ctx, reason).await;
@@ -4973,7 +5238,7 @@ async fn drive_release(
             return Box::pin(finish_child_release_after_proof(lease, ctx, reason)).await;
         }
         if ctx.access_ledger_enabled {
-            match drain_executions_after_target_absence(lease, ctx, || {
+            match drain_execution_cleanup(lease, ctx, || {
                 crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
                     &ctx.client,
                     &ctx.namespace,
@@ -4987,6 +5252,9 @@ async fn drive_release(
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
                     return Ok(execution_cleanup_checkpoint_action());
+                }
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+                    return Ok(Action::requeue(EXECUTION_CREATION_RETRY));
                 }
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
                 | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction =>
@@ -5568,7 +5836,14 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
         // Cannot tell. Take the child path: it waits for evidence, where the
         // management path would release the quota slot on a 404 that proves
         // nothing about a cluster this controller cannot currently see.
-        Err(_) => true,
+        Err(error) => {
+            warn!(
+                lease = %lease.name_any(),
+                error = %error,
+                "could not read the internal ClusterLease; treating the lease as child-placed"
+            );
+            true
+        }
     }
 }
 
@@ -5646,7 +5921,12 @@ async fn recorded_child_access(
                 QuarantineReason::ChildKubeconfigSecretForbidden,
             );
         }
-        Err(_) => {
+        Err(error) => {
+            warn!(
+                lease = %lease.name_any(),
+                error = %error,
+                "could not read the child kubeconfig Secret; retrying"
+            );
             return RecordedChildAccess::Retry("child_kubeconfig_management_read_retry");
         }
     };
@@ -5673,7 +5953,12 @@ async fn recorded_child_access(
     };
     let child = match crate::backend::virtual_client_from_kubeconfig(&kubeconfig).await {
         Ok(child) => child,
-        Err(_) => {
+        Err(error) => {
+            warn!(
+                lease = %lease.name_any(),
+                error = %error,
+                "could not build a client from the child kubeconfig"
+            );
             return RecordedChildAccess::Quarantine(QuarantineReason::ChildKubeconfigClientInvalid);
         }
     };
@@ -5701,7 +5986,14 @@ async fn recorded_child_access(
         Err(kube::Error::Api(_)) => {
             RecordedChildAccess::Quarantine(QuarantineReason::ChildNamespaceUnverifiable)
         }
-        Err(_) => RecordedChildAccess::Quarantine(QuarantineReason::ChildApiResponseUnverifiable),
+        Err(error) => {
+            warn!(
+                lease = %lease.name_any(),
+                error = %error,
+                "child API response could not be verified"
+            );
+            RecordedChildAccess::Quarantine(QuarantineReason::ChildApiResponseUnverifiable)
+        }
     }
 }
 
@@ -5782,32 +6074,38 @@ async fn cleanup_child_executions_after_proof(
     if !ctx.access_ledger_enabled {
         return Ok(None);
     }
-    let outcome = match proof {
-        ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
-            crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
-                &ctx.client,
-                &ctx.namespace,
-                &ctx.reservation_namespace,
-                lease,
-                &ctx.shutdown,
-            )
-            .await
+    let outcome = drain_execution_cleanup(lease, ctx, || async {
+        match proof {
+            ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
+                crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.shutdown,
+                )
+                .await
+            }
+            ChildTargetAbsenceProof::NeverBound => {
+                crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.shutdown,
+                )
+                .await
+            }
         }
-        ChildTargetAbsenceProof::NeverBound => {
-            crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
-                &ctx.client,
-                &ctx.namespace,
-                &ctx.reservation_namespace,
-                lease,
-                &ctx.shutdown,
-            )
-            .await
-        }
-    };
+    })
+    .await;
     match outcome {
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => Ok(None),
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
             Ok(Some(execution_cleanup_checkpoint_action()))
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+            Ok(Some(Action::requeue(EXECUTION_CREATION_RETRY)))
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
             // This function runs only after exact target-absence proof. Reaching
@@ -6339,7 +6637,12 @@ async fn release_child_composition(
             // Cannot tell whether a cluster is out there. Withhold rather than
             // release: an under-counted pool is recoverable, a stranded cluster
             // with its slot already returned is not.
-            Err(_) => {
+            Err(error) => {
+                warn!(
+                    lease = %lease.name_any(),
+                    error = %error,
+                    "could not read the child composition handle; quarantining"
+                );
                 return quarantine_lease(
                     lease,
                     ctx,
@@ -6857,14 +7160,16 @@ async fn release_bound_child_composition(
                 // record and capacity.
                 if ctx.access_ledger_enabled {
                     match execution_cleanup_advance(
-                        crate::api::sandbox_executions::cleanup_lease_executions(
-                            &ctx.client,
-                            &ctx.namespace,
-                            &ctx.reservation_namespace,
-                            lease,
-                            &child_client,
-                            &ctx.shutdown,
-                        )
+                        drain_execution_cleanup(lease, ctx, || {
+                            crate::api::sandbox_executions::cleanup_lease_executions(
+                                &ctx.client,
+                                &ctx.namespace,
+                                &ctx.reservation_namespace,
+                                lease,
+                                &child_client,
+                                &ctx.shutdown,
+                            )
+                        })
                         .await,
                     ) {
                         ExecutionCleanupAdvance::Continue => {}
@@ -6882,8 +7187,8 @@ async fn release_bound_child_composition(
                             )
                             .await;
                         }
-                        ExecutionCleanupAdvance::Retry => {
-                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                        ExecutionCleanupAdvance::Retry(after) => {
+                            return Ok(Action::requeue(after));
                         }
                         ExecutionCleanupAdvance::Quarantine(reason) => {
                             return quarantine_lease(lease, ctx, reason).await;
@@ -7408,32 +7713,39 @@ async fn finish_child_release_after_proof(
     // now, while the exact receipt/NeverBound handle is still retained and
     // before ACK, handle deletion, reservation release, or terminal status.
     if ctx.access_ledger_enabled {
-        let outcome = match proof.absence_proof() {
-            ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
-                crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
-                    &ctx.client,
-                    &ctx.namespace,
-                    &ctx.reservation_namespace,
-                    lease,
-                    &ctx.shutdown,
-                )
-                .await
+        let absence_proof = proof.absence_proof();
+        let outcome = drain_execution_cleanup(lease, ctx, || async {
+            match absence_proof {
+                ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
+                    crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                        &ctx.client,
+                        &ctx.namespace,
+                        &ctx.reservation_namespace,
+                        lease,
+                        &ctx.shutdown,
+                    )
+                    .await
+                }
+                ChildTargetAbsenceProof::NeverBound => {
+                    crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
+                        &ctx.client,
+                        &ctx.namespace,
+                        &ctx.reservation_namespace,
+                        lease,
+                        &ctx.shutdown,
+                    )
+                    .await
+                }
             }
-            ChildTargetAbsenceProof::NeverBound => {
-                crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
-                    &ctx.client,
-                    &ctx.namespace,
-                    &ctx.reservation_namespace,
-                    lease,
-                    &ctx.shutdown,
-                )
-                .await
-            }
-        };
+        })
+        .await;
         match outcome {
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
                 return Ok(execution_cleanup_checkpoint_action());
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation => {
+                return Ok(Action::requeue(EXECUTION_CREATION_RETRY));
             }
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
             | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
@@ -10171,6 +10483,99 @@ fn release_footprint_triggers(
     futures::stream::select_all([claim_triggers, sandbox_triggers, pod_triggers])
 }
 
+/// Map an object to the SandboxPool that controls it.
+///
+/// The Template, WarmPool and certification Claim all carry the exact Pool as
+/// controller owner. The mapping only triggers a reconcile, which re-checks
+/// exact identity itself.
+fn pool_owner_trigger(meta: &kube::api::ObjectMeta) -> Option<ObjectRef<SandboxPool>> {
+    let api_version = SandboxPool::api_version(&());
+    let kind = SandboxPool::kind(&());
+    let owner = meta.owner_references.as_ref()?.iter().find(|owner| {
+        owner.controller == Some(true) && owner.api_version == api_version && owner.kind == kind
+    })?;
+    let namespace = meta.namespace.as_ref()?;
+    Some(ObjectRef::new(&owner.name).within(namespace))
+}
+
+/// Map a ClusterPool to the child-placed SandboxPools that reference it.
+fn cluster_pool_triggers(
+    cluster_pool: &str,
+    pools: &[Arc<SandboxPool>],
+) -> Vec<ObjectRef<SandboxPool>> {
+    pools
+        .iter()
+        .filter(|pool| {
+            matches!(
+                &pool.spec.placement,
+                SandboxPlacement::ChildCluster { cluster_pool_ref } if cluster_pool_ref == cluster_pool
+            )
+        })
+        .map(|pool| ObjectRef::from_obj(pool.as_ref()))
+        .collect()
+}
+
+/// Reconcile requests for pools whose upstream objects or ClusterPool changed.
+///
+/// Certification waits on the WarmPool's replica counts and on its sacrificial
+/// Claim becoming Ready or going away. Without these watches each wait ended on
+/// the 30s timer. Like the lease watches, each stream backs off on error.
+fn pool_event_triggers(
+    templates: Api<DynamicObject>,
+    warm_pools: Api<DynamicObject>,
+    certification_claims: Api<DynamicObject>,
+    cluster_pools: Api<crate::crd::ClusterPool>,
+    pools: kube::runtime::reflector::Store<SandboxPool>,
+) -> impl futures::Stream<Item = ObjectRef<SandboxPool>> + Send + 'static {
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    let managed = format!(
+        "app.kubernetes.io/managed-by={}",
+        crate::sandbox::KOBE_MANAGED_BY
+    );
+    let owned = |api: Api<DynamicObject>, config: Config, kind: &'static str| {
+        watcher(api, config)
+            .default_backoff()
+            .touched_objects()
+            .filter_map(move |object| async move {
+                watched_object(kind, object)
+                    .as_ref()
+                    .and_then(|object| pool_owner_trigger(&object.metadata))
+            })
+            .boxed()
+    };
+    let cluster_pool_requests = watcher(cluster_pools, Config::default())
+        .default_backoff()
+        .touched_objects()
+        .flat_map(move |cluster_pool| {
+            let triggers = watched_object("ClusterPool", cluster_pool)
+                .map(|cluster_pool| cluster_pool_triggers(&cluster_pool.name_any(), &pools.state()))
+                .unwrap_or_default();
+            futures::stream::iter(triggers)
+        })
+        .boxed();
+    futures::stream::select_all([
+        owned(
+            templates,
+            Config::default().labels(&managed),
+            "SandboxTemplate",
+        ),
+        owned(
+            warm_pools,
+            Config::default().labels(&managed),
+            "SandboxWarmPool",
+        ),
+        owned(
+            certification_claims,
+            Config::default().labels(
+                crate::controllers::sandbox_pool_certification::CERTIFICATION_POOL_UID_LABEL,
+            ),
+            "certification SandboxClaim",
+        ),
+        cluster_pool_requests,
+    ])
+}
+
 /// Run Sandbox lifecycle until shutdown.
 ///
 /// Pool placement is started only when `placement_enabled`. The lease loop is
@@ -10194,6 +10599,14 @@ pub async fn run_sandbox_controller(
             crate::sandbox_runtime::ManagedRuntimeIdentity::from_env()
                 .expect("managed runtime identity was validated during startup")
         });
+    let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
+    let internal_cluster_leases: Api<crate::crd::ClusterLease> =
+        Api::namespaced(client.clone(), namespace);
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    // Built before the context so pool accounting can read its lease cache.
+    let lease_controller = Controller::new(leases, Config::default());
+    let lease_store = lease_controller.store();
+
     let ctx = Arc::new(SandboxContext {
         client: client.clone(),
         namespace: namespace.to_string(),
@@ -10204,12 +10617,8 @@ pub async fn run_sandbox_controller(
         placement_enabled,
         runtime_mode,
         managed_runtime_identity,
+        lease_store: Some(lease_store.clone()),
     });
-
-    let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
-    let internal_cluster_leases: Api<crate::crd::ClusterLease> =
-        Api::namespaced(client.clone(), namespace);
-    let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
 
     if placement_enabled {
         info!("Starting Sandbox placement and lifecycle controllers (management)");
@@ -10219,9 +10628,27 @@ pub async fn run_sandbox_controller(
 
     let pool_ctx = ctx.clone();
     let pool_shutdown = shutdown.clone();
+    let pool_client = client.clone();
+    let pool_namespace = namespace.to_string();
     let pool_loop = async move {
         if placement_enabled {
-            Controller::new(pools, Config::default())
+            let upstream = |kind: &str, plural: &str| -> Api<DynamicObject> {
+                Api::namespaced_with(
+                    pool_client.clone(),
+                    &pool_namespace,
+                    &upstream_resource(kind, plural),
+                )
+            };
+            let controller = Controller::new(pools, Config::default());
+            let pool_store = controller.store();
+            controller
+                .reconcile_on(pool_event_triggers(
+                    upstream(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+                    upstream(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
+                    upstream(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+                    Api::namespaced(pool_client.clone(), &pool_namespace),
+                    pool_store,
+                ))
                 .graceful_shutdown_on(async move { pool_shutdown.cancelled().await })
                 .run(reconcile_pool, pool_error_policy, pool_ctx)
                 .for_each(|result| async move {
@@ -10245,9 +10672,7 @@ pub async fn run_sandbox_controller(
         Api::namespaced_with(ctx.client.clone(), namespace, &sandbox_resource());
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
     let lease_loop = async move {
-        let controller = Controller::new(leases, Config::default());
-        let lease_store = controller.store();
-        controller
+        lease_controller
             // Release waits for the upstream Claim, Sandbox and Pod to go
             // away. Without these watches it only noticed on a timer, which
             // was most of a release once teardown itself took a second or two.
@@ -10311,8 +10736,85 @@ pub(crate) mod tests {
             execution_cleanup_advance(
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry,
             ),
-            ExecutionCleanupAdvance::Retry
+            ExecutionCleanupAdvance::Retry(EXECUTION_CLEANUP_RETRY)
         );
+    }
+
+    /// A `Creating` reservation is a short wait for its writer, not an error.
+    /// Waiting the error interval for it held every release behind an
+    /// in-flight exec for 15 seconds.
+    #[test]
+    fn a_creating_execution_is_rechecked_sooner_than_an_error() {
+        assert_eq!(
+            execution_cleanup_advance(
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitCreation,
+            ),
+            ExecutionCleanupAdvance::Retry(EXECUTION_CREATION_RETRY)
+        );
+        assert!(EXECUTION_CREATION_RETRY <= std::time::Duration::from_secs(2));
+    }
+
+    /// A Ready lease is looked at again no later than just after its expiry,
+    /// and never later than the steady interval.
+    #[test]
+    fn a_ready_lease_requeues_at_its_expiry_when_that_is_sooner() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let seconds = |value: i64| now + chrono::Duration::seconds(value);
+        assert_eq!(ready_lease_requeue(seconds(3600), now), READY_LEASE_RECHECK);
+        assert_eq!(
+            ready_lease_requeue(seconds(5), now),
+            std::time::Duration::from_millis(5100)
+        );
+        // Already past the deadline: come back at once rather than in 30s.
+        assert_eq!(
+            ready_lease_requeue(seconds(-5), now),
+            std::time::Duration::from_millis(100)
+        );
+    }
+
+    /// Canary retries back off 1, 2, 4, 8s from the Claim's Ready transition
+    /// and then hold at 10s. With no usable timestamp they stay at 10s.
+    #[test]
+    fn readiness_canary_retries_back_off_from_claim_ready() {
+        let delay = |elapsed: i64| {
+            readiness_canary_retry_delay(Some(chrono::Duration::milliseconds(elapsed))).as_secs()
+        };
+        let schedule: Vec<_> = [0, 1_000, 3_000, 7_000, 15_000, 120_000]
+            .into_iter()
+            .map(delay)
+            .collect();
+        assert_eq!(schedule, vec![1, 2, 4, 8, 10, 10]);
+        assert_eq!(
+            readiness_canary_retry_delay(None),
+            READINESS_CANARY_MAX_RETRY
+        );
+        // A clock skewed behind the Claim's timestamp is not an attempt count.
+        assert_eq!(
+            readiness_canary_retry_delay(Some(chrono::Duration::seconds(-3))),
+            READINESS_CANARY_MAX_RETRY
+        );
+
+        let claim = claim_with(serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "lastTransitionTime": "2026-09-01T00:00:00Z"
+            }]
+        }));
+        assert_eq!(
+            claim_ready_since(&claim).map(|since| since.to_rfc3339()),
+            Some("2026-09-01T00:00:00+00:00".into())
+        );
+        let unready = claim_with(serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "lastTransitionTime": "2026-09-01T00:00:00Z"
+            }]
+        }));
+        assert_eq!(claim_ready_since(&unready), None);
     }
 
     /// Upstream object names are DERIVED, never taken from caller input.
@@ -10612,6 +11114,7 @@ pub(crate) mod tests {
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::Managed,
             managed_runtime_identity: Some(test_managed_identity()),
+            lease_store: None,
         });
         mount_healthy_runtime(&server).await;
         let required_names = crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_CRDS
@@ -11667,13 +12170,13 @@ pub(crate) mod tests {
             .map(|operation| operation["value"].clone())
     }
 
-    /// Pool status is an exact observation, not an optimistic capacity hint.
-    /// The controller must count only admitted exact-UID leases, observe the
-    /// exact-owned WarmPool, and still withhold Ready until certification is
-    /// implemented. The status write itself must be fenced to the Pool object
-    /// version that produced those observations.
-    #[tokio::test]
-    async fn pool_status_counts_exact_uid_and_withholds_uncertified_readiness() {
+    /// Reconcile a management pool against mocked exact-owned upstream objects
+    /// whose WarmPool reports `warm_status`, with a fixed lease population.
+    /// Returns the written status and the requeue action.
+    async fn reconcile_management_pool_with(
+        mut pool: SandboxPool,
+        warm_status: serde_json::Value,
+    ) -> (serde_json::Value, Action) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let ctx = Arc::new(SandboxContext {
@@ -11686,10 +12189,9 @@ pub(crate) mod tests {
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
             managed_runtime_identity: None,
+            lease_store: None,
         });
 
-        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
-        pool.spec.warm_capacity = 2;
         let pool_owner = pool.controller_owner_ref(&()).unwrap();
         let upstream = |kind: &str, uid: &str, resource_version: &str, spec, status| {
             serde_json::json!({
@@ -11741,7 +12243,7 @@ pub(crate) mod tests {
             .get("spec")
             .cloned()
             .unwrap(),
-            serde_json::json!({ "replicas": 2, "readyReplicas": 1, "observedGeneration": 1 }),
+            warm_status,
         );
         for (target, body) in [(TEMPLATE_PATH, template), (WARM_POOL_PATH, warm_pool)] {
             Mock::given(method("GET"))
@@ -11801,8 +12303,6 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
-        pool.spec.warm_capacity = 2;
         pool.metadata.resource_version = Some("pool-rv".into());
         Mock::given(method("PATCH"))
             .and(path(POOL_STATUS_PATH))
@@ -11810,7 +12310,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_pool(Arc::new(pool), ctx).await.unwrap();
+        let action = reconcile_pool(Arc::new(pool), ctx).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let request = requests
@@ -11825,6 +12325,31 @@ pub(crate) mod tests {
         assert_eq!(patch[1]["path"], "/metadata/resourceVersion");
         assert_eq!(patch[1]["value"], "pool-rv");
         let status = status_value_of(request).expect("status operation");
+        (status, action)
+    }
+
+    /// A pool that has not been certified yet.
+    fn uncertified_pool() -> SandboxPool {
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.warm_capacity = 2;
+        let status = pool.status.as_mut().unwrap();
+        status.certification = None;
+        status.conditions.clear();
+        pool
+    }
+
+    /// Pool status is an exact observation, not an optimistic capacity hint.
+    /// The controller must count only admitted exact-UID leases, observe the
+    /// exact-owned WarmPool, and withhold Ready from a pool that is not yet
+    /// certified. The status write itself must be fenced to the Pool object
+    /// version that produced those observations.
+    #[tokio::test]
+    async fn pool_status_counts_exact_uid_and_withholds_uncertified_readiness() {
+        let (status, _) = reconcile_management_pool_with(
+            uncertified_pool(),
+            serde_json::json!({ "replicas": 2, "readyReplicas": 1, "observedGeneration": 1 }),
+        )
+        .await;
         assert_eq!(status["observedGeneration"], POOL_GENERATION);
         assert_eq!(status["ready"], 1);
         assert_eq!(status["allocated"], 2);
@@ -11844,6 +12369,153 @@ pub(crate) mod tests {
                 .as_str()
                 .unwrap()
                 .contains("replicas=2/readyReplicas=1")
+        );
+    }
+
+    fn certified_pool(capacity: u32) -> SandboxPool {
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.warm_capacity = capacity;
+        pool
+    }
+
+    fn condition_of<'a>(
+        status: &'a serde_json::Value,
+        kind: &str,
+    ) -> Option<&'a serde_json::Value> {
+        status["conditions"]
+            .as_array()?
+            .iter()
+            .find(|condition| condition["type"] == kind)
+    }
+
+    /// Adopting a warm member into a tenant Claim lowers the WarmPool's ready
+    /// count until upstream replaces it. An already-certified pool keeps
+    /// Ready through that refill, so admission does not answer 503 for a pool
+    /// that is about to be full again. The refill start is recorded, and the
+    /// pass comes back no later than the steady interval.
+    #[tokio::test]
+    async fn a_certified_pool_keeps_ready_during_a_normal_refill() {
+        let (status, action) = reconcile_management_pool_with(
+            certified_pool(2),
+            serde_json::json!({ "replicas": 1, "readyReplicas": 1, "observedGeneration": 1 }),
+        )
+        .await;
+        let ready = condition_of(&status, POOL_READY_CONDITION).expect("Ready condition");
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], POOL_REFILLING_REASON);
+        // Ready did not transition, so it keeps the fixture's timestamp.
+        assert_eq!(ready["lastTransitionTime"], "2026-08-20T00:00:00Z");
+        assert_eq!(status["ready"], 1);
+        let refilling = condition_of(&status, POOL_REFILLING_CONDITION).expect("refill start");
+        assert_eq!(refilling["status"], "True");
+        assert_eq!(status["certification"]["phase"], "certified");
+        assert_eq!(action, Action::requeue(POOL_STEADY_RECHECK));
+    }
+
+    /// A refill that outlasts the grace is a degraded pool: Ready drops and
+    /// the full certification gate applies again.
+    #[tokio::test]
+    async fn a_refill_past_its_grace_withdraws_ready() {
+        let mut pool = certified_pool(2);
+        let started = chrono::Utc::now() - POOL_REFILL_GRACE - chrono::Duration::seconds(1);
+        pool.status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(SandboxCondition {
+                condition_type: POOL_REFILLING_CONDITION.into(),
+                status: SandboxConditionStatus::True,
+                reason: POOL_REFILLING_REASON.into(),
+                message: String::new(),
+                observed_generation: Some(POOL_GENERATION),
+                last_transition_time: Some(started.to_rfc3339()),
+            });
+        let (status, _) = reconcile_management_pool_with(
+            pool,
+            serde_json::json!({ "replicas": 2, "readyReplicas": 1, "observedGeneration": 1 }),
+        )
+        .await;
+        let ready = condition_of(&status, POOL_READY_CONDITION).expect("Ready condition");
+        assert_eq!(ready["status"], "False");
+        assert_eq!(ready["reason"], POOL_CERTIFICATION_PENDING_REASON);
+        assert!(condition_of(&status, POOL_REFILLING_CONDITION).is_none());
+    }
+
+    /// Only a shortfall of Ready members against an unchanged desired count is
+    /// a refill. A stale WarmPool status, a surplus, or a changed desired
+    /// replica count takes the full gate, and so does an uncertified pool.
+    #[test]
+    fn only_a_ready_shortfall_at_the_desired_count_is_a_refill() {
+        let pool = certified_pool(2);
+        let observation = |replicas: u32, ready: u32, observed: i64, desired: u32| {
+            let warm_pool = DynamicObject {
+                types: None,
+                metadata: ObjectMeta {
+                    name: Some("kobe-agents".into()),
+                    namespace: Some(NS.into()),
+                    uid: Some("warm-pool-uid".into()),
+                    generation: Some(1),
+                    ..ObjectMeta::default()
+                },
+                data: serde_json::json!({
+                    "spec": { "replicas": desired },
+                    "status": { "observedGeneration": observed }
+                }),
+            };
+            let mut template = warm_pool.clone();
+            template.metadata.uid = Some("template-uid".into());
+            WarmPoolObservation {
+                replicas,
+                ready_replicas: ready,
+                template,
+                warm_pool,
+            }
+        };
+        let now = chrono::Utc::now();
+        let hold = |pool: &SandboxPool, observed: WarmPoolObservation| {
+            certified_pool_refill_started(pool, &observed, now)
+        };
+        assert_eq!(hold(&pool, observation(1, 1, 1, 2)), Some(now));
+        assert_eq!(hold(&pool, observation(2, 0, 1, 2)), Some(now));
+        assert_eq!(hold(&pool, observation(2, 2, 1, 2)), None);
+        assert_eq!(hold(&pool, observation(1, 1, 0, 2)), None);
+        assert_eq!(hold(&pool, observation(3, 1, 1, 2)), None);
+        assert_eq!(hold(&pool, observation(1, 1, 1, 3)), None);
+        assert_eq!(hold(&uncertified_pool(), observation(1, 1, 1, 2)), None);
+    }
+
+    /// Upstream objects map back to the pool that controls them; a ClusterPool
+    /// maps to the child pools that reference it.
+    #[test]
+    fn pool_events_map_to_their_pool() {
+        let pool = certified_pool(1);
+        let owner = pool.controller_owner_ref(&()).unwrap();
+        let owned = ObjectMeta {
+            namespace: Some(NS.into()),
+            owner_references: Some(vec![owner.clone()]),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(
+            pool_owner_trigger(&owned),
+            Some(ObjectRef::new("agents").within(NS))
+        );
+        let mut not_controller = owner;
+        not_controller.controller = Some(false);
+        let foreign = ObjectMeta {
+            namespace: Some(NS.into()),
+            owner_references: Some(vec![not_controller]),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(pool_owner_trigger(&foreign), None);
+
+        let mut child = certified_pool(1);
+        child.metadata.name = Some("child-agents".into());
+        child.spec.placement = SandboxPlacement::ChildCluster {
+            cluster_pool_ref: "kind-pool".into(),
+        };
+        assert_eq!(
+            cluster_pool_triggers("kind-pool", &[Arc::new(pool), Arc::new(child)]),
+            vec![ObjectRef::new("child-agents").within(NS)]
         );
     }
 
@@ -14039,9 +14711,14 @@ pub(crate) mod tests {
     }
 
     /// A closed access gate still carries the exact execution inventory.
-    /// Teardown retires one abandoned pre-CREATE slot and ends the pass before
-    /// credentials or workload can be touched; the next pass must re-list the
-    /// execution namespace before accepting absence.
+    ///
+    /// The invariant: nothing touches scoped credentials or the Claim until
+    /// execution cleanup reports `Clean`. Cleanup itself may take several
+    /// durable steps in one pass (each re-reads the manifest and records), so
+    /// this fixture gives it two entries: an abandoned pre-CREATE slot it
+    /// retires, then a `Creating` reservation it must wait for. The pass
+    /// retires the first, re-reads, stops at the second, and requeues on the
+    /// short creation interval without reaching credentials or the Claim.
     #[tokio::test]
     async fn execution_cleanup_checkpoints_before_credentials_and_claims() {
         use sha2::{Digest, Sha256};
@@ -14066,46 +14743,68 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
-        let execution_manifest = serde_json::json!({
-            "execution-a": {
-                "requestDigest": "d".repeat(64),
-                "podUid": "pod-uid",
-                "reservedAt": "2020-01-01T00:00:00Z",
-                "creationState": "rejected",
-                "active": false
-            }
-        })
-        .to_string();
-        let gate_object = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": {
-                "name": gate,
-                "namespace": NS,
-                "uid": "access-gate-uid",
-                "resourceVersion": "1",
-                "labels": {
-                    "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
-                    "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
-                    "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
-                },
-                "annotations": {
-                    "kobe.kunobi.ninja/sandbox-access-state": "closed",
-                    "kobe.kunobi.ninja/sandbox-access-entries": "{}",
-                    "kobe.kunobi.ninja/sandbox-executions": execution_manifest,
-                },
-            },
-            "spec": {},
+        let creating = serde_json::json!({
+            "requestDigest": "e".repeat(64),
+            "podUid": "pod-uid",
+            "reservedAt": "2020-01-01T00:00:00Z",
+            "creationState": "creating",
+            "active": true
         });
+        let gate_with = |manifest: serde_json::Value, resource_version: &str| {
+            serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": gate,
+                    "namespace": NS,
+                    "uid": "access-gate-uid",
+                    "resourceVersion": resource_version,
+                    "labels": {
+                        "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                        "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
+                        "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-access-state": "closed",
+                        "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                        "kobe.kunobi.ninja/sandbox-executions": manifest.to_string(),
+                    },
+                },
+                "spec": {},
+            })
+        };
+        let before = gate_with(
+            serde_json::json!({
+                "execution-a": {
+                    "requestDigest": "d".repeat(64),
+                    "podUid": "pod-uid",
+                    "reservedAt": "2020-01-01T00:00:00Z",
+                    "creationState": "rejected",
+                    "active": false
+                },
+                "execution-b": creating.clone(),
+            }),
+            "1",
+        );
+        let after = gate_with(serde_json::json!({ "execution-b": creating }), "2");
+        // The gate reads up to and including the retirement CAS see both
+        // entries; every read after the PATCH sees only the Creating one.
         Mock::given(method("GET"))
             .and(path(&gate_path))
-            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object.clone()))
-            .expect(3)
+            .respond_with(ResponseTemplate::new(200).set_body_json(before))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(after.clone()))
+            .with_priority(2)
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
             .and(path(&gate_path))
-            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object))
+            .respond_with(ResponseTemplate::new(200).set_body_json(after))
             .expect(1)
             .mount(&server)
             .await;
@@ -14119,13 +14818,28 @@ pub(crate) mod tests {
                 "metadata":{"resourceVersion":"1"},
                 "items":[]
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
+        for name in ["execution-a", "execution-b"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/{name}"
+                )))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Failure",
+                    "reason": "NotFound",
+                    "code": 404
+                })))
+                .mount(&server)
+                .await;
+        }
 
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            execution_cleanup_checkpoint_action()
+            Action::requeue(EXECUTION_CREATION_RETRY)
         );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
@@ -14142,7 +14856,8 @@ pub(crate) mod tests {
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         let entries: serde_json::Value =
             serde_json::from_str(body[3]["value"].as_str().unwrap()).unwrap();
-        assert_eq!(entries, serde_json::json!({}));
+        assert!(entries.get("execution-a").is_none());
+        assert!(entries.get("execution-b").is_some());
     }
 
     /// Footprint events map back to the lease they belong to, and only to it.
@@ -14287,7 +15002,7 @@ pub(crate) mod tests {
         let (ctx, _server) = test_context().await;
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+        let outcome = drain_execution_cleanup(&lease, &ctx, || {
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 if call < 5 {
@@ -14304,7 +15019,7 @@ pub(crate) mod tests {
         // A step that never stops checkpointing is bounded, and the caller
         // requeues rather than treating the lease as clean.
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+        let outcome = drain_execution_cleanup(&lease, &ctx, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { ExecutionCleanupOutcome::Checkpointed }
         })
@@ -14317,7 +15032,7 @@ pub(crate) mod tests {
 
         // Retry and quarantine end the pass immediately.
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = drain_executions_after_target_absence(&lease, &ctx, || {
+        let outcome = drain_execution_cleanup(&lease, &ctx, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { ExecutionCleanupOutcome::Retry }
         })
@@ -17564,6 +18279,82 @@ current-context: child
             .await;
     }
 
+    /// A closed gate whose manifest holds a rejected slot and a `Creating`
+    /// reservation. Reads before the retirement CAS see both entries; later
+    /// reads see only the `Creating` one, whose record is absent. Cleanup
+    /// therefore makes one durable step and then has to wait.
+    async fn mount_retire_then_wait_execution_gate(
+        server: &MockServer,
+        lease: &SandboxLease,
+        gate: &str,
+        gate_path: &str,
+    ) {
+        let creating = serde_json::json!({
+            "requestDigest": "e".repeat(64),
+            "podUid": "pod-uid",
+            "reservedAt": "2026-08-20T00:00:00Z",
+            "creationState": "creating",
+            "active": true
+        });
+        let before = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "creationState": "rejected",
+                "active": false
+            },
+            "execution-b": creating.clone(),
+        })
+        .to_string();
+        let after = serde_json::json!({ "execution-b": creating }).to_string();
+        let mut before_object = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": gate,
+                "namespace": NS,
+                "uid": "access-gate-uid",
+                "resourceVersion": "gate-rv-0",
+                "labels": {
+                    "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                    "kobe.kunobi.ninja/sandbox-lease-name": lease.name_any(),
+                    "kobe.kunobi.ninja/sandbox-access-lease-uid": lease.uid().unwrap(),
+                },
+                "annotations": {
+                    "kobe.kunobi.ninja/sandbox-access-state": "closed",
+                    "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                },
+            },
+            "spec": {},
+        });
+        before_object["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-executions"] =
+            serde_json::json!(before);
+        Mock::given(method("GET"))
+            .and(path(gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(before_object))
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        mount_closed_execution_gate(server, lease, gate, gate_path, &after).await;
+        for name in ["execution-a", "execution-b"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/{name}"
+                )))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Failure",
+                    "reason": "NotFound",
+                    "code": 404
+                })))
+                .mount(server)
+                .await;
+        }
+    }
+
     /// Credential ambiguity is not child unreachability. Only a transport
     /// failure from an exact, digest-checked Secret may select destroy-receipt
     /// fallback; management reads, authentication and child 5xx remain
@@ -18165,21 +18956,14 @@ current-context: child
             generation: None,
         });
         let (gate, gate_path) = attach_test_access_gate(&mut lease);
-        let manifest = serde_json::json!({
-            "execution-a": {
-                "requestDigest": "d".repeat(64),
-                "podUid": "sandbox-pod-uid",
-                "reservedAt": "2026-08-20T00:00:00Z",
-                "creationState": "rejected",
-                "active": false
-            }
-        })
-        .to_string();
-        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+        mount_retire_then_wait_execution_gate(&server, &lease, &gate, &gate_path).await;
 
+        // One retirement lands, the pass re-reads and stops at the Creating
+        // reservation. Credentials and the cluster handle stay untouched
+        // because execution cleanup never reported Clean.
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            execution_cleanup_checkpoint_action()
+            Action::requeue(EXECUTION_CREATION_RETRY)
         );
         assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
         assert_eq!(
@@ -19515,17 +20299,7 @@ current-context: child
         status.child_teardown_mode =
             Some(crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1);
         let (gate, gate_path) = attach_test_access_gate(&mut lease);
-        let manifest = serde_json::json!({
-            "execution-a": {
-                "requestDigest": "d".repeat(64),
-                "podUid": "pod-uid",
-                "reservedAt": "2026-08-20T00:00:00Z",
-                "creationState": "rejected",
-                "active": false
-            }
-        })
-        .to_string();
-        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+        mount_retire_then_wait_execution_gate(&server, &lease, &gate, &gate_path).await;
         let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
         mount_child_evidence(&server, &receipt).await;
         Mock::given(method("GET"))
@@ -19540,9 +20314,12 @@ current-context: child
             .mount(&server)
             .await;
 
+        // The pass retires the rejected slot, re-reads, and stops at the
+        // Creating reservation: execution cleanup is not Clean, so nothing
+        // past it runs.
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            execution_cleanup_checkpoint_action()
+            Action::requeue(EXECUTION_CREATION_RETRY)
         );
         assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
         let statuses: Vec<_> = server
@@ -19971,6 +20748,7 @@ current-context: child
             placement_enabled: true,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
             managed_runtime_identity: None,
+            lease_store: None,
         });
         (ctx, server)
     }

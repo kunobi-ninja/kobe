@@ -39,7 +39,7 @@ use crate::sandbox::{
 const WARM_POOL_LABEL: &str = "agents.x-k8s.io/warm-pool-sandbox";
 const TEMPLATE_REF_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-template-ref-hash";
 const SANDBOX_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
-const CERTIFICATION_POOL_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool-uid";
+pub(super) const CERTIFICATION_POOL_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool-uid";
 const CERTIFICATION_POOL_GENERATION_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool-generation";
 const TEARDOWN_FENCE_LABEL: &str = "kobe.kunobi.ninja/sandbox-teardown-fence";
 const TEARDOWN_FENCE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-teardown-fence";
@@ -673,7 +673,7 @@ fn dynamic_status_count(warm_pool: &DynamicObject, field: &str) -> Option<u32> {
     }
 }
 
-fn warm_pool_status_is_current(warm_pool: &DynamicObject) -> bool {
+pub(super) fn warm_pool_status_is_current(warm_pool: &DynamicObject) -> bool {
     warm_pool.metadata.generation.is_some_and(|generation| {
         warm_pool
             .data
