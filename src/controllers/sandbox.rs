@@ -214,10 +214,44 @@ fn execution_cleanup_checkpoint_action() -> Action {
     Action::requeue(std::time::Duration::from_secs(1))
 }
 
-/// How often release re-checks a management footprint that is still present.
-/// The Pod exits within its short grace period and nothing watches it for us,
-/// so a long poll here would be most of the release.
-const FOOTPRINT_ABSENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Fallback re-check of a management footprint that is still present. The
+/// lease controller watches the Claim, Sandbox and Pod, so their removal
+/// triggers the next pass at once; this only covers a missed event or a
+/// descendant kind that is not watched.
+const FOOTPRINT_ABSENCE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long release waits before re-checking an access gate that still has
+/// operations registered by live replicas. The gate lives in the ledger
+/// namespace, which the operator may not watch, so this is a poll.
+const ACCESS_DRAIN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+const ACCESS_DRAIN_ATTEMPTS: usize = 4;
+
+/// Close the lease's access gate and check it drained, within one pass.
+///
+/// `close_and_drain` reads the gate afresh on every call, so a close that was
+/// just checkpointed, or that lost an optimistic race, can be re-checked at
+/// once. Requeueing after each of those cost a fixed wait on every release.
+async fn close_and_drain_access(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> Result<
+    crate::sandbox_access_ledger::AccessDrain,
+    crate::sandbox_access_ledger::AccessLedgerError,
+> {
+    let mut outcome = crate::sandbox_access_ledger::AccessDrain::Waiting;
+    for _ in 0..ACCESS_DRAIN_ATTEMPTS {
+        outcome = crate::sandbox_access_ledger::close_and_drain(
+            &ctx.client,
+            &ctx.reservation_namespace,
+            lease,
+        )
+        .await?;
+        if matches!(outcome, crate::sandbox_access_ledger::AccessDrain::Drained) {
+            break;
+        }
+    }
+    Ok(outcome)
+}
 
 /// Upper bounds on retiring execution records within one reconcile pass.
 const EXECUTION_DRAIN_MAX_STEPS: usize = 64;
@@ -2696,7 +2730,7 @@ async fn ensure_allocation_fence(
             let now = chrono::Utc::now();
             let fence = k8s_openapi::api::coordination::v1::Lease {
                 metadata: kube::api::ObjectMeta {
-                    name: Some(name),
+                    name: Some(name.clone()),
                     namespace: Some(ctx.namespace.clone()),
                     labels: Some(
                         [
@@ -2736,21 +2770,25 @@ async fn ensure_allocation_fence(
                     ..Default::default()
                 }),
             };
-            return match tokio::time::timeout(
+            // Continue with the created (or concurrently created) object
+            // rather than requeueing: the checks below apply to it as they
+            // would on the next pass, and the wait was a fixed cost of every
+            // release.
+            match tokio::time::timeout(
                 SANDBOX_CLAIM_CREATE_TIMEOUT,
                 fences.create(&PostParams::default(), &fence),
             )
             .await
             {
-                Ok(Ok(_)) => Ok(AllocationFence::Draining(std::time::Duration::from_secs(1))),
-                Ok(Err(kube::Error::Api(error))) if error.code == 409 => {
-                    Ok(AllocationFence::Draining(std::time::Duration::from_secs(1)))
+                Ok(Ok(created)) => created,
+                Ok(Err(kube::Error::Api(error))) if error.code == 409 => fences.get(&name).await?,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    return Ok(AllocationFence::Draining(std::time::Duration::from_secs(
+                        10,
+                    )));
                 }
-                Ok(Err(error)) => Err(error.into()),
-                Err(_) => Ok(AllocationFence::Draining(std::time::Duration::from_secs(
-                    10,
-                ))),
-            };
+            }
         }
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
             return Ok(AllocationFence::Quarantine(
@@ -4801,18 +4839,12 @@ async fn drive_release(
     // its registered operation; a local watch or a sleep cannot provide that
     // cross-replica ordering guarantee.
     if ctx.access_ledger_enabled {
-        match crate::sandbox_access_ledger::close_and_drain(
-            &ctx.client,
-            &ctx.reservation_namespace,
-            lease,
-        )
-        .await
-        {
+        match close_and_drain_access(lease, ctx).await {
             Ok(crate::sandbox_access_ledger::AccessDrain::Drained) => {}
             Ok(
                 crate::sandbox_access_ledger::AccessDrain::Checkpointed
                 | crate::sandbox_access_ledger::AccessDrain::Waiting,
-            ) => return Ok(Action::requeue(std::time::Duration::from_secs(2))),
+            ) => return Ok(Action::requeue(ACCESS_DRAIN_RETRY)),
             Err(
                 crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
                 | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
@@ -10014,6 +10046,131 @@ fn internal_cluster_lease_trigger(
     Some(ObjectRef::new(outer_name).within(namespace))
 }
 
+/// Map a management SandboxClaim to the SandboxLease it was created for.
+///
+/// The Claim name is derived from the lease name by [`claim_name`], and every
+/// Claim this controller creates carries the lease UID label. The mapping only
+/// triggers a reconcile, which re-checks exact identity itself.
+fn claim_lease_trigger(claim: &DynamicObject) -> Option<ObjectRef<SandboxLease>> {
+    claim
+        .labels()
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+        .filter(|uid| !uid.is_empty())?;
+    let lease = claim.metadata.name.as_deref()?.strip_prefix("kobe-")?;
+    let namespace = claim.metadata.namespace.as_ref()?;
+    Some(ObjectRef::new(lease).within(namespace))
+}
+
+/// Map an upstream Sandbox to the SandboxLease whose Claim owns it. Warm
+/// Sandboxes are owned by the warm pool and trigger nothing.
+fn sandbox_lease_trigger(sandbox: &DynamicObject) -> Option<ObjectRef<SandboxLease>> {
+    let owner = sandbox.owner_references().iter().find(|owner| {
+        owner.kind == SANDBOX_CLAIM_KIND && owner.api_version == AGENT_SANDBOX_API_VERSION
+    })?;
+    let lease = owner.name.strip_prefix("kobe-")?;
+    let namespace = sandbox.metadata.namespace.as_ref()?;
+    Some(ObjectRef::new(lease).within(namespace))
+}
+
+/// Map a claimed Sandbox Pod to the leases whose recorded Claim it belongs to.
+///
+/// A Pod whose Claim UID no lease records (a Claim replaced before its UID was
+/// checkpointed) wakes every releasing lease instead. Few leases are releasing
+/// at once, and each pass re-checks exact identity, so the cost is a handful of
+/// reconciles rather than a missed release.
+fn pod_lease_triggers(pod: &Pod, leases: &[Arc<SandboxLease>]) -> Vec<ObjectRef<SandboxLease>> {
+    let Some(claim_uid) = pod
+        .labels()
+        .get("agents.x-k8s.io/claim-uid")
+        .filter(|uid| !uid.is_empty())
+    else {
+        return Vec::new();
+    };
+    let recorded: Vec<_> = leases
+        .iter()
+        .filter(|lease| {
+            lease
+                .status
+                .as_ref()
+                .and_then(|status| status.target.as_ref())
+                .and_then(|target| target.sandbox_claim.as_ref())
+                .is_some_and(|claim| &claim.uid == claim_uid)
+        })
+        .map(|lease| ObjectRef::from_obj(lease.as_ref()))
+        .collect();
+    if !recorded.is_empty() {
+        return recorded;
+    }
+    leases
+        .iter()
+        .filter(|lease| {
+            lease.status.as_ref().map(|status| status.phase)
+                == Some(crate::crd::SandboxLeasePhase::Releasing)
+        })
+        .map(|lease| ObjectRef::from_obj(lease.as_ref()))
+        .collect()
+}
+
+/// Keep a footprint watch's object, logging an error instead of dropping it
+/// silently. The fallback poll still covers the lease while the watch backs off.
+fn watched_object<K>(
+    kind: &'static str,
+    event: Result<K, kube::runtime::watcher::Error>,
+) -> Option<K> {
+    event
+        .inspect_err(|error| warn!(kind, error = %error, "Sandbox release footprint watch failed"))
+        .ok()
+}
+
+/// Reconcile requests for leases whose Claim, Sandbox or Pod changed.
+fn release_footprint_triggers(
+    claims: Api<DynamicObject>,
+    sandboxes: Api<DynamicObject>,
+    pods: Api<Pod>,
+    leases: kube::runtime::reflector::Store<SandboxLease>,
+) -> impl futures::Stream<Item = ObjectRef<SandboxLease>> + Send + 'static {
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    let claim_triggers = watcher(
+        claims,
+        Config::default().labels(crate::sandbox::SANDBOX_LEASE_UID_LABEL),
+    )
+    .default_backoff()
+    .touched_objects()
+    .filter_map(|claim| async move {
+        watched_object("SandboxClaim", claim)
+            .as_ref()
+            .and_then(claim_lease_trigger)
+    })
+    .boxed();
+    let sandbox_triggers = watcher(sandboxes, Config::default())
+        .default_backoff()
+        .touched_objects()
+        .filter_map(|sandbox| async move {
+            watched_object("Sandbox", sandbox)
+                .as_ref()
+                .and_then(sandbox_lease_trigger)
+        })
+        .boxed();
+    let pod_triggers = watcher(
+        pods,
+        Config::default().labels(&format!(
+            "app.kubernetes.io/managed-by={}",
+            crate::sandbox::KOBE_MANAGED_BY
+        )),
+    )
+    .default_backoff()
+    .touched_objects()
+    .flat_map(move |pod| {
+        let triggers = watched_object("Pod", pod)
+            .map(|pod| pod_lease_triggers(&pod, &leases.state()))
+            .unwrap_or_default();
+        futures::stream::iter(triggers)
+    })
+    .boxed();
+    futures::stream::select_all([claim_triggers, sandbox_triggers, pod_triggers])
+}
+
 /// Run Sandbox lifecycle until shutdown.
 ///
 /// Pool placement is started only when `placement_enabled`. The lease loop is
@@ -10079,8 +10236,29 @@ pub async fn run_sandbox_controller(
     };
 
     let lease_shutdown = shutdown.clone();
+    let claims: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        namespace,
+        &upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+    );
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), namespace, &sandbox_resource());
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
     let lease_loop = async move {
-        Controller::new(leases, Config::default())
+        let controller = Controller::new(leases, Config::default());
+        let lease_store = controller.store();
+        controller
+            // Release waits for the upstream Claim, Sandbox and Pod to go
+            // away. Without these watches it only noticed on a timer, which
+            // was most of a release once teardown itself took a second or two.
+            // Each watch backs off on error: `watches_with` does not, and a
+            // missing CRD would otherwise retry in a tight loop.
+            .reconcile_on(release_footprint_triggers(
+                claims,
+                sandboxes,
+                pods,
+                lease_store,
+            ))
             // A child placement waits for its internal ClusterLease to bind.
             // Without this the controller only finds out on a timer, which is
             // most of the wait: the bind itself takes a second or two.
@@ -13667,9 +13845,10 @@ pub(crate) mod tests {
     }
 
     /// The distributed gate is a durable teardown checkpoint: admission has
-    /// already created it open, and the pass that closes it must stop before
-    /// credentials, Claims, or reservations are touched. The next pass is the
-    /// first one allowed to observe it empty.
+    /// already created it open, and nothing may touch credentials, Claims, or
+    /// reservations until a fresh read after the close observes it empty.
+    /// While the gate never reads back drained, release re-checks it a bounded
+    /// number of times in the pass and then requeues without tearing down.
     #[tokio::test]
     async fn release_checkpoints_a_closed_access_gate_before_teardown() {
         use sha2::{Digest, Sha256};
@@ -13716,7 +13895,7 @@ pub(crate) mod tests {
                 },
                 "spec": {},
             })))
-            .expect(1)
+            .expect(ACCESS_DRAIN_ATTEMPTS as u64)
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
@@ -13742,13 +13921,13 @@ pub(crate) mod tests {
                 },
                 "spec": {},
             })))
-            .expect(1)
+            .expect(ACCESS_DRAIN_ATTEMPTS as u64)
             .mount(&server)
             .await;
 
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            Action::requeue(std::time::Duration::from_secs(2))
+            Action::requeue(ACCESS_DRAIN_RETRY)
         );
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
         assert_eq!(
@@ -13773,6 +13952,90 @@ pub(crate) mod tests {
             "/metadata/annotations/kobe.kunobi.ninja~1sandbox-access-state"
         );
         assert_eq!(body[3]["value"], "closed");
+    }
+
+    /// A gate that reads back empty right after its close lets release carry
+    /// on to the allocation fence in the same pass, instead of paying a fixed
+    /// requeue on every release.
+    #[tokio::test]
+    async fn a_gate_drained_after_close_continues_in_the_same_pass() {
+        use sha2::{Digest, Sha256};
+
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "access-gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let gate_object = |state: &str| {
+            serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": gate,
+                    "namespace": NS,
+                    "uid": "access-gate-uid",
+                    "resourceVersion": "1",
+                    "labels": {
+                        "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                        "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
+                        "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-access-state": state,
+                        "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                        "kobe.kunobi.ninja/sandbox-executions": "{}",
+                    },
+                },
+                "spec": {},
+            })
+        };
+        let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object("open")))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object("closed")))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object("closed")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Later teardown steps are not mocked; only the fence read matters.
+        let _ = reconcile_lease(Arc::new(lease), ctx).await;
+        assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
+        assert!(
+            requests_to(
+                &server,
+                "GET",
+                &format!("{RESERVATIONS_PATH}/{}", allocation_fence_name(LEASE))
+            )
+            .await
+                >= 1,
+            "release must reach the allocation fence in the pass that drained the gate"
+        );
     }
 
     /// A closed access gate still carries the exact execution inventory.
@@ -13880,6 +14143,117 @@ pub(crate) mod tests {
         let entries: serde_json::Value =
             serde_json::from_str(body[3]["value"].as_str().unwrap()).unwrap();
         assert_eq!(entries, serde_json::json!({}));
+    }
+
+    /// Footprint events map back to the lease they belong to, and only to it.
+    #[test]
+    fn footprint_events_map_to_their_lease() {
+        let claim: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": AGENT_SANDBOX_API_VERSION,
+            "kind": SANDBOX_CLAIM_KIND,
+            "metadata": {
+                "name": "kobe-sandbox-abc",
+                "namespace": "kobe-system",
+                "labels": {crate::sandbox::SANDBOX_LEASE_UID_LABEL: "lease-uid"},
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            claim_lease_trigger(&claim),
+            Some(ObjectRef::new("sandbox-abc").within("kobe-system"))
+        );
+        let mut unlabelled = claim.clone();
+        unlabelled.metadata.labels = None;
+        assert_eq!(claim_lease_trigger(&unlabelled), None);
+
+        let sandbox = |owner_kind: &str, owner_name: &str| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                "metadata": {
+                    "name": "kobe-sandbox-x1",
+                    "namespace": "kobe-system",
+                    "ownerReferences": [{
+                        "apiVersion": AGENT_SANDBOX_API_VERSION,
+                        "kind": owner_kind,
+                        "name": owner_name,
+                        "uid": "owner-uid",
+                    }],
+                },
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            sandbox_lease_trigger(&sandbox(SANDBOX_CLAIM_KIND, "kobe-sandbox-abc")),
+            Some(ObjectRef::new("sandbox-abc").within("kobe-system"))
+        );
+        // A warm Sandbox belongs to the pool, not to any lease.
+        assert_eq!(
+            sandbox_lease_trigger(&sandbox(SANDBOX_WARM_POOL_KIND, "kobe-sandbox")),
+            None
+        );
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let claim_uid = lease
+            .status
+            .as_ref()
+            .unwrap()
+            .target
+            .as_ref()
+            .unwrap()
+            .sandbox_claim
+            .as_ref()
+            .unwrap()
+            .uid
+            .clone();
+        let mut other = lease.clone();
+        other.metadata.name = Some("sandbox-other".into());
+        other
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim
+            .as_mut()
+            .unwrap()
+            .uid = "other-claim-uid".into();
+        let leases = vec![Arc::new(lease.clone()), Arc::new(other)];
+        let pod = |claim_uid: Option<&str>| -> Pod {
+            let mut pod = Pod::default();
+            pod.metadata.labels = claim_uid.map(|uid| {
+                [("agents.x-k8s.io/claim-uid".to_string(), uid.to_string())]
+                    .into_iter()
+                    .collect()
+            });
+            pod
+        };
+        assert_eq!(
+            pod_lease_triggers(&pod(Some(&claim_uid)), &leases),
+            vec![ObjectRef::from_obj(&lease)]
+        );
+        // An unrecorded Claim UID wakes the releasing leases, not nothing.
+        let mut ready = lease.clone();
+        ready.metadata.name = Some("sandbox-ready".into());
+        ready.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Ready;
+        ready
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim
+            .as_mut()
+            .unwrap()
+            .uid = "ready-claim-uid".into();
+        let with_ready = vec![Arc::new(ready), Arc::new(lease.clone())];
+        assert_eq!(
+            pod_lease_triggers(&pod(Some("unrecorded")), &with_ready),
+            vec![ObjectRef::from_obj(&lease)]
+        );
+        assert!(pod_lease_triggers(&pod(None), &leases).is_empty());
     }
 
     /// Only management placement may skip the fence drain. An unrecorded
