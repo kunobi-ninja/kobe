@@ -61,6 +61,24 @@ fn k0s_image(version: &str) -> String {
 }
 
 /// Direct k0s backend -- manages k0s clusters via raw Kubernetes resources.
+/// Optional pool spec fields this backend reads. See
+/// [`super::unsupported_pool_fields`].
+/// No `registryMirrors` (k0s writes no containerd mirror config) and no
+/// `kubeletSharedMount`.
+pub(crate) const HONORED_POOL_FIELDS: &[super::PoolSpecField] = {
+    use super::PoolSpecField::*;
+    &[
+        Servers,
+        Agents,
+        ServerArgs,
+        Persistence,
+        Expose,
+        Taints,
+        Placement,
+        ClusterDomain,
+    ]
+};
+
 #[derive(Clone)]
 pub struct K0sBackend {
     /// Kubernetes client for the host cluster.
@@ -3060,5 +3078,25 @@ mod tests {
         // MockServer Drop validates that the mock with the exact labelSelector
         // was called exactly once — any different labelSelector would not match
         // and the .expect(1) would fail.
+    }
+}
+
+#[cfg(test)]
+mod pool_spec_coverage_tests {
+    use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
+    use crate::crd::BackendType;
+
+    /// k0s renders no registries file and no kubelet hostPath mount.
+    #[test]
+    fn k0s_refuses_registry_mirrors_and_kubelet_shared_mount() {
+        let spec = pool_spec_requesting_every_field(BackendType::K0s);
+        assert_eq!(
+            unsupported_pool_fields(&spec),
+            vec![
+                "cluster.registryMirrors",
+                "cluster.kubeletSharedMount",
+                "backend.datastore.goldenTemplates",
+            ]
+        );
     }
 }

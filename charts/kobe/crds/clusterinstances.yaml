@@ -95,7 +95,11 @@ spec:
                     properties:
                       goldenTemplates:
                         default: false
-                        description: Enable golden images via PostgreSQL template databases.
+                        description: |-
+                          Reserved; has no effect. Nothing clones clusters from template
+                          databases yet. A pool that sets this to `true` gets
+                          `ConfigSupported=False` and creates no new members, so the setting is
+                          never silently accepted. Leave it unset or `false`.
                         type: boolean
                       secretKey:
                         default: connection-url

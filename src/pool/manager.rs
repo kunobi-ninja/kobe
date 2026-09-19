@@ -398,7 +398,7 @@ impl ClusterEntry {
 }
 
 /// Decisions the pool manager emits after evaluating state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolAction {
     /// Create a new cluster with this name.
     Create(String),

@@ -142,7 +142,10 @@ pub struct DatastoreConfig {
     /// Key in the Secret (default: "connection-url").
     #[serde(default = "default_secret_key")]
     pub secret_key: String,
-    /// Enable golden images via PostgreSQL template databases.
+    /// Reserved; has no effect. Nothing clones clusters from template
+    /// databases yet. A pool that sets this to `true` gets
+    /// `ConfigSupported=False` and creates no new members, so the setting is
+    /// never silently accepted. Leave it unset or `false`.
     #[serde(default)]
     pub golden_templates: bool,
 }
@@ -1492,7 +1495,9 @@ pub enum ClusterPoolPhase {
     /// Consecutive provision failures, currently inside the backoff window.
     Backoff,
     /// Three or more consecutive failures sustained — requires operator
-    /// attention (misconfiguration, missing dependency, etc.).
+    /// attention (misconfiguration, missing dependency, etc.). Also reported,
+    /// with no failures counted, while the `ConfigSupported` condition is
+    /// `False` (the pool sets fields its backend ignores).
     Failing,
     /// Pool scaled to zero by design — no demand, `minReady == 0`, nothing
     /// in flight. Healthy steady state for a fully-idle pool.
@@ -1591,6 +1596,37 @@ pub struct ClusterPoolStatus {
     /// correctly counts failed attempts even during rapid churn.
     #[serde(default)]
     pub last_ready_max_index: u32,
+
+    /// Pool conditions. Currently emitted: `ConfigSupported`, which is
+    /// `False` with reason `UnsupportedFields` when the pool sets fields its
+    /// backend ignores. While it is `False` the pool creates no new members
+    /// and reports phase `Failing`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ClusterPoolCondition>,
+}
+
+/// A Kubernetes-style condition on a [`ClusterPool`]. Same shape as
+/// [`crate::crd::ClusterInstanceCondition`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterPoolCondition {
+    /// Condition name, e.g. `ConfigSupported`.
+    #[serde(rename = "type")]
+    pub condition_type: String,
+
+    /// One of: `True`, `False`, `Unknown`.
+    pub status: String,
+
+    /// Machine-readable reason, e.g. `UnsupportedFields`.
+    pub reason: String,
+
+    /// Human-readable detail.
+    pub message: String,
+
+    /// RFC3339 of the last `status` change. Kept across reconciles while the
+    /// status is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
 }
 
 // --- Defaults ---

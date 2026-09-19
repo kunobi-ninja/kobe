@@ -42,6 +42,18 @@ const MANAGED_BY: &str = "kobe-operator";
 const DEFAULT_IMAGE: &str = "zondax/vkobe:latest";
 
 /// Vkobe backend — manages vkobe virtual clusters.
+/// Optional pool spec fields this backend reads. See
+/// [`super::unsupported_pool_fields`].
+///
+/// `cluster.serverArgs` is read only as the legacy fallback when
+/// `spec.backend.vkobe` is absent (see `VkobeBackend::effective_config`).
+pub(crate) fn honored_pool_fields(vkobe: Option<&VkobeConfig>) -> &'static [super::PoolSpecField] {
+    match vkobe {
+        Some(_) => &[],
+        None => &[super::PoolSpecField::ServerArgs],
+    }
+}
+
 #[derive(Clone)]
 pub struct VkobeBackend {
     client: Client,
@@ -2401,5 +2413,51 @@ mod tests {
         assert_eq!(subject.kind, "ServiceAccount");
         assert_eq!(subject.name, "test-cluster-vkobe");
         assert_eq!(subject.namespace.as_deref(), Some("test-ns"));
+    }
+}
+
+#[cfg(test)]
+mod pool_spec_coverage_tests {
+    use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
+    use crate::crd::BackendType;
+
+    const EVERY_FIELD_BUT_SERVER_ARGS: &[&str] = &[
+        "cluster.servers",
+        "cluster.agents",
+        "cluster.persistence",
+        "cluster.expose",
+        "cluster.taints",
+        "cluster.placement",
+        "cluster.clusterDomain",
+        "cluster.registryMirrors",
+        "cluster.kubeletSharedMount",
+        "backend.datastore.goldenTemplates",
+    ];
+
+    /// Without `spec.backend.vkobe`, vkobe parses its settings out of the
+    /// legacy `cluster.serverArgs`. Nothing else in `spec.cluster` is read.
+    #[test]
+    fn vkobe_without_backend_block_reads_only_server_args() {
+        let spec = pool_spec_requesting_every_field(BackendType::Vkobe);
+        assert_eq!(unsupported_pool_fields(&spec), EVERY_FIELD_BUT_SERVER_ARGS);
+    }
+
+    /// With `spec.backend.vkobe` set, `cluster.serverArgs` is ignored too.
+    #[test]
+    fn vkobe_with_backend_block_refuses_server_args() {
+        let mut spec = pool_spec_requesting_every_field(BackendType::Vkobe);
+        spec.backend.vkobe = Some(
+            serde_json::from_value(serde_json::json!({
+                "dataStoreRef": { "name": "store" },
+                "version": "1.33",
+            }))
+            .expect("vkobe config"),
+        );
+        let unsupported = unsupported_pool_fields(&spec);
+        assert!(
+            unsupported.contains(&"cluster.serverArgs"),
+            "{unsupported:?}"
+        );
+        assert_eq!(unsupported.len(), EVERY_FIELD_BUT_SERVER_ARGS.len() + 1);
     }
 }

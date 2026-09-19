@@ -1350,13 +1350,27 @@ async fn reconcile_profile(
             backend.render_fingerprint(&profile.spec.cluster)
         });
 
-    let actions = compute_pool_actions(
-        &profile,
-        &pool_state,
-        now,
-        &ctx.render_ctx,
-        &bootstrap_specs,
-        render_fingerprint.as_deref(),
+    // Fields the pool sets that its backend would ignore. Such a pool gets no
+    // new members until the spec is fixed; see `hold_unsupported_config`.
+    let unsupported_fields = crate::backend::unsupported_pool_fields(&profile.spec);
+    if !unsupported_fields.is_empty() {
+        warn!(
+            profile = %name,
+            fields = ?unsupported_fields,
+            "Pool sets fields its backend ignores; not creating members"
+        );
+    }
+
+    let actions = hold_unsupported_config(
+        compute_pool_actions(
+            &profile,
+            &pool_state,
+            now,
+            &ctx.render_ctx,
+            &bootstrap_specs,
+            render_fingerprint.as_deref(),
+        ),
+        &unsupported_fields,
     );
 
     // Check whether the backend datastore is degraded. When kine/etcd
@@ -1628,16 +1642,34 @@ async fn reconcile_profile(
         ),
     };
 
-    let phase = crate::pool::manager::compute_pool_phase(
-        &profile,
-        &counts,
-        queue_depth,
-        backoff.consecutive_failures,
-        backoff.next_attempt_at.as_deref(),
+    // An unsupported spec reports `Failing`: it needs operator attention, and
+    // the lease pre-flight already refuses a `Failing` pool with nothing Ready
+    // while still serving any Ready members it has.
+    let phase = if unsupported_fields.is_empty() {
+        crate::pool::manager::compute_pool_phase(
+            &profile,
+            &counts,
+            queue_depth,
+            backoff.consecutive_failures,
+            backoff.next_attempt_at.as_deref(),
+            now,
+        )
+    } else {
+        crate::crd::ClusterPoolPhase::Failing
+    };
+
+    let conditions = pool_conditions(
+        profile
+            .status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default(),
+        config_supported_condition(&profile.spec.backend.backend_type, &unsupported_fields),
         now,
     );
 
     let status = ClusterPoolStatus {
+        conditions,
         phase: Some(phase),
         ready: counts.ready,
         leased: counts.leased,
@@ -1960,6 +1992,85 @@ async fn pool_creation_blocked_by_backend(
     let stores: Api<crate::crd::KobeStore> = Api::namespaced(client.clone(), namespace);
     let store = stores.get(&store_name).await.ok()?;
     crate::controllers::kobestore_health::unhealthy_reason(&store)
+}
+
+/// Condition type reporting whether the pool's backend honors its spec.
+const CONFIG_SUPPORTED: &str = "ConfigSupported";
+
+/// Drop the actions that would act on a spec the backend cannot honor.
+///
+/// With `unsupported` non-empty, no member is created and no member is
+/// recycled for spec drift: the edit that introduced the unsupported field
+/// would otherwise drain Ready members with nothing to replace them. Every
+/// other recycle (unhealthy, timeouts, scale-down, released leases) still
+/// runs.
+fn hold_unsupported_config(actions: Vec<PoolAction>, unsupported: &[&str]) -> Vec<PoolAction> {
+    if unsupported.is_empty() {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .filter(|action| match action {
+            PoolAction::Create(_) => false,
+            PoolAction::Delete(_, reason) => *reason != crate::metrics::RecycleReason::SpecDrift,
+        })
+        .collect()
+}
+
+/// The `ConfigSupported` condition for a pool, without a transition time.
+fn config_supported_condition(
+    backend: &crate::crd::BackendType,
+    unsupported: &[&str],
+) -> crate::crd::ClusterPoolCondition {
+    let (status, reason, message) = if unsupported.is_empty() {
+        ("True", "AllFieldsSupported", String::new())
+    } else {
+        (
+            "False",
+            "UnsupportedFields",
+            format!(
+                "backend {} ignores {}; remove them or pick a backend that \
+                 supports them. No new members are created until then.",
+                format!("{backend:?}").to_lowercase(),
+                unsupported.join(", ")
+            ),
+        )
+    };
+    crate::crd::ClusterPoolCondition {
+        condition_type: CONFIG_SUPPORTED.to_string(),
+        status: status.to_string(),
+        reason: reason.to_string(),
+        message,
+        last_transition_time: None,
+    }
+}
+
+/// Merge `condition` into the pool's previous conditions.
+///
+/// Conditions of other types are kept as they are. `lastTransitionTime`
+/// carries over while the status is unchanged and is set to `now` when it
+/// flips.
+fn pool_conditions(
+    previous: &[crate::crd::ClusterPoolCondition],
+    mut condition: crate::crd::ClusterPoolCondition,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::crd::ClusterPoolCondition> {
+    let prior = previous
+        .iter()
+        .find(|c| c.condition_type == condition.condition_type);
+    condition.last_transition_time = match prior {
+        Some(p) if p.status == condition.status && p.last_transition_time.is_some() => {
+            p.last_transition_time.clone()
+        }
+        _ => Some(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    };
+    let mut conditions: Vec<_> = previous
+        .iter()
+        .filter(|c| c.condition_type != condition.condition_type)
+        .cloned()
+        .collect();
+    conditions.push(condition);
+    conditions
 }
 
 fn error_policy(
@@ -2685,4 +2796,195 @@ fn parse_optional_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::U
     value
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+#[cfg(test)]
+mod unsupported_config_tests {
+    use super::*;
+    use crate::metrics::RecycleReason;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn t(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn unsupported_config_holds_creates_and_drift_recycles_only() {
+        let actions = vec![
+            PoolAction::Create("p-3".into()),
+            PoolAction::Delete("p-0".into(), RecycleReason::SpecDrift),
+            PoolAction::Delete("p-1".into(), RecycleReason::Unhealthy),
+            PoolAction::Delete("p-2".into(), RecycleReason::ScaleDown),
+        ];
+        let held = hold_unsupported_config(actions.clone(), &["cluster.servers"]);
+        assert_eq!(
+            held,
+            vec![
+                PoolAction::Delete("p-1".into(), RecycleReason::Unhealthy),
+                PoolAction::Delete("p-2".into(), RecycleReason::ScaleDown),
+            ]
+        );
+        assert_eq!(hold_unsupported_config(actions.clone(), &[]), actions);
+    }
+
+    #[test]
+    fn config_supported_condition_names_backend_and_fields() {
+        let c = config_supported_condition(
+            &crate::crd::BackendType::Vcluster,
+            &["cluster.servers", "cluster.agents"],
+        );
+        assert_eq!(c.condition_type, "ConfigSupported");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "UnsupportedFields");
+        assert!(
+            c.message
+                .contains("backend vcluster ignores cluster.servers, cluster.agents"),
+            "{}",
+            c.message
+        );
+
+        let ok = config_supported_condition(&crate::crd::BackendType::K3s, &[]);
+        assert_eq!(ok.status, "True");
+    }
+
+    #[test]
+    fn pool_conditions_keep_transition_time_until_status_flips() {
+        let first = pool_conditions(
+            &[],
+            config_supported_condition(&crate::crd::BackendType::Vcluster, &["cluster.servers"]),
+            t("2026-09-01T10:00:00Z"),
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].last_transition_time.as_deref(),
+            Some("2026-09-01T10:00:00Z")
+        );
+
+        let same = pool_conditions(
+            &first,
+            config_supported_condition(&crate::crd::BackendType::Vcluster, &["cluster.agents"]),
+            t("2026-09-01T11:00:00Z"),
+        );
+        assert_eq!(
+            same[0].last_transition_time.as_deref(),
+            Some("2026-09-01T10:00:00Z")
+        );
+        assert!(same[0].message.contains("cluster.agents"));
+
+        let flipped = pool_conditions(
+            &same,
+            config_supported_condition(&crate::crd::BackendType::Vcluster, &[]),
+            t("2026-09-01T12:00:00Z"),
+        );
+        assert_eq!(flipped.len(), 1);
+        assert_eq!(flipped[0].status, "True");
+        assert_eq!(
+            flipped[0].last_transition_time.as_deref(),
+            Some("2026-09-01T12:00:00Z")
+        );
+    }
+
+    /// End to end through `reconcile_profile`: a vcluster pool asking for
+    /// three servers must not create a member, and must say why in status.
+    #[tokio::test]
+    async fn reconcile_blocks_a_pool_whose_backend_ignores_its_fields() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let ctx = Arc::new(ProfileContext {
+            client,
+            namespace: "test-ns".to_string(),
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            velero: None,
+            factory: None,
+            render_ctx: crate::pool::RenderContext::with_kobe_sync_image("zondax/kobe-sync:test"),
+            golden_in_progress: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        });
+
+        let empty_list = |kind: &str| {
+            serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": kind,
+                "metadata": { "resourceVersion": "1" },
+                "items": []
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(empty_list("ClusterInstanceList")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list("ClusterLeaseList")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let pool: ClusterPool = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "metadata": { "name": "vc", "namespace": "test-ns", "uid": "pool-uid", "generation": 1 },
+            "spec": {
+                "size": 1,
+                "backend": { "type": "vcluster" },
+                "cluster": { "version": "v1.33.1", "servers": 3 },
+                "scaling": { "minReady": 1, "maxClusters": 2 }
+            }
+        }))
+        .unwrap();
+
+        let patched = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = patched.clone();
+        let echo = serde_json::to_value(&pool).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/vc/status",
+            ))
+            .respond_with(move |req: &wiremock::Request| {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                    sink.lock().unwrap().push(v);
+                }
+                ResponseTemplate::new(200).set_body_json(echo.clone())
+            })
+            .mount(&server)
+            .await;
+
+        reconcile_profile(Arc::new(pool), ctx)
+            .await
+            .expect("reconcile succeeds");
+
+        let writes = patched.lock().unwrap().clone();
+        let status = &writes.last().expect("status was patched")["status"];
+        assert_eq!(status["phase"], "Failing", "{status}");
+        let condition = status["conditions"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["type"] == "ConfigSupported"))
+            .unwrap_or_else(|| panic!("no ConfigSupported condition: {status}"));
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "UnsupportedFields");
+        assert!(
+            condition["message"]
+                .as_str()
+                .unwrap()
+                .contains("cluster.servers"),
+            "{condition}"
+        );
+    }
 }

@@ -540,6 +540,24 @@ fn render_registries_yaml(mirrors: &BTreeMap<String, Vec<String>>) -> Option<Str
 }
 
 /// Direct k3s backend — manages k3s clusters via raw Kubernetes resources.
+/// Optional pool spec fields this backend reads. See
+/// [`super::unsupported_pool_fields`].
+pub(crate) const HONORED_POOL_FIELDS: &[super::PoolSpecField] = {
+    use super::PoolSpecField::*;
+    &[
+        Servers,
+        Agents,
+        ServerArgs,
+        Persistence,
+        Expose,
+        Taints,
+        Placement,
+        ClusterDomain,
+        RegistryMirrors,
+        KubeletSharedMount,
+    ]
+};
+
 #[derive(Clone)]
 pub struct K3sBackend {
     /// Kubernetes client for the host cluster.
@@ -9068,5 +9086,22 @@ mod tests {
 
         let got = backend.detect_crashloop_impl(cluster, ns).await.unwrap();
         assert_eq!(got, None);
+    }
+}
+
+#[cfg(test)]
+mod pool_spec_coverage_tests {
+    use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
+    use crate::crd::BackendType;
+
+    /// k3s reads every optional `spec.cluster` field. Only the reserved
+    /// `goldenTemplates` flag is refused.
+    #[test]
+    fn k3s_honors_every_cluster_field() {
+        let spec = pool_spec_requesting_every_field(BackendType::K3s);
+        assert_eq!(
+            unsupported_pool_fields(&spec),
+            vec!["backend.datastore.goldenTemplates"]
+        );
     }
 }
