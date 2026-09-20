@@ -30,7 +30,10 @@ use crate::crd::{
 };
 use crate::diagnostics;
 use crate::lease_binding::BindingResolutionError;
-use crate::pool::{PoolState, parse_duration};
+use crate::pool::{
+    PoolState, RenderContext, parse_duration, profile_spec_hash, resolve_bootstrap_specs,
+    spec_hash_is_current,
+};
 
 #[derive(Debug)]
 struct SandboxCompositionIdentity {
@@ -4140,12 +4143,10 @@ async fn reserve_ready_instance(
     let lp =
         ListParams::default().labels(&format!("kobe.kunobi.ninja/pool={}", lease.spec.pool_ref));
     let instances = instances_api.list(&lp).await?;
-    let mut ready: Vec<ClusterInstance> = instances
+    let ready: Vec<ClusterInstance> = instances
         .into_iter()
         .filter(instance_is_free_capacity)
         .collect();
-    ready.sort_by_key(|instance| instance.name_any());
-    let ready = candidates_for_slot(ready, slot);
 
     if ready.is_empty() {
         return Ok(None);
@@ -4161,6 +4162,8 @@ async fn reserve_ready_instance(
         .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
     let pools_api: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
     let pool = pools_api.get(&lease.spec.pool_ref).await?;
+    let current_hash = pool_spec_hash_for_bind(client, namespace, &pool, factory).await;
+    let ready = candidates_for_slot(order_bind_candidates(ready, &current_hash), slot);
 
     for instance in ready {
         let mut binding = match binding_from_observation(&lease, &instance, &pool) {
@@ -4250,7 +4253,8 @@ async fn reserve_ready_instance(
 }
 
 /// The free instances the lease at bind-window `slot` may try, from the
-/// name-sorted free list.
+/// already-ordered free list (current template first; see
+/// [`order_bind_candidates`]).
 ///
 /// The head (slot 0) tries every instance. Any other slot tries only the
 /// instance at its own index, and none if the list is shorter than its slot
@@ -4268,6 +4272,73 @@ fn candidates_for_slot<T>(candidates: Vec<T>, slot: usize) -> Vec<T> {
         return candidates;
     }
     candidates.into_iter().nth(slot).into_iter().collect()
+}
+
+/// Order free Ready instances so a new lease prefers the current template.
+///
+/// Current-spec members (the stamped-hash check drift recycle uses) come
+/// first. Within each group, oldest `stateSince` first so stale members
+/// that do get bound leave through ordinary use sooner, and current
+/// members rotate FIFO. Name is the last tie-break so the slot window
+/// stays deterministic.
+fn order_bind_candidates(
+    mut ready: Vec<ClusterInstance>,
+    current_hash: &str,
+) -> Vec<ClusterInstance> {
+    ready.sort_by(|a, b| {
+        let a_current = spec_hash_is_current(
+            a.status
+                .as_ref()
+                .and_then(|status| status.spec_hash.as_deref()),
+            current_hash,
+        );
+        let b_current = spec_hash_is_current(
+            b.status
+                .as_ref()
+                .and_then(|status| status.spec_hash.as_deref()),
+            current_hash,
+        );
+        b_current
+            .cmp(&a_current)
+            .then_with(|| match (bind_state_since(a), bind_state_since(b)) {
+                (Some(a_since), Some(b_since)) => a_since.cmp(&b_since),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.name_any().cmp(&b.name_any()))
+    });
+    ready
+}
+
+fn bind_state_since(instance: &ClusterInstance) -> Option<chrono::DateTime<chrono::Utc>> {
+    instance
+        .status
+        .as_ref()
+        .and_then(|status| status.state_since.as_deref())
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// The pool spec hash stamped on new members, computed the same way the
+/// pool controller does: resolved bootstrap content, operator render
+/// context, backend fingerprint when the factory can name one.
+async fn pool_spec_hash_for_bind(
+    client: &Client,
+    namespace: &str,
+    pool: &ClusterPool,
+    factory: Option<&BackendFactory>,
+) -> crate::pool::SpecHash {
+    let bootstrap_specs = resolve_bootstrap_specs(client, namespace, pool).await;
+    let fingerprint = factory
+        .and_then(|factory| factory.backend_for(pool).ok())
+        .and_then(|backend| backend.render_fingerprint(&pool.spec.cluster));
+    profile_spec_hash(
+        pool,
+        &RenderContext::from_env(),
+        &bootstrap_specs,
+        fingerprint.as_deref(),
+    )
 }
 
 fn lease_uid_for(lease: &ClusterLease) -> Result<&str, LeaseError> {
@@ -7871,6 +7942,48 @@ mod tests {
         })
     }
 
+    fn current_test_profile_spec_hash() -> String {
+        let pool: ClusterPool = serde_json::from_value(make_test_profile()).unwrap();
+        profile_spec_hash(&pool, &RenderContext::from_env(), &Default::default(), None)
+    }
+
+    fn bindable_instance_json(name: &str, spec_hash: &str) -> serde_json::Value {
+        let backend =
+            BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap();
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "uid": format!("{name}-uid"),
+                "resourceVersion": "20",
+                "generation": 1,
+                "labels": { "kobe.kunobi.ninja/pool": "test-profile" },
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterPool",
+                    "name": "test-profile",
+                    "uid": "test-profile-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+            "status": {
+                "phase": "Ready",
+                "provisioned": true,
+                "leaseRef": null,
+                "specHash": spec_hash,
+                "createdWith": {
+                    "operatorVersion": "v0.37.0",
+                    "backendType": "k3s",
+                    "poolUid": "test-profile-uid",
+                    "backend": backend
+                }
+            }
+        })
+    }
+
     // -----------------------------------------------------------------------
     // error_policy
     // -----------------------------------------------------------------------
@@ -8545,6 +8658,121 @@ mod tests {
                         && ops.iter().any(|op| op["path"] == "/status/binding")
                 }))
         );
+    }
+
+    /// #234: a new lease must take the current-template member even when a
+    /// stale Ready member sorts first by name.
+    #[tokio::test]
+    async fn reserve_ready_instance_binds_the_current_template_member_ahead_of_a_stale_one() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = make_test_lease("bind-current", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+        let current_hash = current_test_profile_spec_hash();
+        let stale = bindable_instance_json("aaa-stale", "ffffffffffffffff");
+        let current = bindable_instance_json("zzz-current", &current_hash);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![stale.clone(), current.clone()]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/zzz-current",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(current.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/zzz-current/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": "zzz-current",
+                    "namespace": "test-ns",
+                    "uid": "zzz-current-uid",
+                    "resourceVersion": "21",
+                    "generation": 1
+                },
+                "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+                "status": { "phase": "Leased", "provisioned": true }
+            })))
+            .mount(&server)
+            .await;
+
+        let intent_response = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let intent_response_for_patch = intent_response.clone();
+        let lease_for_response = (*lease).clone();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-current/status",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("lease intent JSON Patch");
+                let binding = operations
+                    .as_array()
+                    .and_then(|operations| {
+                        operations.iter().find(|operation| {
+                            operation["op"] == "add" && operation["path"] == "/status/binding"
+                        })
+                    })
+                    .map(|operation| operation["value"].clone())
+                    .expect("intent patch carries binding");
+                let mut response = serde_json::to_value(&lease_for_response).unwrap();
+                response["metadata"]["resourceVersion"] = "11".into();
+                response["status"]["binding"] = binding;
+                *intent_response_for_patch.lock().unwrap() = Some(response.clone());
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let intent_response_for_get = intent_response.clone();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-current",
+            ))
+            .respond_with(move |_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    intent_response_for_get
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("intent PATCH precedes lease fence GET"),
+                )
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease, None, 0)
+            .await
+            .unwrap()
+            .expect("current-template instance should be reserved");
+        assert_eq!(
+            binding.instance.name, "zzz-current",
+            "stale aaa-stale sorts first by name and must still lose to the current member"
+        );
+        assert_eq!(binding.instance.uid, "zzz-current-uid");
     }
 
     #[tokio::test]
@@ -10238,6 +10466,70 @@ mod tests {
         assert!(
             candidates_for_slot(free(), 3).is_empty(),
             "a slot past the free list must not wrap onto the head's instance"
+        );
+    }
+
+    fn ready_member(
+        name: &str,
+        spec_hash: Option<&str>,
+        state_since: Option<&str>,
+    ) -> ClusterInstance {
+        let mut instance = instance_fixture(name, "test-profile", "Ready");
+        let status = instance.status.get_or_insert_with(Default::default);
+        status.spec_hash = spec_hash.map(str::to_string);
+        status.state_since = state_since.map(str::to_string);
+        instance
+    }
+
+    fn ordered_names(members: Vec<ClusterInstance>, current: &str) -> Vec<String> {
+        order_bind_candidates(members, current)
+            .into_iter()
+            .map(|instance| instance.name_any())
+            .collect()
+    }
+
+    #[test]
+    fn order_bind_candidates_puts_current_spec_ahead_of_stale_even_when_stale_sorts_first_by_name()
+    {
+        assert_eq!(
+            ordered_names(
+                vec![
+                    ready_member("aaa-stale", Some("old"), None),
+                    ready_member("zzz-current", Some("now"), None),
+                ],
+                "now",
+            ),
+            ["zzz-current", "aaa-stale"]
+        );
+    }
+
+    #[test]
+    fn order_bind_candidates_picks_the_oldest_member_within_each_spec_group() {
+        assert_eq!(
+            ordered_names(
+                vec![
+                    ready_member("current-new", Some("now"), Some("2026-01-02T00:00:00Z")),
+                    ready_member("current-old", Some("now"), Some("2026-01-01T00:00:00Z")),
+                    ready_member("stale-new", Some("old"), Some("2026-01-02T00:00:00Z")),
+                    ready_member("stale-old", Some("old"), Some("2026-01-01T00:00:00Z")),
+                ],
+                "now",
+            ),
+            ["current-old", "current-new", "stale-old", "stale-new"]
+        );
+    }
+
+    #[test]
+    fn order_bind_candidates_does_not_treat_an_unstamped_member_as_current() {
+        assert_eq!(
+            ordered_names(
+                vec![
+                    ready_member("unstamped", None, Some("2026-01-01T00:00:00Z")),
+                    ready_member("current", Some("now"), Some("2026-01-02T00:00:00Z")),
+                ],
+                "now",
+            ),
+            ["current", "unstamped"]
         );
     }
 

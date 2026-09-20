@@ -17,6 +17,7 @@ use crate::crd::{
 };
 use crate::pool::{
     ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
+    resolve_bootstrap_specs,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -2092,52 +2093,7 @@ fn count_queued(leases: &[ClusterLease]) -> u32 {
         .count() as u32
 }
 
-/// Resolve every `BootstrapConfig` referenced by `profile.spec.bootstraps`,
-/// returning a name → spec map suitable for feeding into
-/// `pool::profile_spec_hash`.
-///
-/// Best-effort: if a referenced BootstrapConfig is missing or
-/// unreadable, it's omitted from the result and the caller will see
-/// the `<unresolved>` sentinel inside the hasher (see
-/// `pool::profile_spec_hash`). This means a transient lookup failure
-/// produces a *different* hash than a successful resolution — drift is
-/// detected once the bootstrap reappears, recycle happens, problem
-/// solved. The alternative (failing the entire reconcile) would block
-/// every other pool action behind a missing CRD.
-async fn resolve_bootstrap_specs(
-    client: &Client,
-    namespace: &str,
-    profile: &ClusterPool,
-) -> std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec> {
-    use crate::crd::BootstrapConfig;
-    use kube::ResourceExt;
-
-    let mut specs = std::collections::BTreeMap::new();
-    if profile.spec.bootstraps.is_empty() {
-        return specs;
-    }
-
-    let api: Api<BootstrapConfig> = Api::namespaced(client.clone(), namespace);
-    for bs_ref in &profile.spec.bootstraps {
-        match api.get(&bs_ref.name).await {
-            Ok(cr) => {
-                specs.insert(cr.name_any(), cr.spec);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    profile = %profile.name_any(),
-                    bootstrap = %bs_ref.name,
-                    error = %e,
-                    "Failed to resolve BootstrapConfig for spec-hash; \
-                     drift detection will treat it as unresolved"
-                );
-            }
-        }
-    }
-    specs
-}
-
-/// Returns `Some(reason)` when the pool's backend datastore (a
+/// Returns `Some(reason)` when the pool's backend datastore (a)
 /// `KobeStore`, currently only relevant for vkobe pools) is in a
 /// `Healthy=False` state, so the profile controller should refuse to
 /// create new ClusterInstances against it. `None` means either the
