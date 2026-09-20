@@ -643,23 +643,21 @@ fn open_in_browser(url: &str) -> bool {
         .is_ok()
 }
 
-/// Start the desktop and open a viewer on this machine.
+/// Start the desktop and open the KasmVNC page in the local browser.
 ///
-/// If `vncviewer` (TigerVNC) is on `PATH`, that is the viewer: clipboard and
-/// keyboard work. Otherwise, and with `--web`, this is the KasmVNC page.
-/// Screen Sharing on macOS is not used; it demands a VNC password and our
-/// server has none on purpose (`kobe vnc screenshot` speaks RFB None).
+/// `--native` is TigerVNC against 5900 when `vncviewer` is on PATH. Screen
+/// Sharing on macOS is not used; it demands a VNC password and x11vnc has
+/// none so screenshot/click can speak RFB security None.
 pub(crate) struct OpenDesktop<'a> {
     pub lease: &'a str,
-    /// Remote port inside the Sandbox. `None` picks 5900 for a native viewer
-    /// and 6080 for KasmVNC.
+    /// Remote port inside the Sandbox. `None` picks 6080, or 5900 with `--native`.
     pub port: Option<u16>,
     /// Local port to serve on; 0 picks a free one.
     pub local_port: u16,
     pub launch_browser: bool,
     pub start_desktop: bool,
-    /// Force the KasmVNC page even when a native viewer is installed.
-    pub web: bool,
+    /// Use TigerVNC instead of the browser.
+    pub native: bool,
     pub target_override: Option<&'a str>,
     pub endpoint_override: Option<&'a str>,
     pub output: OutputFormat,
@@ -679,7 +677,7 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
         local_port,
         launch_browser,
         start_desktop,
-        web,
+        native,
         target_override,
         endpoint_override,
         output,
@@ -694,7 +692,9 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
         ensure_desktop(&config, lease, output).await?;
     }
 
-    let native = !web && command_on_path("vncviewer");
+    if native && !command_on_path("vncviewer") {
+        bail!("--native needs `vncviewer` on PATH (TigerVNC)");
+    }
     let remote_port = port.unwrap_or(if native { 5900 } else { 6080 });
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))

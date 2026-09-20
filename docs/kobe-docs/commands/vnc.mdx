@@ -9,11 +9,10 @@ The workspace image ships a desktop: KasmVNC as the X server and browser
 viewer, Openbox, Firefox, and x11vnc on the same display so `kobe vnc` can
 still speak RFB. An agent can look at the screen and act without a browser.
 
-On your laptop, `kobe vnc open` is the viewer. Without `--web` and with
-`vncviewer` on PATH it uses TigerVNC against port 5900. Otherwise it forwards
-KasmVNC's HTTP page on 6080. macOS Screen Sharing is not used: it demands a
-VNC password, and x11vnc has none so screenshot/click can speak RFB security
-None.
+On your laptop, `kobe vnc open` starts the desktop, forwards KasmVNC on 6080,
+and opens it in the browser. `--native` is TigerVNC against 5900 if
+`vncviewer` is on PATH. macOS Screen Sharing is not used: it demands a VNC
+password, and x11vnc has none so screenshot/click can speak RFB security None.
 
 ## `kobe vnc open`
 
@@ -23,17 +22,16 @@ kobe vnc open dev
 
 ```
 Starting the desktop in dev...
-Opened TigerVNC at 127.0.0.1:52341
+Opened http://127.0.0.1:52341/
 Ctrl-C closes the viewer; the sandbox keeps running.
 ```
 
-The forward runs until you interrupt it. Interrupting closes the viewer, not
-the desktop: the sandbox keeps running and `kobe vnc open` reconnects to the
-same session.
+The forward runs until you interrupt it. Interrupting closes the browser view,
+not the desktop: the sandbox keeps running and `kobe vnc open` reconnects to
+the same session.
 
-`--web` forces the KasmVNC page. `--no-browser` prints the URL instead of opening
-a viewer. `--local-port` pins the port. `--no-start` skips starting the
-desktop.
+`--no-browser` prints the URL instead of opening one. `--local-port` pins the
+port. `--no-start` skips starting the desktop.
 
 ## Starting the desktop by hand
 
@@ -123,9 +121,8 @@ short-lived loopback forward carried by the same authenticated stream as
 authorization and costs nothing against the execution budget.
 
 `kobe port-forward dev 6080:6080` still works if you would rather wire it up
-yourself. `kobe vnc open --web` is that plus starting the desktop and knowing
-the query string. `kobe port-forward dev 5901:5900` plus TigerVNC is the
-native path.
+yourself. `kobe vnc open` is that plus starting the desktop. `--native` plus
+TigerVNC is the RFB path.
 
 ## Limits
 
