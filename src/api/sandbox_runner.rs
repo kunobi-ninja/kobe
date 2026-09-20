@@ -50,6 +50,7 @@ use kobe_runner::protocol::{
 };
 
 use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget, exec_capped_until};
+use crate::api::sandbox_credentials::PodAccess;
 use crate::crd::ExecutionState;
 
 /// How long one control call may take.
@@ -422,7 +423,7 @@ fn report_from(
 /// durably, and the runner refuses to spawn a second process for an id it has
 /// seen. A retry of this call after a lost reply reports the original.
 pub async fn start(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -433,7 +434,7 @@ pub async fn start(
     let line = start_line(request)?;
     let argv = start_argv(runner_path, crash);
     let output = call(
-        client,
+        access,
         target,
         container,
         &argv,
@@ -451,7 +452,7 @@ pub async fn start(
 
 /// Ask what one execution is doing.
 pub async fn poll(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -459,7 +460,7 @@ pub async fn poll(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let output = call(
-        client,
+        access,
         target,
         container,
         &control_argv(runner_path, "status", id, &[]),
@@ -473,7 +474,7 @@ pub async fn poll(
 
 /// Terminate one execution's process group.
 pub async fn cancel(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -481,7 +482,7 @@ pub async fn cancel(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let output = call(
-        client,
+        access,
         target,
         container,
         &control_argv(runner_path, "cancel", id, &[]),
@@ -496,7 +497,7 @@ pub async fn cancel(
 /// Read one bounded window of one stream.
 #[allow(clippy::too_many_arguments)]
 pub async fn read_output(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -510,7 +511,7 @@ pub async fn read_output(
         LogStream::Stderr => "stderr",
     };
     let output = call(
-        client,
+        access,
         target,
         container,
         &control_argv(
@@ -584,7 +585,7 @@ fn validate_log_chunk(
 /// spin forever. An explicitly configured cap reports truncation; zero leaves
 /// the response unbounded.
 pub async fn read_wait_output(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -592,7 +593,7 @@ pub async fn read_wait_output(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<RunnerOutput, RunnerCallFailure> {
     let stdout = read_stream_to_cap(
-        client,
+        access,
         target,
         container,
         runner_path,
@@ -601,7 +602,7 @@ pub async fn read_wait_output(
         shutdown,
     );
     let stderr = read_stream_to_cap(
-        client,
+        access,
         target,
         container,
         runner_path,
@@ -620,7 +621,7 @@ pub async fn read_wait_output(
 }
 
 async fn read_stream_to_cap(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -633,7 +634,7 @@ async fn read_stream_to_cap(
     let mut truncated = false;
     loop {
         let chunk = read_output(
-            client,
+            access,
             target,
             container,
             runner_path,
@@ -713,7 +714,7 @@ pub(crate) const RUNNER_CALL_OUTCOMES: &[(&str, &str)] = &[
 /// this function, so `runner_forgot_execution` and friends are not among the
 /// outcomes it can record.
 async fn call(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     argv: &[String],
@@ -721,7 +722,7 @@ async fn call(
     timeout: std::time::Duration,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<u8>, RunnerCallFailure> {
-    let outcome = call_inner(client, target, container, argv, stdin, timeout, shutdown).await;
+    let outcome = call_inner(access, target, container, argv, stdin, timeout, shutdown).await;
     let (result, cause) = match outcome {
         Ok(stdout) => (Ok(stdout), "ok"),
         Err((failure, cause)) => (Err(failure), cause),
@@ -751,7 +752,7 @@ async fn call(
 /// So the precise cause travels alongside the coarse failure and lands only on
 /// the metric. Nothing here changes what the caller is told.
 async fn call_inner(
-    client: &kube::Client,
+    access: PodAccess<'_>,
     target: &SandboxTarget,
     container: &str,
     argv: &[String],
@@ -761,7 +762,7 @@ async fn call_inner(
 ) -> Result<Vec<u8>, (RunnerCallFailure, &'static str)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let raw = exec_capped_until(
-        client,
+        access,
         target,
         container,
         argv,
