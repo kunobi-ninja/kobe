@@ -865,6 +865,22 @@ mod tests {
         );
     }
 
+    /// Debian bookworm's x11vnc 0.9.16 exits on `-clipboard`, and that
+    /// exit takes down KasmVNC with it. Paste still uses ClientCutText.
+    #[test]
+    fn x11vnc_is_not_started_with_the_clipboard_flag() {
+        let script = include_str!("../../../../docker/scripts/kobe-desktop-up");
+        let argv = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !argv.contains("-clipboard"),
+            "x11vnc -clipboard is unknown on Debian 0.9.16 and kills the desktop"
+        );
+    }
+
     /// ClientCutText is type 6, three pad bytes, then a big-endian length.
     #[test]
     fn clipboard_paste_is_client_cut_text() {

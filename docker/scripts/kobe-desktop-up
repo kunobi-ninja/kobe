@@ -100,9 +100,12 @@ xset s off || true
 start_optional xterm -title 'Kobe workspace' -geometry 100x28+32+32 -fa Monospace -fs 11 -e bash -lc 'printf "Kobe GUI workspace ready.\nRight-click the desktop for Terminal, Browser, and status.\n\n"; exec bash'
 # Standard RFB for the CLI. No password: kobe vnc screenshot/click speak
 # security None, and the authenticated Kobe forward is the gate.
+# Do not pass -clipboard: Debian's x11vnc 0.9.16 treats it as unknown and
+# exits, which takes the whole desktop down. RFB ClientCutText plus
+# autocutsel still put paste on CLIPBOARD and PRIMARY.
 start x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -forever -shared \
   -localhost -listen 127.0.0.1 -rfbport 5900 -nopw \
-  -xkb -repeat -clipboard -noxdamage
+  -xkb -repeat -noxdamage
 ready bash -c 'exec 3<>/dev/tcp/127.0.0.1/5900'
 start_optional autocutsel -selection CLIPBOARD
 start_optional autocutsel -selection PRIMARY
