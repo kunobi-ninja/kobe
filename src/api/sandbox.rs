@@ -695,8 +695,7 @@ async fn run_with_runner<B: ClusterBackend>(
 
     let started = tokio::select! {
         started = runner::start(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             target,
             container,
             &runner_path,
@@ -836,8 +835,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     let polled = complete_before_revocation(
         &revoked,
         runner::poll(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             target,
             container,
             &runner_path,
@@ -871,8 +869,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
         }
         None => {
             let cancelled = runner::cancel(
-                &access.reader,
-                &access.actor,
+                access.borrow(),
                 target,
                 container,
                 &runner_path,
@@ -1038,8 +1035,7 @@ async fn wait_output_response<B: ClusterBackend>(
     let output = complete_before_revocation(
         &revoked,
         runner::read_wait_output(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             target,
             container,
             runner_path,
@@ -1219,7 +1215,7 @@ async fn wait_for_runner(
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
                     runner::cancel(
-                        &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
+                        access.borrow(), target, container, runner_path, execution, shutdown,
                     ).await,
                 ));
             }
@@ -1227,14 +1223,14 @@ async fn wait_for_runner(
         }
         report = tokio::select! {
             polled = runner::poll(
-                &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
+                access.borrow(), target, container, runner_path, execution, shutdown,
             ) => {
                 polled.map_err(WaitRunnerFailure::Poll)?
             }
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
                     runner::cancel(
-                        &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
+                        access.borrow(), target, container, runner_path, execution, shutdown,
                     ).await,
                 ));
             }
@@ -1275,8 +1271,7 @@ async fn reconcile_runner<B: ClusterBackend>(
         return record.clone();
     }
     let polled = runner::poll(
-        &access.reader,
-        &access.actor,
+        access.borrow(),
         target,
         container,
         runner_path,
@@ -1644,8 +1639,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         let read = complete_before_revocation(
             &revoked,
             runner::read_output(
-                &access.reader,
-                &access.actor,
+                access.borrow(),
                 &target,
                 &container,
                 &runner_path,
@@ -1748,8 +1742,7 @@ async fn runner_output_revoked_response<B: ClusterBackend>(
         .unwrap_or_default();
     if !current.is_terminal() {
         let cancelled = crate::api::sandbox_runner::cancel(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             target,
             container,
             runner_path,
@@ -1976,8 +1969,7 @@ async fn cancel_runner<B: ClusterBackend>(
     let cancelled = complete_before_revocation(
         revoked,
         runner::cancel(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             target,
             &container,
             &runner_path,
@@ -3150,8 +3142,7 @@ async fn sandbox_exec<B: ClusterBackend>(
 
     let result = tokio::select! {
         result = access::exec_in_sandbox(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             &target,
             &container,
             &request.command,
@@ -3277,8 +3268,7 @@ async fn sandbox_logs<B: ClusterBackend>(
 
     let read = crate::api::sandbox_transport::bounded_setup(
         access::read_sandbox_logs(
-            &access.reader,
-            &access.actor,
+            access.borrow(),
             &target,
             &container,
             access::clamp_tail(query.tail),

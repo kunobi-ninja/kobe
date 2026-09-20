@@ -1980,8 +1980,7 @@ async fn cleanup_lease_executions_inner(
                 .as_deref()
                 .expect("cleanup target always carries runnerPath");
             match runner::cancel(
-                target_client,
-                target_client,
+                crate::api::sandbox_credentials::PodAccess::same(target_client),
                 &target,
                 &target.container,
                 runner_path,

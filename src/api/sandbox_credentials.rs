@@ -762,6 +762,36 @@ pub struct ScopedPodAccess {
     pub actor: kube::Client,
 }
 
+impl ScopedPodAccess {
+    /// Borrow both identities for one operation.
+    pub fn borrow(&self) -> PodAccess<'_> {
+        PodAccess {
+            reader: &self.reader,
+            actor: &self.actor,
+        }
+    }
+}
+
+/// Borrowed reader + actor against one Pod.
+///
+/// The reader may `GET` the Pod (UID check). The actor may only touch the
+/// operation's subresource and must not read `Pod.status` (#219).
+#[derive(Clone, Copy)]
+pub struct PodAccess<'a> {
+    pub reader: &'a kube::Client,
+    pub actor: &'a kube::Client,
+}
+
+impl<'a> PodAccess<'a> {
+    /// Tests and cleanup paths that already hold cluster-admin.
+    pub fn same(client: &'a kube::Client) -> Self {
+        Self {
+            reader: client,
+            actor: client,
+        }
+    }
+}
+
 /// Build a client pair that can reach only this Sandbox's Pod.
 ///
 /// The endpoint and trust anchors come from the operator's own configuration;
