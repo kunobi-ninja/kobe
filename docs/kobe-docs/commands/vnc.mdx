@@ -5,18 +5,16 @@ description: See and drive a Sandbox desktop from the CLI, without a browser.
 
 # Desktop commands
 
-The workspace image ships a desktop: Xvfb, a window manager, Firefox and a VNC
-server. `kobe vnc` reads its framebuffer and sends it input, so an agent can
-look at the screen and act on what it sees without a browser, an open port, or
-a human in the loop.
+The workspace image ships a desktop: KasmVNC as the X server and browser
+viewer, Openbox, Firefox, and x11vnc on the same display so `kobe vnc` can
+still speak RFB. An agent can look at the screen and act without a browser.
 
-Nothing opens a window on your machine. A screenshot is written to a file and
-input events go straight to the server.
+On your laptop, `kobe vnc open` starts the desktop, forwards KasmVNC on 6080,
+and opens it in the browser. `--native` is TigerVNC against 5900 if
+`vncviewer` is on PATH. macOS Screen Sharing is not used: it demands a VNC
+password, and x11vnc has none so screenshot/click can speak RFB security None.
 
 ## `kobe vnc open`
-
-The one command to reach for. It starts the desktop if it is not running,
-forwards noVNC, and opens it in your browser:
 
 ```bash
 kobe vnc open dev
@@ -24,17 +22,16 @@ kobe vnc open dev
 
 ```
 Starting the desktop in dev...
-Opened http://127.0.0.1:52341/vnc.html?autoconnect=1&resize=scale&path=websockify
-Ctrl-C closes the desktop in the browser; the sandbox keeps running.
+Opened http://127.0.0.1:52341/
+Ctrl-C closes the viewer; the sandbox keeps running.
 ```
 
 The forward runs until you interrupt it. Interrupting closes the browser view,
 not the desktop: the sandbox keeps running and `kobe vnc open` reconnects to
 the same session.
 
-`--no-browser` prints the URL instead of opening one, which is what you want
-over SSH or in CI. `--local-port` pins the port when you would rather not have
-a new one each time. `--no-start` skips starting the desktop.
+`--no-browser` prints the URL instead of opening one. `--local-port` pins the
+port. `--no-start` skips starting the desktop.
 
 ## Starting the desktop by hand
 
@@ -80,12 +77,17 @@ refused rather than sent and silently ignored.
 Use `kobe vnc move` to move the pointer without pressing anything, which is how
 you trigger a hover.
 
-## `kobe vnc type` and `kobe vnc key`
+## `kobe vnc type`, `kobe vnc key`, and `kobe vnc paste`
 
 ```bash
 kobe vnc type dev --text 'echo hello > /tmp/note'
 kobe vnc key dev --key return
+kobe vnc paste dev --text 'https://example.com/login'
 ```
+
+`paste` puts the text on the X clipboard. Click the field in the desktop and
+press Ctrl+V (Linux, even when the viewer is on a Mac). That is how a URL or
+password gets into Firefox when you cannot paste from the host.
 
 `type` sends printable ASCII, holding Shift where the character needs it. `key`
 presses one named key: `return`, `tab`, `escape`, `backspace`, `delete`, `home`,
@@ -119,14 +121,15 @@ short-lived loopback forward carried by the same authenticated stream as
 authorization and costs nothing against the execution budget.
 
 `kobe port-forward dev 6080:6080` still works if you would rather wire it up
-yourself. `kobe vnc open` is that plus starting the desktop and knowing the
-query string.
+yourself. `kobe vnc open` is that plus starting the desktop. `--native` plus
+TigerVNC is the RFB path.
 
 ## Limits
 
 - The VNC server must be the one the workspace image starts, listening on
   loopback inside the Sandbox. A server asking for a VNC password is refused:
   kobe reaches the desktop over an already-authenticated stream and holds no
-  VNC credentials.
+  VNC credentials. That is also why macOS Screen Sharing cannot connect: it
+  always prompts for a password.
 - Colour-map servers are refused rather than rendered with the wrong colours.
 - A framebuffer larger than 64 megapixels is refused rather than allocated.

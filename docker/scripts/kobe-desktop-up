@@ -42,7 +42,7 @@ start() {
 }
 
 # Convenience windows must not control the desktop lifetime: users should be
-# able to close the initial terminal without taking down Xvfb or noVNC.
+# able to close the initial terminal without taking down Xvnc or x11vnc.
 start_optional() {
   "$@" 9>&- &
 }
@@ -66,10 +66,24 @@ ready() {
 
 # Unix-domain X11 only, with a fresh cookie readable only by this workload UID.
 rm -f "$XAUTHORITY" "$XDG_RUNTIME_DIR/bus"
+mkdir -p "$HOME/.vnc"
 touch "$XAUTHORITY"
 xauth -f "$XAUTHORITY" add "$DISPLAY" . "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-start Xvfb "$DISPLAY" -screen 0 1440x900x24 -nolisten tcp -auth "$XAUTHORITY"
+# KasmVNC is the X server and the browser viewer (HTTP on 6080). It does not
+# speak standard RFB, so x11vnc still attaches to this display for
+# `kobe vnc paste` / screenshot / click.
+start Xvnc "$DISPLAY" -geometry 1440x900 -depth 24 \
+  -auth "$XAUTHORITY" \
+  -interface 127.0.0.1 \
+  -websocketPort 6080 \
+  -httpd /usr/share/kasmvnc/www \
+  -disableBasicAuth \
+  -AlwaysShared \
+  -BlacklistThreshold 0 \
+  -FrameRate 60 \
+  -SecurityTypes None
 ready xdpyinfo -display "$DISPLAY"
+ready curl --fail --silent http://127.0.0.1:6080/
 
 start dbus-daemon --session --nofork --address="$DBUS_SESSION_BUS_ADDRESS"
 ready dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames
@@ -79,16 +93,20 @@ start openbox --sm-disable
 # announced itself as the window manager.
 ready bash -c 'xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id"'
 xsetroot -solid '#17324d'
+xset -dpms || true
+xset s off || true
 # A visible terminal makes an otherwise empty desktop immediately usable. The
 # Openbox right-click menu also exposes Terminal, Browser, and desktop status.
 start_optional xterm -title 'Kobe workspace' -geometry 100x28+32+32 -fa Monospace -fs 11 -e bash -lc 'printf "Kobe GUI workspace ready.\nRight-click the desktop for Terminal, Browser, and status.\n\n"; exec bash'
+# Standard RFB for the CLI. No password: kobe vnc screenshot/click speak
+# security None, and the authenticated Kobe forward is the gate.
 start x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -forever -shared \
-  -localhost -listen 127.0.0.1 -rfbport 5900 -nopw -noxdamage
+  -localhost -listen 127.0.0.1 -rfbport 5900 -nopw \
+  -xkb -repeat -clipboard -noxdamage
 ready bash -c 'exec 3<>/dev/tcp/127.0.0.1/5900'
-# No VNC password: both listeners are loopback-only within the leased Sandbox.
-start websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900
-ready curl --fail --silent http://127.0.0.1:6080/vnc.html
-printf '%s\n' 'Desktop ready on DISPLAY=:99. Forward port 6080 and open /vnc.html?autoconnect=1&resize=scale&path=websockify'
+start_optional autocutsel -selection CLIPBOARD
+start_optional autocutsel -selection PRIMARY
+printf '%s\n' 'Desktop ready on DISPLAY=:99. kobe vnc open <lease>'
 
 # Any component exit (even zero) ends the desktop and fails the execution.
 status=0

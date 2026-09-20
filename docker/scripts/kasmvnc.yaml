@@ -1,0 +1,28 @@
+# Loopback KasmVNC for kobe-desktop. The authenticated Kobe forward is the
+# gate; this process does not ask for a password and does not speak TLS.
+desktop:
+  resolution:
+    width: 1440
+    height: 900
+  allow_resize: true
+  pixel_depth: 24
+network:
+  protocol: http
+  interface: 127.0.0.1
+  websocket_port: 6080
+  use_ipv4: true
+  use_ipv6: false
+  ssl:
+    require_ssl: false
+  udp:
+    public_ip: 127.0.0.1
+command_line:
+  prompt: false
+data_loss_prevention:
+  clipboard:
+    server_to_client:
+      enabled: true
+      size: unlimited
+    client_to_server:
+      enabled: true
+      size: unlimited

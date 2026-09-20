@@ -40,7 +40,7 @@ check() {
 ready() {
   xdpyinfo >/dev/null 2>&1 \
     && dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames >/dev/null 2>&1 \
-    && curl --fail --silent http://127.0.0.1:6080/vnc.html >/dev/null 2>&1
+    && curl --fail --silent http://127.0.0.1:6080/ >/dev/null 2>&1
 }
 
 status() {
@@ -53,7 +53,7 @@ status() {
   fi
   check 'x11' xdpyinfo || failed=1
   check 'dbus' dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames || failed=1
-  check 'novnc' curl --fail --silent http://127.0.0.1:6080/vnc.html || failed=1
+  check 'kasmvnc' curl --fail --silent http://127.0.0.1:6080/ || failed=1
   check 'browser' firefox-esr --version || failed=1
   return "$failed"
 }
@@ -90,7 +90,7 @@ start() {
     fi
     sleep 0.2
   done
-  printf '%s\n' 'Desktop ready. Forward port 6080 and open /vnc.html?autoconnect=1&resize=scale&path=websockify'
+  printf '%s\n' 'Desktop ready. kobe vnc open <lease>'
 }
 
 stop() {
