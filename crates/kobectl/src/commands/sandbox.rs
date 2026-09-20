@@ -676,6 +676,9 @@ pub(crate) struct SandboxLeaseResponse {
     alias: Option<String>,
     #[serde(default)]
     expires_at: Option<String>,
+    /// Absent on older operators means the lease is as usable as its phase says.
+    #[serde(default = "default_true")]
+    usable: bool,
     #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
@@ -698,6 +701,12 @@ struct LeaseOutput<'a> {
     transport: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     iroh: Option<&'a super::leases::IrohDial>,
+    #[serde(skip_serializing_if = "is_true")]
+    usable: bool,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 const SANDBOX_CAPABILITIES: &[&str] = &[
@@ -1123,6 +1132,7 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
                 capabilities: &actions,
                 transport: None,
                 iroh: None,
+                usable: true,
             },
             command.output,
         );
@@ -1165,6 +1175,7 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
             capabilities: &actions,
             transport: ready.transport.as_deref(),
             iroh: ready.iroh.as_ref(),
+            usable: ready.usable,
         },
         command.output,
     )?;
@@ -1199,6 +1210,11 @@ pub(crate) struct LeasePrint<'a> {
     pub capabilities: &'a [String],
     pub transport: Option<&'a str>,
     pub iroh: Option<&'a super::leases::IrohDial>,
+    pub usable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) -> Result<()> {
@@ -1208,6 +1224,9 @@ pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) ->
             println!("Pool:    {}", lease.pool);
             println!("Kind:    Sandbox");
             println!("Status:  {}", lease.phase.to_ascii_lowercase());
+            if !lease.usable {
+                println!("Usable:  no (the Sandbox Pod is gone or has been replaced)");
+            }
             if let Some(expires_at) = lease.expires_at {
                 println!("Expires: {expires_at}");
             }
@@ -1218,7 +1237,9 @@ pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) ->
             if let Some(iroh) = lease.iroh {
                 println!("Iroh:     {}  ({})", iroh.node_id, iroh.relay);
             }
-            if let Some(next) = next_sandbox_hint(lease.id, lease.phase, lease.capabilities) {
+            if lease.usable
+                && let Some(next) = next_sandbox_hint(lease.id, lease.phase, lease.capabilities)
+            {
                 println!("Next:    {next}");
             }
             Ok(())
@@ -1235,6 +1256,7 @@ pub(crate) fn emit_lease_output(lease: &LeasePrint<'_>, output: OutputFormat) ->
             expires_at: lease.expires_at,
             transport: lease.transport,
             iroh: lease.iroh,
+            usable: lease.usable,
         }),
     }
 }
@@ -2423,6 +2445,21 @@ mod tests {
 
         assert_eq!(lease.id, "sandbox-handoff");
         assert_eq!(lease.phase, "Pending");
+        assert!(
+            lease.usable,
+            "older operators omit usable; treat that as true"
+        );
+    }
+
+    #[test]
+    fn unusable_lease_is_visible_to_the_cli() {
+        let lease: SandboxLeaseResponse = serde_json::from_value(serde_json::json!({
+            "id": "sandbox-stale",
+            "phase": "Ready",
+            "usable": false
+        }))
+        .unwrap();
+        assert!(!lease.usable);
     }
 
     /// The remote exit code is this process's exit code.

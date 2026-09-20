@@ -695,6 +695,10 @@ pub(crate) const RUNNER_CALL_OUTCOMES: &[(&str, &str)] = &[
     ("runner_unreachable", "backend_error"),
     // Not a denial: the exec landed and the runner said nothing.
     ("runner_unreachable", "empty_reply"),
+    // The exec landed, exited non-zero, and still produced no stdout. Clap
+    // usage, a missing binary, or a panic before the JSON reply all look
+    // like this; they are not the empty-success path above.
+    ("runner_unreachable", "nonzero_exit"),
     ("runner_unreadable", "not_declared"),
     ("runner_unreadable", "truncated_reply"),
 ];
@@ -775,16 +779,47 @@ async fn call_inner(
         SandboxAccessDenied::NotDeclared { .. } => (RunnerCallFailure::Unreadable, "not_declared"),
         other => (RunnerCallFailure::Unreachable, other.reason_code()),
     })?;
-    if raw.truncated {
+    if raw.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&raw.stderr);
+        let stderr: String = stderr.chars().take(256).collect();
+        tracing::info!(
+            truncated = raw.truncated,
+            success = raw.success,
+            exit_code = ?raw.exit_code,
+            stderr_len = raw.stderr.len(),
+            %stderr,
+            "sandbox runner exec produced no stdout"
+        );
+    }
+    interpret_runner_stdout(raw.stdout, raw.truncated, raw.success)
+}
+
+/// Decide what an exec against the runner meant, once bytes (or the lack of
+/// them) have arrived.
+///
+/// Split out of [`call_inner`] so the empty-stdout cases are tests, not a
+/// comment. `empty_reply` is reserved for an exec that claimed success and
+/// still produced nothing; a non-zero exit with empty stdout is a different
+/// fault (`nonzero_exit`) even though the caller still sees
+/// `runner_unreachable`.
+pub(crate) fn interpret_runner_stdout(
+    stdout: Vec<u8>,
+    truncated: bool,
+    success: bool,
+) -> Result<Vec<u8>, (RunnerCallFailure, &'static str)> {
+    if truncated {
         return Err((RunnerCallFailure::Unreadable, "truncated_reply"));
     }
-    if raw.stdout.is_empty() {
+    if !stdout.is_empty() {
+        return Ok(stdout);
+    }
+    if success {
         // The exec succeeded and the runner said nothing. That is not an
         // outcome; it is the absence of one — and it is a different fault from
         // an exec that never landed, which is why it is not `backend_error`.
         return Err((RunnerCallFailure::Unreachable, "empty_reply"));
     }
-    Ok(raw.stdout)
+    Err((RunnerCallFailure::Unreachable, "nonzero_exit"))
 }
 
 #[cfg(test)]
@@ -836,6 +871,30 @@ mod tests {
                 "denial {denied} maps to {pair:?}, which RUNNER_CALL_OUTCOMES does not seed"
             );
         }
+        assert!(
+            RUNNER_CALL_OUTCOMES.contains(&("runner_unreachable", "nonzero_exit")),
+            "nonzero_exit must be seeded; it is not a SandboxAccessDenied"
+        );
+    }
+
+    #[test]
+    fn interpret_runner_stdout_splits_empty_success_from_nonzero_exit() {
+        assert!(matches!(
+            interpret_runner_stdout(b"{\"ok\":true}".to_vec(), false, true),
+            Ok(stdout) if stdout == b"{\"ok\":true}"
+        ));
+        assert!(matches!(
+            interpret_runner_stdout(Vec::new(), true, true),
+            Err((RunnerCallFailure::Unreadable, "truncated_reply"))
+        ));
+        assert!(matches!(
+            interpret_runner_stdout(Vec::new(), false, true),
+            Err((RunnerCallFailure::Unreachable, "empty_reply"))
+        ));
+        assert!(matches!(
+            interpret_runner_stdout(Vec::new(), false, false),
+            Err((RunnerCallFailure::Unreachable, "nonzero_exit"))
+        ));
     }
 
     fn report(state: RunnerState) -> ExecutionReport {

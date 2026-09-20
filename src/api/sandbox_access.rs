@@ -994,7 +994,12 @@ async fn exec_capped_inner(
             .map_err(|error| backend_denied(&error))?;
     }
 
-    let stdout_stream = attached.0.stdout();
+    let Some(stdout_stream) = attached.0.stdout() else {
+        // Requested stdout above. Treating a missing stream as empty runner
+        // output would count as `empty_reply` — "the runner said nothing" —
+        // when the transport never gave us a channel to hear it on.
+        return Err(backend_denied(&"exec channel has no stdout reader"));
+    };
     let stderr_stream = attached.0.stderr();
     let status = attached
         .0
@@ -1005,7 +1010,7 @@ async fn exec_capped_inner(
     // before touching stderr deadlocks when the command fills stderr's pipe
     // while Kobe is blocked on stdout (and vice versa).
     let ((stdout, stderr, stdout_truncated, stderr_truncated), status) = tokio::join!(
-        drain_capped_pair(stdout_stream, stderr_stream, output_cap),
+        drain_capped_pair(Some(stdout_stream), stderr_stream, output_cap),
         status,
     );
     let exit_code = exact_exec_exit_code(status.as_ref());

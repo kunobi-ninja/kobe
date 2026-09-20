@@ -247,6 +247,7 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                 capabilities: &actions,
                 transport: detail.transport.as_deref(),
                 iroh: detail.iroh.as_ref(),
+                usable: true,
             },
             command.output,
         )?;
