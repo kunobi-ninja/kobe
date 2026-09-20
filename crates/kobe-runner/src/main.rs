@@ -228,6 +228,10 @@ fn main() {
         serde_json::to_string(&Envelope::new(reply))
             .unwrap_or_else(|_| r#"{"protocol":1,"reply":"error","code":"internal"}"#.into())
     );
+    // `process::exit` skips Drop of stdout's BufWriter. On a pipe (kube exec)
+    // that is not a TTY, the JSON can stay in userspace and Kobe records
+    // `empty_reply` for a reply the runner did print.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     if failed {
         // The reply is what Kobe decides on; this only makes a failure visible
         // to a human running the binary by hand.

@@ -1516,9 +1516,10 @@ pub static SANDBOX_TEARDOWN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock:
 /// an execution. `cause` keeps the distinction on the operator's side, where
 /// [`SandboxAccessDenied::reason_code`](crate::api::sandbox_access::SandboxAccessDenied::reason_code)
 /// already argues it belongs: an `expired` lease, a `pool_unresolvable` one and
-/// a `backend_error` need different fixes, and `empty_reply` — the exec landed
-/// and the runner said nothing — is a different fault again from an exec that
-/// never landed at all.
+/// a `backend_error` need different fixes, and `empty_reply` — the exec landed,
+/// exited 0, and the runner said nothing — is a different fault from
+/// `nonzero_exit` (the exec landed, failed, and still produced no stdout) and
+/// from an exec that never landed at all.
 ///
 /// Transport only. A reply that arrives and is then rejected while parsing does
 /// not pass through the counted path, so no `Refused` code appears here.

@@ -990,10 +990,22 @@ fn output_is_retained_after_the_command_has_finished() {
 }
 
 /// An execution nobody started is not found — never "succeeded".
+///
+/// Also pins that the JSON reaches a piped stdout: Error replies
+/// `process::exit(1)`, and an unflushed pipe is how Kobe records `empty_reply`.
 #[test]
 fn an_unknown_execution_is_not_found() {
     let scratch = Scratch::new();
-    let reply = status(&scratch, "sbxe-never");
+    let output = runner(&scratch, &["status", "--id", "sbxe-never"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.stdout.is_empty(),
+        "error JSON must survive process::exit through a pipe; stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    let reply = reply(output);
     assert!(
         matches!(
             reply,

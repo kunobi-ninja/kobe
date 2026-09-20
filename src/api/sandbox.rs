@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+use k8s_openapi::api::core::v1::Pod;
 use kube::ResourceExt;
 use kube::api::{
     Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions,
@@ -28,9 +29,10 @@ use super::routes::AppState;
 use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
-    ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
-    SandboxPlacement, SandboxPlacementAuthority, SandboxPool, SandboxPoolReference,
-    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxTransport, SandboxVerb,
+    ResolvedSandboxPlacement, SandboxCondition, SandboxConditionStatus, SandboxLease,
+    SandboxLeasePhase, SandboxLeaseSpec, SandboxPlacement, SandboxPlacementAuthority, SandboxPool,
+    SandboxPoolReference, SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance,
+    SandboxTransport, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
@@ -3443,6 +3445,13 @@ struct SandboxLeaseResponse {
     target: Option<SandboxTargetProvenance>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conditions: Vec<SandboxCondition>,
+    /// False when a live GET of the recorded Pod shows it gone or replaced.
+    ///
+    /// Omitted when true so existing clients keep parsing. The CR phase can
+    /// still say Ready: that is the controller's last observation, not a
+    /// statement that executions will succeed.
+    #[serde(skip_serializing_if = "is_true")]
+    usable: bool,
     /// Data-plane transport for attach/port-forward. Omitted when `direct` so
     /// existing clients keep parsing. Present as `iroh` when the admitting
     /// pool selected the P2P path.
@@ -3456,6 +3465,10 @@ struct SandboxLeaseResponse {
 
 fn is_direct_transport(transport: &SandboxTransport) -> bool {
     *transport == SandboxTransport::Direct
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn iroh_dial_for<B: ClusterBackend>(
@@ -3755,6 +3768,7 @@ fn pending_sandbox_lease_response(
         conditions: Vec::new(),
         transport: SandboxTransport::Direct,
         iroh: None,
+        usable: true,
     }
 }
 
@@ -4834,6 +4848,7 @@ pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
 
     let pool_name = lease.spec.pool_ref.name.clone();
     let pool_uid = lease.spec.pool_ref.uid.clone();
+    let live = live_management_target_condition(&state.client, &lease).await;
     let mut body = sandbox_lease_response(lease, None);
     let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
     if let Ok(pool) = pools.get(&pool_name).await
@@ -4842,6 +4857,10 @@ pub(crate) async fn get_sandbox_lease<B: ClusterBackend>(
         body.transport = pool.spec.transport;
     }
     body.iroh = iroh_dial_for(&state, body.transport);
+    if let Some(condition) = live {
+        body.usable = false;
+        body.conditions.push(condition);
+    }
 
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -5642,7 +5661,51 @@ fn sandbox_lease_response(
         conditions: status.conditions,
         transport: SandboxTransport::Direct,
         iroh: None,
+        usable: true,
     }
+}
+
+/// Live-check the recorded Pod for a management-placed Ready lease.
+///
+/// Child-cluster Pods are not on this API server; skipping those avoids a
+/// kubeconfig fetch on every GET. A missing or replaced management Pod is
+/// exactly `target_unresolved` on the exec path, which is the second-largest
+/// `runner_unreachable` cause in production.
+async fn live_management_target_condition(
+    client: &kube::Client,
+    lease: &SandboxLease,
+) -> Option<SandboxCondition> {
+    let status = lease.status.as_ref()?;
+    if status.phase != SandboxLeasePhase::Ready {
+        return None;
+    }
+    if !matches!(
+        status.placement,
+        Some(ResolvedSandboxPlacement::Management {})
+    ) {
+        return None;
+    }
+    let target = status.target.as_ref()?;
+    let pod = target.pod.as_ref()?;
+    if pod.name.is_empty() || pod.uid.is_empty() || target.namespace.is_empty() {
+        return None;
+    }
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &target.namespace);
+    let matches = match pods.get(&pod.name).await {
+        Ok(observed) => observed.uid().as_deref() == Some(pod.uid.as_str()),
+        Err(_) => false,
+    };
+    if matches {
+        return None;
+    }
+    Some(SandboxCondition {
+        condition_type: "Target".into(),
+        status: SandboxConditionStatus::False,
+        reason: "TargetUnresolved".into(),
+        message: "The lease's Pod is gone or has been replaced; executions will fail.".into(),
+        observed_generation: status.observed_generation,
+        last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+    })
 }
 
 /// Strip the internal composition from provenance before it reaches a caller.
@@ -9698,6 +9761,10 @@ mod tests {
         lease.status = Some(SandboxLeaseStatus::default());
         let json = serde_json::to_string(&sandbox_lease_response(lease.clone(), None)).unwrap();
         assert!(!json.contains("alice@example.com"));
+        assert!(
+            !json.contains("usable"),
+            "usable:true must stay omitted so older clients keep parsing"
+        );
         assert!(!json.to_ascii_lowercase().contains("token"));
         assert!(!json.to_ascii_lowercase().contains("kubeconfig"));
         assert!(!json.contains("release_cause"));
