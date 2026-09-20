@@ -2,10 +2,10 @@
 //!
 //! # Why this lives in the CLI
 //!
-//! The workspace image runs Xvfb, a window manager and x11vnc, and until now
-//! the only way to see any of it was a human opening noVNC in a browser
-//! through a port-forward. For an image whose purpose is agent sessions that
-//! is backwards: the agent is the one that needs to look, and then to act.
+//! The workspace image runs KasmVNC as the X server and browser viewer, plus
+//! x11vnc on the same display so this CLI can still speak RFB. For an image
+//! whose purpose is agent sessions, the agent is the one that needs to look,
+//! and then to act.
 //!
 //! Capturing inside the Sandbox and copying the file out is not an
 //! alternative. `kobe exec` cannot carry binary on stdout — 2048 random bytes
@@ -424,6 +424,7 @@ pub(crate) enum VncAction {
     Move { x: u16, y: u16 },
     Type { text: String },
     Key { name: String },
+    Paste { text: String },
 }
 
 /// Open a VNC session to the lease and run one action.
@@ -541,6 +542,10 @@ async fn drive(
             socket.write_all(&key_event(false, keysym)).await?;
             socket.flush().await?;
         }
+        VncAction::Paste { text } => {
+            socket.write_all(&client_cut_text(&text)).await?;
+            socket.flush().await?;
+        }
     }
     Ok(0)
 }
@@ -569,13 +574,22 @@ fn write_png(path: &std::path::Path, width: u16, height: u16, rgb: &[u8]) -> Res
     Ok(())
 }
 
-/// The noVNC query string that turns a blank page into a connected desktop.
+/// KasmVNC's web client is the document at `/`. No query string: autoconnect
+/// is the default, and `path=websockify` is a noVNC leftover that 404s here.
+
+/// RFB ClientCutText: put `text` on the server clipboard.
 ///
-/// Without `autoconnect` the browser shows a connect dialogue asking for a
-/// host nobody can name, since the real one is on the far side of the
-/// forward. `resize=scale` fits a 1440x900 desktop into whatever window the
-/// laptop has, and `path=websockify` is where the image's websockify serves.
-const NOVNC_QUERY: &str = "autoconnect=1&resize=scale&path=websockify";
+/// x11vnc applies this to the X clipboard, which is how paste reaches Firefox
+/// without going through noVNC's broken browser clipboard.
+pub(crate) fn client_cut_text(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let mut message = Vec::with_capacity(8 + bytes.len());
+    message.extend_from_slice(&[6, 0, 0, 0]);
+    message.extend_from_slice(&len.to_be_bytes());
+    message.extend_from_slice(bytes);
+    message
+}
 
 /// Ask the sandbox to start its desktop, if it is not already up.
 ///
@@ -629,23 +643,33 @@ fn open_in_browser(url: &str) -> bool {
         .is_ok()
 }
 
-/// Start the desktop, forward noVNC, and open it in the local browser.
+/// Start the desktop and open a viewer on this machine.
 ///
-/// One command for what was four steps and a query string nobody remembers:
-/// start the desktop, forward the port, work out the URL, open it. The
-/// forward runs until interrupted, because closing it closes the desktop in
-/// the browser.
+/// If `vncviewer` (TigerVNC) is on `PATH`, that is the viewer: clipboard and
+/// keyboard work. Otherwise, and with `--web`, this is the KasmVNC page.
+/// Screen Sharing on macOS is not used; it demands a VNC password and our
+/// server has none on purpose (`kobe vnc screenshot` speaks RFB None).
 pub(crate) struct OpenDesktop<'a> {
     pub lease: &'a str,
-    /// noVNC's port inside the Sandbox.
-    pub port: u16,
+    /// Remote port inside the Sandbox. `None` picks 5900 for a native viewer
+    /// and 6080 for KasmVNC.
+    pub port: Option<u16>,
     /// Local port to serve on; 0 picks a free one.
     pub local_port: u16,
     pub launch_browser: bool,
     pub start_desktop: bool,
+    /// Force the KasmVNC page even when a native viewer is installed.
+    pub web: bool,
     pub target_override: Option<&'a str>,
     pub endpoint_override: Option<&'a str>,
     pub output: OutputFormat,
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
 }
 
 pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
@@ -655,6 +679,7 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
         local_port,
         launch_browser,
         start_desktop,
+        web,
         target_override,
         endpoint_override,
         output,
@@ -669,36 +694,62 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
         ensure_desktop(&config, lease, output).await?;
     }
 
+    let native = !web && command_on_path("vncviewer");
+    let remote_port = port.unwrap_or(if native { 5900 } else { 6080 });
+
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
         .await
         .context("could not bind a local port for the desktop")?;
     let bound = listener.local_addr()?;
-    let url = format!("http://{bound}/vnc.html?{NOVNC_QUERY}");
+    let url = if native {
+        bound.to_string()
+    } else {
+        format!("http://{bound}/")
+    };
 
-    let opened = launch_browser && open_in_browser(&url);
+    let opened = if !launch_browser {
+        false
+    } else if native {
+        std::process::Command::new("vncviewer")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    } else {
+        open_in_browser(&url)
+    };
     match output {
         OutputFormat::Json => print_json(&serde_json::json!({
             "apiVersion": super::sandbox::SANDBOX_CLI_API_VERSION,
             "lease": lease,
-            "url": url,
+            "url": if native { format!("vnc://{url}") } else { url.clone() },
+            "viewer": if native { "vncviewer" } else { "kasmvnc" },
             "browserOpened": opened,
         }))?,
         OutputFormat::Text => {
-            if opened {
+            if native {
+                if opened {
+                    println!("Opened TigerVNC at {url}");
+                } else {
+                    println!("Run: vncviewer {url}");
+                }
+            } else if opened {
                 println!("Opened {url}");
             } else {
                 println!("Open {url}");
             }
-            println!("Ctrl-C closes the desktop in the browser; the sandbox keeps running.");
+            println!("Ctrl-C closes the viewer; the sandbox keeps running.");
         }
     }
 
-    let remote = port.to_string();
+    let remote = remote_port.to_string();
     let path = format!("/v1/sandbox-leases/{lease}/port-forward?port={remote}");
     let iroh = super::sandbox_transport::lease_uses_iroh(&config, lease, output).await;
 
     // A browser opens several connections for the page, its assets and the
     // WebSocket, so this serves them concurrently rather than one at a time.
+    // Screen Sharing is one RFB connection, but reconnects after a drop.
     loop {
         let (mut local, _) = listener.accept().await.context("accept failed")?;
         let config = config.clone();
@@ -813,6 +864,15 @@ mod tests {
                 .to_string()
                 .contains("unknown key")
         );
+    }
+
+    /// ClientCutText is type 6, three pad bytes, then a big-endian length.
+    #[test]
+    fn clipboard_paste_is_client_cut_text() {
+        let wire = client_cut_text("kobe");
+        assert_eq!(&wire[..4], &[6, 0, 0, 0]);
+        assert_eq!(&wire[4..8], &4u32.to_be_bytes());
+        assert_eq!(&wire[8..], b"kobe");
     }
 
     /// A click outside the announced desktop is a caller error worth naming,

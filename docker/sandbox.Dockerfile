@@ -89,7 +89,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxcb-xkb1 \
         libxkbcommon-x11-0 \
         libxkbcommon-x11-dev \
-        novnc \
         openbox \
         openssh-client \
         openssh-server \
@@ -99,7 +98,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         rsync \
         tmux \
         unzip \
-        websockify \
         wget \
         x11-utils \
         x11-xserver-utils \
@@ -107,10 +105,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xauth \
         xdg-utils \
         xterm \
-        xvfb \
         xz-utils \
     && pkg-config --exists xkbcommon-x11 x11-xcb xcb-xkb \
     && rm -rf /var/lib/apt/lists/*
+
+# KasmVNC is the X server and the browser viewer (HTTP :6080). x11vnc still
+# attaches to that display for standard RFB (:5900) so `kobe vnc paste` and
+# screenshot keep working; KasmVNC itself does not speak RFB.
+ARG TARGETARCH
+ARG KASMVNC_VERSION=1.5.0
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) _sha=770fd3df51510beecc89666879d82faf411276e68c6e11df612f736b891b5f71 ;; \
+      arm64) _sha=aa83a1a6c9069d1a02239988b07a3a2a082a433042b4d4ee2b9e9f6b2df9643c ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    _deb="kasmvncserver_bookworm_${KASMVNC_VERSION}_${TARGETARCH}.deb"; \
+    curl -fsSL -o "/tmp/${_deb}" \
+      "https://github.com/kasmtech/KasmVNC/releases/download/v${KASMVNC_VERSION}/${_deb}"; \
+    echo "${_sha}  /tmp/${_deb}" | sha256sum -c; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "/tmp/${_deb}"; \
+    rm -f "/tmp/${_deb}"; \
+    rm -rf /var/lib/apt/lists/*
 
 # --- Workload identity ------------------------------------------------------
 #
@@ -123,7 +140,8 @@ RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
     && useradd --uid "${WORKLOAD_UID}" --gid "${WORKLOAD_GID}" \
         --create-home --home-dir /home/agent --shell /bin/bash nonroot \
     && install -d -o "${WORKLOAD_UID}" -g "${WORKLOAD_GID}" -m 0755 /home/agent/work \
-    && usermod -p '*' nonroot
+    && usermod -p '*' nonroot \
+    && if getent group ssl-cert >/dev/null; then usermod -aG ssl-cert nonroot; fi
 
 # --- SSH over the attach stream ---------------------------------------------
 #
@@ -135,6 +153,7 @@ RUN groupadd --gid "${WORKLOAD_GID}" nonroot \
 # caller's side hands that stream to the local `ssh`. The configuration is
 # root-owned so the workload cannot loosen it; the host key is generated per
 # sandbox under $HOME on first use, so the image ships no key material.
+COPY docker/scripts/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 COPY --chmod=0755 docker/scripts/kobe-desktop docker/scripts/kobe-desktop-up /usr/local/bin/
 COPY --chown=65532:65532 docker/scripts/kobe-openbox-menu.xml /home/agent/.config/openbox/menu.xml
 COPY --chown=65532:65532 docker/scripts/kobe-mimeapps.list /home/agent/.config/mimeapps.list

@@ -54,7 +54,7 @@ printf %s "$GITHUB_TOKEN" | kobe exec agents --stdin -- gh auth login --with-tok
 
 **Open a Linux desktop in the browser**
 
-A GUI pool ships Xvfb, Openbox, noVNC, and Firefox. Start the desktop, forward port 6080, and open VNC. OAuth flows stay inside that Firefox. See [Desktop](/docs/getting-started/desktop).
+A GUI pool ships KasmVNC, Openbox, and Firefox. Start the desktop, forward port 6080, and open the viewer. OAuth flows stay inside that Firefox. See [Desktop](/docs/getting-started/desktop).
 
 ## Five-minute cluster trial
 
@@ -92,7 +92,7 @@ No endpoint yet? [Deploy the operator](/docs/getting-started/deploy), then come 
   <Card title="Deploy the operator" href="/docs/getting-started/deploy" description="Helm install, AccessPolicy, first ClusterPool" />
   <Card title="Lease a cluster" href="/docs/getting-started/quick-start" description="login, lease, kubectl, with-lease" />
   <Card title="Lease a sandbox" href="/docs/getting-started/sandbox" description="kobe run, exec, ssh kobe-…" />
-  <Card title="GUI desktop" href="/docs/getting-started/desktop" description="noVNC desktop in a sandbox" />
+  <Card title="GUI desktop" href="/docs/getting-started/desktop" description="KasmVNC desktop in a sandbox" />
   <Card title="GitHub Actions" href="/docs/getting-started/github-actions" description="OIDC lease with kobe-action" />
   <Card title="Helm and operations" href="/docs/operate/helm" description="Values, upgrades, metrics, troubleshooting" />
 </Cards>

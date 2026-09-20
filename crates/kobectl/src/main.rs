@@ -492,26 +492,43 @@ enum VncCommand {
         #[arg(long, default_value_t = 5900)]
         port: u16,
     },
-    /// Start the desktop and open it in your browser
+    /// Start the desktop and open a viewer
     ///
-    /// One command for what was four steps: start the desktop if it is not
-    /// running, forward noVNC, work out the URL, and open it. The forward
-    /// runs until you interrupt it.
+    /// Uses TigerVNC (`vncviewer`) when it is on PATH, otherwise KasmVNC.
+    /// `--web` forces the browser page. The forward runs until you interrupt it.
     Open {
         /// Lease id, name, or pool
         lease: String,
         /// Local port to serve on; 0 picks a free one
         #[arg(long, default_value_t = 0)]
         local_port: u16,
-        /// noVNC port inside the Sandbox
-        #[arg(long, default_value_t = 6080)]
-        port: u16,
-        /// Print the URL instead of opening a browser
+        /// Remote port inside the Sandbox. Default is 5900 for TigerVNC
+        /// and 6080 for `--web`.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the URL instead of opening a viewer
         #[arg(long)]
         no_browser: bool,
         /// Assume the desktop is already running
         #[arg(long)]
         no_start: bool,
+        /// Open KasmVNC in a browser instead of the native VNC viewer
+        #[arg(long)]
+        web: bool,
+    },
+    /// Put text on the desktop clipboard
+    ///
+    /// Firefox and other X11 clients then paste with Ctrl+V. This is the
+    /// reliable way to get a password or URL into the sandbox; the web
+    /// page does not take Cmd+V from macOS.
+    Paste {
+        /// Lease id, name, or pool
+        lease: String,
+        /// Text to put on the clipboard
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value_t = 5900)]
+        port: u16,
     },
     /// Click at a pixel
     Click {
@@ -924,6 +941,7 @@ async fn main() -> anyhow::Result<()> {
                 port,
                 no_browser,
                 no_start,
+                web,
             } = action
             {
                 let lease = commands::require_lease_capability(
@@ -941,6 +959,7 @@ async fn main() -> anyhow::Result<()> {
                     local_port,
                     launch_browser: !no_browser,
                     start_desktop: !no_start,
+                    web,
                     target_override: target,
                     endpoint_override: endpoint,
                     output,
@@ -982,6 +1001,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 VncCommand::Key { lease, key, port } => {
                     (lease, port, commands::vnc::VncAction::Key { name: key })
+                }
+                VncCommand::Paste { lease, text, port } => {
+                    (lease, port, commands::vnc::VncAction::Paste { text })
                 }
                 VncCommand::Open { .. } => unreachable!("handled above"),
             };
