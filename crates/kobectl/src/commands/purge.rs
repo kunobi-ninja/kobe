@@ -98,6 +98,7 @@ pub async fn purge(
             if !removed_paths.is_empty() {
                 println!("Removed {} kubeconfig file(s):", removed_paths.len());
                 for path in &removed_paths {
+                    // Absolute: a destructive listing must not be ambiguous.
                     println!("  {}", path.display());
                 }
             }
@@ -181,6 +182,7 @@ async fn purge_orphans_only(
         OutputFormat::Text => {
             println!("Removed {} orphan kubeconfig file(s):", removed_paths.len());
             for path in &removed_paths {
+                // Absolute: a destructive listing must not be ambiguous.
                 println!("  {}", path.display());
             }
             if !failures.is_empty() {

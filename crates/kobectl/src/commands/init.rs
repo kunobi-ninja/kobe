@@ -26,7 +26,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::config::{AuthMode, CliConfig, KobeTarget, ResolvedConfig, Scope};
-use super::{OutputFormat, login, pools, print_json, session, ssh_proxy, ssh_setup};
+use super::{
+    OutputFormat, home_path, login, pools, print_json, session, shorten_home, ssh_proxy, ssh_setup,
+};
 
 pub struct InitCommand<'a> {
     /// Create or replace a target at this endpoint.
@@ -59,31 +61,6 @@ struct InitOutput {
     ssh_config: String,
     include: String,
     try_host: String,
-}
-
-/// Rewrite `$HOME/x` as `~/x`. `init` reports four paths and three of them
-/// live under the home directory, where the prefix is the longest and least
-/// informative part of the line.
-///
-/// Takes the home directory rather than reading the environment so the
-/// rewrite can be tested without one.
-fn shorten_home(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home.filter(|home| !home.is_empty()) else {
-        return path.to_string();
-    };
-    let home = home.strip_suffix('/').unwrap_or(home);
-    match path.strip_prefix(home) {
-        Some("") => "~".to_string(),
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
-fn home_path(path: &std::path::Path) -> String {
-    shorten_home(
-        &path.display().to_string(),
-        std::env::var("HOME").ok().as_deref(),
-    )
 }
 
 struct Reporter {
@@ -550,43 +527,6 @@ fn ensure_public_key(
 
 #[cfg(test)]
 mod tests {
-
-    /// `init` prints four paths and three sit under the home directory, so the
-    /// prefix is the longest and least useful part of each line.
-    #[test]
-    fn home_is_shortened_to_a_tilde_only_at_a_path_boundary() {
-        assert_eq!(
-            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij")),
-            "~/.ssh/config"
-        );
-        assert_eq!(shorten_home("/Users/lenij", Some("/Users/lenij")), "~");
-        // A trailing slash on HOME must not produce "~//.ssh/config".
-        assert_eq!(
-            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij/")),
-            "~/.ssh/config"
-        );
-    }
-
-    /// A different account whose name merely starts with ours keeps its path:
-    /// rewriting `/Users/lenija` to `~a` would be worse than not rewriting.
-    #[test]
-    fn a_sibling_directory_sharing_the_prefix_is_left_alone() {
-        assert_eq!(
-            shorten_home("/Users/lenija/.ssh/config", Some("/Users/lenij")),
-            "/Users/lenija/.ssh/config"
-        );
-        assert_eq!(
-            shorten_home("/etc/ssh/config", Some("/Users/lenij")),
-            "/etc/ssh/config"
-        );
-    }
-
-    /// No HOME, no rewrite. The report still has to be printable.
-    #[test]
-    fn without_a_home_the_path_is_printed_as_it_is() {
-        assert_eq!(shorten_home("/Users/lenij/x", None), "/Users/lenij/x");
-        assert_eq!(shorten_home("/Users/lenij/x", Some("")), "/Users/lenij/x");
-    }
     use super::*;
 
     #[test]

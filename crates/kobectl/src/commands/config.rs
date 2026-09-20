@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use super::session;
-use super::{OutputFormat, print_json};
+use super::{OutputFormat, home_path, print_json};
 
 /// Where a target definition lives. Computed during `CliConfig::load`
 /// based on which file each target appears in. Not serialized — pure
@@ -520,7 +520,9 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
     config.save()?;
 
     match output {
-        OutputFormat::Text => println!("Imported config into {}", global_config_path()?.display()),
+        OutputFormat::Text => {
+            println!("Imported config into {}", home_path(&global_config_path()?))
+        }
         OutputFormat::Json => print_json(&config_view_output(&config, None))?,
     }
 
@@ -592,7 +594,7 @@ pub async fn config_set_target(command: SetTargetCommand<'_>) -> Result<()> {
     match output {
         OutputFormat::Text => {
             println!("Set target {name}");
-            println!("Wrote: {}", written_path.display());
+            println!("Wrote: {}", home_path(&written_path));
             println!("(use this target now: kobe target use {name})");
         }
         OutputFormat::Json => print_json(&TargetMutationOutput {
@@ -648,7 +650,7 @@ pub async fn config_use_target(name: &str, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Text => {
             println!("Active target for this shell: {name}");
-            println!("State: {}", saved_path.display());
+            println!("State: {}", home_path(&saved_path));
         }
         OutputFormat::Json => print_json(&TargetMutationOutput {
             name,
