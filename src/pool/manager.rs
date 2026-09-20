@@ -49,9 +49,11 @@
 //! `docs/guides/upgrade-policy.md` for tuning guidance per pool
 //! shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::crd::ClusterPool;
+use kube::{Api, Client, ResourceExt};
+
+use crate::crd::{BootstrapConfig, BootstrapConfigSpec, ClusterPool};
 use crate::metrics::RecycleReason;
 
 /// Hash of the cluster spec at creation time, used to detect drift.
@@ -248,6 +250,53 @@ pub fn profile_spec_hash(
     // Width and shape are load-bearing: `lease_binding` and
     // `ClusterInstance.status.specHash` document a fixed 16-char hex digest.
     format!("{:016x}", hasher.finish())
+}
+
+/// Resolve each `BootstrapConfig` the pool names, so [`profile_spec_hash`]
+/// hashes content rather than names.
+///
+/// A missing or unreadable CR is omitted. The hasher then folds the
+/// `<unresolved>` sentinel, so a transient lookup failure is a different
+/// hash than a successful one and drift fires once the object reappears.
+pub async fn resolve_bootstrap_specs(
+    client: &Client,
+    namespace: &str,
+    profile: &ClusterPool,
+) -> BTreeMap<String, BootstrapConfigSpec> {
+    let mut specs = BTreeMap::new();
+    if profile.spec.bootstraps.is_empty() {
+        return specs;
+    }
+
+    let api: Api<BootstrapConfig> = Api::namespaced(client.clone(), namespace);
+    for bs_ref in &profile.spec.bootstraps {
+        match api.get(&bs_ref.name).await {
+            Ok(cr) => {
+                specs.insert(cr.name_any(), cr.spec);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    profile = %profile.name_any(),
+                    bootstrap = %bs_ref.name,
+                    error = %e,
+                    "Failed to resolve BootstrapConfig for spec-hash; \
+                     drift detection will treat it as unresolved"
+                );
+            }
+        }
+    }
+    specs
+}
+
+/// Whether a member is on the current template.
+///
+/// Same comparison [`compute_pool_actions`] uses for a *stamped* hash:
+/// `spec_hash == current`. An unstamped member is not a match. Bind uses
+/// this to prefer members the recycler will keep; the stamp-race grace
+/// that counts unstamped Ready as clean must not also make bind prefer
+/// a member whose hash is still unknown.
+pub fn spec_hash_is_current(spec_hash: Option<&str>, current_hash: &str) -> bool {
+    spec_hash == Some(current_hash)
 }
 
 /// Fully-populated rolling-upgrade policy values, as consumed by
@@ -1713,6 +1762,19 @@ mod tests {
             with_a,
             profile_spec_hash(&profile, &ctx, &bs, Some("render-a")),
             "same inputs must hash identically"
+        );
+    }
+
+    #[test]
+    fn spec_hash_is_current_requires_a_stamped_equal_hash() {
+        assert!(spec_hash_is_current(Some("abc"), "abc"));
+        assert!(
+            !spec_hash_is_current(Some("abc"), "def"),
+            "a different stamp is stale"
+        );
+        assert!(
+            !spec_hash_is_current(None, "abc"),
+            "unstamped is not current — bind must not prefer the stamp race"
         );
     }
 
