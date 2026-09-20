@@ -157,6 +157,66 @@ pub(crate) fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rewrite `$HOME/x` as `~/x` for informational CLI output.
+///
+/// Takes the home directory rather than reading the environment so the
+/// rewrite can be tested without one. Copy-paste lines (`export KUBECONFIG=`)
+/// and destructive listings (`kobe purge`) keep the absolute path.
+pub(crate) fn shorten_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_string();
+    };
+    let home = home.strip_suffix('/').unwrap_or(home);
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+pub(crate) fn home_path(path: &std::path::Path) -> String {
+    shorten_home(
+        &path.display().to_string(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod home_path_tests {
+    use super::shorten_home;
+
+    #[test]
+    fn home_is_shortened_to_a_tilde_only_at_a_path_boundary() {
+        assert_eq!(
+            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij")),
+            "~/.ssh/config"
+        );
+        assert_eq!(shorten_home("/Users/lenij", Some("/Users/lenij")), "~");
+        assert_eq!(
+            shorten_home("/Users/lenij/.ssh/config", Some("/Users/lenij/")),
+            "~/.ssh/config"
+        );
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_the_prefix_is_left_alone() {
+        assert_eq!(
+            shorten_home("/Users/lenija/.ssh/config", Some("/Users/lenij")),
+            "/Users/lenija/.ssh/config"
+        );
+        assert_eq!(
+            shorten_home("/etc/ssh/config", Some("/Users/lenij")),
+            "/etc/ssh/config"
+        );
+    }
+
+    #[test]
+    fn without_a_home_the_path_is_printed_as_it_is() {
+        assert_eq!(shorten_home("/Users/lenij/x", None), "/Users/lenij/x");
+        assert_eq!(shorten_home("/Users/lenij/x", Some("")), "/Users/lenij/x");
+    }
+}
+
 /// Get a valid auth header value based on the configured auth mode.
 /// Returns None for no-auth mode, Some(header) for token/oidc/ssh.
 pub(crate) async fn get_auth_header(

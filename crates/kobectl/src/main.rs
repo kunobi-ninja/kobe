@@ -130,6 +130,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show your leases, the pools you can use, and who you are signed in as
+    #[command(visible_alias = "list", alias = "ls", alias = "ps")]
     Status {
         /// Include released and expired leases
         ///
@@ -1697,6 +1698,19 @@ mod tests {
     /// Every visible command appears in exactly one help group, and every
     /// group entry is a real, visible command. A new command without a group
     /// would otherwise vanish from `kobe --help`.
+    #[test]
+    fn status_accepts_the_names_people_type() {
+        for name in ["status", "list", "ls", "ps"] {
+            let cli = Cli::try_parse_from(["kobe", name]).unwrap();
+            assert!(
+                matches!(cli.command, Commands::Status { all: false }),
+                "{name} must be status"
+            );
+        }
+        let cli = Cli::try_parse_from(["kobe", "list", "--all"]).unwrap();
+        assert!(matches!(cli.command, Commands::Status { all: true }));
+    }
+
     #[test]
     fn help_groups_cover_every_visible_command_once() {
         let command = Cli::command();

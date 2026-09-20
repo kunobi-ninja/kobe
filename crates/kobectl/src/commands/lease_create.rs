@@ -11,7 +11,9 @@ use super::leases::{LeaseDetail, LeaseSummary, fetch_lease};
 use super::picker::{PickerItem, run_picker};
 use super::pools::{PoolSummary, fetch_pool_for_config_with_output, fetch_pools_for_config};
 use super::state::record_kubeconfig;
-use super::{OutputFormat, Reaching, authed_client, get_auth_header, print_json, with_auth};
+use super::{
+    OutputFormat, Reaching, authed_client, get_auth_header, home_path, print_json, with_auth,
+};
 
 pub struct LeaseCreateCommand<'a> {
     pub pool: Option<&'a str>,
@@ -480,9 +482,10 @@ fn emit_ready_output(
             if let Some(ttl) = effective_ttl.as_deref() {
                 println!("TTL:     {ttl}");
             }
-            println!("Config:  {}", kubeconfig_path.display());
+            println!("Config:  {}", home_path(&kubeconfig_path));
             println!("Actions: {}", CLUSTER_CAPABILITIES.join(", "));
             println!();
+            // Absolute: `~` after `=` does not survive quoting or `sh`.
             println!("export KUBECONFIG={}", kubeconfig_path.display());
         }
         OutputFormat::Json => print_json(&LeaseCreateOutput {
