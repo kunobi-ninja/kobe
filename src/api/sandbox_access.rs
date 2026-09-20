@@ -739,7 +739,8 @@ fn tail_with_limit(requested: Option<i64>, limit: u64) -> Option<i64> {
 /// placement is a different workload wearing the same name, and returning its
 /// output would show one caller another's logs.
 pub async fn read_sandbox_logs(
-    client: &kube::Client,
+    reader: &kube::Client,
+    actor: &kube::Client,
     target: &SandboxTarget,
     container: &str,
     tail_lines: Option<i64>,
@@ -747,8 +748,8 @@ pub async fn read_sandbox_logs(
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::LogParams;
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &target.namespace);
-    let pod = match pods.get(&target.pod_name).await {
+    let reader_pods: Api<Pod> = Api::namespaced(reader.clone(), &target.namespace);
+    let pod = match reader_pods.get(&target.pod_name).await {
         Ok(pod) => pod,
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return Err(SandboxAccessDenied::TargetUnresolved);
@@ -768,7 +769,8 @@ pub async fn read_sandbox_logs(
         follow: false,
         ..Default::default()
     };
-    let logs = pods
+    let actor_pods: Api<Pod> = Api::namespaced(actor.clone(), &target.namespace);
+    let logs = actor_pods
         .logs(&target.pod_name, &params)
         .await
         .map_err(|error| backend_denied(&error))?;
@@ -815,7 +817,8 @@ pub struct SandboxExecResponse {
 /// need a stream protocol with its own revocation story (#83). No shell either
 /// — argv is executed directly, so quoting is never the security boundary.
 pub async fn exec_in_sandbox(
-    client: &kube::Client,
+    reader: &kube::Client,
+    actor: &kube::Client,
     target: &SandboxTarget,
     container: &str,
     command: &[String],
@@ -829,7 +832,8 @@ pub async fn exec_in_sandbox(
     }
     let _duration = MeasureDuration(std::time::Instant::now());
     let raw = exec_capped(
-        client,
+        reader,
+        actor,
         target,
         container,
         command,
@@ -891,7 +895,8 @@ impl Drop for AbortExecOnDrop {
 /// The runner reads a single line precisely so it never has to wait for an EOF
 /// that the exec transport may not deliver.
 pub async fn exec_capped(
-    client: &kube::Client,
+    reader: &kube::Client,
+    actor: &kube::Client,
     target: &SandboxTarget,
     container: &str,
     command: &[String],
@@ -901,7 +906,8 @@ pub async fn exec_capped(
 ) -> Result<RawExecOutput, SandboxAccessDenied> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     exec_capped_until(
-        client,
+        reader,
+        actor,
         target,
         container,
         command,
@@ -921,7 +927,8 @@ pub async fn exec_capped(
 /// graceful shutdown alive indefinitely.
 #[allow(clippy::too_many_arguments)]
 pub async fn exec_capped_until(
-    client: &kube::Client,
+    reader: &kube::Client,
+    actor: &kube::Client,
     target: &SandboxTarget,
     container: &str,
     command: &[String],
@@ -934,12 +941,13 @@ pub async fn exec_capped_until(
         biased;
         _ = shutdown.cancelled() => Err(backend_denied(&"exec aborted: the operator is shutting down")),
         _ = tokio::time::sleep_until(deadline) => Err(backend_denied(&"exec preempted at its execution deadline")),
-        result = exec_capped_inner(client, target, container, command, stdin, output_cap) => result,
+        result = exec_capped_inner(reader, actor, target, container, command, stdin, output_cap) => result,
     }
 }
 
 async fn exec_capped_inner(
-    client: &kube::Client,
+    reader: &kube::Client,
+    actor: &kube::Client,
     target: &SandboxTarget,
     container: &str,
     command: &[String],
@@ -952,10 +960,10 @@ async fn exec_capped_inner(
         return Err(SandboxAccessDenied::NotDeclared { what: "command" });
     }
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &target.namespace);
-    // The name resolved at placement; the identity must still match, or this is
-    // a different workload wearing the same name.
-    let pod = pods
+    // UID check uses the reader, not the actor. The minted Role must not
+    // `GET` the Pod: that object includes `terminated.message` (#219).
+    let reader_pods: Api<Pod> = Api::namespaced(reader.clone(), &target.namespace);
+    let pod = reader_pods
         .get(&target.pod_name)
         .await
         .map_err(|_| SandboxAccessDenied::TargetUnresolved)?;
@@ -963,6 +971,7 @@ async fn exec_capped_inner(
         return Err(SandboxAccessDenied::TargetUnresolved);
     }
 
+    let actor_pods: Api<Pod> = Api::namespaced(actor.clone(), &target.namespace);
     let params = AttachParams::default()
         .container(container)
         .stdin(stdin.is_some())
@@ -971,7 +980,8 @@ async fn exec_capped_inner(
         .tty(false);
 
     let mut attached = AbortExecOnDrop(
-        pods.exec(&target.pod_name, command, &params)
+        actor_pods
+            .exec(&target.pod_name, command, &params)
             .await
             .map_err(|error| backend_denied(&error))?,
     );
@@ -1781,6 +1791,7 @@ mod tests {
         ] {
             let error = exec_in_sandbox(
                 &client,
+                &client,
                 &target,
                 "agent",
                 &command,
@@ -1833,6 +1844,7 @@ mod tests {
         assert_eq!(
             exec_capped_until(
                 &client,
+                &client,
                 &target,
                 "agent",
                 &["/bin/true".into()],
@@ -1853,6 +1865,7 @@ mod tests {
         stopped.cancel();
         assert_eq!(
             exec_capped_until(
+                &client,
                 &client,
                 &target,
                 "agent",

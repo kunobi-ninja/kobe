@@ -22,7 +22,10 @@
 //! verb over every Pod in the namespace, which in a management cluster is every
 //! tenant's Sandbox at once.
 //!
-//! It cannot read Secrets, mutate RBAC, create Pods, list anything, reach
+//! It cannot `get` or `list` `pods` or `pods/status`. That read returns
+//! `terminated.message`, which a workload can fill by writing the kubelet's
+//! world-writable termination log. UID checks use the cluster admin client
+//! instead. It also cannot read Secrets, mutate RBAC, create Pods, reach
 //! Nodes, or cross namespaces. Those are not omissions to be filled in later:
 //! a Sandbox operation needs none of them, and each would be reachable from a
 //! caller-facing path.
@@ -102,11 +105,15 @@ impl SandboxOperation {
     /// `kubectl`'s SPDY `POST` would need, produced a Role that 403s every
     /// single one of these calls: a failure invisible to every unit test,
     /// because no unit test mints a real token.
+    ///
+    /// None of these grant `get`/`list` on `pods` or `pods/status`. That GET
+    /// returns `Pod.status`, including `terminated.message` — the channel
+    /// [#219](https://github.com/kunobi-ninja/kobe/issues/219) is about. UID
+    /// verification uses the cluster's admin identity, which already holds
+    /// that read; the minted Role must not.
     pub fn subresources(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            // `get` on `pods` as well: the caller verifies the Pod's UID before
-            // touching it, and that read must not need a broader rule.
-            Self::Logs => &[("pods", "get"), ("pods/log", "get")],
+            Self::Logs => &[("pods/log", "get")],
             // Upgrade subresources carry BOTH verbs. kube-rs sends the
             // WebSocket upgrade as a GET, which apiservers before 1.35
             // authorize as `get` — but 1.35's
@@ -114,25 +121,13 @@ impl SandboxOperation {
             // KEP-4006) closed that read-verb escalation and demands `create`
             // for any upgrade. `resourceNames` still pins both verbs to the
             // one Pod: an upgrade request names its target in the URL.
-            Self::Exec => &[
-                ("pods", "get"),
-                ("pods/exec", "get"),
-                ("pods/exec", "create"),
-            ],
+            Self::Exec => &[("pods/exec", "get"), ("pods/exec", "create")],
             // A bare attach (no command) calls `pods/attach`, a DIFFERENT
             // subresource from exec. Sharing the exec identity meant that path
             // was a guaranteed 403 on a socket that had already upgraded
             // cleanly, so the caller saw an opaque transport error.
-            Self::Attach => &[
-                ("pods", "get"),
-                ("pods/attach", "get"),
-                ("pods/attach", "create"),
-            ],
-            Self::PortForward => &[
-                ("pods", "get"),
-                ("pods/portforward", "get"),
-                ("pods/portforward", "create"),
-            ],
+            Self::Attach => &[("pods/attach", "get"), ("pods/attach", "create")],
+            Self::PortForward => &[("pods/portforward", "get"), ("pods/portforward", "create")],
         }
     }
 
@@ -758,18 +753,27 @@ pub async fn operator_config() -> Result<&'static kube::Config, SandboxAccessDen
         .await
 }
 
-/// Build a client that can reach only this Sandbox's Pod.
+/// Admin reader plus one-operation actor against one Pod.
+///
+/// The reader may `GET` the Pod (UID check). The actor may only touch the
+/// operation's subresource and must not read `Pod.status` (#219).
+pub struct ScopedPodAccess {
+    pub reader: kube::Client,
+    pub actor: kube::Client,
+}
+
+/// Build a client pair that can reach only this Sandbox's Pod.
 ///
 /// The endpoint and trust anchors come from the operator's own configuration;
-/// only the identity differs. Every other authorisation on that config is
+/// only the actor identity differs. Every other authorisation on that config is
 /// **dropped** rather than merged: an inherited client certificate would
 /// out-rank the bearer token and silently restore the operator's authority,
 /// which is the one thing this function exists to remove.
-pub async fn scoped_client(
+pub async fn scoped_pod_access(
     cluster: &crate::api::sandbox_access::TargetCluster,
     target: &SandboxTarget,
     operation: SandboxOperation,
-) -> Result<kube::Client, SandboxAccessDenied> {
+) -> Result<ScopedPodAccess, SandboxAccessDenied> {
     // Minted in the cluster the Pod is in — for a child composition that is the
     // child cluster, not Kobe's. A token issued by the management cluster would
     // not authenticate there at all, and reaching the child as its admin
@@ -783,7 +787,11 @@ pub async fn scoped_client(
     };
     config.default_namespace = target.namespace.clone();
 
-    kube::Client::try_from(config).map_err(|error| backend_denied(&error))
+    let actor = kube::Client::try_from(config).map_err(|error| backend_denied(&error))?;
+    Ok(ScopedPodAccess {
+        reader: cluster.admin.clone(),
+        actor,
+    })
 }
 
 #[cfg(test)]
@@ -1656,10 +1664,44 @@ mod tests {
                     );
                 }
                 // `create` on bare `pods` would be a way to start a workload
-                // that outlives the lease entirely.
-                if resources.iter().any(|resource| resource == "pods") {
-                    assert_eq!(rule.verbs, vec!["get".to_string()]);
+                // that outlives the lease entirely. `get`/`list` on `pods` or
+                // `pods/status` returns `terminated.message` (#219).
+                for resource in &resources {
+                    assert_ne!(
+                        resource.as_str(),
+                        "pods",
+                        "{operation:?} must not GET the Pod object: {rule:?}"
+                    );
+                    assert_ne!(
+                        resource.as_str(),
+                        "pods/status",
+                        "{operation:?} must not read Pod status: {rule:?}"
+                    );
                 }
+            }
+        }
+    }
+
+    /// The minted Role is the identity that lives in the Sandbox namespace.
+    ///
+    /// #219: a `get` on `pods` returns `terminated.message`. UID verification
+    /// belongs on the cluster admin client, which already holds that read.
+    #[test]
+    fn minted_role_cannot_read_pod_status() {
+        for operation in SandboxOperation::ALL {
+            for rule in scoped_rules(&target(), operation) {
+                let resources = rule.resources.clone().unwrap_or_default();
+                let verbs = &rule.verbs;
+                let reads_object = resources.iter().any(|resource| {
+                    resource == "pods" || resource == "pods/status" || resource == "*"
+                });
+                let is_read = verbs
+                    .iter()
+                    .any(|verb| matches!(verb.as_str(), "get" | "list" | "watch" | "*"));
+                assert!(
+                    !(reads_object && is_read),
+                    "{operation:?} grants a Pod-object read: {rule:?}"
+                );
             }
         }
     }

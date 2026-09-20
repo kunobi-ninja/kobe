@@ -489,7 +489,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // already passed can therefore never reserve, create, or mint a fresh
     // credential, and an event racing setup cancels the network wait instead
     // of letting it complete under ended authority.
-    let scoped = match scoped_client_after_registration(
+    let access = match scoped_client_after_registration(
         &state,
         &lease,
         &target,
@@ -498,7 +498,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     )
     .await
     {
-        Ok(client) => client,
+        Ok(access) => access,
         Err(ScopedSetupDenied::Access(denied)) => {
             if fresh {
                 executions::record_terminal(
@@ -562,7 +562,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
 
     if !fresh {
         return resume_wait_with_runner(
-            &state, &identity, &id, &target, &container, &reserved, &scoped, revoked,
+            &state, &identity, &id, &target, &container, &reserved, &access, revoked,
         )
         .await;
     }
@@ -610,7 +610,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     );
 
     run_with_runner(
-        &state, &identity, &id, &target, &container, &requested, &reserved, &scoped, timeout,
+        &state, &identity, &id, &target, &container, &requested, &reserved, &access, timeout,
         revoked,
     )
     .await
@@ -637,7 +637,7 @@ async fn run_with_runner<B: ClusterBackend>(
     container: &str,
     requested: &crate::api::sandbox_executions::ExecutionRequest,
     reserved: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     timeout: std::time::Duration,
     revoked: tokio_util::sync::CancellationToken,
 ) -> Response {
@@ -695,7 +695,8 @@ async fn run_with_runner<B: ClusterBackend>(
 
     let started = tokio::select! {
         started = runner::start(
-            scoped,
+            &access.reader,
+            &access.actor,
             target,
             container,
             &runner_path,
@@ -770,7 +771,7 @@ async fn run_with_runner<B: ClusterBackend>(
         target,
         container,
         reserved,
-        scoped,
+        access,
         &runner_path,
         report,
         revoked,
@@ -794,7 +795,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
     record: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     revoked: tokio_util::sync::CancellationToken,
 ) -> Response {
     use crate::api::sandbox_runner as runner;
@@ -825,7 +826,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
             target,
             container,
             record,
-            scoped,
+            access,
             &runner_path,
             revoked,
         )
@@ -835,7 +836,8 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     let polled = complete_before_revocation(
         &revoked,
         runner::poll(
-            scoped,
+            &access.reader,
+            &access.actor,
             target,
             container,
             &runner_path,
@@ -869,7 +871,8 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
         }
         None => {
             let cancelled = runner::cancel(
-                scoped,
+                &access.reader,
+                &access.actor,
                 target,
                 container,
                 &runner_path,
@@ -897,7 +900,7 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
         target,
         container,
         record,
-        scoped,
+        access,
         &runner_path,
         report,
         revoked,
@@ -913,7 +916,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
     record: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     runner_path: &str,
     report: kobe_runner::protocol::ExecutionReport,
     revoked: tokio_util::sync::CancellationToken,
@@ -922,7 +925,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
     use crate::api::sandbox_runner as runner;
 
     let report = match wait_for_runner(
-        scoped,
+        access,
         target,
         container,
         runner_path,
@@ -980,7 +983,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
         target,
         container,
         &durable,
-        scoped,
+        access,
         runner_path,
         revoked,
     )
@@ -1025,7 +1028,7 @@ async fn wait_output_response<B: ClusterBackend>(
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
     record: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     runner_path: &str,
     revoked: tokio_util::sync::CancellationToken,
 ) -> Response {
@@ -1035,7 +1038,8 @@ async fn wait_output_response<B: ClusterBackend>(
     let output = complete_before_revocation(
         &revoked,
         runner::read_wait_output(
-            scoped,
+            &access.reader,
+            &access.actor,
             target,
             container,
             runner_path,
@@ -1199,7 +1203,7 @@ enum WaitRunnerFailure {
 /// later GET can recover the answer; it never invents a terminal outcome.
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_runner(
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -1215,7 +1219,7 @@ async fn wait_for_runner(
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
                     runner::cancel(
-                        scoped, target, container, runner_path, execution, shutdown,
+                        &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
                     ).await,
                 ));
             }
@@ -1223,14 +1227,14 @@ async fn wait_for_runner(
         }
         report = tokio::select! {
             polled = runner::poll(
-                scoped, target, container, runner_path, execution, shutdown,
+                &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
             ) => {
                 polled.map_err(WaitRunnerFailure::Poll)?
             }
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
                     runner::cancel(
-                        scoped, target, container, runner_path, execution, shutdown,
+                        &access.reader, &access.actor, target, container, runner_path, execution, shutdown,
                     ).await,
                 ));
             }
@@ -1257,7 +1261,7 @@ async fn reconcile_runner<B: ClusterBackend>(
     container: &str,
     runner_path: &str,
     record: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
 ) -> crate::crd::SandboxExecution {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
@@ -1271,7 +1275,8 @@ async fn reconcile_runner<B: ClusterBackend>(
         return record.clone();
     }
     let polled = runner::poll(
-        scoped,
+        &access.reader,
+        &access.actor,
         target,
         container,
         runner_path,
@@ -1388,7 +1393,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                     }
                 };
                 let revoked = guard.cancelled();
-                let scoped = match scoped_client_after_registration(
+                let access = match scoped_client_after_registration(
                     &state,
                     &lease,
                     &target,
@@ -1397,7 +1402,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                 )
                 .await
                 {
-                    Ok(scoped) => scoped,
+                    Ok(access) => access,
                     Err(ScopedSetupDenied::Access(denied)) => {
                         return access_denied(&identity, &id, "execution", denied);
                     }
@@ -1422,7 +1427,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                 };
                 match complete_before_revocation(
                     &revoked,
-                    reconcile_runner(&state, &target, container, runner_path, &record, &scoped),
+                    reconcile_runner(&state, &target, container, runner_path, &record, &access),
                 )
                 .await
                 {
@@ -1577,7 +1582,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
-    let scoped = match scoped_client_after_registration(
+    let access = match scoped_client_after_registration(
         &state,
         &lease,
         &target,
@@ -1586,7 +1591,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     )
     .await
     {
-        Ok(client) => client,
+        Ok(access) => access,
         Err(ScopedSetupDenied::Access(denied)) => {
             return access_denied(&identity, &id, "execution-logs", denied);
         }
@@ -1613,7 +1618,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     // raw records were refused above, so this id is always runner-owned.
     let record = match complete_before_revocation(
         &revoked,
-        reconcile_runner(&state, &target, &container, &runner_path, &record, &scoped),
+        reconcile_runner(&state, &target, &container, &runner_path, &record, &access),
     )
     .await
     {
@@ -1622,7 +1627,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
             return runner_output_revoked_response(
                 &state,
                 &record,
-                &scoped,
+                &access,
                 &target,
                 &container,
                 &runner_path,
@@ -1639,7 +1644,8 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         let read = complete_before_revocation(
             &revoked,
             runner::read_output(
-                &scoped,
+                &access.reader,
+                &access.actor,
                 &target,
                 &container,
                 &runner_path,
@@ -1673,7 +1679,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                 return runner_output_revoked_response(
                     &state,
                     &record,
-                    &scoped,
+                    &access,
                     &target,
                     &container,
                     &runner_path,
@@ -1730,7 +1736,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
 async fn runner_output_revoked_response<B: ClusterBackend>(
     state: &AppState<B>,
     record: &crate::crd::SandboxExecution,
-    scoped: &kube::Client,
+    access: &crate::api::sandbox_credentials::ScopedPodAccess,
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
     runner_path: &str,
@@ -1742,7 +1748,8 @@ async fn runner_output_revoked_response<B: ClusterBackend>(
         .unwrap_or_default();
     if !current.is_terminal() {
         let cancelled = crate::api::sandbox_runner::cancel(
-            scoped,
+            &access.reader,
+            &access.actor,
             target,
             container,
             runner_path,
@@ -1930,7 +1937,7 @@ async fn cancel_runner<B: ClusterBackend>(
         }
     };
 
-    let scoped = match scoped_client_after_registration(
+    let access = match scoped_client_after_registration(
         state,
         lease,
         target,
@@ -1939,7 +1946,7 @@ async fn cancel_runner<B: ClusterBackend>(
     )
     .await
     {
-        Ok(scoped) => scoped,
+        Ok(access) => access,
         Err(ScopedSetupDenied::Access(denied)) => {
             return RunnerCancellation::Handled(access_denied(
                 identity,
@@ -1969,7 +1976,8 @@ async fn cancel_runner<B: ClusterBackend>(
     let cancelled = complete_before_revocation(
         revoked,
         runner::cancel(
-            &scoped,
+            &access.reader,
+            &access.actor,
             target,
             &container,
             &runner_path,
@@ -2196,7 +2204,7 @@ struct UpgradeContext {
     /// Argv the upgrade will actually run: the caller's, else the pool's
     /// declared attach command, else nothing at all.
     command: Option<Vec<String>>,
-    scoped: kube::Client,
+    access: crate::api::sandbox_credentials::ScopedPodAccess,
     /// Byte ceiling captured from operator configuration before upgrading.
     max_stream_bytes: Option<u64>,
     /// The registration claimed before the upgrade. Held here so the slot is
@@ -2231,7 +2239,7 @@ async fn scoped_client_after_registration<B: ClusterBackend>(
     target: &crate::api::sandbox_access::SandboxTarget,
     operation: crate::api::sandbox_credentials::SandboxOperation,
     revoked: &tokio_util::sync::CancellationToken,
-) -> Result<kube::Client, ScopedSetupDenied> {
+) -> Result<crate::api::sandbox_credentials::ScopedPodAccess, ScopedSetupDenied> {
     use crate::api::sandbox_transport::{StreamEnd, bounded_setup};
 
     let cluster = match bounded_setup(
@@ -2252,12 +2260,12 @@ async fn scoped_client_after_registration<B: ClusterBackend>(
     };
 
     match bounded_setup(
-        crate::api::sandbox_credentials::scoped_client(&cluster, target, operation),
+        crate::api::sandbox_credentials::scoped_pod_access(&cluster, target, operation),
         revoked,
     )
     .await
     {
-        Ok(Ok(client)) => Ok(client),
+        Ok(Ok(access)) => Ok(access),
         Ok(Err(denied)) => Err(ScopedSetupDenied::Access(denied)),
         Err(StreamEnd::Revoked) => Err(ScopedSetupDenied::Revoked),
         Err(_) => Err(ScopedSetupDenied::CredentialTimeout),
@@ -2479,9 +2487,9 @@ async fn prepare_upgrade<B: ClusterBackend>(
     // Both placements go through the same resolution. Child composition
     // changes which cluster the Pod is in; it changes nothing about what the
     // caller may do, which is the equivalence #76 sets out to prove.
-    let scoped =
+    let access =
         match scoped_client_after_registration(state, &lease, &target, operation, &revoked).await {
-            Ok(client) => client,
+            Ok(access) => access,
             Err(ScopedSetupDenied::Access(denied)) => {
                 return Err(access_denied(identity, id, operation.as_str(), denied));
             }
@@ -2508,7 +2516,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
         target,
         container,
         command,
-        scoped,
+        access,
         guard,
     })
 }
@@ -2574,14 +2582,19 @@ async fn sandbox_attach<B: ClusterBackend>(
         let guard = context.guard;
         let revoked = guard.cancelled();
 
+        let reader_pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.access.reader.clone(), &context.target.namespace);
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
-            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+            kube::Api::namespaced(context.access.actor.clone(), &context.target.namespace);
 
         // The name resolved at placement; the identity must still match. A Pod
         // recycled under the same name is a different workload, and attaching a
         // terminal to it would put a caller's keystrokes into somebody else's
         // container. Logs and exec already recheck; this path did not.
-        match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+        // UID check uses the reader: the actor Role cannot GET the Pod (#219).
+        match transport::bounded_setup(pod_identity_holds(&reader_pods, &context.target), &revoked)
+            .await
+        {
             Ok(true) => {}
             Ok(false) | Err(transport::StreamEnd::TargetError) => {
                 transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
@@ -2692,12 +2705,17 @@ async fn sandbox_port_forward<B: ClusterBackend>(
         let guard = context.guard;
         let revoked = guard.cancelled();
 
+        let reader_pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.access.reader.clone(), &context.target.namespace);
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
-            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+            kube::Api::namespaced(context.access.actor.clone(), &context.target.namespace);
 
         // Same fence as attach: a recycled Pod under the recorded name would
         // forward the caller's connection into another tenant's workload.
-        match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+        // UID check uses the reader: the actor Role cannot GET the Pod (#219).
+        match transport::bounded_setup(pod_identity_holds(&reader_pods, &context.target), &revoked)
+            .await
+        {
             Ok(true) => {}
             Ok(false) | Err(transport::StreamEnd::TargetError) => {
                 transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
@@ -2926,10 +2944,14 @@ async fn serve_iroh_session(
 
     let guard = context.guard;
     let revoked = guard.cancelled();
+    let reader_pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(context.access.reader.clone(), &context.target.namespace);
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
-        kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+        kube::Api::namespaced(context.access.actor.clone(), &context.target.namespace);
 
-    match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+    match transport::bounded_setup(pod_identity_holds(&reader_pods, &context.target), &revoked)
+        .await
+    {
         Ok(true) => {}
         Ok(false) | Err(transport::StreamEnd::TargetError) => {
             transport::close_with_iroh(&mut link, transport::StreamEnd::TargetError).await;
@@ -3080,7 +3102,7 @@ async fn sandbox_exec<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
-    let scoped = match scoped_client_after_registration(
+    let access = match scoped_client_after_registration(
         &state,
         &lease,
         &target,
@@ -3089,7 +3111,7 @@ async fn sandbox_exec<B: ClusterBackend>(
     )
     .await
     {
-        Ok(client) => client,
+        Ok(access) => access,
         Err(ScopedSetupDenied::Access(denied)) => {
             return access_denied(&identity, &id, "exec", denied);
         }
@@ -3128,7 +3150,8 @@ async fn sandbox_exec<B: ClusterBackend>(
 
     let result = tokio::select! {
         result = access::exec_in_sandbox(
-            &scoped,
+            &access.reader,
+            &access.actor,
             &target,
             &container,
             &request.command,
@@ -3221,7 +3244,7 @@ async fn sandbox_logs<B: ClusterBackend>(
     // than under the operator's own authority. The resolver has already denied
     // everything it should — this is the layer that makes a bug in the request
     // path a 403 instead of a privilege escalation.
-    let scoped = match scoped_client_after_registration(
+    let access = match scoped_client_after_registration(
         &state,
         &lease,
         &target,
@@ -3230,7 +3253,7 @@ async fn sandbox_logs<B: ClusterBackend>(
     )
     .await
     {
-        Ok(client) => client,
+        Ok(access) => access,
         Err(ScopedSetupDenied::Access(denied)) => {
             return access_denied(&identity, &id, "logs", denied);
         }
@@ -3253,7 +3276,13 @@ async fn sandbox_logs<B: ClusterBackend>(
     };
 
     let read = crate::api::sandbox_transport::bounded_setup(
-        access::read_sandbox_logs(&scoped, &target, &container, access::clamp_tail(query.tail)),
+        access::read_sandbox_logs(
+            &access.reader,
+            &access.actor,
+            &target,
+            &container,
+            access::clamp_tail(query.tail),
+        ),
         &revoked,
     )
     .await;

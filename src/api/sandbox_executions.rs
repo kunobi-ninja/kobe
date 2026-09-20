@@ -1981,6 +1981,7 @@ async fn cleanup_lease_executions_inner(
                 .expect("cleanup target always carries runnerPath");
             match runner::cancel(
                 target_client,
+                target_client,
                 &target,
                 &target.container,
                 runner_path,
