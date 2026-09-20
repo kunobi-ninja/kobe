@@ -574,9 +574,6 @@ fn write_png(path: &std::path::Path, width: u16, height: u16, rgb: &[u8]) -> Res
     Ok(())
 }
 
-/// KasmVNC's web client is the document at `/`. No query string: autoconnect
-/// is the default, and `path=websockify` is a noVNC leftover that 404s here.
-
 /// RFB ClientCutText: put `text` on the server clipboard.
 ///
 /// x11vnc applies this to the X clipboard, which is how paste reaches Firefox
@@ -704,6 +701,8 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
     let url = if native {
         bound.to_string()
     } else {
+        // KasmVNC serves the client at `/`. No query string: autoconnect is
+        // the default, and `path=websockify` is a noVNC leftover that 404s.
         format!("http://{bound}/")
     };
 
