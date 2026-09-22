@@ -429,7 +429,7 @@ async fn reconcile_receipt_authority_tracked<B: ClusterBackend + Clone + 'static
     ctx: Arc<InstanceContext<B>>,
 ) -> Result<Action, InstanceError> {
     let name = instance.name_any();
-    if let Some(remaining) = ctx.failures.defer(&name, instance.metadata.generation) {
+    if let Some(remaining) = ctx.failures.defer(&name, &instance.metadata) {
         debug!(
             instance = %name,
             retry_in = ?remaining,
@@ -635,7 +635,7 @@ fn receipt_authority_error_policy<B: ClusterBackend>(
     ctx: Arc<InstanceContext<B>>,
 ) -> Action {
     let name = instance.name_any();
-    let delay = ctx.failures.record(&name, instance.metadata.generation);
+    let delay = ctx.failures.record(&name, &instance.metadata);
     warn!(instance = %name, retry_in = ?delay, %error, "teardown receipt authority reconcile failed");
     Action::requeue(delay)
 }
@@ -660,7 +660,7 @@ async fn reconcile_instance_tracked<B: ClusterBackend + Clone + 'static>(
     ctx: Arc<InstanceContext<B>>,
 ) -> Result<Action, InstanceError> {
     let name = instance.name_any();
-    if let Some(remaining) = ctx.failures.defer(&name, instance.metadata.generation) {
+    if let Some(remaining) = ctx.failures.defer(&name, &instance.metadata) {
         debug!(
             instance = %name,
             retry_in = ?remaining,
@@ -4900,7 +4900,7 @@ fn error_policy<B: ClusterBackend>(
     ctx: Arc<InstanceContext<B>>,
 ) -> Action {
     let name = instance.name_any();
-    let delay = ctx.failures.record(&name, instance.metadata.generation);
+    let delay = ctx.failures.record(&name, &instance.metadata);
     // The single ERROR for a failed reconcile. Named, so the object is
     // identifiable without parsing it back out of a Debug blob.
     error!(instance = %name, retry_in = ?delay, "Instance reconciliation error: {error}");
@@ -6816,7 +6816,8 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.failures.defer("broken", Some(2)),
+            ctx.failures
+                .defer("broken", &instance_at_generation("broken", 2).metadata,),
             None,
             "a higher generation is a spec change and must reconcile at once"
         );
