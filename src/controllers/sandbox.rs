@@ -8054,6 +8054,23 @@ async fn finish_child_release_after_proof(
 /// binding supplies cleanup mode, creation manifest, connect-token UID and
 /// durable attempt; the outer Sandbox supplies the exact handle, pool and
 /// instance identities it checkpointed before release.
+/// Name the predicate that rejected a receipt, then reject it.
+///
+/// Every caller of the validators below collapses a `None` into the single
+/// `child_receipt_does_not_match` quarantine reason, which is terminal and
+/// carries no field. A lease that quarantines in CI therefore says only that
+/// *something* did not line up — see #367, where the nightly failure could not
+/// be attributed to a predicate without re-running the suite. The verdict is
+/// unchanged; only the log now says which check produced it.
+fn reject_child_receipt(lease: &str, predicate: &'static str) -> Option<String> {
+    warn!(
+        lease = %lease,
+        predicate = predicate,
+        "child receipt rejected"
+    );
+    None
+}
+
 fn validated_child_receipt_token(
     lease: &crate::crd::ClusterLease,
     receipt: &crate::crd::TeardownReceipt,
@@ -8061,25 +8078,43 @@ fn validated_child_receipt_token(
     recorded_instance: Option<&crate::crd::SandboxObjectReference>,
     recorded_pool: &crate::crd::SandboxObjectReference,
 ) -> Option<String> {
-    let namespace = recorded_lease.namespace.as_deref()?;
-    let status = lease.status.as_ref()?;
-    let binding = status.binding.as_ref()?;
-    if lease.name_any() != recorded_lease.name
-        || lease.uid().as_deref() != Some(recorded_lease.uid.as_str())
-        || binding.lease.name != recorded_lease.name
+    let name = lease.name_any();
+    let Some(namespace) = recorded_lease.namespace.as_deref() else {
+        return reject_child_receipt(&name, "recorded_handle_namespace_missing");
+    };
+    let Some(status) = lease.status.as_ref() else {
+        return reject_child_receipt(&name, "handle_status_missing");
+    };
+    let Some(binding) = status.binding.as_ref() else {
+        return reject_child_receipt(&name, "handle_binding_missing");
+    };
+    if name != recorded_lease.name || binding.lease.name != recorded_lease.name {
+        return reject_child_receipt(&name, "handle_name_changed");
+    }
+    if lease.uid().as_deref() != Some(recorded_lease.uid.as_str())
         || binding.lease.uid.as_deref() != Some(recorded_lease.uid.as_str())
-        || binding.pool.name != recorded_pool.name
+    {
+        return reject_child_receipt(&name, "handle_uid_changed");
+    }
+    if binding.pool.name != recorded_pool.name
         || binding.pool.uid.as_deref() != Some(recorded_pool.uid.as_str())
     {
-        return None;
+        return reject_child_receipt(&name, "pool_identity_changed");
     }
-    let expected = recorded_instance?;
-    if expected.uid.is_empty()
-        || binding.instance.name != expected.name
-        || binding.instance.uid != expected.uid
-        || binding.instance.observed_generation != expected.generation?
-    {
-        return None;
+    let Some(expected) = recorded_instance else {
+        return reject_child_receipt(&name, "recorded_instance_missing");
+    };
+    if expected.uid.is_empty() {
+        return reject_child_receipt(&name, "recorded_instance_uid_empty");
+    }
+    if binding.instance.name != expected.name || binding.instance.uid != expected.uid {
+        return reject_child_receipt(&name, "instance_identity_changed");
+    }
+    let Some(expected_generation) = expected.generation else {
+        return reject_child_receipt(&name, "recorded_instance_generation_missing");
+    };
+    if binding.instance.observed_generation != expected_generation {
+        return reject_child_receipt(&name, "instance_generation_changed");
     }
 
     validated_binding_receipt_token(lease, receipt, namespace)
@@ -8127,17 +8162,35 @@ fn validated_binding_receipt_token(
     receipt: &crate::crd::TeardownReceipt,
     namespace: &str,
 ) -> Option<String> {
-    let status = lease.status.as_ref()?;
-    let binding = status.binding.as_ref()?;
-    let durable_attempt = status.teardown_attempt_id.as_deref()?;
-    if status.phase != crate::crd::LeasePhase::Recycling
-        || lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
-        || binding.cleanup_mode != crate::crd::CleanupMode::VerifiedDestroy
-        || receipt.attempt_id != durable_attempt
-    {
-        return None;
+    let name = lease.name_any();
+    let Some(status) = lease.status.as_ref() else {
+        return reject_child_receipt(&name, "producer_status_missing");
+    };
+    let Some(binding) = status.binding.as_ref() else {
+        return reject_child_receipt(&name, "producer_binding_missing");
+    };
+    let Some(durable_attempt) = status.teardown_attempt_id.as_deref() else {
+        return reject_child_receipt(&name, "teardown_attempt_id_missing");
+    };
+    if status.phase != crate::crd::LeasePhase::Recycling {
+        // Not expected to fire: the producer holds the lease in `Recycling`
+        // until its receipt is acknowledged, then deletes it outright — it
+        // never advances to another phase underneath a live receipt. Logged
+        // by name so a nightly failure can rule this out rather than leave it
+        // as a hypothesis.
+        return reject_child_receipt(&name, "producer_phase_not_recycling");
     }
-    let manifest = binding.creation_manifest.as_ref()?;
+    if lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
+        || binding.cleanup_mode != crate::crd::CleanupMode::VerifiedDestroy
+    {
+        return reject_child_receipt(&name, "cleanup_mode_not_verified_destroy");
+    }
+    if receipt.attempt_id != durable_attempt {
+        return reject_child_receipt(&name, "receipt_attempt_id_stale");
+    }
+    let Some(manifest) = binding.creation_manifest.as_ref() else {
+        return reject_child_receipt(&name, "creation_manifest_missing");
+    };
     if manifest.validate().is_err()
         || manifest.namespace != namespace
         || manifest.instance.name != binding.instance.name
@@ -8145,13 +8198,17 @@ fn validated_binding_receipt_token(
         || manifest.backend_type != binding.backend.backend_type
         || manifest.config_digest != binding.backend.config_digest
     {
-        return None;
+        return reject_child_receipt(&name, "creation_manifest_does_not_match_binding");
     }
-    let manifest_digest = manifest.digest().ok()?;
+    let Ok(manifest_digest) = manifest.digest() else {
+        return reject_child_receipt(&name, "creation_manifest_digest_failed");
+    };
     if binding.creation_manifest_digest.as_deref() != Some(manifest_digest.as_str()) {
-        return None;
+        return reject_child_receipt(&name, "creation_manifest_digest_changed");
     }
-    let connect_token = binding.connect_token.as_ref()?;
+    let Some(connect_token) = binding.connect_token.as_ref() else {
+        return reject_child_receipt(&name, "connect_token_missing");
+    };
     if crate::api::connect::require_connect_token_identity_shape(
         connect_token,
         namespace,
@@ -8159,15 +8216,18 @@ fn validated_binding_receipt_token(
     )
     .is_err()
     {
-        return None;
+        return reject_child_receipt(&name, "connect_token_identity_shape_invalid");
     }
     let plan =
         crate::crd::BindingTeardownPlan::new(binding, manifest, manifest_digest, connect_token);
     let scope = plan.scope(durable_attempt);
-    receipt
-        .permits_release_for(&scope)
-        .then(|| receipt.acknowledgement_token())
-        .flatten()
+    if !receipt.permits_release_for(&scope) {
+        return reject_child_receipt(&name, "receipt_scope_does_not_permit_release");
+    }
+    match receipt.acknowledgement_token() {
+        Some(token) => Some(token),
+        None => reject_child_receipt(&name, "receipt_acknowledgement_token_missing"),
+    }
 }
 
 /// Revalidate a retained producer receipt using only its controller-owned
