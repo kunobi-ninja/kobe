@@ -77,6 +77,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq \
         less \
         libayatana-appindicator3-dev \
+        libcap2-bin \
         libgl1-mesa-dri \
         librsvg2-dev \
         libssl-dev \
@@ -107,6 +108,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xterm \
         xz-utils \
     && pkg-config --exists xkbcommon-x11 x11-xcb xcb-xkb \
+# Debian ships ping with `cap_net_raw+ep` as a file capability, and ping6 is a
+# symlink to it. A sandbox runs with `no_new_privs`, where execve of a file
+# carrying capabilities fails with EPERM, so ping is unrunnable however it is
+# invoked. Copying the binary drops the `security.capability` xattr, and
+# `net.ipv4.ping_group_range` covers every GID, so an unprivileged ICMP
+# datagram socket works without the capability.
+    && cp /usr/bin/ping /usr/bin/ping.nocap \
+    && mv /usr/bin/ping.nocap /usr/bin/ping \
+# The build itself runs without `no_new_privs`, so running ping here would pass
+# whether or not the xattr is gone. Assert on the capability instead.
+    && test -z "$(getcap /usr/bin/ping)" \
     && rm -rf /var/lib/apt/lists/*
 
 # KasmVNC is the X server and the browser viewer (HTTP :6080). x11vnc still
