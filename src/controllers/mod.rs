@@ -1,4 +1,5 @@
 pub mod auth_policy;
+pub mod backoff;
 pub mod instance;
 pub mod ipam;
 pub mod kobestore_health;

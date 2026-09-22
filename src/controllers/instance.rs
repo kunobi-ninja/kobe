@@ -27,6 +27,7 @@ use crate::backend::{
     BackendCreationFootprint, BackendFactory, BootstrapJobPlan, ClusterBackend, CreateProgress,
     resolve_bootstrap_addons, resolve_bootstrap_jobs,
 };
+use crate::controllers::backoff::FailureBackoff;
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
     CheckResult, CleanupMode, ClusterConfig, ClusterInstance, ClusterInstanceCondition,
@@ -165,6 +166,10 @@ pub struct InstanceContext<B: ClusterBackend> {
     pub namespace: String,
     pub factory: Option<BackendFactory>,
     pub velero: Option<VeleroCoordinator>,
+    /// Retry spacing for instances whose reconcile keeps failing, and the gate
+    /// that keeps one of this controller's four `reconcile_on` streams from
+    /// cancelling that spacing. See [`crate::controllers::backoff`].
+    pub failures: FailureBackoff,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +207,7 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
         namespace: namespace.to_string(),
         factory,
         velero,
+        failures: FailureBackoff::default(),
     });
 
     info!("Starting instance controller");
@@ -242,7 +248,7 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
             "backend StatefulSet",
             |sts: &StatefulSet| owning_instance(&sts.metadata),
         ))
-        .run(reconcile_instance, error_policy, ctx)
+        .run(reconcile_instance_tracked, error_policy, ctx)
         .for_each(|result| async move { observe_instance_result(result) });
 
     tokio::select! {
@@ -272,6 +278,7 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
         namespace: namespace.to_string(),
         factory,
         velero: None,
+        failures: FailureBackoff::default(),
     });
     info!("Starting isolated teardown receipt authority");
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
@@ -285,7 +292,7 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
             lease_instance_trigger,
         ))
         .run(
-            reconcile_receipt_authority,
+            reconcile_receipt_authority_tracked,
             receipt_authority_error_policy,
             ctx,
         )
@@ -411,6 +418,31 @@ where
                 .ok()?;
             map(&object)
         })
+}
+
+/// [`reconcile_receipt_authority`] behind the same backoff gate the lifecycle
+/// controller uses. This loop wakes on the bound lease as well as its own
+/// object, so it has the same way of losing a backoff to a change it does not
+/// control.
+async fn reconcile_receipt_authority_tracked<B: ClusterBackend + Clone + 'static>(
+    instance: Arc<ClusterInstance>,
+    ctx: Arc<InstanceContext<B>>,
+) -> Result<Action, InstanceError> {
+    let name = instance.name_any();
+    if let Some(remaining) = ctx.failures.defer(&name, instance.metadata.generation) {
+        debug!(
+            instance = %name,
+            retry_in = ?remaining,
+            "Receipt authority woke inside its failure backoff; deferring",
+        );
+        return Ok(Action::requeue(remaining));
+    }
+
+    let result = reconcile_receipt_authority(instance, ctx.clone()).await;
+    if result.is_ok() {
+        ctx.failures.forget(&name);
+    }
+    result
 }
 
 async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
@@ -598,15 +630,52 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
 }
 
 fn receipt_authority_error_policy<B: ClusterBackend>(
-    _instance: Arc<ClusterInstance>,
+    instance: Arc<ClusterInstance>,
     error: &InstanceError,
-    _ctx: Arc<InstanceContext<B>>,
+    ctx: Arc<InstanceContext<B>>,
 ) -> Action {
-    warn!(%error, "teardown receipt authority reconcile failed");
-    Action::requeue(std::time::Duration::from_secs(15))
+    let name = instance.name_any();
+    let delay = ctx.failures.record(&name, instance.metadata.generation);
+    warn!(instance = %name, retry_in = ?delay, %error, "teardown receipt authority reconcile failed");
+    Action::requeue(delay)
 }
 
+/// Reconcile an instance, unless it is still serving a failure backoff, and
+/// forget that backoff once it succeeds.
+///
+/// The gate is what makes the delay `error_policy` returns mean something.
+/// This controller wakes on four streams besides its own object — a bound
+/// lease, a bootstrap Job, a CIDRClaim, a backend StatefulSet — and any of
+/// them can deliver a reconcile request before the backoff has elapsed. A
+/// bootstrap Job in crashloop is the concrete case: it churns for as long as
+/// the failure it reports lasts, and without this every one of its events
+/// re-ran a reconcile that was always going to fail again.
+///
+/// Deferring here rather than at the scheduler is not a choice: by the time a
+/// request exists the scheduler has accepted it, so the only thing left to
+/// control is how much work it causes. This costs one map lookup.
 #[tracing::instrument(skip_all, fields(instance = %instance.name_any()))]
+async fn reconcile_instance_tracked<B: ClusterBackend + Clone + 'static>(
+    instance: Arc<ClusterInstance>,
+    ctx: Arc<InstanceContext<B>>,
+) -> Result<Action, InstanceError> {
+    let name = instance.name_any();
+    if let Some(remaining) = ctx.failures.defer(&name, instance.metadata.generation) {
+        debug!(
+            instance = %name,
+            retry_in = ?remaining,
+            "Instance woke inside its failure backoff; deferring",
+        );
+        return Ok(Action::requeue(remaining));
+    }
+
+    let result = reconcile_instance(instance, ctx.clone()).await;
+    if result.is_ok() {
+        ctx.failures.forget(&name);
+    }
+    result
+}
+
 async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
     instance: Arc<ClusterInstance>,
     ctx: Arc<InstanceContext<B>>,
@@ -4828,12 +4897,14 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
 fn error_policy<B: ClusterBackend>(
     instance: Arc<ClusterInstance>,
     error: &InstanceError,
-    _ctx: Arc<InstanceContext<B>>,
+    ctx: Arc<InstanceContext<B>>,
 ) -> Action {
+    let name = instance.name_any();
+    let delay = ctx.failures.record(&name, instance.metadata.generation);
     // The single ERROR for a failed reconcile. Named, so the object is
     // identifiable without parsing it back out of a Debug blob.
-    error!(instance = %instance.name_any(), "Instance reconciliation error: {error}");
-    Action::requeue(std::time::Duration::from_secs(30))
+    error!(instance = %name, retry_in = ?delay, "Instance reconciliation error: {error}");
+    Action::requeue(delay)
 }
 
 #[cfg(test)]
@@ -5295,6 +5366,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             factory: None,
             velero: None,
+            failures: FailureBackoff::default(),
         });
         (ctx, server, backend)
     }
@@ -6640,6 +6712,114 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    /// An instance at `generation`, with nothing else the backoff path reads.
+    fn instance_at_generation(name: &str, generation: i64) -> Arc<ClusterInstance> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "uid": format!("{name}-uid"),
+                    "resourceVersion": "10",
+                    "generation": generation,
+                },
+                "spec": {
+                    "backend": { "type": "k3s" },
+                    "cluster": { "version": "v1.31.3+k3s1" },
+                    "addons": [],
+                    "readinessGates": []
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A permanently failing instance must retry further and further apart.
+    /// A flat delay is the same load in hour 48 as in minute 1, and a pool
+    /// whose instances all fail pays it once per instance.
+    #[tokio::test]
+    async fn error_policy_backs_off_exponentially_per_instance() {
+        let (ctx, _server, _) = test_instance_context().await;
+        let instance = instance_at_generation("broken", 1);
+        let error = || InstanceError::Lifecycle(anyhow::anyhow!("boom"));
+
+        let delays: Vec<Action> = (0..3)
+            .map(|_| error_policy(instance.clone(), &error(), ctx.clone()))
+            .collect();
+
+        assert_eq!(
+            delays,
+            vec![
+                Action::requeue(std::time::Duration::from_secs(2)),
+                Action::requeue(std::time::Duration::from_secs(4)),
+                Action::requeue(std::time::Duration::from_secs(8)),
+            ]
+        );
+        assert_eq!(
+            error_policy(instance_at_generation("other", 1), &error(), ctx.clone()),
+            Action::requeue(std::time::Duration::from_secs(2)),
+            "a second instance must start its own series"
+        );
+    }
+
+    /// The whole point of the backoff: a wake that arrives from one of this
+    /// controller's `reconcile_on` streams while the instance is backing off
+    /// must cost nothing. Asserted as zero API traffic, because that is what
+    /// a crashlooping bootstrap Job was generating on every one of its events.
+    #[tokio::test]
+    async fn a_drift_wake_inside_the_backoff_does_no_api_work() {
+        let (ctx, server, _) = test_instance_context().await;
+        let instance = instance_at_generation("broken", 1);
+
+        let delay = error_policy(
+            instance.clone(),
+            &InstanceError::Lifecycle(anyhow::anyhow!("boom")),
+            ctx.clone(),
+        );
+        assert_eq!(delay, Action::requeue(std::time::Duration::from_secs(2)));
+
+        let action = reconcile_instance_tracked(instance, ctx)
+            .await
+            .expect("a deferral is not an error");
+
+        // `Action` exposes no variants, so the remaining time is asserted in
+        // `controllers::backoff`'s own tests. What belongs here is that the
+        // wake was answered without touching the cluster.
+        assert_ne!(
+            action,
+            Action::await_change(),
+            "a deferred wake must come back on its own, not wait for an event"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .is_none_or(|requests| requests.is_empty()),
+            "a deferred wake must not reach the API server",
+        );
+    }
+
+    /// Editing a broken instance is usually the fix. It must not wait out the
+    /// backoff the previous spec earned.
+    #[tokio::test]
+    async fn new_intent_is_not_deferred() {
+        let (ctx, _server, _) = test_instance_context().await;
+
+        error_policy(
+            instance_at_generation("broken", 1),
+            &InstanceError::Lifecycle(anyhow::anyhow!("boom")),
+            ctx.clone(),
+        );
+
+        assert_eq!(
+            ctx.failures.defer("broken", Some(2)),
+            None,
+            "a higher generation is a spec change and must reconcile at once"
+        );
     }
 
     /// First-ever reconcile of a fresh `ClusterInstance` MUST stamp the
