@@ -32,7 +32,7 @@ test:
 # minimal shared crate so Kani verifies the same function the operator calls.
 [group('test')]
 test-instance-state-machine-kani:
-    cargo kani -p kobe-state-machine --harness recovery_apply_requires_the_exact_leased_subject --harness teardown_phases_are_never_reopened_by_recovery --harness bound_publication_requires_two_exact_reciprocal_sides --harness terminal_leases_never_publish_bound
+    cargo kani -p kobe-state-machine --harness recovery_apply_requires_the_exact_leased_subject --harness teardown_phases_are_never_reopened_by_recovery --harness bound_publication_requires_two_exact_reciprocal_sides --harness terminal_leases_never_publish_bound --harness live_evidence_is_rejected_only_when_teardown_was_disproven --harness acceptance_happens_only_under_recycling --harness acceptance_requires_a_receipt
 
 # Mutation gate for every production branch in the exact-binding recovery
 # function. A viable mutant surviving this command means the matrix tests are
