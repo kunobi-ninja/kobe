@@ -134,7 +134,13 @@ pub(crate) async fn fetch_pool_for_config_with_output(
 
 /// Ready is always shown. Other counters only when non-zero.
 pub(crate) fn format_pool_counts(pool: &PoolSummary) -> String {
-    let mut parts = vec![format!("ready {}", pool.ready)];
+    // The count carries the label's color, so a glance at the numbers says how
+    // much of this pool is usable without reading the words.
+    let count = |label: &str, value: u32| match crate::commands::phase_sgr(label) {
+        Some(sgr) => format!("{label} {}", crate::commands::styled(sgr, value)),
+        None => format!("{label} {value}"),
+    };
+    let mut parts = vec![count("ready", pool.ready)];
     for (label, value) in [
         ("leased", pool.leased),
         ("creating", pool.creating),
@@ -144,7 +150,7 @@ pub(crate) fn format_pool_counts(pool: &PoolSummary) -> String {
         ("queue", pool.queue_depth),
     ] {
         if value > 0 {
-            parts.push(format!("{label} {value}"));
+            parts.push(count(label, value));
         }
     }
     parts.join("  ")
@@ -196,13 +202,25 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
         }
 
         let phase = pool.phase.as_deref().unwrap_or("Unknown");
-        println!("{indent}{}  {}  {phase}", pool.name, pool.resource_kind);
+        println!(
+            "{indent}{}  {}  {}",
+            crate::commands::styled("1", &pool.name),
+            crate::commands::styled("2", &pool.resource_kind),
+            crate::commands::styled_phase(phase),
+        );
         println!("{indent}  {}", format_pool_counts(pool));
+        // Sizing policy is reference, not something anyone scans for, so it is
+        // dimmed. `actions` dims only its label: the verbs after it are what a
+        // reader is looking up.
         if let Some(policy) = format_policy(pool) {
-            println!("{indent}  {policy}");
+            println!("{indent}  {}", crate::commands::styled("2", policy));
         }
         if !pool.capabilities.is_empty() {
-            println!("{indent}  actions {}", pool.capabilities.join(", "));
+            println!(
+                "{indent}  {} {}",
+                crate::commands::styled("2", "actions"),
+                pool.capabilities.join(", ")
+            );
         }
         if let Some(count) = recycling_leases.get(&pool.name)
             && *count > 0

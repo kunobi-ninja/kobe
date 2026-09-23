@@ -292,30 +292,40 @@ pub(crate) fn short_lease_id(id: &str) -> String {
 
 /// One status cell: phase, plus TTL or queue when that is not the same word.
 pub(crate) fn lease_glance_label(lease: &LeaseSummary) -> String {
+    // Every comparison below runs on the plain phase. Styling is applied only
+    // to what is returned, so a color can never change what this decides.
     let phase = lease_phase_label(lease);
+    let shown = super::styled_phase(&phase);
     if is_status_hidden_phase(&lease.phase) {
-        return phase;
+        return shown;
     }
     if lease.phase.eq_ignore_ascii_case("pending") && lease.queue_position > 0 {
-        return format!("{phase}  queue #{}", lease.queue_position);
+        return format!("{shown}  queue #{}", lease.queue_position);
     }
     let Some(expires_at) = lease.expires_at.as_deref() else {
-        return phase;
+        return shown;
     };
     let when = format_relative_time(expires_at);
     if when == "expired" || when == phase {
-        return phase;
+        return shown;
     }
     let remaining = when.strip_suffix(" left").unwrap_or(&when);
-    format!("{phase}  {remaining}")
+    format!("{shown}  {remaining}")
 }
 
 /// One text `kobe status` lease row: short id, optional alias, pool, glance.
 pub(crate) fn format_lease_status_line(lease: &LeaseSummary) -> String {
     let id = short_lease_id(&lease.id);
     let glance = lease_glance_label(lease);
+    // The alias is what people scan this listing for, so it is the one thing
+    // emphasized. The id stays plain: it is the widest column, and dimming it
+    // is unreadable on the terminals where `dim` renders poorly.
     let mut line = match lease.alias.as_deref().filter(|alias| !alias.is_empty()) {
-        Some(alias) => format!("{id}  {alias}  {}  {glance}", lease.profile),
+        Some(alias) => format!(
+            "{id}  {}  {}  {glance}",
+            super::styled("1", alias),
+            lease.profile
+        ),
         None => format!("{id}  {}  {glance}", lease.profile),
     };
     if lease.transport.as_deref() == Some("iroh") {

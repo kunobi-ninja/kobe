@@ -655,6 +655,45 @@ pub(crate) fn styled(sgr: &str, text: impl std::fmt::Display) -> String {
     }
 }
 
+/// The SGR style for a lease or pool phase, on one axis: how usable the thing
+/// is right now.
+///
+/// One axis is what makes a listing readable at a glance. Green is capacity
+/// you can take, cyan is healthy but taken, yellow is moving, red wants a
+/// human, dim is over and uninteresting.
+///
+/// `leased` is deliberately cyan rather than green. A taken lease is healthy,
+/// but it is not available capacity, and painting it like `ready` would make
+/// `ready 5  leased 2` read as seven usable things.
+///
+/// An unknown phase returns `None` and is printed unstyled: a phase this CLI
+/// has not been taught is exactly the one a guessed color would misreport,
+/// and a newer server can always name one.
+pub(crate) fn phase_sgr(phase: &str) -> Option<&'static str> {
+    match phase.to_ascii_lowercase().as_str() {
+        // Usable now.
+        "ready" | "available" => Some("32"),
+        // Healthy, in use.
+        "bound" | "leased" | "active" => Some("36"),
+        // In transition.
+        "pending" | "creating" | "provisioning" | "releasing" | "recycling" | "scalingup"
+        | "scalingdown" => Some("33"),
+        // Wants attention.
+        "failed" | "quarantined" | "unhealthy" | "error" => Some("31"),
+        // Over.
+        "released" | "expired" | "cancelled" => Some("2"),
+        _ => None,
+    }
+}
+
+/// `phase` in its own style, or unchanged when it has none.
+pub(crate) fn styled_phase(phase: &str) -> String {
+    match phase_sgr(phase) {
+        Some(sgr) => styled(sgr, phase),
+        None => phase.to_string(),
+    }
+}
+
 /// The process-wide HTTP client.
 ///
 /// `reqwest::Client` owns a connection pool, so building a fresh one per
@@ -845,6 +884,59 @@ mod reachability_tests {
             assert!(!kind.hint().is_empty(), "{kind:?} has no hint");
             assert!(!kind.summary().is_empty(), "{kind:?} has no summary");
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_color_tests {
+    use super::*;
+
+    /// The palette is one axis — how usable the thing is — and `leased` sits
+    /// on the taken side of it. Painting it like `ready` would make
+    /// `ready 5  leased 2` read as seven usable things.
+    #[test]
+    fn leased_is_not_coloured_like_ready() {
+        assert_eq!(phase_sgr("ready"), Some("32"));
+        assert_ne!(
+            phase_sgr("leased"),
+            phase_sgr("ready"),
+            "available capacity and taken capacity must not look the same",
+        );
+    }
+
+    #[test]
+    fn each_band_maps_to_one_colour() {
+        for phase in ["ready", "available"] {
+            assert_eq!(phase_sgr(phase), Some("32"), "{phase}");
+        }
+        for phase in ["bound", "leased", "active"] {
+            assert_eq!(phase_sgr(phase), Some("36"), "{phase}");
+        }
+        for phase in ["pending", "creating", "releasing", "recycling", "scalingup"] {
+            assert_eq!(phase_sgr(phase), Some("33"), "{phase}");
+        }
+        for phase in ["failed", "quarantined", "unhealthy"] {
+            assert_eq!(phase_sgr(phase), Some("31"), "{phase}");
+        }
+        for phase in ["released", "expired", "cancelled"] {
+            assert_eq!(phase_sgr(phase), Some("2"), "{phase}");
+        }
+    }
+
+    /// A server newer than this CLI can name a phase it has never heard of.
+    /// Guessing a colour there is how a listing reports the wrong thing with
+    /// total confidence, so an unknown phase is printed as it arrived.
+    #[test]
+    fn an_unknown_phase_is_left_alone() {
+        assert_eq!(phase_sgr("Hibernating"), None);
+        assert_eq!(styled_phase("Hibernating"), "Hibernating");
+    }
+
+    /// Phases arrive in whatever case the server used.
+    #[test]
+    fn matching_ignores_case() {
+        assert_eq!(phase_sgr("ScalingUp"), phase_sgr("scalingup"));
+        assert_eq!(phase_sgr("Ready"), phase_sgr("ready"));
     }
 }
 
