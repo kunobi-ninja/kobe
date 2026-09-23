@@ -62,7 +62,24 @@ use std::time::{Duration, Instant};
 /// First retry after a failed reconcile. Doubles per consecutive failure.
 pub(crate) const DEFAULT_BASE: Duration = Duration::from_secs(2);
 /// Longest retry after repeated failed reconciles.
+///
+/// Only for a reconciler that owns no deadline. A reconciler that enforces one
+/// — a creating-timeout, a provisioning deadline, a queue timeout — must pass a
+/// cap it cannot overrun; see [`FailureBackoff::new`].
 pub(crate) const DEFAULT_MAX: Duration = Duration::from_secs(300);
+
+/// Cap for a reconciler that enforces a deadline on its own timer.
+///
+/// `lease.rs` states the rule this exists for: a timeout is a clock deadline,
+/// so the backstop never sleeps past it. A failure backoff is another backstop,
+/// and one that grows without regard for that deadline breaks the same
+/// invariant — quietly, and only on objects that have already failed several
+/// times in a row, which are exactly the ones a timeout is there to reclaim.
+///
+/// Escalation still buys most of what it is for: reaching this cap takes six
+/// consecutive failures, by which point the retry rate is already 30x lower
+/// than a flat 2s.
+pub(crate) const DEADLINE_BOUND_MAX: Duration = Duration::from_secs(60);
 
 /// How long an untouched entry survives, as a multiple of the cap. Anything
 /// older belongs to an object that stopped being reconciled — deleted, or
@@ -247,6 +264,34 @@ mod tests {
             Duration::from_secs(300),
             "the series must cap rather than overflow"
         );
+    }
+
+    /// A reconciler that enforces a deadline on its own timer must not sleep
+    /// past it. Six failures reach the bound; nothing after that goes higher.
+    #[test]
+    fn the_deadline_bound_cap_is_reached_and_never_exceeded() {
+        let backoff = FailureBackoff::new(DEFAULT_BASE, DEADLINE_BOUND_MAX);
+
+        let series: Vec<Duration> = (0..6).map(|_| backoff.record("a", &meta(1))).collect();
+        assert_eq!(
+            series,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(32),
+                DEADLINE_BOUND_MAX,
+            ]
+        );
+
+        for _ in 0..10 {
+            assert_eq!(
+                backoff.record("a", &meta(1)),
+                DEADLINE_BOUND_MAX,
+                "a deadline-bound reconciler must never wait longer than its cap",
+            );
+        }
     }
 
     #[test]

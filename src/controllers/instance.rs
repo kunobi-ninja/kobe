@@ -27,7 +27,7 @@ use crate::backend::{
     BackendCreationFootprint, BackendFactory, BootstrapJobPlan, ClusterBackend, CreateProgress,
     resolve_bootstrap_addons, resolve_bootstrap_jobs,
 };
-use crate::controllers::backoff::FailureBackoff;
+use crate::controllers::backoff::{self, FailureBackoff};
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
     CheckResult, CleanupMode, ClusterConfig, ClusterInstance, ClusterInstanceCondition,
@@ -207,7 +207,9 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
         namespace: namespace.to_string(),
         factory,
         velero,
-        failures: FailureBackoff::default(),
+        // This reconciler enforces the create budget on its own timer, so its
+        // backoff takes the deadline-bound cap rather than the default.
+        failures: FailureBackoff::new(backoff::DEFAULT_BASE, backoff::DEADLINE_BOUND_MAX),
     });
 
     info!("Starting instance controller");
@@ -278,7 +280,7 @@ pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'stati
         namespace: namespace.to_string(),
         factory,
         velero: None,
-        failures: FailureBackoff::default(),
+        failures: FailureBackoff::new(backoff::DEFAULT_BASE, backoff::DEADLINE_BOUND_MAX),
     });
     info!("Starting isolated teardown receipt authority");
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);

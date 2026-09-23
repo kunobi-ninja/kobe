@@ -86,6 +86,9 @@ const RESTART_LOOP_THRESHOLD: i32 = 3;
 pub struct HealthContext {
     pub client: Client,
     pub namespace: String,
+    /// Retry spacing for stores whose health reconcile keeps failing. This
+    /// reconciler enforces no deadline of its own, so it takes the default cap.
+    pub failures: crate::controllers::backoff::FailureBackoff,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +106,7 @@ pub async fn run_kobestore_health_controller(
     let ctx = Arc::new(HealthContext {
         client,
         namespace: namespace.to_string(),
+        failures: crate::controllers::backoff::FailureBackoff::default(),
     });
 
     info!("Starting KobeStore health controller");
@@ -124,9 +128,11 @@ pub async fn run_kobestore_health_controller(
     }
 }
 
-fn error_policy(_: Arc<KobeStore>, err: &HealthError, _: Arc<HealthContext>) -> Action {
-    error!("KobeStore health reconcile error: {err}");
-    Action::requeue(Duration::from_secs(30))
+fn error_policy(store: Arc<KobeStore>, err: &HealthError, ctx: Arc<HealthContext>) -> Action {
+    let name = store.name_any();
+    let delay = ctx.failures.record(&name, &store.metadata);
+    error!(store = %name, retry_in = ?delay, "KobeStore health reconcile error: {err}");
+    Action::requeue(delay)
 }
 
 async fn reconcile_store_health(

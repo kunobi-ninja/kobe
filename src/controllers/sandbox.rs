@@ -56,6 +56,10 @@ use crate::sandbox::{
 /// Shared state for Sandbox placement and cleanup controllers.
 pub struct SandboxContext {
     pub client: Client,
+    /// Retry spacing for pools and leases whose reconcile keeps failing. This
+    /// reconciler enforces `provisioning_deadline` on its own timer, so it
+    /// takes the deadline-bound cap rather than the default.
+    pub failures: crate::controllers::backoff::FailureBackoff,
     /// Operator-owned namespace the upstream objects live in. Never
     /// caller-selectable: a lease that could choose its namespace could place
     /// work next to somebody else's.
@@ -10184,27 +10188,43 @@ fn upstream_claim_is_ready(claim: &DynamicObject) -> bool {
 }
 
 fn pool_error_policy(
-    _pool: Arc<SandboxPool>,
+    pool: Arc<SandboxPool>,
     error: &SandboxPlacementError,
-    _ctx: Arc<SandboxContext>,
+    ctx: Arc<SandboxContext>,
 ) -> Action {
-    warn!(error = %error, "SandboxPool reconcile failed");
-    Action::requeue(std::time::Duration::from_secs(30))
+    let name = pool.name_any();
+    let delay = ctx.failures.record(&name, &pool.metadata);
+    warn!(pool = %name, retry_in = ?delay, error = %error, "SandboxPool reconcile failed");
+    Action::requeue(delay)
 }
 
 fn lease_error_policy(
-    _lease: Arc<SandboxLease>,
+    lease: Arc<SandboxLease>,
     error: &SandboxPlacementError,
-    _ctx: Arc<SandboxContext>,
+    ctx: Arc<SandboxContext>,
 ) -> Action {
-    warn!(error = %error, reason = error.reason_code(), "SandboxLease placement failed");
-    Action::requeue(std::time::Duration::from_secs(15))
+    let name = lease.name_any();
+    let delay = ctx.failures.record(&name, &lease.metadata);
+    warn!(
+        lease = %name,
+        retry_in = ?delay,
+        error = %error,
+        reason = error.reason_code(),
+        "SandboxLease placement failed",
+    );
+    Action::requeue(delay)
 }
 
 #[derive(Clone)]
 struct ReceiptAckAuthorityContext {
     client: Client,
     namespace: String,
+    /// Retry spacing for this loop. It enforces no deadline of its own, so it
+    /// takes the default cap.
+    /// Held behind an `Arc` because this context is cloned: a cloned
+    /// backoff would get its own map, and the reconciler and `error_policy`
+    /// would silently stop sharing one.
+    failures: std::sync::Arc<crate::controllers::backoff::FailureBackoff>,
 }
 
 /// Watch durable Sandbox consumer checkpoints and publish producer ACKs under
@@ -10223,6 +10243,7 @@ pub async fn run_receipt_ack_authority_controller(
     let context = Arc::new(ReceiptAckAuthorityContext {
         client,
         namespace: namespace.to_string(),
+        failures: std::sync::Arc::new(crate::controllers::backoff::FailureBackoff::default()),
     });
     info!("Starting isolated teardown acknowledgement authority");
     Controller::new(leases, Config::default())
@@ -10439,12 +10460,14 @@ async fn persist_authority_acknowledgement(
 }
 
 fn receipt_ack_authority_error_policy(
-    _lease: Arc<SandboxLease>,
+    lease: Arc<SandboxLease>,
     error: &SandboxPlacementError,
-    _ctx: Arc<ReceiptAckAuthorityContext>,
+    ctx: Arc<ReceiptAckAuthorityContext>,
 ) -> Action {
-    warn!(%error, "teardown acknowledgement authority reconcile failed");
-    Action::requeue(std::time::Duration::from_secs(15))
+    let name = lease.name_any();
+    let delay = ctx.failures.record(&name, &lease.metadata);
+    warn!(lease = %name, retry_in = ?delay, %error, "teardown acknowledgement authority reconcile failed");
+    Action::requeue(delay)
 }
 
 /// The independently running half of the Sandbox controller pair that ended.
@@ -10773,6 +10796,10 @@ pub async fn run_sandbox_controller(
     let lease_store = lease_controller.store();
 
     let ctx = Arc::new(SandboxContext {
+        failures: crate::controllers::backoff::FailureBackoff::new(
+            crate::controllers::backoff::DEFAULT_BASE,
+            crate::controllers::backoff::DEADLINE_BOUND_MAX,
+        ),
         client: client.clone(),
         namespace: namespace.to_string(),
         reservation_namespace: reservation_namespace.to_string(),
@@ -11325,6 +11352,10 @@ pub(crate) mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let ctx = Arc::new(SandboxContext {
+            failures: crate::controllers::backoff::FailureBackoff::new(
+                crate::controllers::backoff::DEFAULT_BASE,
+                crate::controllers::backoff::DEADLINE_BOUND_MAX,
+            ),
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.to_string(),
             reservation_namespace: NS.to_string(),
@@ -12421,6 +12452,10 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         let ctx = Arc::new(SandboxContext {
+            failures: crate::controllers::backoff::FailureBackoff::new(
+                crate::controllers::backoff::DEFAULT_BASE,
+                crate::controllers::backoff::DEADLINE_BOUND_MAX,
+            ),
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
             reservation_namespace: NS.into(),
@@ -21102,6 +21137,10 @@ current-context: child
                 .await;
         }
         let ctx = Arc::new(SandboxContext {
+            failures: crate::controllers::backoff::FailureBackoff::new(
+                crate::controllers::backoff::DEFAULT_BASE,
+                crate::controllers::backoff::DEADLINE_BOUND_MAX,
+            ),
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
             reservation_namespace: NS.into(),
