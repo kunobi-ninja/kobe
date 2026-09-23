@@ -3434,7 +3434,7 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
         let receipt_token = status
             .teardown_receipt
             .as_ref()
-            .and_then(|receipt| validated_retained_receipt_token(&handle, receipt));
+            .and_then(|receipt| validated_retained_receipt_token(&handle, receipt).token());
         let receipt_verified = receipt_token.is_some();
         let receipt_evidence_is_authoritative = match status.teardown_receipt.as_ref() {
             Some(receipt) if crate::receipt_authority::is_separate() => {
@@ -6327,10 +6327,17 @@ async fn recover_torn_down_child_identity(
             QuarantineReason::ChildBindingIdentityUnverifiable,
         );
     }
-    if validated_binding_receipt_token(handle, receipt, &ctx.namespace).is_none() {
-        return TornDownChildIdentity::Quarantine(
-            QuarantineReason::ChildReceiptDoesNotMatchPrecheckpoint,
-        );
+    match validated_binding_receipt_token(handle, receipt, &ctx.namespace) {
+        ChildReceipt::Valid(_) => {}
+        // The producer holds live evidence and has not been swept yet. Read
+        // again rather than withholding this child's capacity forever over a
+        // gap between two of the producer's own writes (#367).
+        ChildReceipt::NotYet => return TornDownChildIdentity::Retry,
+        ChildReceipt::Invalid => {
+            return TornDownChildIdentity::Quarantine(
+                QuarantineReason::ChildReceiptDoesNotMatchPrecheckpoint,
+            );
+        }
     }
     let pools: Api<crate::crd::ClusterPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let live_pool = match pools.get(&binding.pool.name).await {
@@ -6497,6 +6504,7 @@ async fn release_child_composition(
                                     recorded_instance,
                                     pool,
                                 )
+                                .token()
                                 .is_some()
                             })
                         })
@@ -6919,19 +6927,28 @@ async fn release_child_composition(
                     ))
                     .await;
                 }
-                let Some(token) = validated_child_receipt_token(
+                let token = match validated_child_receipt_token(
                     &current,
                     receipt,
                     recorded,
                     recorded_instance,
                     recorded_pool,
-                ) else {
-                    return quarantine_lease(
-                        lease,
-                        ctx,
-                        QuarantineReason::ChildReceiptDoesNotMatch,
-                    )
-                    .await;
+                ) {
+                    ChildReceipt::Valid(token) => token,
+                    // Mid-handoff, not a verdict: the producer wrote its
+                    // receipt and its lease controller has not swept the phase
+                    // yet. Come back rather than quarantining (#367).
+                    ChildReceipt::NotYet => {
+                        return Ok(Action::requeue(CHILD_RECEIPT_HANDOFF_RETRY));
+                    }
+                    ChildReceipt::Invalid => {
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            QuarantineReason::ChildReceiptDoesNotMatch,
+                        )
+                        .await;
+                    }
                 };
                 if status.child_teardown_receipt_acknowledgement.as_deref() != Some(token.as_str())
                     || status.child_teardown_evidence.as_ref() != Some(&evidence)
@@ -7681,21 +7698,30 @@ async fn finish_child_release_after_proof(
             )
             .await;
         };
-        let Some(token) = validated_child_receipt_token(
+        let token = match validated_child_receipt_token(
             &current,
             receipt,
             recorded,
             recorded_instance,
             recorded_pool,
-        ) else {
-            return record_post_proof_cleanup_failure(
-                lease,
-                ctx,
-                "ChildReceiptChangedAfterCheckpoint",
-                "Workload absence is proven, but the exact child receipt no longer validates",
-                std::time::Duration::from_secs(300),
-            )
-            .await;
+        ) {
+            ChildReceipt::Valid(token) => token,
+            // Not a changed receipt — an unswept one. Saying otherwise stalls
+            // for five minutes over a gap that closes in seconds, and names a
+            // cause that did not happen.
+            ChildReceipt::NotYet => {
+                return Ok(Action::requeue(CHILD_RECEIPT_HANDOFF_RETRY));
+            }
+            ChildReceipt::Invalid => {
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildReceiptChangedAfterCheckpoint",
+                    "Workload absence is proven, but the exact child receipt no longer validates",
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
+            }
         };
         let evidence = match authoritative_child_receipt_matches(
             &ctx.client,
@@ -8066,13 +8092,61 @@ async fn finish_child_release_after_proof(
 /// *something* did not line up — see #367, where the nightly failure could not
 /// be attributed to a predicate without re-running the suite. The verdict is
 /// unchanged; only the log now says which check produced it.
-fn reject_child_receipt(lease: &str, predicate: &'static str) -> Option<String> {
+/// What a consumer concludes about a producer's receipt.
+///
+/// Three outcomes, not two. A producer holding live evidence that its lease
+/// controller has not swept into `Recycling` yet is mid-handoff between two
+/// controllers, not a producer that can never prove teardown — and collapsing
+/// both onto one rejection is what turned a timing window into a quarantine
+/// (#367). The reachable states and this split are modelled and proven in
+/// `kobe-state-machine`: see `child_receipt_acceptance`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildReceipt {
+    /// Valid evidence, carrying its acknowledgement token.
+    Valid(String),
+    /// Not decidable yet. Read again; concluding anything now is a timing bug.
+    NotYet,
+    /// This producer can never yield valid evidence for this consumer.
+    Invalid,
+}
+
+impl ChildReceipt {
+    pub(crate) fn token(self) -> Option<String> {
+        match self {
+            ChildReceipt::Valid(token) => Some(token),
+            _ => None,
+        }
+    }
+}
+
+/// How long to wait out a producer's receipt-to-phase handoff.
+///
+/// Both writes are the producer's own and land on consecutive reconciles, so
+/// this is a short gap. Short enough that a child is not held up, long enough
+/// that a consumer does not spin on it.
+const CHILD_RECEIPT_HANDOFF_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn reject_child_receipt(lease: &str, predicate: &'static str) -> ChildReceipt {
     warn!(
         lease = %lease,
         predicate = predicate,
         "child receipt rejected"
     );
-    None
+    ChildReceipt::Invalid
+}
+
+/// The producer wrote its receipt but has not been swept yet.
+///
+/// Logged at debug rather than warn: this is the ordinary gap between the
+/// instance controller writing `teardownReceipt` and the lease controller
+/// moving the phase to `Recycling`, not a fault.
+fn defer_child_receipt(lease: &str, predicate: &'static str) -> ChildReceipt {
+    debug!(
+        lease = %lease,
+        predicate = predicate,
+        "child receipt not decidable yet; producer is mid-handoff"
+    );
+    ChildReceipt::NotYet
 }
 
 fn validated_child_receipt_token(
@@ -8081,7 +8155,7 @@ fn validated_child_receipt_token(
     recorded_lease: &crate::crd::SandboxObjectReference,
     recorded_instance: Option<&crate::crd::SandboxObjectReference>,
     recorded_pool: &crate::crd::SandboxObjectReference,
-) -> Option<String> {
+) -> ChildReceipt {
     let name = lease.name_any();
     let Some(namespace) = recorded_lease.namespace.as_deref() else {
         return reject_child_receipt(&name, "recorded_handle_namespace_missing");
@@ -8151,7 +8225,8 @@ fn receipt_proven_child_instance(
         recorded_lease,
         Some(&instance),
         recorded_pool,
-    )?;
+    )
+    .token()?;
     Some(instance)
 }
 
@@ -8165,7 +8240,7 @@ fn validated_binding_receipt_token(
     lease: &crate::crd::ClusterLease,
     receipt: &crate::crd::TeardownReceipt,
     namespace: &str,
-) -> Option<String> {
+) -> ChildReceipt {
     let name = lease.name_any();
     let Some(status) = lease.status.as_ref() else {
         return reject_child_receipt(&name, "producer_status_missing");
@@ -8176,13 +8251,22 @@ fn validated_binding_receipt_token(
     let Some(durable_attempt) = status.teardown_attempt_id.as_deref() else {
         return reject_child_receipt(&name, "teardown_attempt_id_missing");
     };
-    if status.phase != crate::crd::LeasePhase::Recycling {
-        // Not expected to fire: the producer holds the lease in `Recycling`
-        // until its receipt is acknowledged, then deletes it outright — it
-        // never advances to another phase underneath a live receipt. Logged
-        // by name so a nightly failure can rule this out rather than leave it
-        // as a hypothesis.
-        return reject_child_receipt(&name, "producer_phase_not_recycling");
+    // The producer is written by two controllers on independent timers: the
+    // instance controller writes `teardownReceipt` after verifying the
+    // instance is gone and touches no phase, and the lease controller moves
+    // the phase to `Recycling` on a later reconcile of its own. So a live
+    // receipt under a terminal phase is the gap between those two writes, and
+    // reading it as a verdict is what #367 flaked on.
+    //
+    // `Quarantined` is the opposite case and keeps rejecting: teardown was
+    // attempted for this exact capacity and could not be proven, so a receipt
+    // there is evidence already judged insufficient.
+    match status.phase {
+        crate::crd::LeasePhase::Recycling => {}
+        crate::crd::LeasePhase::Released | crate::crd::LeasePhase::Expired => {
+            return defer_child_receipt(&name, "producer_not_yet_recycling");
+        }
+        _ => return reject_child_receipt(&name, "producer_phase_not_recycling"),
     }
     if lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
         || binding.cleanup_mode != crate::crd::CleanupMode::VerifiedDestroy
@@ -8229,7 +8313,7 @@ fn validated_binding_receipt_token(
         return reject_child_receipt(&name, "receipt_scope_does_not_permit_release");
     }
     match receipt.acknowledgement_token() {
-        Some(token) => Some(token),
+        Some(token) => ChildReceipt::Valid(token),
         None => reject_child_receipt(&name, "receipt_acknowledgement_token_missing"),
     }
 }
@@ -8240,8 +8324,10 @@ fn validated_binding_receipt_token(
 fn validated_retained_receipt_token(
     lease: &crate::crd::ClusterLease,
     receipt: &crate::crd::TeardownReceipt,
-) -> Option<String> {
-    let namespace = lease.namespace()?;
+) -> ChildReceipt {
+    let Some(namespace) = lease.namespace() else {
+        return reject_child_receipt(&lease.name_any(), "producer_namespace_missing");
+    };
     validated_binding_receipt_token(lease, receipt, &namespace)
 }
 
@@ -10323,6 +10409,7 @@ async fn reconcile_receipt_ack_authority(
                 .and_then(|target| target.child_cluster_instance.as_ref()),
             recorded_pool,
         );
+        let expected = expected.token();
         if authoritative != *checkpoint || expected.as_deref() != Some(token) {
             return Ok(Action::requeue(std::time::Duration::from_secs(60)));
         }
@@ -20971,6 +21058,60 @@ current-context: child
         );
     }
 
+    /// #367: a producer holding live evidence under a terminal phase is
+    /// mid-handoff, not a verdict.
+    ///
+    /// Two controllers write a producer lease on independent timers. The
+    /// instance controller writes `teardownReceipt` once it has verified the
+    /// instance is gone and touches no phase; the lease controller moves the
+    /// phase to `Recycling` on a later reconcile of its own. Reading that gap
+    /// as a rejection is what quarantined children at random — on the TTL path
+    /// and the explicit-release path alike.
+    ///
+    /// `Quarantined` is the opposite case and keeps rejecting: teardown was
+    /// attempted for this exact capacity and could not be proven, so evidence
+    /// there was already judged insufficient. The reachable states and this
+    /// split are enumerated and proven in `kobe-state-machine`.
+    ///
+    /// Exercises `validated_binding_receipt_token` directly: it is the half
+    /// that owns the phase, and the outer validator's identity checks are
+    /// already covered by `only_a_complete_receipt_about_this_instance_counts`.
+    #[test]
+    fn an_unswept_producer_defers_and_a_quarantined_one_rejects() {
+        let receipt: crate::crd::TeardownReceipt =
+            serde_json::from_value(verified_receipt("kobe-abc123", "child-instance-uid"))
+                .expect("receipt fixture parses");
+
+        let verdict_under = |phase: &str| {
+            let lease: crate::crd::ClusterLease = serde_json::from_value(child_cluster_lease(
+                "child-lease-uid",
+                phase,
+                Some(serde_json::to_value(&receipt).unwrap()),
+            ))
+            .unwrap();
+            validated_binding_receipt_token(&lease, &receipt, NS)
+        };
+
+        assert!(
+            matches!(verdict_under("Recycling"), ChildReceipt::Valid(_)),
+            "precondition: a swept producer accepts",
+        );
+
+        for phase in ["Released", "Expired"] {
+            assert_eq!(
+                verdict_under(phase),
+                ChildReceipt::NotYet,
+                "{phase} with a live receipt is the handoff window, not a verdict",
+            );
+        }
+
+        assert_eq!(
+            verdict_under("Quarantined"),
+            ChildReceipt::Invalid,
+            "teardown was disproven for this capacity; the rejection must stay",
+        );
+    }
+
     /// Everything short of a complete, verified, correctly-addressed receipt
     /// fails closed.
     ///
@@ -21023,6 +21164,7 @@ current-context: child
                 instance,
                 &recorded_pool,
             )
+            .token()
             .is_some()
         };
 
