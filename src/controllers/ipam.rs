@@ -55,6 +55,9 @@ const CIDRPOOL_SINGLETON: &str = "default";
 pub struct IpamContext {
     pub client: Client,
     pub namespace: String,
+    /// Retry spacing for claims whose reconcile keeps failing. This reconciler
+    /// enforces no deadline of its own, so it takes the default cap.
+    pub failures: crate::controllers::backoff::FailureBackoff,
     /// Cached plan so reconciles don't reparse every time.
     pub plan: PoolPlan,
     /// True when a `CIDRPool/default` is present but INVALID. The operator
@@ -187,6 +190,7 @@ pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: Canc
         namespace: namespace.to_string(),
         plan,
         blocked,
+        failures: crate::controllers::backoff::FailureBackoff::default(),
     });
 
     if blocked {
@@ -230,9 +234,11 @@ pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: Canc
     }
 }
 
-fn error_policy(_claim: Arc<CIDRClaim>, err: &IpamError, _ctx: Arc<IpamContext>) -> Action {
-    error!("IPAM reconcile error: {err}");
-    Action::requeue(std::time::Duration::from_secs(30))
+fn error_policy(claim: Arc<CIDRClaim>, err: &IpamError, ctx: Arc<IpamContext>) -> Action {
+    let name = claim.name_any();
+    let delay = ctx.failures.record(&name, &claim.metadata);
+    error!(claim = %name, retry_in = ?delay, "IPAM reconcile error: {err}");
+    Action::requeue(delay)
 }
 
 async fn reconcile_claim(

@@ -1038,6 +1038,12 @@ async fn reconcile_lease_tracked<B: ClusterBackend + Clone + 'static>(
 struct ReleaseAuthorityContext {
     client: Client,
     namespace: String,
+    /// Retry spacing for this loop. It shares the queue-timeout contract of
+    /// the lease controller it attests for, so it takes the deadline-bound cap.
+    /// Held behind an `Arc` because this context is cloned: a cloned
+    /// backoff would get its own map, and the reconciler and `error_policy`
+    /// would silently stop sharing one.
+    failures: std::sync::Arc<crate::controllers::backoff::FailureBackoff>,
 }
 
 /// Run the read/attest half of terminal lease handling under the dedicated
@@ -1056,6 +1062,10 @@ pub async fn run_release_authority_controller(
     let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
     let secrets: Api<PartialObjectMeta<Secret>> = Api::namespaced(client.clone(), namespace);
     let context = Arc::new(ReleaseAuthorityContext {
+        failures: std::sync::Arc::new(crate::controllers::backoff::FailureBackoff::new(
+            crate::controllers::backoff::DEFAULT_BASE,
+            crate::controllers::backoff::DEADLINE_BOUND_MAX,
+        )),
         client,
         namespace: namespace.to_string(),
     });
@@ -1389,12 +1399,14 @@ async fn record_authority_unbound_release_proof(
 }
 
 fn release_authority_error_policy(
-    _lease: Arc<ClusterLease>,
+    lease: Arc<ClusterLease>,
     error: &LeaseError,
-    _ctx: Arc<ReleaseAuthorityContext>,
+    ctx: Arc<ReleaseAuthorityContext>,
 ) -> Action {
-    warn!(%error, "release authority reconcile failed");
-    Action::requeue(std::time::Duration::from_secs(15))
+    let name = lease.name_any();
+    let delay = ctx.failures.record(&name, &lease.metadata);
+    warn!(lease = %name, retry_in = ?delay, %error, "release authority reconcile failed");
+    Action::requeue(delay)
 }
 
 /// Rebuild priority queues from existing Pending ClusterLease CRDs.
