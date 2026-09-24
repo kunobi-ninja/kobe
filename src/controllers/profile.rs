@@ -1290,7 +1290,14 @@ async fn reconcile_profile(
             // every ~30s reconcile during the multi-minute backup would respawn a
             // duplicate task racing on the same temp cluster + Velero Backup name.
             let key = (name.clone(), profile_gen);
-            let newly_started = ctx.golden_in_progress.lock().unwrap().insert(key.clone());
+            // A poisoned lock means another task panicked holding it. Panicking again
+            // here takes the pool controller down over bookkeeping; treating it as
+            // "already in progress" is the conservative read — it starts nothing twice.
+            let newly_started = ctx
+                .golden_in_progress
+                .lock()
+                .map(|mut in_progress| in_progress.insert(key.clone()))
+                .unwrap_or(false);
             if !newly_started {
                 debug!(
                     profile = %name,
@@ -1387,7 +1394,9 @@ async fn reconcile_profile(
 
                     // Release the guard so a later generation (or a retry after
                     // failure) can rebuild.
-                    in_progress.lock().unwrap().remove(&key);
+                    if let Ok(mut in_progress) = in_progress.lock() {
+                        in_progress.remove(&key);
+                    }
                 });
             }
         }

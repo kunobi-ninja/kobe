@@ -1,57 +1,28 @@
 //! Per-object retry backoff for reconcile failures, and the gate that keeps a
 //! drift event from cancelling one.
 //!
-//! # Why a controller needs both halves
+//! Four things here are not derivable from the code:
 //!
-//! `Action::requeue(d)` asks the scheduler to come back in `d`. It does not
-//! promise that nothing else will. Every `reconcile_on` stream this operator
-//! wires up — a bootstrap Job, a CIDRClaim, a backend StatefulSet, a bound
-//! lease — can deliver a request for the same object sooner, and the scheduler
-//! takes whichever instant arrives first. So on an object that keeps failing,
-//! a delay returned from `error_policy` is advisory: a child churning once a
-//! second turns a 5-minute backoff into a 1-second retry loop, and the
-//! controller hammers the API server and the backend for as long as the
-//! failure lasts.
+//! **`Action::requeue` is advisory.** It asks the scheduler to come back in
+//! `d`; it does not promise nothing else will. Every `reconcile_on` stream
+//! this operator wires up can deliver a request for the same object sooner,
+//! and the scheduler takes the earlier instant. A child churning once a second
+//! turns a 5-minute backoff into a 1-second retry loop. Suppressing the
+//! trigger is not possible — by then the scheduler has accepted it — so
+//! [`FailureBackoff::defer`] makes the reconcile cheap instead.
 //!
-//! Suppressing the trigger is not possible — by the time a reconcile request
-//! exists the scheduler has already accepted it. What is possible is to make
-//! the reconcile cheap: [`FailureBackoff::defer`] answers, before any API call,
-//! whether this wake is the retry the backoff was waiting for or a drift event
-//! arriving early, and the caller returns the remaining time instead of doing
-//! the work.
+//! **`generation` separates intent from status.** Kubernetes bumps it on a
+//! spec write and never on a status write, so a higher one is someone editing
+//! a broken object — usually to fix it — and must not wait out a backoff.
 //!
-//! # New intent still wins
+//! **A delete bumps nothing.** `deletionTimestamp` is metadata, so the check
+//! above cannot see it, and what sits behind the gate is the finalizer. This
+//! shipped in v0.55.2 and left backend clusters running for minutes after
+//! their object was removed. `defer` takes the whole `ObjectMeta` so no caller
+//! can pass a generation and forget the deletion.
 //!
-//! A backoff must not delay a spec change. Someone editing a broken object is
-//! usually fixing it, and making them wait out a 5-minute backoff to find out
-//! is the opposite of what the edit was for. `metadata.generation` is what
-//! tells the two apart: Kubernetes bumps it on a spec write and never on a
-//! status write, so a generation higher than the one recorded at failure time
-//! is new intent, clears the backoff, and reconciles at once. A status write —
-//! this controller's own, or another writer's — leaves it in place.
-//!
-//! A delete is the other thing that must never wait, and `generation` does not
-//! see it: `deletionTimestamp` is metadata, so setting it bumps nothing. What
-//! sits behind the gate is the finalizer, so deferring a delete leaves a
-//! backend cluster running for minutes after its object was removed. `defer`
-//! therefore reads the whole `ObjectMeta` rather than a generation a caller
-//! could pass while forgetting the deletion.
-//!
-//! # Calling contract
-//!
-//! - `error_policy` calls [`record`](FailureBackoff::record) and requeues the
-//!   delay it returns.
-//! - The reconciler calls [`defer`](FailureBackoff::defer) first and returns
-//!   `Action::requeue` of whatever it gets.
-//! - Something calls [`forget`](FailureBackoff::forget) when the object
-//!   reconciles successfully, so the next failure starts the series over, and
-//!   a later object reusing the name does not inherit the old count.
-//!   [`tracked`] wraps a reconciler to do it.
-//!
-//! Entries whose object is deleted mid-failure never reach `forget`, so
-//! [`record`](FailureBackoff::record) also prunes anything untouched for far
-//! longer than the cap. The map is bounded by what has failed recently rather
-//! than by everything that has ever failed.
+//! **Entries are pruned because a deleted object never reaches `forget`.** The
+//! map is bounded by what failed recently, not by everything that ever failed.
 
 use kube::core::ObjectMeta;
 
