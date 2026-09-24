@@ -835,13 +835,27 @@ jobs:
     # release paths identical and lets kobe adopt signing later without a
     # second migration. See kunobi-ninja/_workflows for the rationale and the
     # maintenance contract (the pin and the allowlist must move together).
-    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@b43559c8bc0fc6fee5f22e48989e350df823d4db # v2
+    # Past the `v2` tag, which still points at b43559c8. Bumped for the
+    # `cache_windows_sysroot` input below; that is the only functional change in
+    # the range (the one commit between them was reverted), and the input
+    # defaults to false, so the bump alone is a no-op. No allowlist change: the
+    # new step calls an action, not a reusable workflow, and the entry matches
+    # the workflow a job is defined in. Worth a `v3` tag in _workflows.
+    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@6283fdb03ec1d645591ff67f99e47922ffab5bbb
     with:
       binary_name: kobe
       build_args: -p kobectl --bin kobe
       deb_package: kobectl
       # Build .deb assets (kobe_<version>_{amd64,arm64}.deb) for the apt repo.
       build_deb: true
+      # Restore the MSVC CRT/SDK instead of downloading it inside the build's
+      # 45-minute cap. Seeded on main by `warm-windows-sysroot.yml`; the action
+      # falls back to downloading on a cache miss, so this is safe before the
+      # first warm completes. Without it both Windows legs spent 27-34 minutes
+      # under that one timeout and v0.56.0 crossed it at 45m25s, which
+      # cancelled the leg and left the tag pushed with no Release
+      # (kunobi-ninja/_workflows#6).
+      cache_windows_sysroot: true
       # Publish the bare signed kobe.exe per Windows arch (kobe-<triple>-pc-windows-msvc.exe)
       # as a first-class asset so winget installs it as InstallerType: portable.
       upload_windows_exe: true
