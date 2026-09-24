@@ -4138,8 +4138,24 @@ async fn checkpoint_management_descendants(
     if validation != TargetFootprintCheck::Verified {
         return ManagementDescendantCheckpoint::Check(validation);
     }
-    let current_target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
-    let claim_ref = current_target.sandbox_claim.as_ref().unwrap();
+    // `Verified` is what establishes that these exist, and that guarantee lives
+    // in whatever produced it rather than here. Reading it out instead of
+    // unwrapping keeps a change to what `Verified` means from becoming a panic
+    // in a reconciler, which takes the controller down rather than the lease.
+    let Some(current_target) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+    else {
+        return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+            "target_missing_after_verification",
+        ));
+    };
+    let Some(claim_ref) = current_target.sandbox_claim.as_ref() else {
+        return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+            "claim_missing_after_verification",
+        ));
+    };
     let claim = match claims.get(&claim_ref.name).await {
         Ok(claim) if claim.uid().as_deref() == Some(claim_ref.uid.as_str()) => claim,
         // The workload Claim may already be gone and a release tombstone (or
@@ -4492,8 +4508,18 @@ async fn preflight_management_target(
     if validation != TargetFootprintCheck::Verified {
         return validation;
     }
-    let target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
-    let claim = target.sandbox_claim.as_ref().unwrap();
+    // See `checkpoint_management_descendants`: `Verified` is the guarantee,
+    // and it is not this function's to assert with a panic.
+    let Some(target) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+    else {
+        return TargetFootprintCheck::Retry("target_missing_after_verification");
+    };
+    let Some(claim) = target.sandbox_claim.as_ref() else {
+        return TargetFootprintCheck::Retry("claim_missing_after_verification");
+    };
     exact_owned_storage_is_absent(
         &ctx.client,
         &ctx.namespace,
@@ -4676,8 +4702,18 @@ async fn management_target_footprint_absent(
     if validation != TargetFootprintCheck::Verified {
         return validation;
     }
-    let target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
-    let claim = target.sandbox_claim.as_ref().unwrap();
+    // See `checkpoint_management_descendants`: `Verified` is the guarantee,
+    // and it is not this function's to assert with a panic.
+    let Some(target) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+    else {
+        return TargetFootprintCheck::Retry("target_missing_after_verification");
+    };
+    let Some(claim) = target.sandbox_claim.as_ref() else {
+        return TargetFootprintCheck::Retry("claim_missing_after_verification");
+    };
     if lease
         .status
         .as_ref()
