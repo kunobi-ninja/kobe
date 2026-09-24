@@ -67,20 +67,41 @@ pub async fn require_pool_capability(
 
 /// Resolve an exact ID, alias, or unique pool selector and reject an
 /// incompatible operation before it reaches a kind-specific route.
-/// Resolve a lease for a capability when the caller named none.
+/// Resolve a lease for `capability`, whether or not the caller named one.
 ///
-/// `kobe attach` with no argument: one attachable lease is taken, several open
-/// the picker, none is an error naming the verb. Kept beside
-/// [`require_lease_capability`] so a named lease and an unnamed one answer the
-/// same question about what the lease can serve.
-pub async fn pick_lease_with_capability(
+/// The two halves of the same question, so a command with an optional lease
+/// argument has one call rather than a branch: a named selector is checked
+/// against what it can serve, and an absent one is picked from the leases that
+/// already serve it. Either way the caller gets an id or a reason.
+///
+/// `purpose` titles the picker. It is separate from `capability` because they
+/// are not the same sentence: `kobe vnc open` filters on `port-forward` — that
+/// is how the desktop is reached — but "Select a lease to port-forward" is not
+/// what the person is doing.
+pub async fn lease_for_capability(
+    selector: Option<&str>,
     capability: &str,
+    purpose: &str,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
 ) -> anyhow::Result<String> {
-    let config = config::CliConfig::load()?.resolve(target_override, endpoint_override)?;
-    select::resolve_lease_for_capability(&config, capability, output).await
+    match selector {
+        Some(selector) => {
+            require_lease_capability(
+                selector,
+                capability,
+                target_override,
+                endpoint_override,
+                output,
+            )
+            .await
+        }
+        None => {
+            let config = config::CliConfig::load()?.resolve(target_override, endpoint_override)?;
+            select::resolve_lease_for_capability(&config, capability, purpose, output).await
+        }
+    }
 }
 
 pub async fn require_lease_capability(
@@ -654,6 +675,19 @@ pub(crate) fn styled(sgr: &str, text: impl std::fmt::Display) -> String {
     }
 }
 
+/// Whether this invocation may stop and ask the person something.
+///
+/// Four conditions, and each rules out a different way of being unattended:
+/// an explicit `--yes`, machine output, a redirected stdin, a redirected
+/// stdout. `kobe init` has asked exactly this since it was written; it is
+/// stated here so that every command answers it the same way and a new one
+/// cannot quietly answer it with fewer conditions.
+///
+/// A command that has no `--yes` passes `false` for `assume_yes`.
+pub(crate) fn can_prompt(output: OutputFormat, assume_yes: bool) -> bool {
+    !assume_yes && output == OutputFormat::Text && picker::terminal_is_interactive()
+}
+
 /// The SGR style for a lease or pool phase, on one axis: how usable the thing
 /// is right now.
 ///
@@ -975,5 +1009,26 @@ mod auth_tests {
             AuthInteraction::NonInteractive,
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    /// Each condition rules out a different way of being unattended, and any
+    /// one of them is enough. Under `cargo test` the terminal half is already
+    /// false, which is what makes the last case meaningful.
+    #[test]
+    fn every_condition_alone_is_enough_to_stay_quiet() {
+        assert!(
+            !can_prompt(OutputFormat::Json, false),
+            "machine output never prompts"
+        );
+        assert!(!can_prompt(OutputFormat::Text, true), "--yes never prompts");
+        assert!(
+            !can_prompt(OutputFormat::Text, false),
+            "no terminal never prompts"
+        );
     }
 }

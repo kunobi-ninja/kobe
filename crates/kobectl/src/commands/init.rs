@@ -19,7 +19,6 @@
 //! prompt: a step that would need an answer fails with the command that
 //! supplies it.
 
-use std::io::IsTerminal;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -106,10 +105,7 @@ impl Reporter {
 }
 
 pub async fn init(command: InitCommand<'_>) -> Result<()> {
-    let interactive = !command.yes
-        && command.output == OutputFormat::Text
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal();
+    let interactive = super::can_prompt(command.output, command.yes);
     let report = Reporter::new(command.output);
 
     // 1. target

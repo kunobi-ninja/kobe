@@ -149,6 +149,7 @@ fn serving(leases: Vec<LeaseSummary>, capability: &str) -> Vec<LeaseSummary> {
 pub(crate) async fn resolve_lease_for_capability(
     config: &ResolvedConfig,
     capability: &str,
+    purpose: &str,
     output: OutputFormat,
 ) -> Result<String> {
     let capable = serving(fetch_all_leases(config).await?, capability);
@@ -164,7 +165,7 @@ pub(crate) async fn resolve_lease_for_capability(
         Selection::NeedsPicker(candidates) => {
             let items = picker_items(&candidates);
             let selected = run_picker(
-                &format!("Select a lease to {capability}"),
+                &format!("Select a lease to {purpose}"),
                 "↑/↓ to move · Enter to select · q to cancel",
                 &items,
             )?;
