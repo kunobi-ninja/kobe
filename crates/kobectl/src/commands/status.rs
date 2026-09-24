@@ -107,10 +107,12 @@ pub async fn status(
     };
 
     let client = authed_client();
-    let response = with_auth(client.get(format!("{endpoint}/v1/status")), &token)
-        .send()
-        .await
-        .reaching(&config)?;
+    let response = crate::trace::send(with_auth(
+        client.get(format!("{endpoint}/v1/status")),
+        &token,
+    ))
+    .await
+    .reaching(&config)?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to get status (HTTP {})", response.status());

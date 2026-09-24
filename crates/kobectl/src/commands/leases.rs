@@ -103,8 +103,7 @@ pub(crate) async fn fetch_leases_path(
     let token = get_auth_header(config, "GET", path, b"").await?;
 
     let client = authed_client();
-    let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
-        .send()
+    let response = crate::trace::send(with_auth(client.get(format!("{endpoint}{path}")), &token))
         .await
         .reaching(config)?;
 
@@ -129,10 +128,12 @@ pub(crate) async fn fetch_all_leases_with_output(
         let path = "/v1/leases";
         let endpoint = config.endpoint.as_str();
         let token = get_auth_header_for_output(config, "GET", path, b"", output).await?;
-        let response = with_auth(authed_client().get(format!("{endpoint}{path}")), &token)
-            .send()
-            .await
-            .reaching(config)?;
+        let response = crate::trace::send(with_auth(
+            authed_client().get(format!("{endpoint}{path}")),
+            &token,
+        ))
+        .await
+        .reaching(config)?;
         if !response.status().is_success() {
             anyhow::bail!("Failed to list leases (HTTP {})", response.status());
         }
@@ -204,8 +205,7 @@ pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Resu
     let token = get_auth_header(config, "GET", &path, b"").await?;
 
     let client = authed_client();
-    let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
-        .send()
+    let response = crate::trace::send(with_auth(client.get(format!("{endpoint}{path}")), &token))
         .await
         .reaching(config)?;
 

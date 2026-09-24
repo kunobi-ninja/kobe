@@ -93,10 +93,12 @@ pub(crate) async fn fetch_pools_for_config_with_output(
     let token = get_auth_header_for_output(config, "GET", "/v1/pools", b"", output).await?;
 
     let client = authed_client();
-    let response = with_auth(client.get(format!("{endpoint}/v1/pools")), &token)
-        .send()
-        .await
-        .reaching(config)?;
+    let response = crate::trace::send(with_auth(
+        client.get(format!("{endpoint}/v1/pools")),
+        &token,
+    ))
+    .await
+    .reaching(config)?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to list pools (HTTP {})", response.status());
@@ -113,11 +115,10 @@ pub(crate) async fn fetch_pool_for_config_with_output(
     let endpoint = config.endpoint.as_str();
     let path = format!("/v1/pools/{name}");
     let token = get_auth_header_for_output(config, "GET", &path, b"", output).await?;
-    let response = with_auth(
+    let response = crate::trace::send(with_auth(
         super::authed_client().get(format!("{endpoint}{path}")),
         &token,
-    )
-    .send()
+    ))
     .await
     .reaching(config)?;
     let status = response.status();

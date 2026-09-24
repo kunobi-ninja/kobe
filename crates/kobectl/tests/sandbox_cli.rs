@@ -115,6 +115,48 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     })
 }
 
+/// Requests a test server was asked for but does not stub.
+///
+/// Shared with the server thread, so a stray request is evidence rather than a
+/// crash. Panicking inside the handler kills the listener, after which every
+/// later request in the test fails to connect and the assertion that finally
+/// fires reports a symptom far from the cause — an exit code, from a command
+/// that was never the problem. That is what made the `/v1/pools/ci-small`
+/// flake cost a release to diagnose.
+#[derive(Clone, Default)]
+struct Unexpected(Arc<Mutex<Vec<String>>>);
+
+impl Unexpected {
+    /// Record `request` and answer it 404, keeping the server alive.
+    fn record(&self, stream: &mut TcpStream, request: &Request, since: Instant) {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push(format!(
+                "+{:?} {} {}",
+                since.elapsed(),
+                request.method,
+                request.path
+            ));
+        }
+        reply(stream, 404, &[], "{\"error\":\"unexpected request\"}");
+    }
+
+    /// What the server was asked for and never stubbed, oldest first.
+    fn seen(&self) -> Vec<String> {
+        self.0.lock().map(|seen| seen.clone()).unwrap_or_default()
+    }
+
+    /// Fail naming every stray request and when it arrived.
+    fn assert_none(&self) {
+        let seen = self.seen();
+        assert!(
+            seen.is_empty(),
+            "server was asked for {} request(s) it does not stub:\n  {}",
+            seen.len(),
+            seen.join("\n  "),
+        );
+    }
+}
+
 fn reply(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &str) {
     let reason = match status {
         200 => "OK",
@@ -2575,14 +2617,19 @@ fn ssh_capable_pools() -> String {
 
 #[test]
 fn init_then_doctor_round_trip_without_prompts() {
-    let server = Server::start(move |request, stream| {
-        match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
-            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            _ => panic!("unexpected request: {request:?}"),
-        }
-    });
+    let unexpected = Unexpected::default();
+    let started = Instant::now();
+    let server = {
+        let unexpected = unexpected.clone();
+        Server::start(move |request, stream| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
+                ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+                ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+                _ => unexpected.record(stream, &request, started),
+            }
+        })
+    };
     let endpoint = server.endpoint();
     let directory = tempfile::tempdir().unwrap();
     write_public_key(&directory);
@@ -2592,6 +2639,10 @@ fn init_then_doctor_round_trip_without_prompts() {
             .current_dir(directory.path())
             .env("HOME", directory.path())
             .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            // Names the caller of every request. Without it an unstubbed one
+            // is a path on the server's side with no origin, which is what
+            // made the `/v1/pools/ci-small` flake undiagnosable.
+            .env("KOBE_TRACE", "1")
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2645,8 +2696,9 @@ fn init_then_doctor_round_trip_without_prompts() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "stderr={} unstubbed={:?}",
+        String::from_utf8_lossy(&output.stderr),
+        unexpected.seen(),
     );
     assert_eq!(
         std::fs::read_to_string(&user_config).unwrap(),
@@ -2688,18 +2740,24 @@ fn init_then_doctor_round_trip_without_prompts() {
             .unwrap()
             .contains("default small")
     );
+    unexpected.assert_none();
 }
 
 #[test]
 fn doctor_reports_what_init_would_fix() {
-    let server = Server::start(move |request, stream| {
-        match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
-            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
-            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
-            _ => panic!("unexpected request: {request:?}"),
-        }
-    });
+    let unexpected = Unexpected::default();
+    let started = Instant::now();
+    let server = {
+        let unexpected = unexpected.clone();
+        Server::start(move |request, stream| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/status") => reply(stream, 200, &[], &status_body(&[])),
+                ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+                ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+                _ => unexpected.record(stream, &request, started),
+            }
+        })
+    };
     let (_directory, child) = spawn_child(&server.endpoint(), &["doctor", "--output", "json"]);
     let output = wait_output(child);
     assert_eq!(output.status.code(), Some(1));
@@ -2717,16 +2775,22 @@ fn doctor_reports_what_init_would_fix() {
     assert_eq!(by_name["public key"]["status"], "fail");
     assert_eq!(by_name["ssh config"]["status"], "fail");
     assert_eq!(by_name["ssh config"]["fix"], "kobe init");
+    unexpected.assert_none();
 }
 
 #[test]
 fn init_refuses_a_pool_that_cannot_serve_ssh() {
-    let server = Server::start(move |request, stream| {
-        match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
-            _ => panic!("unexpected request: {request:?}"),
-        }
-    });
+    let unexpected = Unexpected::default();
+    let started = Instant::now();
+    let server = {
+        let unexpected = unexpected.clone();
+        Server::start(move |request, stream| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/pools") => reply(stream, 200, &[], &ssh_capable_pools()),
+                _ => unexpected.record(stream, &request, started),
+            }
+        })
+    };
     let (_directory, child) = spawn_child_with_public_key(
         &server.endpoint(),
         &["init", "--default-pool", "ci-small", "--yes"],
@@ -2736,6 +2800,7 @@ fn init_refuses_a_pool_that_cannot_serve_ssh() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("ci-small cannot serve SSH"), "{stderr}");
     assert!(stderr.contains("small"), "{stderr}");
+    unexpected.assert_none();
 }
 
 // --- attach over a pipe -----------------------------------------------------
