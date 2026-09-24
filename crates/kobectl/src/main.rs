@@ -485,8 +485,9 @@ enum Commands {
 enum VncCommand {
     /// Write the desktop to a PNG file
     Screenshot {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Where to write the image
         #[arg(long, short = 'f', default_value = "screenshot.png")]
         out: std::path::PathBuf,
@@ -499,8 +500,9 @@ enum VncCommand {
     /// Forwards KasmVNC on 6080 and opens `http://127.0.0.1:<port>/`.
     /// `--native` is TigerVNC against 5900 if `vncviewer` is on PATH.
     Open {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Local port to serve on; 0 picks a free one
         #[arg(long, default_value_t = 0)]
         local_port: u16,
@@ -523,8 +525,9 @@ enum VncCommand {
     /// reliable way to get a password or URL into the sandbox; the web
     /// page does not take Cmd+V from macOS.
     Paste {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Text to put on the clipboard
         #[arg(long)]
         text: String,
@@ -533,8 +536,9 @@ enum VncCommand {
     },
     /// Click at a pixel
     Click {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Pixel to click, as `X,Y`
         #[arg(long, value_name = "X,Y")]
         at: String,
@@ -546,8 +550,9 @@ enum VncCommand {
     },
     /// Move the pointer without pressing anything
     Move {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Pixel to move to, as `X,Y`
         #[arg(long, value_name = "X,Y")]
         at: String,
@@ -556,8 +561,9 @@ enum VncCommand {
     },
     /// Type printable text
     Type {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// The text to type
         #[arg(long)]
         text: String,
@@ -566,8 +572,9 @@ enum VncCommand {
     },
     /// Press one named key, such as return or escape
     Key {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can serve a desktop.
+        lease: Option<String>,
         /// Key name
         #[arg(long)]
         key: String,
@@ -945,9 +952,10 @@ async fn main() -> anyhow::Result<()> {
                 native,
             } = action
             {
-                let lease = commands::require_lease_capability(
-                    &lease,
+                let lease = commands::lease_for_capability(
+                    lease.as_deref(),
                     "port-forward",
+                    "open a desktop on",
                     target,
                     endpoint,
                     output,
@@ -1008,9 +1016,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 VncCommand::Open { .. } => unreachable!("handled above"),
             };
-            let lease = commands::require_lease_capability(
-                &lease,
+            let lease = commands::lease_for_capability(
+                lease.as_deref(),
                 "port-forward",
+                "drive the desktop on",
                 target,
                 endpoint,
                 output,
@@ -1329,9 +1338,11 @@ async fn dispatch_resource_action(
                         (Err(error), _) => Err(error),
                     }
                 }
-                None => commands::pick_lease_with_capability("attach", target, endpoint, output)
-                    .await
-                    .map(|lease| (lease, session)),
+                None => commands::lease_for_capability(
+                    None, "attach", "attach", target, endpoint, output,
+                )
+                .await
+                .map(|lease| (lease, session)),
             }
             .unwrap_or_else(|error| exit_resource_error(error, output));
             match session {

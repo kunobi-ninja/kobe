@@ -1,39 +1,20 @@
-//! Opt-in request tracing for the CLI.
+//! Opt-in request tracing, behind `KOBE_TRACE`.
 //!
-//! The CLI had no logging of any kind, which is why a stray `GET
-//! /v1/pools/ci-small` in CI could not be attributed to a command: the only
-//! evidence was a test server's view of the wire, and nothing on this side
-//! said who asked or why. Turning it on prints one line per request and one
-//! per response, to stderr, so a failure carries the sequence that produced
-//! it.
+//! The CLI had no logging of any kind, so a stray `GET /v1/pools/ci-small` in
+//! CI could not be attributed: the only evidence was a test server's view of
+//! the wire, with no origin. One line per request and one per response is
+//! enough to name the caller.
 //!
-//! Deliberately not a logging framework. `kobectl` is published to crates.io
-//! with a slim dependency tree, and this needs no filtering, no levels and no
-//! subscriber — one environment variable and `eprintln!`.
+//! stderr, always — stdout carries `--output json`, and a trace line in it
+//! would break every machine consumer the moment somebody debugged one.
 //!
-//! # Where it writes, and why that matters
-//!
-//! stderr, always. stdout carries `--output json`, and a trace line mixed into
-//! it would break every machine consumer the moment someone turned this on to
-//! debug one.
-//!
-//! # Turning it on
-//!
-//! ```text
-//! KOBE_TRACE=1 kobe status
-//! ```
-//!
-//! CI enables it for the integration tests that have flaked on unexplained
-//! requests, so the next occurrence names the caller instead of leaving a
-//! server-side path and no origin.
+//! No logging framework: `kobectl` ships a slim dependency tree, and this
+//! needs no levels, filtering or subscriber.
 
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Whether `KOBE_TRACE` asks for request tracing.
-///
-/// Read once: the environment cannot change under a CLI invocation, and a
-/// per-request read would be the only syscall on an otherwise local path.
+/// Read once: the environment cannot change under a CLI invocation.
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -43,9 +24,8 @@ pub(crate) fn enabled() -> bool {
 
 /// Send `builder`, tracing the request and what came back.
 ///
-/// Takes the builder apart with `build_split` so the method and URL can be
-/// named before anything is sent — including when the send fails, which is
-/// exactly the case where knowing what was attempted matters most.
+/// `build_split` names the request before it goes out, so a send that fails
+/// still reports what was attempted — the case where it matters most.
 pub(crate) async fn send(builder: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
     if !enabled() {
         return builder.send().await;
