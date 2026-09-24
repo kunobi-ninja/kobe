@@ -1,0 +1,44 @@
+name: Warm Windows release sysroot
+
+# Seeds the pinned MSVC CRT/SDK cache that `release-cli` restores, so a release
+# build does not download it.
+#
+# Without this, every Windows target in a release downloads the sysroot through
+# cargo-xwin as part of the build, inside the build job's 45-minute cap. Both
+# Windows legs measured 27-34 minutes across v0.55.2, v0.55.3 and v0.56.0 — all
+# of that under one timeout — and on v0.56.0 one leg crossed it at 45m25s and
+# was cancelled. A cancelled leg fails the reusable workflow, so `v0.56.0` sat
+# tagged with no GitHub Release until the job was re-run by hand. The tag is
+# already pushed when that happens and cannot be taken back.
+#
+# Caches are repository- and ref-scoped, and only a default-branch cache is
+# visible to a later release tag, which is why this runs on `main` rather than
+# as part of the release.
+#
+# Mirrors `kunobi-ninja/kache`, which has had this since before the release
+# path was shared. See kunobi-ninja/_workflows#6.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/warm-windows-sysroot.yml
+  schedule:
+    # Weekly: the cache key covers the whole sysroot configuration, so this only
+    # does work when that configuration changed or GitHub evicted the entry.
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-windows-sysroot
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    # Forks share neither the cache nor the runners.
+    if: github.repository == 'kunobi-ninja/kobe'
+    # Default-branch caches are visible to future release tags.
+    uses: Zondax/_workflows/.github/workflows/_warm-windows-sysroot.yml@451103fbdc9c0672aa13fc53a71230e64f6b5c8a
