@@ -361,13 +361,12 @@ async fn discover_ssh_audience(config: &ResolvedConfig) -> anyhow::Result<String
 
     // Try twice — the server may not have loaded policies on first attempt
     for attempt in 0..2 {
-        let resp: serde_json::Value = authed_client()
-            .get(format!("{endpoint}/v1/status"))
-            .send()
-            .await
-            .reaching(config)?
-            .json()
-            .await?;
+        let resp: serde_json::Value =
+            crate::trace::send(authed_client().get(format!("{endpoint}/v1/status")))
+                .await
+                .reaching(config)?
+                .json()
+                .await?;
         if let Some(methods) = resp["auth"]["methods"].as_array() {
             for method in methods {
                 if method["type"].as_str() == Some("ssh")

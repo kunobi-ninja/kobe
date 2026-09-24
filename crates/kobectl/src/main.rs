@@ -1,4 +1,5 @@
 mod commands;
+mod trace;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind};

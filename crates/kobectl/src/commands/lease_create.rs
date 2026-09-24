@@ -111,12 +111,13 @@ pub(crate) async fn create_lease_request(
         // Sign with empty body for now. Signed per attempt: the signature is
         // time-bound.
         let token = get_auth_header(config, "POST", "/v1/leases", b"").await?;
-        let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
-            .header("Content-Type", "application/json")
-            .body(body_bytes.clone())
-            .send()
-            .await
-            .reaching(config)?;
+        let response = crate::trace::send(
+            with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
+                .header("Content-Type", "application/json")
+                .body(body_bytes.clone()),
+        )
+        .await
+        .reaching(config)?;
 
         let status = response.status();
         if status.is_success() {
@@ -556,10 +557,10 @@ pub(crate) async fn wait_for_usable_lease(
 
         let poll = async {
             let token = get_auth_header(config, "GET", &path, b"").await?;
-            let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
-                .send()
-                .await
-                .reaching(config)?;
+            let response =
+                crate::trace::send(with_auth(client.get(format!("{endpoint}{path}")), &token))
+                    .await
+                    .reaching(config)?;
             match response.status().as_u16() {
                 200 => {
                     let detail: LeaseDetail = response.json().await?;

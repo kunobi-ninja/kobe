@@ -274,9 +274,7 @@ pub async fn init(command: InitCommand<'_>) -> Result<()> {
 /// advertises: ssh needs no secret and no browser, so it comes first.
 async fn discover_auth_mode(endpoint: &str) -> Result<AuthMode> {
     let url = format!("{}/v1/status", endpoint.trim_end_matches('/'));
-    let response = super::authed_client()
-        .get(&url)
-        .send()
+    let response = crate::trace::send(super::authed_client().get(&url))
         .await
         .map_err(|error| {
             anyhow::anyhow!(super::unreachable_message(

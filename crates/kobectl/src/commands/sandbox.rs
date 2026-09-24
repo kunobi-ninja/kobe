@@ -1725,8 +1725,7 @@ async fn recover_expected_lease(
     loop {
         let attempt = async {
             let token = sandbox_auth_header(config, "GET", &path, b"", output).await?;
-            let response = with_auth(authed_client().get(&absolute), &token)
-                .send()
+            let response = crate::trace::send(with_auth(authed_client().get(&absolute), &token))
                 .await
                 .reaching(config)?;
             let status = response.status();

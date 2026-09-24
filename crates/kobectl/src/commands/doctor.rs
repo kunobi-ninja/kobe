@@ -197,7 +197,7 @@ async fn collect(target_override: Option<&str>, endpoint_override: Option<&str>)
 
 async fn endpoint_check(config: &ResolvedConfig) -> Check {
     let url = format!("{}/v1/status", config.endpoint);
-    match super::authed_client().get(&url).send().await {
+    match crate::trace::send(super::authed_client().get(&url)).await {
         Ok(response) if response.status().is_success() => {
             let body: serde_json::Value = response.json().await.unwrap_or_default();
             let version = body["version"].as_str().unwrap_or("?");

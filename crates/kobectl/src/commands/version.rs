@@ -37,11 +37,10 @@ pub(crate) fn warn_if_cli_behind_endpoint(endpoint_version: &str) {
 }
 
 pub(crate) async fn fetch_endpoint_version(config: &ResolvedConfig) -> Option<String> {
-    let response = authed_client()
-        .get(format!("{}/v1/status", config.endpoint))
-        .send()
-        .await
-        .ok()?;
+    let response =
+        crate::trace::send(authed_client().get(format!("{}/v1/status", config.endpoint)))
+            .await
+            .ok()?;
     if !response.status().is_success() {
         return None;
     }

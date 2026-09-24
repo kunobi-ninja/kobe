@@ -2639,6 +2639,10 @@ fn init_then_doctor_round_trip_without_prompts() {
             .current_dir(directory.path())
             .env("HOME", directory.path())
             .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            // Names the caller of every request. Without it an unstubbed one
+            // is a path on the server's side with no origin, which is what
+            // made the `/v1/pools/ci-small` flake undiagnosable.
+            .env("KOBE_TRACE", "1")
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
