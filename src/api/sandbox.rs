@@ -11589,7 +11589,7 @@ mod tests {
         let reservations: Api<Lease> = Api::namespaced(client, TEST_LEDGER_NAMESPACE);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
             resolve_timed_out_admission_until(
                 &leases,
                 &reservations,
@@ -11598,7 +11598,7 @@ mod tests {
                 None,
                 None,
                 &shutdown,
-                tokio::time::Instant::now() + std::time::Duration::from_millis(120),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
             ),
         )
         .await
@@ -12109,7 +12109,7 @@ mod tests {
             .await;
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
             create_sandbox_lease_until::<crate::testutil::MockBackend>(
                 test_state(&server),
                 identity(),
@@ -12119,7 +12119,7 @@ mod tests {
                     alias: None,
                     idempotency_key: None,
                 },
-                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
             ),
         )
         .await
@@ -12307,6 +12307,23 @@ mod tests {
     }
 
     /// Cleanup after a malformed CREATE response shares the original absolute
+    ///
+    /// # The budget is 2s against a 30s stall, and the margin is the point
+    ///
+    /// This is real wall clock: `MockServer` serves over a socket, so the
+    /// create POST has to complete before the deadline can be tested against
+    /// the stalled GET that follows. At 200ms it did not, on a loaded runner —
+    /// the POST never landed, `parent` stayed `None`, and the failure surfaced
+    /// several layers from the cause, on a PR that changed no Rust (#390).
+    ///
+    /// `start_paused` does not fix it. Virtual time auto-advances while the
+    /// runtime is idle, and a real HTTP round trip is not a timer, so the
+    /// deadline fires before the request completes and the test then fails
+    /// every time instead of occasionally. Verified, not assumed.
+    ///
+    /// So the budget clears how long local HTTP takes under load while staying
+    /// 15x under the stall it must not wait out. What it proves is unchanged:
+    /// a deadline far below the stall still bounds the cleanup.
     /// deadline. A stalled absence proof must not retain the HTTP task or begin
     /// reservation admission after that budget expires.
     #[tokio::test]
@@ -12344,7 +12361,7 @@ mod tests {
             .await;
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
             create_sandbox_lease_until::<crate::testutil::MockBackend>(
                 test_state(&server),
                 identity(),
@@ -12354,7 +12371,7 @@ mod tests {
                     alias: None,
                     idempotency_key: None,
                 },
-                tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
             ),
         )
         .await
