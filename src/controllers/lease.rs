@@ -1076,7 +1076,7 @@ pub async fn run_release_authority_controller(
         .reconcile_on(instance_lease_triggers(instances, None))
         .reconcile_on(connect_token_lease_triggers(secrets))
         .run(
-            reconcile_release_authority,
+            reconcile_release_authority_tracked,
             release_authority_error_policy,
             context,
         )
@@ -1093,6 +1093,37 @@ pub async fn run_release_authority_controller(
         _ = controller => {},
         _ = shutdown.cancelled() => info!("Release-attempt authority shutting down"),
     }
+}
+
+/// [`reconcile_release_authority`] behind the failure-backoff gate.
+///
+/// This loop wakes on instance changes and the connect-token Secret besides
+/// its own object, so a wake inside a backoff is usually one of those rather
+/// than the retry the delay was for.
+///
+/// The main lease controller deliberately does not get this yet: it wakes on
+/// four streams, one of them a deletion-eviction channel, and deferring there
+/// without first establishing what a Pending lease needs could delay a
+/// binding — which is the one thing a user measures.
+async fn reconcile_release_authority_tracked(
+    lease: Arc<ClusterLease>,
+    ctx: Arc<ReleaseAuthorityContext>,
+) -> Result<Action, LeaseError> {
+    let name = lease.name_any();
+    if let Some(remaining) = ctx.failures.defer(&name, &lease.metadata) {
+        debug!(
+            lease = %name,
+            retry_in = ?remaining,
+            "Release authority woke inside its failure backoff; deferring",
+        );
+        return Ok(Action::requeue(remaining));
+    }
+
+    let result = reconcile_release_authority(lease, ctx.clone()).await;
+    if result.is_ok() {
+        ctx.failures.forget(&name);
+    }
+    result
 }
 
 async fn reconcile_release_authority(

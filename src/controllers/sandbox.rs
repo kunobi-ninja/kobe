@@ -1030,6 +1030,46 @@ async fn patch_pool_status_fenced(
 /// Child placement proves composition eligibility and repeats runtime/canary
 /// checks inside the exact child before its Claim. Replica counters alone
 /// never authorize admission.
+/// [`reconcile_pool`] behind the failure-backoff gate.
+///
+/// This loop wakes on SandboxTemplate, SandboxWarmPool and SandboxClaim events upstream besides its own object, so a wake inside a
+/// backoff is usually one of those rather than the retry the delay was for.
+/// Deferring costs a map lookup; reconciling costs the API calls that were
+/// already going to fail.
+///
+/// What must never be deferred is decided inside
+/// [`crate::controllers::backoff`]: a delete, because `deletionTimestamp`
+/// bumps no generation and the finalizer sits behind this gate, and new
+/// intent, because a higher generation is somebody fixing the object. Neither
+/// `sandbox.rs` nor `lease.rs` has a manual-override annotation that would
+/// need a third exception — checked, not assumed.
+pub async fn reconcile_pool_tracked(
+    pool: Arc<SandboxPool>,
+    ctx: Arc<SandboxContext>,
+) -> Result<Action, SandboxPlacementError> {
+    {
+        let name = pool.name_any();
+        if let Some(remaining) = ctx.failures.defer(&name, &pool.metadata) {
+            {
+                debug!(
+                    pool = %name,
+                    retry_in = ?remaining,
+                    "SandboxPool woke inside its failure backoff; deferring",
+                );
+                return Ok(Action::requeue(remaining));
+            }
+        }
+
+        let result = reconcile_pool(pool, ctx.clone()).await;
+        if result.is_ok() {
+            {
+                ctx.failures.forget(&name);
+            }
+        }
+        result
+    }
+}
+
 pub async fn reconcile_pool(
     pool: Arc<SandboxPool>,
     ctx: Arc<SandboxContext>,
@@ -1316,6 +1356,46 @@ pub async fn reconcile_pool(
 /// been satisfied by whoever won it. Terminal leases never resolve a pool or
 /// recreate workload; clean terminal leases only remove Kobe's cleanup
 /// finalizer after both teardown proof checkpoints are durable.
+/// [`reconcile_lease`] behind the failure-backoff gate.
+///
+/// This loop wakes on claim, sandbox and pod footprint changes, child placements and internal ClusterLeases besides its own object, so a wake inside a
+/// backoff is usually one of those rather than the retry the delay was for.
+/// Deferring costs a map lookup; reconciling costs the API calls that were
+/// already going to fail.
+///
+/// What must never be deferred is decided inside
+/// [`crate::controllers::backoff`]: a delete, because `deletionTimestamp`
+/// bumps no generation and the finalizer sits behind this gate, and new
+/// intent, because a higher generation is somebody fixing the object. Neither
+/// `sandbox.rs` nor `lease.rs` has a manual-override annotation that would
+/// need a third exception — checked, not assumed.
+pub async fn reconcile_lease_tracked(
+    lease: Arc<SandboxLease>,
+    ctx: Arc<SandboxContext>,
+) -> Result<Action, SandboxPlacementError> {
+    {
+        let name = lease.name_any();
+        if let Some(remaining) = ctx.failures.defer(&name, &lease.metadata) {
+            {
+                debug!(
+                    lease = %name,
+                    retry_in = ?remaining,
+                    "SandboxLease woke inside its failure backoff; deferring",
+                );
+                return Ok(Action::requeue(remaining));
+            }
+        }
+
+        let result = reconcile_lease(lease, ctx.clone()).await;
+        if result.is_ok() {
+            {
+                ctx.failures.forget(&name);
+            }
+        }
+        result
+    }
+}
+
 pub async fn reconcile_lease(
     lease: Arc<SandboxLease>,
     ctx: Arc<SandboxContext>,
@@ -10965,7 +11045,7 @@ pub async fn run_sandbox_controller(
                     pool_store,
                 ))
                 .graceful_shutdown_on(async move { pool_shutdown.cancelled().await })
-                .run(reconcile_pool, pool_error_policy, pool_ctx)
+                .run(reconcile_pool_tracked, pool_error_policy, pool_ctx)
                 .for_each(|result| async move {
                     if let Err(error) = result {
                         error!(error = %error, "SandboxPool controller error");
@@ -11014,7 +11094,7 @@ pub async fn run_sandbox_controller(
                 },
             )
             .graceful_shutdown_on(async move { lease_shutdown.cancelled().await })
-            .run(reconcile_lease, lease_error_policy, ctx)
+            .run(reconcile_lease_tracked, lease_error_policy, ctx)
             .for_each(|result| async move {
                 if let Err(error) = result {
                     error!(error = %error, "SandboxLease controller error");
