@@ -838,9 +838,26 @@ jobs:
     # Past the `v2` tag, which still points at b43559c8. Bumped for the
     # `cache_windows_sysroot` input below; that is the only functional change in
     # the range (the one commit between them was reverted), and the input
-    # defaults to false, so the bump alone is a no-op. No allowlist change: the
-    # new step calls an action, not a reusable workflow, and the entry matches
-    # the workflow a job is defined in. Worth a `v3` tag in _workflows.
+    # defaults to false, so the bump alone is a no-op.
+    #
+    # MOVING THIS PIN REQUIRES AN ORG SETTINGS EDIT. The `signing-runners`
+    # runner group is `restricted_to_workflows: true` and its allowlist names
+    # workflows BY SHA, so a new pin is not authorized until it is added at
+    # Organization settings -> Actions -> Runner groups -> signing-runners.
+    # Until then both `release-cli / Build *-apple-darwin` jobs queue forever
+    # against idle, online runners with NO error anywhere — not in the run, the
+    # job, or the API. Windows and Linux are unaffected; they use the `kunobi`
+    # group, which is unrestricted.
+    #
+    # Adding the SHA does not release work already waiting: authorization is
+    # decided when a job is created, so queued jobs must be re-run.
+    #
+    # This bump cost v0.57.0 an hour exactly that way. The earlier note here
+    # said no allowlist change was needed because the new step calls an action
+    # rather than a reusable workflow — true about the step, and irrelevant:
+    # the entry matches the workflow a job is DEFINED in, whatever changed
+    # inside it. See kunobi-ninja/_workflows#6; a `v3` tag plus a tag-shaped
+    # allowlist entry would retire this footgun.
     uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@6283fdb03ec1d645591ff67f99e47922ffab5bbb
     with:
       binary_name: kobe
