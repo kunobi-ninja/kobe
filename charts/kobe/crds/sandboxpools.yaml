@@ -386,7 +386,34 @@ spec:
 
                       The Secret is referenced by name only; Kobe never copies its bytes into
                       the Pool object. A missing Secret fails Pod startup and therefore pool
-                      certification. Content rotation does not recreate warm Sandboxes.
+                      certification.
+
+                      # Rotating the Secret's content reaches no Sandbox
+
+                      Not running ones, and not idle warm members. A pool keeps serving the
+                      value that was current when each Pod was created, indefinitely, with
+                      nothing in the API or status saying so.
+
+                      Running Sandboxes cannot update because each key is mounted with
+                      `subPath`, which binds the *resolved* path once at Pod creation.
+                      kubelet's atomic writer rotates a Secret by writing a new timestamped
+                      directory and flipping a symlink, then deleting the old one — so the
+                      bind is left pointing at a directory that no longer exists
+                      (`/..2026_09_22_07_13_06.3044771300/file-0//deleted` in
+                      `/proc/self/mountinfo`). It is not stale pending a refresh; it can
+                      never refresh.
+
+                      Warm members do not update either, because nothing recreates them on a
+                      content change: `pool/manager.rs` deletes warm members only when they
+                      exceed `warmCapacity`, so a healthy old one is never replaced. A pool
+                      *spec* change does recreate them through certification, which is why
+                      adding `files` produces fresh boxes and a later content change does
+                      not.
+
+                      So after rotating a credential, the next lease hands out a box carrying
+                      the old one. Deleting the unclaimed warm members
+                      (`kubectl delete sandbox -l agents.x-k8s.io/warm-pool-sandbox`) is the
+                      workaround. See #374.
                     items:
                       description: |-
                         One Secret key mounted as a file in every Sandbox container.
