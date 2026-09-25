@@ -176,8 +176,9 @@ enum Commands {
     },
     /// Run a command in a lease and exit with its exit code
     Exec {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can run a command on.
+        lease: Option<String>,
         /// Working directory for the command
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
@@ -221,8 +222,9 @@ enum Commands {
     },
     /// Read a lease's logs, or the output of one execution
     Logs {
-        /// Lease id, name, or pool
-        lease: String,
+        /// Lease id, name, or pool. Omit it to pick from the ones that
+        /// can read logs from.
+        lease: Option<String>,
         /// Read the output of this execution instead of the lease's logs
         #[arg(long, value_name = "ID", conflicts_with = "tail")]
         execution: Option<String>,
@@ -267,7 +269,13 @@ enum Commands {
     },
     /// Forward a local port to a port the pool declares
     PortForward {
-        /// Lease id, name, or pool
+        /// Lease id, name, or pool.
+        ///
+        /// Required, unlike `exec` and `logs`: `spec` is a positional that
+        /// follows it, and clap rejects an optional positional before a
+        /// required one. Making this optional needs `spec` to become a flag
+        /// or to swap places, both of which break the command line people
+        /// already use.
         lease: String,
         /// LOCAL:REMOTE, where REMOTE is a port name or number (8080:http)
         spec: String,
@@ -916,10 +924,16 @@ async fn main() -> anyhow::Result<()> {
             sync,
             command,
         } => {
-            let lease =
-                commands::require_lease_capability(&lease, "exec", target, endpoint, output)
-                    .await
-                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            let lease = commands::lease_for_capability(
+                lease.as_deref(),
+                "exec",
+                "run a command on",
+                target,
+                endpoint,
+                output,
+            )
+            .await
+            .unwrap_or_else(|error| exit_resource_error(error, output));
             dispatch_resource_action(
                 SandboxAction::Exec {
                     lease,
@@ -1037,10 +1051,16 @@ async fn main() -> anyhow::Result<()> {
             follow,
             tail,
         } => {
-            let lease =
-                commands::require_lease_capability(&lease, "logs", target, endpoint, output)
-                    .await
-                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            let lease = commands::lease_for_capability(
+                lease.as_deref(),
+                "logs",
+                "read logs from",
+                target,
+                endpoint,
+                output,
+            )
+            .await
+            .unwrap_or_else(|error| exit_resource_error(error, output));
             dispatch_resource_action(
                 SandboxAction::Logs {
                     lease,
@@ -1563,7 +1583,7 @@ mod tests {
         else {
             panic!("expected resource logs")
         };
-        assert_eq!(lease, "sandbox-1");
+        assert_eq!(lease.as_deref(), Some("sandbox-1"));
         assert_eq!(execution.as_deref(), Some("sbxe-1"));
         assert!(follow);
         assert_eq!(tail, None);
