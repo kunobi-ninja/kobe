@@ -598,6 +598,41 @@ impl LeasedSandbox {
             .await
     }
 
+    /// Exec, waiting out a runner that has not finished recovering.
+    ///
+    /// `clear_execution_crash` clears the *injection*, not the runner. The
+    /// process the crash interrupted may still be coming back, and an exec
+    /// landing in that window answers `runner_unreachable` — which is
+    /// liveness, not the fail-closed behaviour these scenarios assert. So it
+    /// is waited out rather than asserted on.
+    ///
+    /// Everything else is returned untouched, success or not, so the caller
+    /// still judges the exact `Unknown` and its reason. Weakening that is
+    /// what this must not do: the point of each scenario is that a crash in
+    /// its window produces exactly one reason and never runs the payload.
+    ///
+    /// Without this the retry races the runner and fails on the liveness
+    /// check, several assertions before the one under test (#373).
+    async fn exec_once_the_runner_answers(
+        &self,
+        argv: &[&str],
+        key: &str,
+        within: Duration,
+    ) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+        let deadline = Instant::now() + within;
+        loop {
+            let (status, body) = self.exec(argv, key).await?;
+            if body["reason"] != "runner_unreachable" {
+                return Ok((status, body));
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the runner never answered again after the injected crash cleared: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Count an execution's externally visible side effect without assuming
     /// the marker exists. Zero is therefore evidence for the pre-spawn window,
     /// while one distinguishes idempotency from a duplicated hidden spawn.
@@ -1717,7 +1752,9 @@ both_placements_serial!(
         interrupted_request(&attempted, WINDOW)?;
         cleared?;
 
-        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        let (status, first) = sandbox
+            .exec_once_the_runner_answers(&argv, KEY, Duration::from_secs(60))
+            .await?;
         anyhow::ensure!(status.is_success(), "pre-target retry failed: {first}");
         anyhow::ensure!(
             first["state"] == "Unknown"
@@ -1769,7 +1806,9 @@ both_placements_serial!(
             "pre-spawn runner crash returned HTTP {status}, expected 502: {interrupted}"
         );
 
-        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        let (status, first) = sandbox
+            .exec_once_the_runner_answers(&argv, KEY, Duration::from_secs(60))
+            .await?;
         anyhow::ensure!(status.is_success(), "pre-spawn retry failed: {first}");
         anyhow::ensure!(
             first["state"] == "Unknown"
@@ -1822,7 +1861,9 @@ both_placements_serial!(
             "lost runner acknowledgement returned HTTP {status}, expected 502: {interrupted}"
         );
 
-        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        let (status, first) = sandbox
+            .exec_once_the_runner_answers(&argv, KEY, Duration::from_secs(60))
+            .await?;
         anyhow::ensure!(status.is_success(), "lost-ack retry failed: {first}");
         anyhow::ensure!(
             first["state"] == "Unknown"
@@ -1871,7 +1912,9 @@ both_placements_serial!(
         interrupted_request(&attempted, WINDOW)?;
         cleared?;
 
-        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        let (status, first) = sandbox
+            .exec_once_the_runner_answers(&argv, KEY, Duration::from_secs(60))
+            .await?;
         anyhow::ensure!(status.is_success(), "post-ack retry failed: {first}");
         anyhow::ensure!(
             first["state"] == "Failed"
