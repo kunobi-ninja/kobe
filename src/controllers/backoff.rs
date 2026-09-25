@@ -333,6 +333,37 @@ mod tests {
         );
     }
 
+    /// Every controller behind this gate answers "what must never be
+    /// deferred" the same way, and that is the whole reason the answer lives
+    /// here rather than at each call site.
+    ///
+    /// `instance`, `sandbox` (pool and lease) and the release authority all
+    /// gate on this. The audit for extending it past `instance` looked for a
+    /// third urgent path that bypasses `generation` — a manual-override
+    /// annotation, a force-release, an unfence — and `sandbox.rs` and
+    /// `lease.rs` have none. If one is ever added, it belongs in `defer`, not
+    /// in the reconciler that happens to notice first.
+    #[test]
+    fn only_a_delete_and_new_intent_cut_a_backoff() {
+        let backoff = FailureBackoff::new(Duration::from_secs(300), DEFAULT_MAX);
+        backoff.record("a", &meta(7));
+
+        // Everything that is not one of the two still waits.
+        assert!(
+            backoff.defer("a", &meta(7)).is_some(),
+            "an unchanged generation is a status write or a drift event"
+        );
+        assert!(
+            backoff.defer("a", &meta(6)).is_some(),
+            "a stale read is not new intent"
+        );
+
+        // The two that do not.
+        assert_eq!(backoff.defer("a", &meta_deleting(7)), None);
+        backoff.record("a", &meta(7));
+        assert_eq!(backoff.defer("a", &meta(8)), None);
+    }
+
     /// A delete must never wait out a backoff. `deletionTimestamp` bumps no
     /// generation, so nothing else in `defer` would notice it, and the
     /// finalizer that runs `backend.delete()` is what sits behind the gate.
