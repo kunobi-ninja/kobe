@@ -1100,6 +1100,19 @@ pub struct SandboxPoolStatus {
         extend("x-kubernetes-list-map-keys" = ["type"])
     )]
     pub conditions: Vec<SandboxCondition>,
+    /// `resourceVersion` of each Secret named in `spec.template.files`, as it
+    /// was when this pool's warm members were last refilled against it.
+    ///
+    /// The only way to tell a rotated Secret from an unchanged one. Content is
+    /// never read or recorded — a `resourceVersion` says *that* it changed,
+    /// which is all a refill needs, and is not a credential.
+    ///
+    /// An entry appears the first time a pool reconciles with that file
+    /// declared, and is rewritten whenever the version moves. A file removed
+    /// from the spec leaves no entry behind.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schemars(length(max = 16))]
+    pub observed_file_secrets: std::collections::BTreeMap<String, String>,
 }
 
 /// Durable phase of one management-pool certification attempt.
@@ -1775,6 +1788,7 @@ mod tests {
             placement_authority: None,
             certification: None,
             conditions: vec![],
+            observed_file_secrets: Default::default(),
         })
         .unwrap();
         assert_eq!(

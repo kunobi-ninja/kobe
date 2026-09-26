@@ -1940,6 +1940,7 @@ mod tests {
             placement_authority: None,
             certification: Some(pool_certification(3)),
             conditions: vec![ready_condition(SandboxConditionStatus::True, Some(3))],
+            observed_file_secrets: Default::default(),
         }));
         assert_eq!(require_current_sandbox_pool_ready(&certified), Ok(()));
 
@@ -2049,6 +2050,7 @@ mod tests {
                 observed_generation: Some(3),
                 last_transition_time: None,
             }],
+            observed_file_secrets: Default::default(),
         }));
         child.spec.placement = SandboxPlacement::ChildCluster {
             cluster_pool_ref: "children".into(),

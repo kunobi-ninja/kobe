@@ -1052,6 +1052,21 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedFileSecrets:
+                additionalProperties:
+                  type: string
+                description: |-
+                  `resourceVersion` of each Secret named in `spec.template.files`, as it
+                  was when this pool's warm members were last refilled against it.
+
+                  The only way to tell a rotated Secret from an unchanged one. Content is
+                  never read or recorded — a `resourceVersion` says *that* it changed,
+                  which is all a refill needs, and is not a credential.
+
+                  An entry appears the first time a pool reconciles with that file
+                  declared, and is rewritten whenever the version moves. A file removed
+                  from the spec leaves no entry behind.
+                type: object
               observedGeneration:
                 format: int64
                 minimum: 0.0

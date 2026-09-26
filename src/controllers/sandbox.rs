@@ -904,6 +904,113 @@ fn pool_allocation_counts<L: std::borrow::Borrow<SandboxLease>>(
 /// Counters remain observations; only `Ready=True` authorizes admission. The
 /// caller must therefore pass `certified=true` only after completing every
 /// placement-specific live check described by [`reconcile_pool`].
+/// Whether a Secret moved since a pool last refilled against it.
+///
+/// A first sighting is **not** a rotation. Adopting this must not recycle
+/// every pool once, and a pool that has never recorded a version has no
+/// evidence that its members carry a different one.
+fn secret_rotated(recorded: Option<&String>, observed: &str) -> bool {
+    recorded.is_some_and(|previous| previous != observed)
+}
+
+/// Refill a pool's warm members when a Secret it mounts has rotated.
+///
+/// `template.files` mounts each key with `subPath`, which binds the resolved
+/// path once at Pod creation — so kubelet rotating the Secret leaves a running
+/// Sandbox bound to a directory that no longer exists, and nothing recreates
+/// an idle warm member on a content change either. A pool therefore keeps
+/// handing out the value that was current when each Pod was created (#374).
+///
+/// **Only unclaimed warm members are deleted.** Pulling a credential out from
+/// under a running session is worse than the staleness, so a leased Sandbox
+/// keeps what it has until it ends. The upstream WarmPool controller refills
+/// against the current Secret, which is the same operation an operator runs by
+/// hand today with
+/// `kubectl delete sandbox -l agents.x-k8s.io/warm-pool-sandbox`.
+///
+/// A file whose Secret cannot be read is skipped rather than treated as
+/// changed: a transient read failure must not delete capacity. The first
+/// reconcile that sees a file records its version and deletes nothing, so
+/// adopting this does not recycle every pool once.
+///
+/// Returns the versions to record, which the caller writes only after the
+/// deletes it authorised actually happened.
+async fn refill_warm_members_on_secret_rotation(
+    ctx: &SandboxContext,
+    pool: &SandboxPool,
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+
+    let recorded = pool
+        .status
+        .as_ref()
+        .map(|status| status.observed_file_secrets.clone())
+        .unwrap_or_default();
+    if pool.spec.template.files.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let mut observed = BTreeMap::new();
+    let mut rotated = Vec::new();
+    for file in &pool.spec.template.files {
+        let Ok(secret) = secrets.get(&file.secret).await else {
+            // Unreadable is not rotated. Carry the recorded version so a
+            // transient failure neither deletes capacity nor forgets what was
+            // last seen.
+            if let Some(previous) = recorded.get(&file.secret) {
+                observed.insert(file.secret.clone(), previous.clone());
+            }
+            continue;
+        };
+        let Some(version) = secret.resource_version() else {
+            continue;
+        };
+        if secret_rotated(recorded.get(&file.secret), &version) {
+            rotated.push(file.secret.clone());
+        }
+        observed.insert(file.secret.clone(), version);
+    }
+
+    if rotated.is_empty() {
+        return observed;
+    }
+
+    let selector = format!(
+        "agents.x-k8s.io/warm-pool-sandbox={}",
+        crate::controllers::sandbox_pool_certification::upstream_name_hash(&pool.name_any())
+    );
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
+    match sandboxes
+        .delete_collection(
+            &DeleteParams::default(),
+            &kube::api::ListParams::default().labels(&selector),
+        )
+        .await
+    {
+        Ok(_) => info!(
+            pool = %pool.name_any(),
+            rotated = ?rotated,
+            "Secret rotated; deleted unclaimed warm members so the pool refills against it"
+        ),
+        Err(error) => {
+            // The record is not advanced on failure, so the next reconcile
+            // sees the same rotation and tries again rather than serving the
+            // old value forever with nothing left to notice it.
+            warn!(
+                pool = %pool.name_any(),
+                rotated = ?rotated,
+                %error,
+                "could not delete warm members after a Secret rotation; will retry"
+            );
+            return recorded;
+        }
+    }
+    observed
+}
+
 fn pool_status(
     pool: &SandboxPool,
     ready: u32,
@@ -978,6 +1085,14 @@ fn pool_status(
             .status
             .as_ref()
             .and_then(|status| status.certification.clone()),
+        // Carried forward like `certification`: only the refill path below
+        // knows whether a Secret moved, and every other status write must
+        // leave its record alone rather than clear it and lose the comparison.
+        observed_file_secrets: pool
+            .status
+            .as_ref()
+            .map(|status| status.observed_file_secrets.clone())
+            .unwrap_or_default(),
         conditions,
     })
 }
@@ -1336,6 +1451,11 @@ pub async fn reconcile_pool(
         &message,
     )?;
     status.certification = progress_status;
+    // Runs on the steady-state path, after certification: a rotation is not an
+    // error and must not race the certification write that authorizes leases.
+    // The record only advances once the deletes it authorised succeeded, so a
+    // failed delete is retried on the next reconcile rather than forgotten.
+    status.observed_file_secrets = refill_warm_members_on_secret_rotation(&ctx, &pool).await;
     if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
         debug!(pool = %name, "SandboxPool status write lost a race");
         return Ok(Action::await_change());
@@ -11115,6 +11235,29 @@ pub async fn run_sandbox_controller(
 pub(crate) mod tests {
     use super::*;
 
+    /// Adopting this must not recycle every pool once.
+    ///
+    /// A pool that has never recorded a version has no evidence its members
+    /// carry a different one, so a first sighting records and deletes nothing.
+    /// Getting this wrong deletes every warm member in the fleet on upgrade.
+    #[test]
+    fn a_first_sighting_is_not_a_rotation() {
+        assert!(!secret_rotated(None, "1"));
+    }
+
+    /// The comparison is on `resourceVersion` and nothing else — never on
+    /// content, which is a credential and is never read.
+    #[test]
+    fn only_a_moved_resource_version_is_a_rotation() {
+        assert!(!secret_rotated(Some(&"4021".to_string()), "4021"));
+        assert!(secret_rotated(Some(&"4021".to_string()), "4022"));
+        assert!(
+            secret_rotated(Some(&"4022".to_string()), "4021"),
+            "a version that moved backwards still moved; kubelet already \
+             remounted whatever is current"
+        );
+    }
+
     /// `supervisor_lost` is deliberately not process-absence proof. Its cleanup
     /// outcome must advance the exact target's destruction instead of joining
     /// ordinary retries; management then deletes the Claim, while child
@@ -11949,6 +12092,7 @@ pub(crate) mod tests {
                     observed_generation: Some(generation),
                     last_transition_time: Some("2026-08-20T00:00:00Z".into()),
                 }],
+                observed_file_secrets: Default::default(),
             }),
         };
         let upstream = |kind: &str, object_uid: &str| DynamicObject {
