@@ -495,6 +495,33 @@ pub struct SandboxTemplateSpec {
     /// the old one. Deleting the unclaimed warm members
     /// (`kubectl delete sandbox -l agents.x-k8s.io/warm-pool-sandbox`) is the
     /// workaround. See #374.
+    ///
+    /// # Everything here is shared by every lease, including its revocation
+    ///
+    /// One file, one value, every Sandbox the pool hands out. That is the
+    /// point of the mechanism and also its sharpest edge: **anything done
+    /// inside one Sandbox that invalidates the credential invalidates it for
+    /// the whole pool.** `readOnly` does not prevent this — a revocation or a
+    /// token rotation happens at the provider, not at the file.
+    ///
+    /// Two shapes of credential behave very differently here.
+    ///
+    /// A **machine credential** — an API key, a service account — has no
+    /// expiry, no refresh and no per-use rotation. `readOnly` is then exactly
+    /// right, and the only way to break the pool is to revoke the key
+    /// deliberately.
+    ///
+    /// A **person's OAuth login** is scoped to a human, expires, and usually
+    /// rotates its refresh token on use. Mounted here it fails in ways that
+    /// do not look like credential problems: a logout inside any one Sandbox
+    /// revokes the pool; a refresh in one Sandbox can invalidate the token the
+    /// next one will read; and because the workload's own account metadata is
+    /// writable while the credential is not, a box can report one identity
+    /// while authenticating as another. All three have happened. See #375.
+    ///
+    /// Prefer the machine credential. If a pool must carry a person's login,
+    /// treat "somebody logged out" as a first-class explanation the next time
+    /// every lease starts failing at once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 16))]
     pub files: Vec<SandboxTemplateFile>,
