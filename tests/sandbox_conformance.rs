@@ -600,19 +600,26 @@ impl LeasedSandbox {
 
     /// Exec, waiting out a runner that has not finished recovering.
     ///
-    /// `clear_execution_crash` clears the *injection*, not the runner. The
-    /// process the crash interrupted may still be coming back, and an exec
-    /// landing in that window answers `runner_unreachable` — which is
-    /// liveness, not the fail-closed behaviour these scenarios assert. So it
-    /// is waited out rather than asserted on.
+    /// # `runner_unreachable` is two different answers
+    ///
+    /// As an **execution record** — carrying `state`, `startedAt`,
+    /// `finishedAt` — it is the verdict: this execution is `Unknown` *because*
+    /// the runner was unreachable. `crash_before_spawn` and
+    /// `crash_after_spawn_before_ack` assert exactly that, so waiting for it
+    /// to change waits for something that never will.
+    ///
+    /// As an **error envelope** — `{"error": …, "reason": …}`, no `state` —
+    /// it is liveness: the runner has not finished coming back from the
+    /// injected crash, and an exec that lands in that window is answered
+    /// before there is anything to record. That is what #373 flaked on, and
+    /// the only thing waited out here.
+    ///
+    /// The presence of `state` is the distinction, and it is the whole reason
+    /// this helper can tell them apart. An earlier version keyed on `reason`
+    /// alone and broke both scenarios above by waiting out their verdict.
     ///
     /// Everything else is returned untouched, success or not, so the caller
-    /// still judges the exact `Unknown` and its reason. Weakening that is
-    /// what this must not do: the point of each scenario is that a crash in
-    /// its window produces exactly one reason and never runs the payload.
-    ///
-    /// Without this the retry races the runner and fails on the liveness
-    /// check, several assertions before the one under test (#373).
+    /// still judges the exact `Unknown` and its reason.
     async fn exec_once_the_runner_answers(
         &self,
         argv: &[&str],
@@ -622,7 +629,9 @@ impl LeasedSandbox {
         let deadline = Instant::now() + within;
         loop {
             let (status, body) = self.exec(argv, key).await?;
-            if body["reason"] != "runner_unreachable" {
+            let liveness_failure =
+                body["reason"] == "runner_unreachable" && body.get("state").is_none();
+            if !liveness_failure {
                 return Ok((status, body));
             }
             anyhow::ensure!(
