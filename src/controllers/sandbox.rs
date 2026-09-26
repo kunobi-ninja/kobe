@@ -977,10 +977,7 @@ async fn refill_warm_members_on_secret_rotation(
         return observed;
     }
 
-    let selector = format!(
-        "agents.x-k8s.io/warm-pool-sandbox={}",
-        crate::controllers::sandbox_pool_certification::upstream_name_hash(&pool.name_any())
-    );
+    let selector = crate::controllers::sandbox_pool_certification::warm_member_selector(pool);
     let sandboxes: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
     match sandboxes

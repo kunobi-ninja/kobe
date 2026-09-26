@@ -87,8 +87,21 @@ fn pvc_resource() -> ApiResource {
     }
 }
 
-fn management_object_name(pool: &SandboxPool) -> String {
+pub(super) fn management_object_name(pool: &SandboxPool) -> String {
     format!("kobe-{}", pool.name_any())
+}
+
+/// The label selector matching a pool's warm Sandbox members.
+///
+/// The hash is over the **upstream WarmPool's** name, which is
+/// [`management_object_name`] and not the pool's own — a distinction worth one
+/// function, because hashing the bare pool name produces a selector that
+/// matches nothing, deletes nothing, and reports success.
+pub(super) fn warm_member_selector(pool: &SandboxPool) -> String {
+    format!(
+        "{WARM_POOL_LABEL}={}",
+        upstream_name_hash(&management_object_name(pool))
+    )
 }
 
 fn certification_claim_name(pool_uid: &str) -> String {
@@ -4174,6 +4187,65 @@ mod tests {
         assert_eq!(
             body["metadata"]["ownerReferences"][0]["uid"],
             status.sandbox.unwrap().uid
+        );
+    }
+}
+
+#[cfg(test)]
+mod warm_selector_tests {
+    use super::*;
+
+    fn pool(name: &str) -> SandboxPool {
+        let mut pool: SandboxPool = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxPool",
+            "metadata": { "name": name, "namespace": "kobe-system" },
+            "spec": {
+                "warmCapacity": 1,
+                "defaultTtl": "30m",
+                "maxTtl": "1h",
+                "provisioningTimeout": "10m",
+                "placement": { "type": "management" },
+                "template": {
+                    "defaultContainer": "workspace",
+                    "containers": [{
+                        "name": "workspace",
+                        "image": "example/image:v1",
+                        "resources": {
+                            "requests": { "cpu": "1", "memory": "1Gi", "ephemeralStorage": "1Gi" },
+                            "limits": { "cpu": "1", "memory": "1Gi", "ephemeralStorage": "1Gi" }
+                        }
+                    }]
+                },
+                "isolation": { "tier": "trusted-runc" },
+                "readiness": { "canary": { "argv": ["/bin/true"], "timeout": "30s" } }
+            }
+        }))
+        .expect("pool fixture parses");
+        pool.metadata.generation = Some(1);
+        pool
+    }
+
+    /// The hash is over the upstream WarmPool's name, not the pool's own.
+    ///
+    /// Hashing the bare pool name yields a selector that matches nothing —
+    /// `delete_collection` then removes zero objects and returns `Ok`, so a
+    /// rotation is recorded as handled while every warm member keeps serving
+    /// the old credential. Silent and indistinguishable from working, which is
+    /// exactly what shipped in #397 and what this pins.
+    #[test]
+    fn the_warm_selector_hashes_the_upstream_name_not_the_pool_name() {
+        let pool = pool("agents");
+
+        assert_eq!(management_object_name(&pool), "kobe-agents");
+        assert_eq!(
+            warm_member_selector(&pool),
+            format!("{WARM_POOL_LABEL}={}", upstream_name_hash("kobe-agents")),
+        );
+        assert_ne!(
+            warm_member_selector(&pool),
+            format!("{WARM_POOL_LABEL}={}", upstream_name_hash("agents")),
+            "hashing the pool's own name is the bug this exists for"
         );
     }
 }
