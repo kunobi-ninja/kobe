@@ -10584,11 +10584,13 @@ fn upstream_claim_finished(claim: &DynamicObject) -> Option<LostWorkload> {
 /// `Finished` is only the trigger. Upstream copies it onto the claim without a
 /// Pod UID and clears it only as newer state propagates, so on its own it can
 /// describe a Pod this lease never used. The loss is confirmed only when the
-/// recorded Pod, by name AND UID, is observed in a terminal phase. While that
-/// Pod exists upstream cannot create a replacement (both would carry the
-/// Sandbox's name), so teardown cannot record a different Pod over the one
-/// this lease's executions name (#409). A missing, replaced, running or
-/// unreadable Pod confirms nothing, and the lease keeps its ordinary TTL.
+/// recorded Pod, by name AND UID, is observed in a terminal phase. A missing,
+/// replaced, running or unreadable Pod confirms nothing, and the lease keeps
+/// its ordinary TTL. Upstream only creates a Pod when the Sandbox has none, so
+/// requiring the ended Pod to still be present avoids starting teardown while
+/// a replacement may already exist. It does not stop one appearing later if
+/// the ended Pod is deleted mid-teardown; that window predates this check,
+/// exists for every release cause, and is #409.
 ///
 /// Kubelet's account is preferred over upstream's generic one: "Evicted:
 /// ephemeral local storage exceeds 100Gi" tells a caller what to change,
