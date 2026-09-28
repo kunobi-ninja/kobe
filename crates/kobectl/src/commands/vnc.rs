@@ -41,6 +41,14 @@ use super::{OutputFormat, print_json};
 /// and still bounds the allocation at a quarter of a gigabyte.
 const MAX_FRAMEBUFFER_PIXELS: u64 = 64 * 1024 * 1024;
 
+mod ard;
+
+/// A Screen Sharing login, for servers that offer no unauthenticated type.
+pub(crate) struct Credentials {
+    pub user: String,
+    pub password: String,
+}
+
 /// What the server said about itself during the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ServerInit {
@@ -120,12 +128,19 @@ impl PixelFormat {
 
 /// Complete the RFB handshake and return what the server announced.
 ///
-/// Only the `None` security type is accepted. The image's x11vnc runs
-/// `-nopw` on loopback inside the Sandbox, where the authenticated stream is
-/// the boundary; a server asking for VNC authentication here would mean the
-/// far end is not the one this command was aimed at, which is worth refusing
-/// rather than prompting for a password nobody set.
-pub(crate) async fn handshake<S>(socket: &mut S) -> Result<ServerInit>
+/// With no `credentials`, only the `None` security type is accepted. The
+/// image's x11vnc runs `-nopw` on loopback inside the Sandbox, where the
+/// authenticated stream is the boundary; a server asking for a password there
+/// would mean the far end is not the one this command was aimed at, which is
+/// worth refusing rather than prompting for a password nobody set.
+///
+/// With `credentials`, a server that offers `None` still gets `None`, and
+/// one that offers Apple's type 30 (macOS Screen Sharing, reached through
+/// `kobe vnc --host`) gets that login instead.
+pub(crate) async fn handshake<S>(
+    socket: &mut S,
+    credentials: Option<&Credentials>,
+) -> Result<ServerInit>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -161,18 +176,31 @@ where
     }
     let mut types = vec![0u8; usize::from(count[0])];
     socket.read_exact(&mut types).await?;
-    if !types.contains(&1) {
-        bail!(
+    match credentials {
+        _ if types.contains(&1) => {
+            socket.write_all(&[1]).await?;
+            socket.flush().await?;
+        }
+        Some(credentials) if types.contains(&ard::SECURITY_TYPE) => {
+            socket.write_all(&[ard::SECURITY_TYPE]).await?;
+            socket.flush().await?;
+            apple_login(socket, credentials).await?;
+        }
+        Some(_) => bail!(
+            "the VNC server offers neither an unauthenticated type nor Apple's (30); offered {types:?}"
+        ),
+        None => bail!(
             "the VNC server offers no unauthenticated security type (offered {types:?}); \
              kobe reaches it over an already-authenticated stream and does not hold a VNC password"
-        );
+        ),
     }
-    socket.write_all(&[1]).await?;
-    socket.flush().await?;
 
     let mut result = [0u8; 4];
     socket.read_exact(&mut result).await?;
     if u32::from_be_bytes(result) != 0 {
+        if credentials.is_some() {
+            bail!("the VNC server rejected the login: check the account name and password");
+        }
         bail!("the VNC server rejected the security handshake");
     }
 
@@ -216,6 +244,52 @@ where
         height,
         format,
     })
+}
+
+/// Read the type-30 key exchange and answer it with `credentials`.
+async fn apple_login<S>(socket: &mut S, credentials: &Credentials) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut header = [0u8; 4];
+    socket
+        .read_exact(&mut header)
+        .await
+        .context("the server closed during the Screen Sharing key exchange")?;
+    let generator = u16::from_be_bytes([header[0], header[1]]);
+    let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    // Screen Sharing uses 128 bytes; refuse what would be an absurd allocation.
+    if length == 0 || length > 1024 {
+        bail!("the server announced a {length}-byte key, which kobe refuses");
+    }
+    let mut prime = vec![0u8; length];
+    socket.read_exact(&mut prime).await?;
+    let mut server_key = vec![0u8; length];
+    socket.read_exact(&mut server_key).await?;
+
+    let mut private_key = vec![0u8; length];
+    let mut filler = [0u8; 128];
+    {
+        use rand::RngCore;
+        let mut rng = rand::rngs::OsRng;
+        rng.fill_bytes(&mut private_key);
+        rng.fill_bytes(&mut filler);
+    }
+    let challenge = ard::Challenge {
+        generator,
+        prime,
+        server_key,
+    };
+    let reply = ard::response(
+        &challenge,
+        &credentials.user,
+        &credentials.password,
+        &private_key,
+        &filler,
+    )?;
+    socket.write_all(&reply).await?;
+    socket.flush().await?;
+    Ok(())
 }
 
 /// Ask for the whole framebuffer and decode the raw-encoded answer to RGB.
@@ -469,7 +543,7 @@ pub(crate) async fn run(
         .context("could not reach the local end of the VNC forward")?;
     socket.set_nodelay(true).ok();
 
-    let result = drive(&mut socket, action, lease, output).await;
+    let result = drive(&mut socket, None, action, lease, output).await;
 
     // The forward ends with this connection; a failure there explains a
     // failure here better than a bare read error does.
@@ -483,13 +557,19 @@ pub(crate) async fn run(
     result
 }
 
-async fn drive(
-    socket: &mut tokio::net::TcpStream,
+/// Log in, then run one action. `lease` labels the JSON output; for
+/// `kobe vnc --host` it is the host's name.
+pub(crate) async fn drive<S>(
+    socket: &mut S,
+    credentials: Option<&Credentials>,
     action: VncAction,
     lease: &str,
     output: OutputFormat,
-) -> Result<i32> {
-    let server = handshake(socket).await?;
+) -> Result<i32>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let server = handshake(socket, credentials).await?;
     match action {
         VncAction::Screenshot { path } => {
             let pixels = capture(socket, server).await?;
@@ -767,6 +847,118 @@ pub(crate) async fn open(options: OpenDesktop<'_>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS Screen Sharing, as far as the login goes: it offers only Apple's
+    /// security types, runs its side of the type-30 key exchange, and checks
+    /// the account it decrypts. Returns what it decrypted.
+    async fn fake_screen_sharing(
+        mut server: tokio::io::DuplexStream,
+        account: (&str, &str),
+    ) -> Option<(String, String)> {
+        use aes::Aes128;
+        use aes::cipher::{BlockDecrypt, KeyInit};
+        use md5::{Digest, Md5};
+        use num_bigint::BigUint;
+
+        const PRIME: [u8; 16] = [
+            0xd5, 0xbb, 0xb9, 0x6d, 0x30, 0x08, 0x6e, 0xc4, 0x84, 0xeb, 0xa3, 0xd7, 0xf9, 0xca,
+            0xeb, 0x07,
+        ];
+        let pad = |value: BigUint| {
+            let bytes = value.to_bytes_be();
+            let mut out = vec![0u8; PRIME.len() - bytes.len()];
+            out.extend_from_slice(&bytes);
+            out
+        };
+        let prime = BigUint::from_bytes_be(&PRIME);
+        let private = BigUint::from_bytes_be(&[5u8; 16]);
+
+        server.write_all(b"RFB 003.889\n").await.unwrap();
+        let mut version = [0u8; 12];
+        server.read_exact(&mut version).await.unwrap();
+        server.write_all(&[4, 30, 33, 36, 35]).await.unwrap();
+        let mut choice = [0u8; 1];
+        if server.read_exact(&mut choice).await.is_err() {
+            return None; // the client gave up before choosing
+        }
+        assert_eq!(choice[0], 30, "the client must pick Apple's type 30");
+
+        let mut challenge = vec![0, 2, 0, PRIME.len() as u8];
+        challenge.extend_from_slice(&PRIME);
+        challenge.extend_from_slice(&pad(BigUint::from(2u32).modpow(&private, &prime)));
+        server.write_all(&challenge).await.unwrap();
+
+        let mut reply = vec![0u8; 128 + PRIME.len()];
+        server.read_exact(&mut reply).await.unwrap();
+        let shared = BigUint::from_bytes_be(&reply[128..]).modpow(&private, &prime);
+        let cipher = Aes128::new(&Md5::digest(pad(shared)));
+        let mut block = reply[..128].to_vec();
+        for chunk in block.chunks_exact_mut(16) {
+            let chunk: &mut [u8; 16] = chunk.try_into().unwrap();
+            cipher.decrypt_block(chunk.into());
+        }
+        let text = |field: &[u8]| {
+            let end = field.iter().position(|&b| b == 0).unwrap();
+            String::from_utf8(field[..end].to_vec()).unwrap()
+        };
+        let seen = (text(&block[..64]), text(&block[64..]));
+        if (seen.0.as_str(), seen.1.as_str()) != account {
+            server.write_all(&1u32.to_be_bytes()).await.unwrap();
+            return Some(seen);
+        }
+        server.write_all(&0u32.to_be_bytes()).await.unwrap();
+        let mut shared_flag = [0u8; 1];
+        server.read_exact(&mut shared_flag).await.unwrap();
+        let mut init = vec![0, 4, 0, 2];
+        init.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+        init.extend_from_slice(&0u32.to_be_bytes());
+        server.write_all(&init).await.unwrap();
+        Some(seen)
+    }
+
+    fn login(user: &str, password: &str) -> Credentials {
+        Credentials {
+            user: user.into(),
+            password: password.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn screen_sharing_accepts_the_apple_login() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(fake_screen_sharing(server, ("ci", "pw")));
+        let init = handshake(&mut client, Some(&login("ci", "pw")))
+            .await
+            .unwrap();
+        assert_eq!((init.width, init.height), (4, 2));
+        assert_eq!(fake.await.unwrap(), Some(("ci".into(), "pw".into())));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_reported_as_a_rejected_login() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(fake_screen_sharing(server, ("ci", "pw")));
+        let error = handshake(&mut client, Some(&login("ci", "nope")))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("rejected the login"), "{error}");
+        assert_eq!(fake.await.unwrap(), Some(("ci".into(), "nope".into())));
+    }
+
+    #[tokio::test]
+    async fn without_credentials_screen_sharing_is_refused_as_before() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(fake_screen_sharing(server, ("ci", "pw")));
+        let error = handshake(&mut client, None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no unauthenticated security type"),
+            "{error}"
+        );
+        drop(client);
+        assert_eq!(fake.await.unwrap(), None);
+    }
 
     fn format_32bpp_little_endian() -> PixelFormat {
         PixelFormat::parse(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0])

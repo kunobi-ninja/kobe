@@ -1,0 +1,89 @@
+---
+title: Host commands
+description: Reach a machine you already SSH into, such as a self-hosted CI Mac, with the same exec, port-forward and VNC verbs.
+---
+
+# Host commands
+
+A host is a machine you reach with plain `ssh`, such as a Mac mini that runs
+self-hosted CI runners. `kobe host` gives it the same verbs a lease has, and
+`kobe vnc <action> --host` drives its screen through macOS Screen Sharing.
+
+A host is not a lease. Nothing is created, reserved or recycled: the machine is
+always there, and it may be running other work while you use it. Every verb
+runs your own `ssh`, so a host is reachable exactly when `ssh <dest>` is, with
+your `~/.ssh/config`, agent and keys.
+
+## Define a host
+
+```bash
+kobe host set mini --ssh ci@192.168.64.10 --vnc-password "op://Zondax/macos ci/password"
+```
+
+This writes the global config. `--local` writes `./.kobe.toml` instead, so a
+project can share the definition:
+
+```toml
+[hosts.mini]
+ssh = "ci@192.168.64.10"
+vnc_password = "op://Zondax/macos ci/password"
+```
+
+| Field | Meaning |
+| --- | --- |
+| `ssh` | `ssh` destination: `user@address` or an alias from `~/.ssh/config` |
+| `vnc_user` | Screen Sharing account. Defaults to the user in `ssh` |
+| `vnc_password` | Where to read that account's password (see below). Needed only for `kobe vnc --host` |
+| `vnc_port` | VNC port on the host. Defaults to 5900, where Screen Sharing listens |
+
+`vnc_password` is a reference, never the password. kobe refuses anything else
+before it reaches a file:
+
+| Reference | Read with |
+| --- | --- |
+| `op://vault/item/field` | `op read` (1Password CLI) |
+| `keychain:<service>` | `security find-generic-password -w -s <service>` |
+| `env:<VAR>` | the environment variable |
+| `cmd:<command>` | the command's output |
+
+The password is read when a VNC command connects and is not stored anywhere.
+
+`kobe host list` shows the hosts from both files. `kobe host remove mini`
+removes one.
+
+## Run, forward, log in
+
+```bash
+kobe host exec mini -- uname -a          # exits with the remote exit code
+kobe host port-forward mini 8080:8080    # until Ctrl-C
+kobe host ssh mini                       # interactive shell
+```
+
+## Drive the screen
+
+Every [desktop command](/docs/kobe/commands/vnc) takes `--host` in place of a
+lease:
+
+```bash
+kobe vnc screenshot --host mini -f mini.png
+kobe vnc click --host mini --at 640,400
+kobe vnc type --host mini --text "sshd-keygen-wrapper"
+kobe vnc key --host mini --key return
+```
+
+The RFB stream runs over `ssh -W`, so no local port is opened and nothing is
+installed on the Mac. kobe logs in to Screen Sharing with Apple's security type
+30. Input over Screen Sharing is real input to macOS, so it also works in
+places that ignore scripted clicks, such as System Settings privacy panes.
+
+`kobe vnc open --host mini` forwards Screen Sharing to a local port and opens
+it in your system VNC viewer, which asks for the account itself.
+
+## Limits
+
+- The Mac must have Screen Sharing on (System Settings > General > Sharing),
+  and the account must be allowed to use it.
+- kobe does not check who else is using the host. On a CI machine, runners may
+  be building while you click.
+- Access is whatever `ssh` allows. There is no kobe-side access policy or audit
+  for hosts.
