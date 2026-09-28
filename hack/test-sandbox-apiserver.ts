@@ -1032,6 +1032,66 @@ async function testReleaseCauseCel(): Promise<void> {
 	]);
 }
 
+function podReference(uid: string): Record<string, string> {
+	return {
+		apiVersion: "v1",
+		kind: "Pod",
+		namespace,
+		name: "sandbox-pod",
+		uid,
+	};
+}
+
+// Teardown must prove every recorded replacement Pod absent, so the API server
+// has to refuse a status write that drops one (kunobi-ninja/kobe#409).
+async function testReplacementPodsCel(): Promise<void> {
+	const name = "replacement-pods";
+	let lease = await createLease(name);
+	await patchStatus(name, lease.metadata.uid, lease.metadata.resourceVersion, [
+		{
+			op: "add",
+			path: "/status",
+			value: {
+				phase: "Releasing",
+				releaseCause: "Requested",
+				conditions: [],
+				target: { namespace, replacementPods: [podReference("pod-a")] },
+			},
+		},
+	]);
+	lease = await getLease(name);
+	await patchStatus(name, lease.metadata.uid, lease.metadata.resourceVersion, [
+		{
+			op: "add",
+			path: "/status/target/replacementPods/-",
+			value: podReference("pod-b"),
+		},
+	]);
+	lease = await getLease(name);
+	const recorded = (
+		lease.status as { target?: { replacementPods?: { uid: string }[] } }
+	).target?.replacementPods?.map((pod) => pod.uid);
+	assert(
+		JSON.stringify(recorded) === JSON.stringify(["pod-a", "pod-b"]),
+		`replacementPods append was not persisted: ${JSON.stringify(recorded)}`,
+	);
+	info("replacementPods append accepted");
+
+	await expectRejected("replacementPods entry removal", name, [
+		{ op: "remove", path: "/status/target/replacementPods/0" },
+	]);
+	await expectRejected("replacementPods field removal", name, [
+		{ op: "remove", path: "/status/target/replacementPods" },
+	]);
+	await expectRejected("replacementPods beyond its bound", name, [
+		{
+			op: "replace",
+			path: "/status/target/replacementPods",
+			value: ["pod-a", "pod-b", "pod-c", "pod-d", "pod-e"].map(podReference),
+		},
+	]);
+}
+
 async function expectFenceRejected(
 	label: string,
 	name: string,
@@ -1266,6 +1326,7 @@ try {
 		`SandboxLease API-server contract (${context}, namespace ${namespace})`,
 	);
 	await testReleaseCauseCel();
+	await testReplacementPodsCel();
 	await testTemplateFilesAdmission();
 	await testJsonPatchFences();
 	await testAdmissionCancellationCas();

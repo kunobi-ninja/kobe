@@ -800,6 +800,7 @@ pub fn child_provenance(
         sandbox_claim: None,
         sandbox: None,
         pod: None,
+        replacement_pods: Vec::new(),
         service: None,
         service_required: None,
     }

@@ -628,9 +628,9 @@ spec:
                     type: string
                   pod:
                     description: |-
-                      Non-secret identity of one exact Kubernetes object. String fields use the
-                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
-                      finite admission cost instead of being rejected by the API server.
+                      The Pod this lease resolved to and served. Every execution record and
+                      scoped credential of the lease names this exact UID, so it is written
+                      once and never changed afterwards, not even during teardown.
                     nullable: true
                     properties:
                       apiVersion:
@@ -666,6 +666,56 @@ spec:
                     - name
                     - uid
                     type: object
+                  replacementPods:
+                    description: |-
+                      Pods the recorded Sandbox created after [`Self::pod`] was recorded.
+
+                      Agent Sandbox creates a Pod whenever its Sandbox has none, so deleting
+                      the served Pod during teardown produces a replacement under the same
+                      name with a new UID. It is a descendant teardown must prove absent,
+                      but it never served this lease: it is kept here, append-only and
+                      bounded, rather than replacing [`Self::pod`].
+                    items:
+                      description: |-
+                        Non-secret identity of one exact Kubernetes object. String fields use the
+                        Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                        finite admission cost instead of being rejected by the API server.
+                      properties:
+                        apiVersion:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        generation:
+                          format: int64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        kind:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          maxLength: 63
+                          minLength: 1
+                          nullable: true
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        uid:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    maxItems: 4
+                    type: array
                   sandbox:
                     description: |-
                       Non-secret identity of one exact Kubernetes object. String fields use the
@@ -951,6 +1001,8 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSha256) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSha256) && self.status.target.childClusterKubeconfigSha256 == oldSelf.status.target.childClusterKubeconfigSha256)'
         - message: child kubeconfig Secret identity and payload digest must be checkpointed together
           rule: '!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))'
+        - message: status.target.replacementPods is append-only
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.replacementPods) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.replacementPods) && oldSelf.status.target.replacementPods.all(recorded, self.status.target.replacementPods.exists(kept, kept.uid == recorded.uid)))'
         - message: status.target.serviceRequired is immutable once recorded
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.serviceRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.serviceRequired) && self.status.target.serviceRequired == oldSelf.status.target.serviceRequired)'
         - message: childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance

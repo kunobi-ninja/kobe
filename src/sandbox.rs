@@ -1002,6 +1002,9 @@ pub fn merge_target_provenance(
         )?,
         sandbox: merge_reference("sandbox", &existing.sandbox, proposed.sandbox)?,
         pod: merge_reference("pod", &existing.pod, proposed.pod)?,
+        // Append-only: teardown records replacements, and no later proposal
+        // may drop one it must still prove absent.
+        replacement_pods: merge_append_only(&existing.replacement_pods, proposed.replacement_pods),
         service: merge_reference("service", &existing.service, proposed.service)?,
         // Monotonic for the same reason every reference above is. The pool
         // generation is fenced for the life of a lease, so an honest reconcile
@@ -1254,6 +1257,19 @@ fn merge_reference(
         (Some(current), Some(proposed)) if current == &proposed => Ok(Some(current.clone())),
         (Some(_), Some(_)) => Err(SandboxProvenanceError::ReferenceChanged(field)),
     }
+}
+
+fn merge_append_only(
+    existing: &[SandboxObjectReference],
+    proposed: Vec<SandboxObjectReference>,
+) -> Vec<SandboxObjectReference> {
+    let mut merged = existing.to_vec();
+    for reference in proposed {
+        if !merged.contains(&reference) {
+            merged.push(reference);
+        }
+    }
+    merged
 }
 
 fn merge_string(
@@ -1615,6 +1631,8 @@ pub enum QuarantineReason {
     PodOwnerIdentityChanged,
     PodProvenanceMissing,
     PodSelectorAmbiguous,
+    /// The recorded Sandbox kept producing replacement Pods during teardown.
+    PodReplacementUnbounded,
     PreCreateChildHandlePresent,
     PreCreateProvenanceInvalid,
     PvEnumerationUnverifiable,
@@ -1755,6 +1773,7 @@ impl QuarantineReason {
             Self::PodOwnerIdentityChanged => "pod_owner_identity_changed",
             Self::PodProvenanceMissing => "pod_provenance_missing",
             Self::PodSelectorAmbiguous => "pod_selector_ambiguous",
+            Self::PodReplacementUnbounded => "pod_replacement_unbounded",
             Self::PreCreateChildHandlePresent => "pre_create_child_handle_present",
             Self::PreCreateProvenanceInvalid => "pre_create_provenance_invalid",
             Self::PvEnumerationUnverifiable => "pv_enumeration_unverifiable",
@@ -2110,6 +2129,7 @@ mod tests {
             sandbox_claim: claim,
             sandbox: None,
             pod: None,
+            replacement_pods: Vec::new(),
             service: None,
             service_required: None,
         }
@@ -2696,6 +2716,7 @@ mod tests {
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            replacement_pods: Vec::new(),
             service: None,
             service_required: None,
         };

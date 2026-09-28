@@ -935,6 +935,10 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status.target.childClusterKubeconfigSha256 is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))")
         .message("child kubeconfig Secret identity and payload digest must be checkpointed together"),
+    // Teardown must prove every recorded replacement Pod absent, so a later
+    // status write may add to `replacementPods` but never drop an entry.
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.replacementPods) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.replacementPods) && oldSelf.status.target.replacementPods.all(recorded, self.status.target.replacementPods.exists(kept, kept.uid == recorded.uid)))")
+        .message("status.target.replacementPods is append-only"),
     // Release reads `serviceRequired` back as proof that this lease was never
     // supposed to own a Service. A value that could be flipped or cleared later
     // would be proof of nothing, so it is pinned at the API server as well as
@@ -1557,8 +1561,21 @@ pub struct SandboxTargetProvenance {
     pub sandbox_claim: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxObjectReference>,
+    /// The Pod this lease resolved to and served. Every execution record and
+    /// scoped credential of the lease names this exact UID, so it is written
+    /// once and never changed afterwards, not even during teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<SandboxObjectReference>,
+    /// Pods the recorded Sandbox created after [`Self::pod`] was recorded.
+    ///
+    /// Agent Sandbox creates a Pod whenever its Sandbox has none, so deleting
+    /// the served Pod during teardown produces a replacement under the same
+    /// name with a new UID. It is a descendant teardown must prove absent,
+    /// but it never served this lease: it is kept here, append-only and
+    /// bounded, rather than replacing [`Self::pod`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 4))]
+    pub replacement_pods: Vec<SandboxObjectReference>,
     /// Exact headless Service created by Agent Sandbox when the pool exposes
     /// ports. Teardown uses this UID rather than assuming Claim disappearance
     /// proves every nested dependent is gone.
