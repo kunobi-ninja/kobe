@@ -1274,6 +1274,9 @@ pub struct SandboxLeaseStatus {
     /// `Unverifiable` means Kobe could not verify the lease's own admission
     /// gate: the lease is treated as unsafe to serve and torn down through the
     /// evidence-gated path rather than holding finalizer and quota forever.
+    /// `WorkloadLost` means the lease's recorded Sandbox Pod reached a terminal
+    /// phase, for example evicted by kubelet; the `WorkloadLost` condition
+    /// carries the Pod's own reason and message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cause: Option<SandboxReleaseCause>,
 
@@ -1439,6 +1442,12 @@ pub enum SandboxReleaseCause {
     // forever. Distinct from Requested so billing and support can see the
     // capacity was taken by the system, not given back by the caller.
     Unverifiable,
+    // The exact Pod the lease recorded reached a terminal phase (for example
+    // evicted by kubelet), as reported by upstream and confirmed on the Pod.
+    // Pods run with `restartPolicy: Never`, so the workload cannot come back;
+    // the lease is torn down instead of being served as Ready until its TTL.
+    // The `WorkloadLost` condition carries the Pod's own reason for the caller.
+    WorkloadLost,
 }
 
 impl std::fmt::Display for SandboxLeasePhase {
@@ -2609,6 +2618,7 @@ mod tests {
                 "ProvisioningDeadline",
                 "ModeDisabled",
                 "Unverifiable",
+                "WorkloadLost",
                 null
             ])
         );

@@ -1641,6 +1641,13 @@ pub async fn reconcile_lease(
         }
     }
 
+    // Loss detection for a Ready management lease reads its recorded claim,
+    // not the current pool: the fences below refuse a pool edited since
+    // admission, which would otherwise hide a dead workload until its TTL.
+    if let Some(lost) = recorded_management_workload_lost(&lease, &ctx).await {
+        return release_lost_workload(&lease, &ctx, &lost).await;
+    }
+
     let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let pool = pools.get(&lease.spec.pool_ref.name).await?;
 
@@ -2001,6 +2008,18 @@ pub async fn reconcile_lease(
         }
         return Ok(Action::await_change());
     }
+    // Every lease that reaches its claim is checked here, before readiness,
+    // because a lost workload is also an unready one: a child placement (its
+    // claim lives in a composed cluster) and a management lease that is still
+    // provisioning. A Ready management lease was already checked before the
+    // pool fences, which an edited pool would otherwise keep it behind. The
+    // recorded Pod, not the claim, confirms the loss.
+    if let Some(report) = upstream_claim_finished(&claim)
+        && let Some(lost) =
+            confirm_lost_workload(&target.client, &target.namespace, &status, report).await
+    {
+        return release_lost_workload(&lease, &ctx, &lost).await;
+    }
     if !upstream_claim_is_ready(&claim) {
         debug!(lease = %name, "claim not Ready yet; TTL clock has not started");
         return Ok(Action::requeue(std::time::Duration::from_secs(10)));
@@ -2316,6 +2335,10 @@ enum ReleaseReason {
     /// stamped `Unverifiable` and torn down through the ordinary evidence path
     /// rather than being held without a reachable exit.
     Unverifiable,
+    /// The recorded Sandbox Pod reached a terminal phase. The Pod cannot
+    /// restart, so the lease would otherwise answer Ready for a workload that
+    /// no longer exists until its TTL ran out.
+    WorkloadLost,
 }
 
 impl ReleaseReason {
@@ -2327,6 +2350,7 @@ impl ReleaseReason {
             Self::ModeDisabled => "ModeDisabled",
             Self::MissingCause => "ReleaseCauseMissing",
             Self::Unverifiable => "IntegrityUnverifiable",
+            Self::WorkloadLost => "WorkloadLost",
         }
     }
 
@@ -2339,6 +2363,7 @@ impl ReleaseReason {
             }
             Self::ModeDisabled => Some(crate::crd::SandboxReleaseCause::ModeDisabled),
             Self::Unverifiable => Some(crate::crd::SandboxReleaseCause::Unverifiable),
+            Self::WorkloadLost => Some(crate::crd::SandboxReleaseCause::WorkloadLost),
             Self::MissingCause => None,
         }
     }
@@ -2350,6 +2375,7 @@ impl ReleaseReason {
             crate::crd::SandboxReleaseCause::ProvisioningDeadline => Self::ProvisioningDeadline,
             crate::crd::SandboxReleaseCause::ModeDisabled => Self::ModeDisabled,
             crate::crd::SandboxReleaseCause::Unverifiable => Self::Unverifiable,
+            crate::crd::SandboxReleaseCause::WorkloadLost => Self::WorkloadLost,
         }
     }
 
@@ -2365,7 +2391,7 @@ impl ReleaseReason {
             // but the terminal phases only distinguish given-back from taken:
             // the durable `releaseCause` carries that distinction for billing
             // and support.
-            Self::Requested | Self::ModeDisabled | Self::Unverifiable => {
+            Self::Requested | Self::ModeDisabled | Self::Unverifiable | Self::WorkloadLost => {
                 crate::crd::SandboxLeasePhase::Released
             }
             Self::MissingCause => unreachable!("missing release cause must quarantine"),
@@ -8858,6 +8884,9 @@ const FOOTPRINT_ABSENT_CONDITION: &str = "FootprintAbsent";
 /// administrator's command inside a live tenant workload again after every
 /// controller restart.
 const READINESS_CANARY_CONDITION: &str = "ReadinessCanary";
+/// Why a lease's workload ended, recorded when it is released as
+/// [`ReleaseReason::WorkloadLost`].
+const WORKLOAD_LOST_CONDITION: &str = "WorkloadLost";
 
 /// Whether the readiness canary has already been observed to pass.
 fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
@@ -10504,6 +10533,197 @@ fn upstream_claim_is_ready(claim: &DynamicObject) -> bool {
                     && condition.get("status").and_then(|s| s.as_str()) == Some("True")
             })
         })
+}
+
+/// Why a lease's workload ended, as recorded on its `WorkloadLost` condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LostWorkload {
+    reason: String,
+    message: String,
+}
+
+/// Bounds for text copied onto the lease: the condition schema caps `reason`
+/// at 128 bytes, and a status write the API server rejects would leave the
+/// lease Ready — the failure this record exists to end.
+const LOST_WORKLOAD_REASON_MAX: usize = 128;
+const LOST_WORKLOAD_MESSAGE_MAX: usize = 1024;
+
+/// Upstream's report that the claim's Sandbox Pod reached a terminal phase.
+///
+/// Upstream sets `Finished=True` only for a Pod the Sandbox owns that is
+/// `Succeeded` or `Failed`, and keeps it across expiry. `Ready=False` alone is
+/// not enough: it also covers transient states such as a failing readiness
+/// probe, from which the same Pod recovers.
+fn upstream_claim_finished(claim: &DynamicObject) -> Option<LostWorkload> {
+    let finished = claim
+        .data
+        .pointer("/status/conditions")?
+        .as_array()?
+        .iter()
+        .find(|condition| {
+            condition.get("type").and_then(|t| t.as_str()) == Some("Finished")
+                && condition.get("status").and_then(|s| s.as_str()) == Some("True")
+        })?;
+    let text = |field: &str, fallback: &str| {
+        finished
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    Some(LostWorkload {
+        reason: text("reason", "Finished"),
+        message: text("message", "Sandbox Pod reached a terminal phase"),
+    })
+}
+
+/// Confirm upstream's `Finished` report against the exact Pod this lease
+/// recorded, and explain it.
+///
+/// `Finished` is only the trigger. Upstream copies it onto the claim without a
+/// Pod UID and clears it only as newer state propagates, so on its own it can
+/// describe a Pod this lease never used. The loss is confirmed only when the
+/// recorded Pod, by name AND UID, is observed in a terminal phase. A missing,
+/// replaced, running or unreadable Pod confirms nothing, and the lease keeps
+/// its ordinary TTL. Upstream only creates a Pod when the Sandbox has none, so
+/// requiring the ended Pod to still be present avoids starting teardown while
+/// a replacement may already exist. It does not stop one appearing later if
+/// the ended Pod is deleted mid-teardown; that window predates this check,
+/// exists for every release cause, and is #409.
+///
+/// Kubelet's account is preferred over upstream's generic one: "Evicted:
+/// ephemeral local storage exceeds 100Gi" tells a caller what to change,
+/// "PodFailed" does not. The Pod's `status.reason` and `status.message` are
+/// written by kubelet, never by the tenant.
+async fn confirm_lost_workload(
+    client: &Client,
+    namespace: &str,
+    status: &crate::crd::SandboxLeaseStatus,
+    upstream: LostWorkload,
+) -> Option<LostWorkload> {
+    let recorded = status.target.as_ref()?.pod.as_ref()?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = match pods.get_opt(&recorded.name).await {
+        Ok(Some(pod)) if pod.metadata.uid.as_deref() == Some(recorded.uid.as_str()) => pod,
+        Ok(_) => {
+            debug!(pod = %recorded.name, "recorded Sandbox Pod is gone or replaced; not releasing as lost");
+            return None;
+        }
+        Err(error) => {
+            debug!(pod = %recorded.name, %error, "could not read recorded Sandbox Pod; not releasing as lost");
+            return None;
+        }
+    };
+    let pod_status = pod.status.unwrap_or_default();
+    if !matches!(pod_status.phase.as_deref(), Some("Failed" | "Succeeded")) {
+        debug!(pod = %recorded.name, phase = ?pod_status.phase, "claim reports Finished but the recorded Pod is not terminal");
+        return None;
+    }
+    let Some(reason) = pod_status.reason.filter(|reason| !reason.trim().is_empty()) else {
+        return Some(upstream);
+    };
+    let message = pod_status
+        .message
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+        .unwrap_or(upstream.message);
+    Some(LostWorkload { reason, message })
+}
+
+/// Cut `text` to at most `max` bytes on a character boundary.
+fn truncate_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// Whether a Ready management lease's recorded Sandbox has ended.
+///
+/// Reads the claim by the exact name and UID the lease recorded, in the
+/// operator namespace, so it answers without the current pool: an edited or
+/// deleted pool must not keep a dead workload's lease Ready. A claim with
+/// another UID is a reused name and says nothing about this lease. Any read
+/// failure answers "not lost": the ordinary path runs next, and a missing
+/// signal must never be what tears a live workload down. The claim's report
+/// is then confirmed against the recorded Pod by [`confirm_lost_workload`].
+///
+/// Child placement is not covered here: its claim lives in a composed cluster
+/// whose client this early path does not build, so a Ready child lease still
+/// reaches loss detection only through the pool fences.
+async fn recorded_management_workload_lost(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> Option<LostWorkload> {
+    let status = lease.status.as_ref()?;
+    // Only a Ready lease can be stranded: before readiness the provisioning
+    // deadline already bounds it, and the claim is checked after placement.
+    if status.phase != crate::crd::SandboxLeasePhase::Ready
+        || !matches!(
+            status.placement,
+            Some(crate::crd::ResolvedSandboxPlacement::Management {})
+        )
+    {
+        return None;
+    }
+    let recorded = status.target.as_ref()?.sandbox_claim.as_ref()?;
+    let lease_uid = lease.uid()?;
+    let claims: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &ctx.namespace,
+        &upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+    );
+    let claim = match claims.get_opt(&recorded.name).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return None,
+        Err(error) => {
+            debug!(lease = %lease.name_any(), %error, "could not read recorded SandboxClaim for loss detection");
+            return None;
+        }
+    };
+    if claim.uid().as_deref() != Some(recorded.uid.as_str())
+        || !claim_is_for_lease(&claim, &lease_uid)
+    {
+        return None;
+    }
+    let report = upstream_claim_finished(&claim)?;
+    confirm_lost_workload(&ctx.client, &ctx.namespace, status, report).await
+}
+
+/// Tear down a lease whose workload ended, recording why.
+///
+/// The condition rides in the same fenced status write that moves the lease to
+/// `Releasing` with [`ReleaseReason::WorkloadLost`], so a reader never sees the
+/// cause without its explanation. Everything after that is the ordinary
+/// evidence-gated release, including settling open executions: an
+/// unreachable runner is recorded `Unknown`, never guessed at.
+async fn release_lost_workload(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    explanation: &LostWorkload,
+) -> Result<Action, SandboxPlacementError> {
+    warn!(
+        lease = %lease.name_any(),
+        reason = %explanation.reason,
+        message = %explanation.message,
+        "Sandbox workload ended; releasing"
+    );
+    let mut lease = lease.clone();
+    let status = lease.status.get_or_insert_with(Default::default);
+    status.conditions = with_condition_for_status(
+        status,
+        lease.metadata.generation,
+        WORKLOAD_LOST_CONDITION,
+        crate::crd::SandboxConditionStatus::True,
+        &truncate_to(&explanation.reason, LOST_WORKLOAD_REASON_MAX),
+        &truncate_to(&explanation.message, LOST_WORKLOAD_MESSAGE_MAX),
+    );
+    drive_release(&lease, ctx, ReleaseReason::WorkloadLost).await
 }
 
 fn pool_error_policy(
@@ -13429,6 +13649,404 @@ pub(crate) mod tests {
             0,
             "the lease must not be marked Ready before the Sandbox is"
         );
+    }
+
+    /// A lease that has been Ready, with its canary recorded and a runtime
+    /// deadline still an hour away: the state a live session is in when its
+    /// Pod dies underneath it.
+    fn ready_lease() -> SandboxLease {
+        let mut lease = lease_past_the_canary();
+        let status = lease.status.as_mut().unwrap();
+        let ready_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some(ready_at.to_rfc3339());
+        status.expires_at = Some((ready_at + chrono::Duration::hours(1)).to_rfc3339());
+        lease
+    }
+
+    /// Serve the admitted pool, the claim with `conditions`, and accept any
+    /// lease status write, so a test can inspect what the reconcile decided.
+    async fn serve_ready_lease_claim(server: &MockServer, conditions: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": conditions,
+                    "sandbox": { "name": "sbx" }
+                }))),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready_lease()))
+            .mount(server)
+            .await;
+    }
+
+    /// Upstream's report of a Sandbox whose own Pod reached `Failed`.
+    fn finished_pod_failed_conditions() -> serde_json::Value {
+        serde_json::json!([
+            { "type": "Ready", "status": "False", "reason": "PodFailed", "message": "Pod failed" },
+            { "type": "Finished", "status": "True", "reason": "PodFailed", "message": "Pod failed" }
+        ])
+    }
+
+    /// Serve the lease's recorded Pod path with a Pod of `uid` in `phase`.
+    async fn serve_pod(server: &MockServer, uid: &str, pod_status: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(POD_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "sandbox-pod", "namespace": NS, "uid": uid },
+                "status": pod_status
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn lease_status_writes(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .filter_map(status_value_of)
+            .collect()
+    }
+
+    /// A Ready lease whose Pod was evicted is released, not left Ready.
+    ///
+    /// This is kunobi-ninja/kobe#406. Kubelet evicted a Sandbox Pod for
+    /// exceeding its ephemeral-storage limit; upstream reported
+    /// `Finished=True/PodFailed` on the claim, and the lease kept answering
+    /// `Ready` for two more days. Callers kept sending executions to a Pod that
+    /// no longer existed, and the dead lease held one of their concurrency
+    /// slots. With `restartPolicy: Never` nothing can bring that Pod back, so
+    /// the only honest outcome is teardown, with kubelet's own explanation on
+    /// the lease so the caller can learn why their session ended.
+    #[tokio::test]
+    async fn a_ready_lease_whose_pod_was_evicted_is_released_as_workload_lost() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        Mock::given(method("GET"))
+            .and(path(POD_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "sandbox-pod", "namespace": NS, "uid": "pod-uid" },
+                "status": {
+                    "phase": "Failed",
+                    "reason": "Evicted",
+                    "message": "Pod ephemeral local storage usage exceeds the total limit of containers 100Gi. "
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(ready_lease()), ctx).await.unwrap();
+
+        let writes = lease_status_writes(&server).await;
+        let [status] = writes.as_slice() else {
+            panic!("expected exactly one lease status write, got {writes:?}");
+        };
+        assert_eq!(
+            status["phase"], "Releasing",
+            "a dead workload must not stay Ready"
+        );
+        assert_eq!(status["releaseCause"], "WorkloadLost");
+        let lost = condition_of(status, WORKLOAD_LOST_CONDITION)
+            .expect("the lease must say why its workload ended");
+        assert_eq!(lost["status"], "True");
+        assert_eq!(
+            lost["reason"], "Evicted",
+            "kubelet's reason, not upstream's generic one"
+        );
+        assert_eq!(
+            lost["message"],
+            "Pod ephemeral local storage usage exceeds the total limit of containers 100Gi."
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", CLAIM_PATH).await,
+            0,
+            "a lost workload must not have its shutdown re-stamped as if it were live"
+        );
+    }
+
+    /// An edited pool does not hide a lost workload.
+    ///
+    /// Placement refuses a pool whose generation moved since admission, and
+    /// operators edit pools routinely (warm capacity, image bumps). If loss
+    /// detection sat behind that fence, every pass for a lease admitted before
+    /// the edit would fail on the generation check and the lease would stay
+    /// Ready until its TTL: #406 again, just under a different precondition.
+    /// Detection for a placed management lease uses its recorded claim
+    /// identity instead of the current pool.
+    #[tokio::test]
+    async fn a_lost_workload_is_released_even_after_its_pool_was_edited() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION + 1)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": finished_pod_failed_conditions(),
+                    "sandbox": { "name": "sbx" }
+                }))),
+            )
+            .mount(&server)
+            .await;
+        serve_pod(&server, "pod-uid", serde_json::json!({ "phase": "Failed" })).await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready_lease()))
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(ready_lease()), ctx)
+            .await
+            .expect("a lost workload must not be blocked by the admitted-generation fence");
+
+        let writes = lease_status_writes(&server).await;
+        let [status] = writes.as_slice() else {
+            panic!("expected exactly one lease status write, got {writes:?}");
+        };
+        assert_eq!(status["phase"], "Releasing");
+        assert_eq!(status["releaseCause"], "WorkloadLost");
+    }
+
+    /// A Sandbox whose Pod ends while still provisioning is released at once,
+    /// rather than retrying a canary against a dead Pod until the provisioning
+    /// deadline expires the lease.
+    #[tokio::test]
+    async fn a_provisioning_lease_whose_pod_ended_is_released_as_workload_lost() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        serve_pod(&server, "pod-uid", serde_json::json!({ "phase": "Failed" })).await;
+
+        reconcile_lease(Arc::new(lease_past_the_canary()), ctx)
+            .await
+            .unwrap();
+
+        let writes = lease_status_writes(&server).await;
+        let [status] = writes.as_slice() else {
+            panic!("expected exactly one lease status write, got {writes:?}");
+        };
+        assert_eq!(status["phase"], "Releasing");
+        assert_eq!(status["releaseCause"], "WorkloadLost");
+    }
+
+    /// A same-named claim with another UID is not this lease's evidence.
+    ///
+    /// Detection reads the claim by its recorded name, so a delete-and-recreate
+    /// of that name must not let somebody else's finished Sandbox end this
+    /// lease.
+    #[tokio::test]
+    async fn a_reused_claim_name_does_not_end_a_lease() {
+        let (ctx, server) = test_context().await;
+        let mut foreign = claim_json(serde_json::json!({
+            "conditions": finished_pod_failed_conditions(),
+            "sandbox": { "name": "sbx" }
+        }));
+        foreign["metadata"]["uid"] = "another-claim-uid".into();
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION + 1)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
+            .mount(&server)
+            .await;
+
+        let _ = reconcile_lease(Arc::new(ready_lease()), ctx).await;
+
+        assert_eq!(
+            requests_to(&server, "PATCH", LEASE_STATUS_PATH).await,
+            0,
+            "a claim with a different UID must not start teardown"
+        );
+    }
+
+    /// Kubelet's reason is a courtesy; a terminal Pod without one is still a
+    /// lost workload, explained by upstream's own report.
+    #[tokio::test]
+    async fn a_failed_pod_without_a_reason_is_explained_by_upstream() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        serve_pod(&server, "pod-uid", serde_json::json!({ "phase": "Failed" })).await;
+
+        reconcile_lease(Arc::new(ready_lease()), ctx).await.unwrap();
+
+        let writes = lease_status_writes(&server).await;
+        let [status] = writes.as_slice() else {
+            panic!("expected exactly one lease status write, got {writes:?}");
+        };
+        assert_eq!(status["releaseCause"], "WorkloadLost");
+        let lost = condition_of(status, WORKLOAD_LOST_CONDITION).unwrap();
+        assert_eq!(lost["reason"], "PodFailed");
+        assert_eq!(lost["message"], "Pod failed");
+    }
+
+    /// Upstream's `Finished` is a trigger, not the verdict: the recorded Pod
+    /// decides.
+    ///
+    /// Upstream copies `Finished` onto the claim without a Pod UID, and clears
+    /// it only as newer state propagates. A Pod that failed and was replaced
+    /// before this lease first resolved one can leave a stale report behind
+    /// while the Pod the lease actually recorded is running. Ending that lease
+    /// would destroy a working session on somebody else's evidence.
+    #[tokio::test]
+    async fn a_stale_finished_report_does_not_end_a_lease_whose_pod_is_running() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        serve_pod(
+            &server,
+            "pod-uid",
+            serde_json::json!({ "phase": "Running" }),
+        )
+        .await;
+
+        let _ = reconcile_lease(Arc::new(ready_lease()), ctx).await;
+
+        assert_eq!(
+            requests_to(&server, "PATCH", LEASE_STATUS_PATH).await,
+            0,
+            "a running recorded Pod must veto a stale Finished report"
+        );
+    }
+
+    /// A recorded Pod that is gone is left to the TTL, not released early.
+    ///
+    /// Upstream creates a Pod whenever none exists, so once the recorded one is
+    /// deleted a replacement with a new UID can appear at any moment. Releasing
+    /// then would let teardown record that replacement over the Pod this
+    /// lease's executions name, and quarantine their cleanup (#409). While the
+    /// terminal Pod still exists no replacement can, since both carry the
+    /// Sandbox's name, which is the case this release is for.
+    #[tokio::test]
+    async fn a_finished_claim_whose_pod_is_gone_leaves_the_lease_to_its_ttl() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        Mock::given(method("GET"))
+            .and(path(POD_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        let _ = reconcile_lease(Arc::new(ready_lease()), ctx).await;
+
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+    }
+
+    /// A same-named Pod with another UID is a replacement, not this lease's
+    /// Pod: the same #409 hazard as a missing one, so the lease is left alone.
+    #[tokio::test]
+    async fn a_replacement_pod_does_not_end_the_lease() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(&server, finished_pod_failed_conditions()).await;
+        serve_pod(
+            &server,
+            "another-pod-uid",
+            serde_json::json!({ "phase": "Failed", "reason": "Evicted", "message": "not this lease's Pod" }),
+        )
+        .await;
+
+        let _ = reconcile_lease(Arc::new(ready_lease()), ctx).await;
+
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+    }
+
+    /// A claim that is merely unready does not end a live lease.
+    ///
+    /// Upstream reports `Ready=False` for transient states too — a Pod that
+    /// briefly failed its readiness probe, a Service still being provisioned.
+    /// Tearing a caller's session down on one of those would turn a blip into
+    /// data loss. Only `Finished=True`, a terminal Pod phase, is final.
+    #[tokio::test]
+    async fn an_unready_claim_that_has_not_finished_leaves_a_ready_lease_alone() {
+        let (ctx, server) = test_context().await;
+        serve_ready_lease_claim(
+            &server,
+            serde_json::json!([
+                { "type": "Ready", "status": "False", "reason": "DependenciesNotReady" }
+            ]),
+        )
+        .await;
+
+        reconcile_lease(Arc::new(ready_lease()), ctx).await.unwrap();
+
+        assert_eq!(
+            requests_to(&server, "PATCH", LEASE_STATUS_PATH).await,
+            0,
+            "a transient unready claim must not start teardown"
+        );
+        assert_eq!(requests_to(&server, "GET", POD_PATH).await, 0);
+    }
+
+    /// Text copied onto the lease is clamped on a character boundary.
+    ///
+    /// The condition schema caps `reason` at 128 bytes; an oversized value
+    /// would make the API server reject the very status write that ends the
+    /// stuck Ready state. Cutting inside a multi-byte character would produce
+    /// invalid UTF-8 and panic instead.
+    #[test]
+    fn lost_workload_text_is_clamped_on_a_character_boundary() {
+        assert_eq!(truncate_to("Evicted", LOST_WORKLOAD_REASON_MAX), "Evicted");
+        let long = "é".repeat(LOST_WORKLOAD_REASON_MAX);
+        let clamped = truncate_to(&long, LOST_WORKLOAD_REASON_MAX);
+        assert!(clamped.len() <= LOST_WORKLOAD_REASON_MAX);
+        assert_eq!(clamped, "é".repeat(LOST_WORKLOAD_REASON_MAX / 2));
+        assert_eq!(truncate_to("aé", 2), "a", "must not split the two-byte é");
+    }
+
+    /// A lost workload is taken by the system, and its cause survives restarts.
+    ///
+    /// Once persisted, `WorkloadLost` must read back as the same reason — the
+    /// first cause wins forever — and end in `Released`, alongside the other
+    /// system-taken teardown (`Unverifiable`). `Expired` would tell the caller
+    /// their time ran out, which is not what happened.
+    #[test]
+    fn workload_lost_round_trips_and_ends_released() {
+        let reason = ReleaseReason::WorkloadLost;
+        let persisted = reason.persisted_cause().unwrap();
+        assert_eq!(persisted, crate::crd::SandboxReleaseCause::WorkloadLost);
+        assert_eq!(ReleaseReason::from_persisted(persisted), reason);
+        assert_eq!(
+            reason.terminal_phase(),
+            crate::crd::SandboxLeasePhase::Released
+        );
+
+        let mut lease = ready_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(persisted);
+        assert_eq!(release_reason(&lease), Some(ReleaseReason::WorkloadLost));
     }
 
     /// A lease is Ready only once its shutdown is bounded WITHOUT Kobe.
