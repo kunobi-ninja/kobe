@@ -129,7 +129,8 @@ TigerVNC is the RFB path.
 - The VNC server must be the one the workspace image starts, listening on
   loopback inside the Sandbox. A server asking for a VNC password is refused:
   kobe reaches the desktop over an already-authenticated stream and holds no
-  VNC credentials. That is also why macOS Screen Sharing cannot connect: it
-  always prompts for a password.
+  VNC credentials. The exception is `--host`, which logs in to a Mac's Screen
+  Sharing with a password you configure; see
+  [host commands](/docs/kobe/commands/host).
 - Colour-map servers are refused rather than rendered with the wrong colours.
 - A framebuffer larger than 64 megapixels is refused rather than allocated.

@@ -81,6 +81,34 @@ pub struct KobeTarget {
     pub default_pool: Option<String>,
 }
 
+/// A persistent machine reached over plain SSH, such as a self-hosted CI Mac.
+///
+/// Not a [`KobeTarget`]: a target is an API endpoint that leases pods, and a
+/// host is one machine that is always there. `kobe host` and
+/// `kobe vnc --host` reach it with the system `ssh`, so it works with
+/// whatever `~/.ssh/config`, agent and keys already reach it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KobeHost {
+    /// `ssh` destination, e.g. `ci@192.168.64.10` or an alias from
+    /// `~/.ssh/config`.
+    pub ssh: String,
+
+    /// Account for the Screen Sharing login. Defaults to the user in
+    /// [`Self::ssh`], else the local user name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnc_user: Option<String>,
+
+    /// Where to read that account's password: `op://vault/item/field`,
+    /// `keychain:<service>`, `env:<VAR>` or `cmd:<shell command>`. Never the
+    /// password itself; see [`super::host::resolve_secret`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnc_password: Option<String>,
+
+    /// VNC port on the host. Screen Sharing listens on 5900.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnc_port: Option<u16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub target: Option<String>,
@@ -193,6 +221,10 @@ pub struct CliConfig {
     )]
     pub targets: BTreeMap<String, KobeTarget>,
 
+    /// Machines reached over SSH, by name (`kobe host`, `kobe vnc --host`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, KobeHost>,
+
     /// Per-target scope (Global/Local/Both). Populated during
     /// `load()` and used by `config list` / `config current`. Not
     /// serialized — pure runtime metadata.
@@ -300,6 +332,10 @@ impl CliConfig {
             self.target_scopes.insert(name.clone(), scope);
             self.targets.insert(name, target);
         }
+
+        // A project file can name a shared host; it shadows a global one of
+        // the same name, as local targets do.
+        self.hosts.extend(local.hosts);
 
         if local.endpoint.is_some() {
             self.endpoint = local.endpoint;
@@ -624,6 +660,50 @@ pub(crate) fn write_target_to_local(name: &str, target: KobeTarget) -> Result<Pa
     std::fs::write(&path, toml_str)
         .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Insert or replace a host in the global config, or in the local
+/// `./.kobe.toml` when `local` is set. Returns the path written.
+pub(crate) fn write_host(name: &str, host: KobeHost, local: bool) -> Result<PathBuf> {
+    if !local {
+        let mut config = CliConfig::load_global()?;
+        config.hosts.insert(name.to_string(), host);
+        config.save()?;
+        return global_config_path();
+    }
+    let path = local_config_path()?
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine current directory for .kobe.toml"))?;
+    let mut config: CliConfig = if path.exists() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        CliConfig::default()
+    };
+    config.hosts.insert(name.to_string(), host);
+    std::fs::write(&path, toml::to_string_pretty(&config)?)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Remove a host from the global config, or from `./.kobe.toml` when
+/// `local` is set. Returns whether it was there.
+pub(crate) fn remove_host(name: &str, local: bool) -> Result<bool> {
+    if !local {
+        let mut config = CliConfig::load_global()?;
+        let removed = config.hosts.remove(name).is_some();
+        if removed {
+            config.save()?;
+        }
+        return Ok(removed);
+    }
+    let Some(path) = local_config_path()?.filter(|path| path.exists()) else {
+        return Ok(false);
+    };
+    let mut config: CliConfig = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let removed = config.hosts.remove(name).is_some();
+    if removed {
+        std::fs::write(&path, toml::to_string_pretty(&config)?)?;
+    }
+    Ok(removed)
 }
 
 /// Make `<name>` the active target for **this terminal window only**.
@@ -1162,6 +1242,35 @@ mod tests {
         };
         global.overlay(local);
         assert_eq!(global.current_target.as_deref(), Some("default"));
+    }
+
+    /// A project's `.kobe.toml` can name a shared host; the global file (JSON)
+    /// keeps its own. Same name: the local one wins, as for targets.
+    #[test]
+    fn hosts_come_from_both_files_and_local_shadows_global() {
+        let mut global: CliConfig =
+            serde_json::from_str(r#"{"hosts":{"mini":{"ssh":"ci@10.0.0.1"},"lab":{"ssh":"lab"}}}"#)
+                .unwrap();
+        let local: CliConfig = toml::from_str(
+            r#"
+            [hosts.mini]
+            ssh = "ci@192.168.64.10"
+            vnc_password = "op://Zondax/macos ci/password"
+            "#,
+        )
+        .unwrap();
+        global.overlay(local);
+        assert_eq!(global.hosts["lab"].ssh, "lab");
+        let mini = &global.hosts["mini"];
+        assert_eq!(mini.ssh, "ci@192.168.64.10");
+        assert_eq!(
+            mini.vnc_password.as_deref(),
+            Some("op://Zondax/macos ci/password")
+        );
+
+        // A config without hosts writes none back.
+        let json = serde_json::to_string(&CliConfig::default()).unwrap();
+        assert!(!json.contains("hosts"), "{json}");
     }
 
     /// …and when they *are* set, local wins for every legacy field. The

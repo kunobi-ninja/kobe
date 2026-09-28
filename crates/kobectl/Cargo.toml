@@ -33,6 +33,11 @@ clap = { version = "4", features = ["derive"] }
 # Pure Rust through miniz_oxide, so it adds no platform surface to the Windows
 # cross-build this dependency set is kept slim for.
 png = "0.17"
+# Screen Sharing login (RFB security type 30): see src/commands/vnc/ard.rs.
+aes = "0.8"
+md-5 = "0.10"
+num-bigint = "0.4"
+rand = "0.8"
 clap_complete = "4"
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }

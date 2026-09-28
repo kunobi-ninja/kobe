@@ -23,7 +23,7 @@ const GLOBAL_OPTIONS: &str = "Global options";
 
 /// Top-level help sections, in print order. clap lists subcommands in one
 /// flat block; twenty commands read better grouped by what you are doing.
-/// A test keeps this table and the command tree in step.
+/// Every visible command appears once; a test checks this against the command tree.
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Get started",
@@ -47,7 +47,14 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Setup",
-        &["config", "target", "ssh-config", "completions", "version"],
+        &[
+            "config",
+            "target",
+            "host",
+            "ssh-config",
+            "completions",
+            "version",
+        ],
     ),
 ];
 
@@ -219,6 +226,15 @@ enum Commands {
     Vnc {
         #[command(subcommand)]
         action: VncCommand,
+    },
+    /// Machines reached over SSH, such as a self-hosted CI Mac
+    ///
+    /// A host is not a lease: nothing is created or recycled, and it may be
+    /// running other work while you use it. Every verb runs your own `ssh`.
+    /// `kobe vnc <action> --host NAME` drives its screen.
+    Host {
+        #[command(subcommand)]
+        action: HostCommand,
     },
     /// Read a lease's logs, or the output of one execution
     Logs {
@@ -496,12 +512,16 @@ enum VncCommand {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Where to write the image
         #[arg(long, short = 'f', default_value = "screenshot.png")]
         out: std::path::PathBuf,
-        /// VNC port inside the Sandbox
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Start the desktop and open it in the browser
     ///
@@ -511,6 +531,10 @@ enum VncCommand {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Local port to serve on; 0 picks a free one
         #[arg(long, default_value_t = 0)]
         local_port: u16,
@@ -536,59 +560,136 @@ enum VncCommand {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Text to put on the clipboard
         #[arg(long)]
         text: String,
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Click at a pixel
     Click {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Pixel to click, as `X,Y`
         #[arg(long, value_name = "X,Y")]
         at: String,
         /// left, middle, or right
         #[arg(long, default_value = "left")]
         button: String,
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Move the pointer without pressing anything
     Move {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Pixel to move to, as `X,Y`
         #[arg(long, value_name = "X,Y")]
         at: String,
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Type printable text
     Type {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// The text to type
         #[arg(long)]
         text: String,
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Press one named key, such as return or escape
     Key {
         /// Lease id, name, or pool. Omit it to pick from the ones that
         /// can serve a desktop.
         lease: Option<String>,
+        /// A host from `kobe host set` instead of a lease: its Screen Sharing,
+        /// reached over SSH.
+        #[arg(long, conflicts_with = "lease")]
+        host: Option<String>,
         /// Key name
         #[arg(long)]
         key: String,
-        #[arg(long, default_value_t = 5900)]
-        port: u16,
+        /// VNC port: inside the Sandbox, or on the host (default 5900)
+        #[arg(long)]
+        port: Option<u16>,
     },
+}
+
+#[derive(Subcommand)]
+enum HostCommand {
+    /// Define or update a host
+    Set {
+        /// Name to use with --host and `kobe host <verb>`
+        name: String,
+        /// ssh destination, e.g. ci@192.168.64.10 or an ~/.ssh/config alias
+        #[arg(long)]
+        ssh: String,
+        /// Screen Sharing account; defaults to the ssh user
+        #[arg(long)]
+        vnc_user: Option<String>,
+        /// Where to read the Screen Sharing password: op://vault/item/field,
+        /// keychain:<service>, env:<VAR> or cmd:<command>. Never the password.
+        #[arg(long)]
+        vnc_password: Option<String>,
+        /// VNC port on the host; Screen Sharing uses 5900
+        #[arg(long)]
+        vnc_port: Option<u16>,
+        /// Write to ./.kobe.toml instead of the global config
+        #[arg(long)]
+        local: bool,
+    },
+    /// List hosts
+    List,
+    /// Remove a host
+    Remove {
+        name: String,
+        /// Remove from ./.kobe.toml instead of the global config
+        #[arg(long)]
+        local: bool,
+    },
+    /// Run a command on a host and exit with its exit code
+    Exec {
+        name: String,
+        /// The command to run, after `--`
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Forward a local port to a port on the host's loopback
+    PortForward {
+        name: String,
+        /// LOCAL:REMOTE, e.g. 5901:5900
+        spec: String,
+        /// Local address to listen on
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
+        bind: String,
+    },
+    /// Open an interactive shell on a host
+    Ssh { name: String },
 }
 
 #[derive(Subcommand)]
@@ -959,6 +1060,7 @@ async fn main() -> anyhow::Result<()> {
             }
             if let VncCommand::Open {
                 lease,
+                host,
                 local_port,
                 port,
                 no_browser,
@@ -966,6 +1068,12 @@ async fn main() -> anyhow::Result<()> {
                 native,
             } = action
             {
+                if let Some(host) = host {
+                    let code = commands::host::open_vnc(&host, port, local_port, !no_browser)
+                        .await
+                        .unwrap_or_else(|error| exit_resource_error(error, output));
+                    std::process::exit(code);
+                }
                 let lease = commands::lease_for_capability(
                     lease.as_deref(),
                     "port-forward",
@@ -991,14 +1099,21 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|error| exit_resource_error(error, output));
                 std::process::exit(code);
             }
-            let (lease, port, todo) = match action {
-                VncCommand::Screenshot { lease, out, port } => (
+            let (lease, host, port, todo) = match action {
+                VncCommand::Screenshot {
                     lease,
+                    host,
+                    out,
+                    port,
+                } => (
+                    lease,
+                    host,
                     port,
                     commands::vnc::VncAction::Screenshot { path: out },
                 ),
                 VncCommand::Click {
                     lease,
+                    host,
                     at: spec,
                     button,
                     port,
@@ -1007,29 +1122,51 @@ async fn main() -> anyhow::Result<()> {
                     let button = commands::vnc::Button::parse(&button)?;
                     (
                         lease,
+                        host,
                         port,
                         commands::vnc::VncAction::Click { x, y, button },
                     )
                 }
                 VncCommand::Move {
                     lease,
+                    host,
                     at: spec,
                     port,
                 } => {
                     let (x, y) = at(&spec)?;
-                    (lease, port, commands::vnc::VncAction::Move { x, y })
+                    (lease, host, port, commands::vnc::VncAction::Move { x, y })
                 }
-                VncCommand::Type { lease, text, port } => {
-                    (lease, port, commands::vnc::VncAction::Type { text })
-                }
-                VncCommand::Key { lease, key, port } => {
-                    (lease, port, commands::vnc::VncAction::Key { name: key })
-                }
-                VncCommand::Paste { lease, text, port } => {
-                    (lease, port, commands::vnc::VncAction::Paste { text })
-                }
+                VncCommand::Type {
+                    lease,
+                    host,
+                    text,
+                    port,
+                } => (lease, host, port, commands::vnc::VncAction::Type { text }),
+                VncCommand::Key {
+                    lease,
+                    host,
+                    key,
+                    port,
+                } => (
+                    lease,
+                    host,
+                    port,
+                    commands::vnc::VncAction::Key { name: key },
+                ),
+                VncCommand::Paste {
+                    lease,
+                    host,
+                    text,
+                    port,
+                } => (lease, host, port, commands::vnc::VncAction::Paste { text }),
                 VncCommand::Open { .. } => unreachable!("handled above"),
             };
+            if let Some(host) = host {
+                let code = commands::host::vnc(&host, port, todo, output)
+                    .await
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
+                std::process::exit(code);
+            }
             let lease = commands::lease_for_capability(
                 lease.as_deref(),
                 "port-forward",
@@ -1040,9 +1177,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .unwrap_or_else(|error| exit_resource_error(error, output));
-            let code = commands::vnc::run(&lease, port, todo, target, endpoint, output)
-                .await
-                .unwrap_or_else(|error| exit_resource_error(error, output));
+            let code =
+                commands::vnc::run(&lease, port.unwrap_or(5900), todo, target, endpoint, output)
+                    .await
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
             std::process::exit(code);
         }
         Commands::Logs {
@@ -1236,6 +1374,43 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Target { action } => {
             run_target_action(action.unwrap_or(TargetAction::List), output).await
+        }
+        Commands::Host { action } => {
+            // exec, port-forward and ssh exit with ssh's own code.
+            let code = match action {
+                HostCommand::Set {
+                    name,
+                    ssh,
+                    vnc_user,
+                    vnc_password,
+                    vnc_port,
+                    local,
+                } => commands::host::set(commands::host::SetHostCommand {
+                    name: &name,
+                    ssh: &ssh,
+                    vnc_user: vnc_user.as_deref(),
+                    vnc_password: vnc_password.as_deref(),
+                    vnc_port,
+                    local,
+                    output,
+                })
+                .await
+                .map(|()| 0),
+                HostCommand::List => commands::host::list(output).await.map(|()| 0),
+                HostCommand::Remove { name, local } => commands::host::remove(&name, local, output)
+                    .await
+                    .map(|()| 0),
+                HostCommand::Exec { name, command } => commands::host::exec(&name, &command).await,
+                HostCommand::PortForward { name, spec, bind } => {
+                    commands::host::port_forward(&name, &spec, &bind).await
+                }
+                HostCommand::Ssh { name } => commands::host::shell(&name).await,
+            }
+            .unwrap_or_else(|error| exit_resource_error(error, output));
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     };
     // One place decides how a failure reaches the caller: every command
@@ -1687,6 +1862,65 @@ mod tests {
 
     /// `kobe target` owns the target commands; the `kobe config` spellings
     /// they had before must keep parsing, because scripts call them.
+    #[test]
+    fn host_verbs_and_vnc_host_parse() {
+        let cli = Cli::try_parse_from([
+            "kobe",
+            "host",
+            "set",
+            "mini",
+            "--ssh",
+            "ci@192.168.64.10",
+            "--vnc-password",
+            "op://Zondax/macos ci/password",
+        ])
+        .unwrap();
+        let Commands::Host {
+            action:
+                HostCommand::Set {
+                    name,
+                    ssh,
+                    vnc_password,
+                    local,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected host set")
+        };
+        assert_eq!((name.as_str(), ssh.as_str()), ("mini", "ci@192.168.64.10"));
+        assert_eq!(
+            vnc_password.as_deref(),
+            Some("op://Zondax/macos ci/password")
+        );
+        assert!(!local, "global unless --local");
+
+        let cli =
+            Cli::try_parse_from(["kobe", "host", "exec", "mini", "--", "uname", "-a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Host { action: HostCommand::Exec { ref command, .. } } if command == &["uname", "-a"]
+        ));
+
+        let cli =
+            Cli::try_parse_from(["kobe", "vnc", "screenshot", "--host", "mini", "-f", "m.png"])
+                .unwrap();
+        let Commands::Vnc {
+            action: VncCommand::Screenshot {
+                lease, host, port, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected vnc screenshot")
+        };
+        assert_eq!((lease, host.as_deref(), port), (None, Some("mini"), None));
+
+        // A lease and a host name two different machines.
+        assert!(
+            Cli::try_parse_from(["kobe", "vnc", "screenshot", "sb-1", "--host", "mini"]).is_err()
+        );
+    }
+
     #[test]
     fn target_commands_parse_under_both_spellings() {
         let cli = Cli::try_parse_from(["kobe", "target"]).unwrap();

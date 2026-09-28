@@ -4,6 +4,7 @@
     "reference",
     "sandbox",
     "vnc",
+    "host",
     "ssh"
   ]
 }
