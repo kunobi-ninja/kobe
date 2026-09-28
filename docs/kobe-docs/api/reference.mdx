@@ -638,7 +638,9 @@ kubelet evicted it for exceeding its ephemeral-storage limit. Pods are not
 restarted, so the lease is released instead of staying `Ready` until its TTL,
 and finishes as `Released`. The `WorkloadLost` entry in `conditions` carries
 the Pod's own reason and message (such as `Evicted` and the storage limit it
-crossed). Anything written inside the Sandbox is gone; lease a new one.
+crossed). Anything written inside the Sandbox is gone; lease a new one. Kobe
+releases only while it can still see the ended Pod; if that Pod was already
+deleted, the lease is not marked `WorkloadLost` and ends at its TTL as before.
 
 When resolved, the response may include non-secret placement and target object
 references with exact Kubernetes UIDs. It never includes bearer tokens or

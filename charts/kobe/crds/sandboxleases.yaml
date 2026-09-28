@@ -415,7 +415,7 @@ spec:
                   `Unverifiable` means Kobe could not verify the lease's own admission
                   gate: the lease is treated as unsafe to serve and torn down through the
                   evidence-gated path rather than holding finalizer and quota forever.
-                  `WorkloadLost` means upstream reported the Sandbox Pod in a terminal
+                  `WorkloadLost` means the lease's recorded Sandbox Pod reached a terminal
                   phase, for example evicted by kubelet; the `WorkloadLost` condition
                   carries the Pod's own reason and message.
                 enum:
