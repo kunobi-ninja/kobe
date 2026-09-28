@@ -467,6 +467,42 @@ spec:
                     nullable: true
                     pattern: ^/[A-Za-z0-9._/-]*$
                     type: string
+                  workspaceVolume:
+                    description: |-
+                      Optional persistent workspace volume for the default container. See
+                      [`SandboxWorkspaceVolume`]. Absent keeps today's shape: no volumes
+                      beyond `files`, and the workspace lives in the container's writable
+                      layer.
+                    nullable: true
+                    properties:
+                      mountPath:
+                        description: |-
+                          Absolute directory in the default container where the volume is
+                          mounted. It must not be `/`, and must neither contain nor sit inside a
+                          path from `files`.
+                        maxLength: 4096
+                        minLength: 2
+                        pattern: ^/[^/\x00]+(/[^/\x00]+)*$
+                        type: string
+                      size:
+                        description: Requested capacity as a Kubernetes quantity, for example `200Gi`.
+                        maxLength: 32
+                        minLength: 1
+                        type: string
+                      storageClassName:
+                        description: |-
+                          StorageClass the claim is provisioned from. It must delete its volumes
+                          (`reclaimPolicy: Delete`): teardown waits for the volume to be gone
+                          before returning capacity, and certification refuses any other policy.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - mountPath
+                    - size
+                    - storageClassName
+                    type: object
                 required:
                 - containers
                 - defaultContainer

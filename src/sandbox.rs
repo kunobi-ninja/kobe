@@ -227,6 +227,10 @@ pub enum SandboxPoolReadinessError {
 /// privilege escalation and service-account token/service-link injection, and
 /// uses RuntimeDefault seccomp. It cannot emit PVC templates, environment
 /// values, service accounts, arbitrary volumes, or caller metadata.
+/// Name of the claim template, and of the Pod volume upstream derives from it,
+/// for a pool's workspace volume.
+pub const SANDBOX_WORKSPACE_VOLUME_NAME: &str = "workspace";
+
 pub fn build_sandbox_template(
     name: &str,
     namespace: &str,
@@ -236,12 +240,32 @@ pub fn build_sandbox_template(
     pool.validate()?;
     aggregate_resource_limits(&pool.template)?;
     let (volumes, volume_mounts) = project_secret_files(&pool.template.files);
+    let workspace = pool.template.workspace_volume.as_ref();
+    if let Some(workspace) = workspace {
+        parse_positive_quantity_nanos(
+            &workspace.size,
+            QuantityDimension::Bytes,
+            "workspaceVolume.size",
+        )?;
+    }
 
     let containers = pool
         .template
         .containers
         .iter()
         .map(|container| {
+            // The workspace belongs to the caller's session, which runs in the
+            // default container; sidecars keep only the Secret files.
+            let mut volume_mounts = volume_mounts.clone();
+            if let Some(workspace) = workspace
+                && container.name == pool.template.default_container
+            {
+                volume_mounts.push(VolumeMount {
+                    name: SANDBOX_WORKSPACE_VOLUME_NAME.to_string(),
+                    mount_path: workspace.mount_path.clone(),
+                    ..VolumeMount::default()
+                });
+            }
             // Only published ports become `ContainerPort`s. A `portRange`
             // authorizes forwarding and publishes nothing: one band supplies
             // neither the single number nor the single name a `ContainerPort`
@@ -291,7 +315,7 @@ pub fn build_sandbox_template(
                 // kubelet's own default.
                 termination_message_path: Some(SANDBOX_TERMINATION_MESSAGE_PATH.to_string()),
                 termination_message_policy: Some(SANDBOX_TERMINATION_MESSAGE_POLICY.to_string()),
-                volume_mounts: (!volume_mounts.is_empty()).then(|| volume_mounts.clone()),
+                volume_mounts: (!volume_mounts.is_empty()).then_some(volume_mounts),
                 security_context: Some(SecurityContext {
                     allow_privilege_escalation: Some(false),
                     capabilities: Some(Capabilities {
@@ -319,6 +343,12 @@ pub fn build_sandbox_template(
         termination_grace_period_seconds: Some(SANDBOX_TERMINATION_GRACE_SECONDS),
         volumes: (!volumes.is_empty()).then_some(volumes),
         security_context: Some(PodSecurityContext {
+            // A provisioned volume is root-owned; without an fsGroup the
+            // non-root Sandbox user could mount its workspace but not write
+            // to it. Only set when there is a volume, so pools without one
+            // keep their certified shape.
+            fs_group: workspace.map(|_| 65_532),
+            fs_group_change_policy: workspace.map(|_| "OnRootMismatch".to_string()),
             run_as_group: Some(65_532),
             run_as_non_root: Some(true),
             run_as_user: Some(65_532),
@@ -331,8 +361,20 @@ pub fn build_sandbox_template(
         ..Default::default()
     };
     let pod_spec = serde_json::to_value(pod_spec)?;
+    // One claim per Sandbox, owned by it and deleted with it. The
+    // claim-template policy below still stops callers adding their own.
+    let volume_claim_templates = workspace.map(|workspace| {
+        serde_json::json!([{
+            "metadata": { "name": SANDBOX_WORKSPACE_VOLUME_NAME },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": workspace.storage_class_name,
+                "resources": { "requests": { "storage": workspace.size } }
+            }
+        }])
+    });
 
-    Ok(managed_object(
+    let mut object = managed_object(
         SANDBOX_TEMPLATE_KIND,
         name,
         namespace,
@@ -356,7 +398,11 @@ pub fn build_sandbox_template(
                 "volumeClaimTemplatesPolicy": "Disallowed"
             }
         }),
-    ))
+    );
+    if let Some(templates) = volume_claim_templates {
+        object.data["spec"]["volumeClaimTemplates"] = templates;
+    }
+    Ok(object)
 }
 
 /// Mode for Secret files inside the container. UID 65532 has to read them;
@@ -1016,6 +1062,13 @@ pub fn merge_target_provenance(
             "serviceRequired",
             &existing.service_required,
             proposed.service_required,
+        )?,
+        // Monotonic for the same reason: teardown decides from this whether
+        // Sandbox-owned storage is this lease's workspace or a violation.
+        workspace_volume_required: merge_flag(
+            "workspaceVolumeRequired",
+            &existing.workspace_volume_required,
+            proposed.workspace_volume_required,
         )?,
     })
 }
@@ -1857,6 +1910,7 @@ mod tests {
                 runner_path: None,
                 attach_command: None,
                 files: vec![],
+                workspace_volume: None,
             },
             isolation: SandboxIsolation::Gvisor {
                 runtime_class_name: "runsc".into(),
@@ -2132,6 +2186,115 @@ mod tests {
             replacement_pods: Vec::new(),
             service: None,
             service_required: None,
+            workspace_volume_required: None,
+        }
+    }
+
+    fn workspace_volume() -> crate::crd::SandboxWorkspaceVolume {
+        crate::crd::SandboxWorkspaceVolume {
+            storage_class_name: "openebs-zfs".into(),
+            size: "200Gi".into(),
+            mount_path: "/home/agent/work".into(),
+        }
+    }
+
+    /// A declared workspace volume becomes exactly one administrator-owned
+    /// claim template, mounted only into the default container.
+    ///
+    /// The volume is what turns "the disk is full" from an eviction that
+    /// destroys the session (kunobi-ninja/kobe#406) into writes failing with
+    /// ENOSPC while the Sandbox keeps running (#407). Callers still cannot add
+    /// volumes: the claim-template policy stays `Disallowed`.
+    #[test]
+    fn a_workspace_volume_is_one_claim_template_mounted_into_the_default_container() {
+        let mut spec = pool();
+        spec.template.containers.push(SandboxContainerSpec {
+            name: "sidecar".into(),
+            image: "example.invalid/sidecar@sha256:def".into(),
+            command: vec![],
+            args: vec![],
+            resources: SandboxContainerResources {
+                requests: quantity("100m", "64Mi", "64Mi"),
+                limits: quantity("100m", "64Mi", "64Mi"),
+            },
+        });
+        spec.template.workspace_volume = Some(workspace_volume());
+
+        let value = serde_json::to_value(
+            build_sandbox_template("agents", "targets", &spec, Some(&owner())).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["spec"]["volumeClaimTemplates"],
+            serde_json::json!([{
+                "metadata": { "name": SANDBOX_WORKSPACE_VOLUME_NAME },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "openebs-zfs",
+                    "resources": { "requests": { "storage": "200Gi" } }
+                }
+            }])
+        );
+        assert_eq!(value["spec"]["volumeClaimTemplatesPolicy"], "Disallowed");
+        let containers = &value["spec"]["podTemplate"]["spec"]["containers"];
+        assert_eq!(
+            containers[0]["volumeMounts"],
+            serde_json::json!([{ "name": SANDBOX_WORKSPACE_VOLUME_NAME, "mountPath": "/home/agent/work" }])
+        );
+        assert!(
+            containers[1].get("volumeMounts").is_none(),
+            "only the default container is the caller's workspace"
+        );
+    }
+
+    /// The Sandbox runs as UID/GID 65532 with no capabilities, and a freshly
+    /// provisioned volume is owned by root. Without an `fsGroup` the workspace
+    /// would be mounted but unwritable.
+    #[test]
+    fn a_workspace_volume_is_writable_by_the_sandbox_user() {
+        let mut spec = pool();
+        spec.template.workspace_volume = Some(workspace_volume());
+
+        let value = serde_json::to_value(
+            build_sandbox_template("agents", "targets", &spec, Some(&owner())).unwrap(),
+        )
+        .unwrap();
+        let security = &value["spec"]["podTemplate"]["spec"]["securityContext"];
+        assert_eq!(security["fsGroup"], 65_532);
+        assert_eq!(security["fsGroupChangePolicy"], "OnRootMismatch");
+    }
+
+    /// A pool without a workspace volume renders exactly as before: no claim
+    /// templates and no `fsGroup`, so existing pools keep their certified shape.
+    #[test]
+    fn a_pool_without_a_workspace_volume_renders_no_storage() {
+        let value = serde_json::to_value(
+            build_sandbox_template("agents", "targets", &pool(), Some(&owner())).unwrap(),
+        )
+        .unwrap();
+        assert!(value["spec"].get("volumeClaimTemplates").is_none());
+        assert!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]
+                .get("fsGroup")
+                .is_none()
+        );
+    }
+
+    /// The size is a Kubernetes quantity the PVC will request; a malformed or
+    /// zero size is refused before any object is rendered.
+    #[test]
+    fn a_workspace_volume_needs_a_positive_size() {
+        for size in ["", "0", "0Gi", "lots", "-1Gi"] {
+            let mut spec = pool();
+            spec.template.workspace_volume = Some(crate::crd::SandboxWorkspaceVolume {
+                size: size.into(),
+                ..workspace_volume()
+            });
+            assert!(
+                build_sandbox_template("agents", "targets", &spec, Some(&owner())).is_err(),
+                "size {size:?} must be refused"
+            );
         }
     }
 
@@ -2719,6 +2882,7 @@ mod tests {
             replacement_pods: Vec::new(),
             service: None,
             service_required: None,
+            workspace_volume_required: None,
         };
         assert_eq!(
             merge_target_provenance(Some(&target), target.clone(), &placement, "kobe"),

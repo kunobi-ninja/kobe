@@ -157,6 +157,43 @@ directories the tool needs to write in the image with ownership for UID
 Rotating the Secret updates new Pods. Warm Sandboxes already running keep the
 bytes they started with until those Pods are recreated.
 
+## Workspace volume
+
+Without a volume, everything a lease writes (the clone, build output, tool
+caches) lives in the container's writable layer and counts against
+`limits.ephemeralStorage`. When a box crosses that limit, kubelet evicts the Pod
+and the whole session is lost.
+
+`template.workspaceVolume` gives each Sandbox its own persistent volume, mounted
+into the default container:
+
+```yaml
+spec:
+  placement:
+    type: management
+  template:
+    workspaceVolume:
+      storageClassName: openebs-zfs
+      size: 200Gi
+      mountPath: /home/agent/work
+```
+
+When the volume fills up, writes fail with "No space left on device" and the
+Sandbox keeps running, so you can free space and carry on. Keep repositories and
+build output under `mountPath` to benefit; anything outside it still counts
+against the ephemeral-storage limit.
+
+- Each Sandbox gets its own claim, deleted with the Sandbox. Nothing is shared
+  between leases, and teardown returns capacity only after the claim is gone.
+- The StorageClass must use `reclaimPolicy: Delete`. A pool whose class retains
+  volumes, or names a class that does not exist, is not certified.
+- A node-local class with `volumeBindingMode: WaitForFirstConsumer` binds each
+  volume where its Pod is scheduled. Warm Sandboxes create their claim up front.
+- The volume is only available with `management` placement. `mountPath` must be
+  an absolute directory other than `/`, and must not contain or sit inside a
+  path from `files`.
+- Callers still cannot add volumes of their own.
+
 ## Idle reclaim
 
 Without `maxIdle`, a sandbox has a fixed lifetime from readiness: extensions cannot move expiry past `readyAt + maxTtl`. A box used every day and one forgotten yesterday look the same.

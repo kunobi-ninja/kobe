@@ -14447,6 +14447,7 @@ mod tests {
             replacement_pods: Vec::new(),
             service: Some(reference("Service", "sbx")),
             service_required: None,
+            workspace_volume_required: None,
         };
 
         let visible = caller_visible_provenance(target.clone());

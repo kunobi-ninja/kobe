@@ -280,6 +280,12 @@ impl SandboxPoolSpec {
         }
 
         self.template.validate_files()?;
+        self.template.validate_workspace_volume()?;
+        if self.template.workspace_volume.is_some()
+            && !matches!(self.placement, SandboxPlacement::Management {})
+        {
+            return Err(SandboxPoolValidationError::WorkspaceVolumeRequiresManagementPlacement);
+        }
 
         Ok(())
     }
@@ -498,6 +504,13 @@ pub struct SandboxTemplateSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 16))]
     pub files: Vec<SandboxTemplateFile>,
+
+    /// Optional persistent workspace volume for the default container. See
+    /// [`SandboxWorkspaceVolume`]. Absent keeps today's shape: no volumes
+    /// beyond `files`, and the workspace lives in the container's writable
+    /// layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_volume: Option<SandboxWorkspaceVolume>,
 }
 
 impl SandboxTemplateSpec {
@@ -527,8 +540,44 @@ impl SandboxTemplateSpec {
     /// no ports whose absence nothing would notice — except the provenance
     /// check that demands an exact Service identity whenever one was required.
     #[allow(dead_code)]
+    pub fn requires_workspace_volume(&self) -> bool {
+        self.workspace_volume.is_some()
+    }
+
     pub fn requires_service(&self) -> bool {
         self.published_ports().next().is_some()
+    }
+
+    fn validate_workspace_volume(&self) -> Result<(), SandboxPoolValidationError> {
+        let Some(volume) = self.workspace_volume.as_ref() else {
+            return Ok(());
+        };
+        if !is_dns1123_subdomain(&volume.storage_class_name) {
+            return Err(SandboxPoolValidationError::InvalidWorkspaceStorageClass(
+                volume.storage_class_name.clone(),
+            ));
+        }
+        let mount_path = volume.mount_path.as_str();
+        if validate_file_path(mount_path).is_err() {
+            return Err(SandboxPoolValidationError::InvalidWorkspaceMountPath(
+                mount_path.into(),
+            ));
+        }
+        let within = |inner: &str, outer: &str| {
+            inner == outer
+                || inner
+                    .strip_prefix(outer)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        for file in &self.files {
+            if within(&file.path, mount_path) || within(mount_path, &file.path) {
+                return Err(SandboxPoolValidationError::WorkspaceMountCoversFile {
+                    mount_path: mount_path.into(),
+                    file: file.path.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn validate_files(&self) -> Result<(), SandboxPoolValidationError> {
@@ -561,6 +610,35 @@ impl SandboxTemplateSpec {
         }
         Ok(())
     }
+}
+
+/// Administrator-declared persistent workspace for each Sandbox.
+///
+/// Without it, everything a lease writes lives in the container's writable
+/// layer and counts against its ephemeral-storage limit; crossing that limit
+/// gets the Pod evicted and the session lost (kunobi-ninja/kobe#406). A volume
+/// with its own size fails writes with ENOSPC instead, and the Sandbox keeps
+/// running. Each Sandbox gets its own claim, deleted with the Sandbox; nothing
+/// is shared between leases.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxWorkspaceVolume {
+    /// StorageClass the claim is provisioned from. It must delete its volumes
+    /// (`reclaimPolicy: Delete`): teardown waits for the volume to be gone
+    /// before returning capacity, and certification refuses any other policy.
+    #[schemars(
+        length(min = 1, max = 253),
+        pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+    )]
+    pub storage_class_name: String,
+    /// Requested capacity as a Kubernetes quantity, for example `200Gi`.
+    #[schemars(length(min = 1, max = 32))]
+    pub size: String,
+    /// Absolute directory in the default container where the volume is
+    /// mounted. It must not be `/`, and must neither contain nor sit inside a
+    /// path from `files`.
+    #[schemars(length(min = 2, max = 4096), pattern(r"^/[^/\x00]+(/[^/\x00]+)*$"))]
+    pub mount_path: String,
 }
 
 /// One Secret key mounted as a file in every Sandbox container.
@@ -939,6 +1017,10 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
     // status write may add to `replacementPods` but never drop an entry.
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.replacementPods) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.replacementPods) && oldSelf.status.target.replacementPods.all(recorded, self.status.target.replacementPods.exists(kept, kept.uid == recorded.uid)))")
         .message("status.target.replacementPods is append-only"),
+    // Teardown reads `workspaceVolumeRequired` to decide whether Sandbox-owned
+    // storage is this lease's workspace or a violation; it must not flip.
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.workspaceVolumeRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.workspaceVolumeRequired) && self.status.target.workspaceVolumeRequired == oldSelf.status.target.workspaceVolumeRequired)")
+        .message("status.target.workspaceVolumeRequired is immutable once recorded"),
     // Release reads `serviceRequired` back as proof that this lease was never
     // supposed to own a Service. A value that could be flipped or cleared later
     // would be proof of nothing, so it is pinned at the API server as well as
@@ -1637,6 +1719,14 @@ pub struct SandboxTargetProvenance {
     /// child with matching identities can pick the flag up there.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_required: Option<bool>,
+    /// Whether the exact pool generation that placed this lease declared a
+    /// workspace volume, recorded with the pool provenance before any Claim
+    /// exists. Teardown reads it to tell this lease's own workspace claim from
+    /// storage that violates the closed template, without asking a pool that
+    /// may since have been edited or deleted. Absent on leases placed before
+    /// workspace volumes existed, which is read as "not declared".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_volume_required: Option<bool>,
 }
 
 /// Kubernetes-style condition with the generation from which it was derived.
@@ -1673,6 +1763,16 @@ pub enum SandboxConditionStatus {
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[allow(dead_code)] // Used by runtime admission/mapping, not the `crdgen` binary.
 pub enum SandboxPoolValidationError {
+    #[error(
+        "workspaceVolume.mountPath {0:?} must be an absolute, normalised directory other than /"
+    )]
+    InvalidWorkspaceMountPath(String),
+    #[error("workspaceVolume.mountPath {mount_path:?} collides with template file {file:?}")]
+    WorkspaceMountCoversFile { mount_path: String, file: String },
+    #[error("workspaceVolume.storageClassName {0:?} is not a valid object name")]
+    InvalidWorkspaceStorageClass(String),
+    #[error("workspaceVolume is only supported with management placement")]
+    WorkspaceVolumeRequiresManagementPlacement,
     #[error("{0} must not be empty")]
     EmptyDuration(&'static str),
     #[error("warmCapacity exceeds upstream int32 replicas")]
@@ -1778,6 +1878,7 @@ mod tests {
                 runner_path: None,
                 attach_command: None,
                 files: vec![],
+                workspace_volume: None,
             },
             isolation: SandboxIsolation::TrustedRunc {},
             readiness: SandboxReadinessRequirements {
@@ -2317,6 +2418,83 @@ mod tests {
         assert!(matches!(
             spec.validate(),
             Err(SandboxPoolValidationError::TooManyFiles(_))
+        ));
+    }
+
+    /// The workspace mount path is an absolute, normalised directory that
+    /// neither is `/` nor contains, or sits inside, a mounted Secret file:
+    /// a volume over the credential file would hide it, and a file inside the
+    /// volume would be shadowed by it.
+    #[test]
+    fn a_workspace_volume_mount_path_must_not_collide() {
+        let volume = |mount_path: &str| SandboxWorkspaceVolume {
+            storage_class_name: "openebs-zfs".into(),
+            size: "200Gi".into(),
+            mount_path: mount_path.into(),
+        };
+        let mut spec = valid_pool_spec();
+        spec.template.files = vec![SandboxTemplateFile {
+            secret: "claude".into(),
+            key: "credentials.json".into(),
+            path: "/home/agent/.claude/.credentials.json".into(),
+        }];
+
+        spec.template.workspace_volume = Some(volume("/home/agent/work"));
+        assert!(spec.validate().is_ok());
+
+        for bad in ["/", "relative/work", "/home/agent/../work", "/home//agent"] {
+            spec.template.workspace_volume = Some(volume(bad));
+            assert!(
+                matches!(
+                    spec.validate(),
+                    Err(SandboxPoolValidationError::InvalidWorkspaceMountPath(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        for colliding in [
+            "/home/agent/.claude",
+            "/home/agent",
+            "/home/agent/.claude/.credentials.json",
+        ] {
+            spec.template.workspace_volume = Some(volume(colliding));
+            assert!(
+                matches!(
+                    spec.validate(),
+                    Err(SandboxPoolValidationError::WorkspaceMountCoversFile { .. })
+                ),
+                "{colliding:?} must be refused"
+            );
+        }
+
+        spec.template.workspace_volume = Some(SandboxWorkspaceVolume {
+            storage_class_name: "Not_A_Name".into(),
+            ..volume("/home/agent/work")
+        });
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::InvalidWorkspaceStorageClass(_))
+        ));
+    }
+
+    /// A child placement's Sandbox runs in a composed cluster, with its own
+    /// StorageClasses and a teardown that destroys the whole cluster. The
+    /// workspace volume is only supported where Kobe itself proves each
+    /// claim gone: management placement.
+    #[test]
+    fn a_workspace_volume_requires_management_placement() {
+        let mut spec = valid_pool_spec();
+        spec.placement = SandboxPlacement::ChildCluster {
+            cluster_pool_ref: "children".into(),
+        };
+        spec.template.workspace_volume = Some(SandboxWorkspaceVolume {
+            storage_class_name: "openebs-zfs".into(),
+            size: "200Gi".into(),
+            mount_path: "/home/agent/work".into(),
+        });
+        assert!(matches!(
+            spec.validate(),
+            Err(SandboxPoolValidationError::WorkspaceVolumeRequiresManagementPlacement)
         ));
     }
 
