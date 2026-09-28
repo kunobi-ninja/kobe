@@ -974,6 +974,16 @@ spec:
                       child with matching identities can pick the flag up there.)
                     nullable: true
                     type: boolean
+                  workspaceVolumeRequired:
+                    description: |-
+                      Whether the exact pool generation that placed this lease declared a
+                      workspace volume, recorded with the pool provenance before any Claim
+                      exists. Teardown reads it to tell this lease's own workspace claim from
+                      storage that violates the closed template, without asking a pool that
+                      may since have been edited or deleted. Absent on leases placed before
+                      workspace volumes existed, which is read as "not declared".
+                    nullable: true
+                    type: boolean
                 required:
                 - namespace
                 type: object
@@ -1003,6 +1013,8 @@ spec:
           rule: '!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))'
         - message: status.target.replacementPods is append-only
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.replacementPods) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.replacementPods) && oldSelf.status.target.replacementPods.all(recorded, self.status.target.replacementPods.exists(kept, kept.uid == recorded.uid)))'
+        - message: status.target.workspaceVolumeRequired is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.workspaceVolumeRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.workspaceVolumeRequired) && self.status.target.workspaceVolumeRequired == oldSelf.status.target.workspaceVolumeRequired)'
         - message: status.target.serviceRequired is immutable once recorded
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.serviceRequired) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.serviceRequired) && self.status.target.serviceRequired == oldSelf.status.target.serviceRequired)'
         - message: childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance

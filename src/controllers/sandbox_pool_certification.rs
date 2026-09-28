@@ -889,6 +889,22 @@ fn secret_volumes_match(expected: &Option<Vec<Volume>>, actual: &Option<Vec<Volu
     fn normalized(volumes: &Option<Vec<Volume>>) -> Option<Vec<Volume>> {
         let mut volumes = volumes.clone().unwrap_or_default();
         for volume in &mut volumes {
+            if let Some(mut claim) = volume.persistent_volume_claim.clone() {
+                // Kubernetes may omit the false default when returning the object.
+                claim.read_only = Some(claim.read_only.unwrap_or(false));
+                let normalized = Volume {
+                    name: volume.name.clone(),
+                    persistent_volume_claim: Some(claim),
+                    ..Default::default()
+                };
+                let mut original = volume.clone();
+                original.persistent_volume_claim = normalized.persistent_volume_claim.clone();
+                if original != normalized {
+                    return None;
+                }
+                *volume = normalized;
+                continue;
+            }
             let mut secret = volume.secret.clone()?;
             let items = secret.items.as_mut()?;
             items.sort_by(|a, b| (&a.key, &a.path, a.mode).cmp(&(&b.key, &b.path, b.mode)));
@@ -929,6 +945,86 @@ fn expected_pod_spec(pool: &SandboxPool, namespace: &str) -> Result<PodSpec, Str
         .cloned()
         .ok_or_else(|| "restricted template has no Pod spec".to_string())?;
     serde_json::from_value(spec).map_err(|error| format!("invalid projected Pod spec: {error}"))
+}
+
+/// The Pod one specific Sandbox must run: the projected template plus, when
+/// the pool declares a workspace volume, the claim upstream injects for it.
+/// A declared workspace volume must come from a StorageClass that deletes
+/// its volumes. Teardown returns capacity once each lease's claim is gone and
+/// relies on the class to remove the volume behind it; a retaining class
+/// would leave every lease's data on disk.
+fn check_workspace_storage_class(
+    pool: &SandboxPool,
+    class: Option<&k8s_openapi::api::storage::v1::StorageClass>,
+) -> Result<(), String> {
+    let Some(volume) = pool.spec.template.workspace_volume.as_ref() else {
+        return Ok(());
+    };
+    let Some(class) = class else {
+        return Err(format!(
+            "workspace StorageClass {} does not exist",
+            volume.storage_class_name
+        ));
+    };
+    // Kubernetes defaults an unset reclaimPolicy to Delete.
+    match class.reclaim_policy.as_deref().unwrap_or("Delete") {
+        "Delete" => Ok(()),
+        other => Err(format!(
+            "workspace StorageClass {} has reclaimPolicy {other}; only Delete removes each lease's data",
+            volume.storage_class_name
+        )),
+    }
+}
+
+async fn validate_workspace_storage_class(
+    client: &Client,
+    pool: &SandboxPool,
+) -> Result<(), String> {
+    let Some(volume) = pool.spec.template.workspace_volume.as_ref() else {
+        return Ok(());
+    };
+    let classes: Api<k8s_openapi::api::storage::v1::StorageClass> = Api::all(client.clone());
+    let class = classes
+        .get_opt(&volume.storage_class_name)
+        .await
+        .map_err(|error| format!("workspace StorageClass lookup failed: {error}"))?;
+    check_workspace_storage_class(pool, class.as_ref())
+}
+
+/// The Pod one specific Sandbox must run: the projected template plus, when
+/// the pool declares a workspace volume, the claim upstream injects for it.
+/// Certification builds the template once per pass and applies
+/// [`with_workspace_claim`] per Sandbox; this is that composition for tests.
+#[cfg(test)]
+fn expected_sandbox_pod_spec(
+    pool: &SandboxPool,
+    namespace: &str,
+    sandbox_name: &str,
+) -> Result<PodSpec, String> {
+    Ok(with_workspace_claim(
+        expected_pod_spec(pool, namespace)?,
+        pool,
+        sandbox_name,
+    ))
+}
+
+/// Upstream names each Sandbox's claim `<template>-<sandbox>` and mounts it
+/// through a Pod volume carrying the template's name.
+fn with_workspace_claim(mut spec: PodSpec, pool: &SandboxPool, sandbox_name: &str) -> PodSpec {
+    if pool.spec.template.workspace_volume.is_some() {
+        let name = crate::sandbox::SANDBOX_WORKSPACE_VOLUME_NAME;
+        spec.volumes.get_or_insert_with(Vec::new).push(Volume {
+            name: name.to_string(),
+            persistent_volume_claim: Some(
+                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: format!("{name}-{sandbox_name}"),
+                    read_only: None,
+                },
+            ),
+            ..Default::default()
+        });
+    }
+    spec
 }
 
 fn validate_pod_spec(expected: &PodSpec, actual: &PodSpec) -> Result<(), String> {
@@ -1428,7 +1524,10 @@ async fn validate_resolved_workload(
         .spec
         .as_ref()
         .ok_or_else(|| "Sandbox Pod spec is missing".to_string())?;
-    validate_pod_spec(expected_pod, pod_spec)?;
+    validate_pod_spec(
+        &with_workspace_claim((*expected_pod).clone(), pool, &resolved.sandbox_name),
+        pod_spec,
+    )?;
     let node_name = pod_spec
         .node_name
         .as_deref()
@@ -1840,6 +1939,7 @@ pub async fn reconcile_management_pool_certification(
             crate::sandbox_runtime::AGENT_SANDBOX_RELEASE
         ));
     }
+    validate_workspace_storage_class(client, pool).await?;
     let existing = pool
         .status
         .as_ref()
@@ -3137,6 +3237,105 @@ mod tests {
         assert!(
             error.contains("drifted from the closed pool template"),
             "{error}"
+        );
+    }
+
+    /// Teardown returns capacity once the workspace claim is gone and relies
+    /// on the StorageClass to delete the volume behind it. A class that
+    /// retains volumes would leave every lease's data behind, so a pool using
+    /// one is not certified. A missing class is refused too: nothing can
+    /// provision from it.
+    #[test]
+    fn a_workspace_storage_class_must_delete_its_volumes() {
+        let mut declared = pool(0);
+        declared.spec.template.workspace_volume = Some(crate::crd::SandboxWorkspaceVolume {
+            storage_class_name: "openebs-zfs".into(),
+            size: "200Gi".into(),
+            mount_path: "/home/agent/work".into(),
+        });
+        let class = |reclaim_policy: Option<&str>| k8s_openapi::api::storage::v1::StorageClass {
+            metadata: ObjectMeta {
+                name: Some("openebs-zfs".into()),
+                ..Default::default()
+            },
+            provisioner: "zfs.csi.openebs.io".into(),
+            reclaim_policy: reclaim_policy.map(str::to_string),
+            ..Default::default()
+        };
+
+        assert!(check_workspace_storage_class(&declared, Some(&class(Some("Delete")))).is_ok());
+        assert!(
+            check_workspace_storage_class(&declared, Some(&class(None))).is_ok(),
+            "Kubernetes defaults an unset reclaimPolicy to Delete"
+        );
+        let retained =
+            check_workspace_storage_class(&declared, Some(&class(Some("Retain")))).unwrap_err();
+        assert!(retained.contains("reclaimPolicy"), "{retained}");
+        let missing = check_workspace_storage_class(&declared, None).unwrap_err();
+        assert!(missing.contains("openebs-zfs"), "{missing}");
+
+        assert!(
+            check_workspace_storage_class(&pool(0), None).is_ok(),
+            "a pool without a workspace volume needs no StorageClass"
+        );
+    }
+
+    /// Upstream injects the workspace claim into the real Pod from the
+    /// template's `volumeClaimTemplates`, so it is absent from the projected
+    /// `podTemplate`. Certification accepts exactly that one claim, named for
+    /// this Sandbox, and still refuses any other volume source.
+    #[test]
+    fn pod_spec_certification_accepts_only_this_sandboxs_workspace_claim() {
+        let mut declared = pool(0);
+        declared.spec.template.workspace_volume = Some(crate::crd::SandboxWorkspaceVolume {
+            storage_class_name: "openebs-zfs".into(),
+            size: "200Gi".into(),
+            mount_path: "/home/agent/work".into(),
+        });
+        let expected = expected_sandbox_pod_spec(&declared, "kobe-system", "sbx-1").unwrap();
+        let mut scheduled = expected.clone();
+        scheduled.node_name = Some("node-1".into());
+        validate_pod_spec(&expected, &scheduled).unwrap();
+
+        let claim = |scheduled: &mut PodSpec| {
+            scheduled
+                .volumes
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|volume| volume.name == crate::sandbox::SANDBOX_WORKSPACE_VOLUME_NAME)
+                .and_then(|volume| volume.persistent_volume_claim.as_mut())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(claim(&mut scheduled.clone()).claim_name, "workspace-sbx-1");
+
+        let mut foreign = scheduled.clone();
+        for volume in foreign.volumes.as_mut().unwrap() {
+            if let Some(pvc) = volume.persistent_volume_claim.as_mut() {
+                pvc.claim_name = "workspace-another-sandbox".into();
+            }
+        }
+        assert!(
+            validate_pod_spec(&expected, &foreign).is_err(),
+            "another Sandbox's claim must not be accepted"
+        );
+
+        let mut read_only = scheduled.clone();
+        for volume in read_only.volumes.as_mut().unwrap() {
+            if let Some(pvc) = volume.persistent_volume_claim.as_mut() {
+                pvc.read_only = Some(true);
+            }
+        }
+        assert!(validate_pod_spec(&expected, &read_only).is_err());
+
+        let undeclared = expected_sandbox_pod_spec(&pool(0), "kobe-system", "sbx-1").unwrap();
+        let mut sneaked = undeclared.clone();
+        sneaked.node_name = Some("node-1".into());
+        sneaked.volumes = scheduled.volumes.clone();
+        assert!(
+            validate_pod_spec(&undeclared, &sneaked).is_err(),
+            "a pool that declares no workspace must not certify a claim"
         );
     }
 

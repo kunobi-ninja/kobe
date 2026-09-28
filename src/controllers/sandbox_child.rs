@@ -803,6 +803,7 @@ pub fn child_provenance(
         replacement_pods: Vec::new(),
         service: None,
         service_required: None,
+        workspace_volume_required: None,
     }
 }
 

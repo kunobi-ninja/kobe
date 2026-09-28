@@ -4705,16 +4705,71 @@ fn classify_exact_absence(
 
 /// Enumerate persistent storage tied to the exact recorded Sandbox owner.
 ///
-/// Kobe sets both upstream volume-claim policies to `Disallowed`, so the only
-/// valid result is an empty set. Any exact-owned PVC is therefore a policy
-/// violation and any PV whose `claimRef.uid` points to it is retained evidence
-/// of the same unexpected tenant storage. Neither is deleted automatically:
-/// quarantine preserves the evidence for an operator.
+/// Callers can never add volume claims (the upstream policy is `Disallowed`),
+/// so the only storage a Sandbox may own is the one workspace claim its pool
+/// declared, and only when [`WorkspaceStorage`] says the lease's admitted pool
+/// declared one. Anything else, including any storage at all for a pool that
+/// declared none, is a policy violation, and any PV whose `claimRef.uid`
+/// points to it is retained evidence of the same unexpected tenant storage.
+/// Neither is deleted automatically: quarantine preserves the evidence for an
+/// operator.
+/// The storage expectation recorded for this lease: `declared` only when its
+/// admitted pool declared a workspace volume.
+fn workspace_storage(
+    target: &crate::crd::SandboxTargetProvenance,
+    declared: WorkspaceStorage,
+) -> WorkspaceStorage {
+    if target.workspace_volume_required == Some(true) {
+        declared
+    } else {
+        WorkspaceStorage::Forbidden
+    }
+}
+
+/// Whether the only storage found is the one workspace claim upstream creates
+/// for this exact Sandbox (`<template>-<sandbox>`), controlled by it.
+fn is_only_the_declared_workspace_claim(
+    owned: &[PersistentVolumeClaim],
+    sandbox: Option<&SandboxObjectReference>,
+) -> bool {
+    let Some(sandbox) = sandbox else {
+        return false;
+    };
+    let expected_name = format!(
+        "{}-{}",
+        crate::sandbox::SANDBOX_WORKSPACE_VOLUME_NAME,
+        sandbox.name
+    );
+    matches!(owned, [claim] if claim.name_any() == expected_name
+    && metadata_is_controlled_by(
+        &claim.metadata,
+        &sandbox.api_version,
+        &sandbox.kind,
+        &sandbox.name,
+        &sandbox.uid,
+    ))
+}
+
+/// What teardown expects of storage owned by a lease's Sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceStorage {
+    /// The pool declared no workspace volume: any owned storage violates the
+    /// closed template.
+    Forbidden,
+    /// Declared, and the Sandbox is still being torn down: its one workspace
+    /// claim may still exist.
+    MayExist,
+    /// Declared, and deletion has started: the workspace claim must be gone
+    /// before capacity returns.
+    MustBeGone,
+}
+
 async fn exact_owned_storage_is_absent(
     client: &Client,
     namespace: &str,
     claim_uids: &[&str],
     sandbox: Option<&SandboxObjectReference>,
+    expected: WorkspaceStorage,
 ) -> TargetFootprintCheck {
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
     let owned: Vec<_> = match pvcs.list(&ListParams::default()).await {
@@ -4768,6 +4823,19 @@ async fn exact_owned_storage_is_absent(
 
     if owned.is_empty() && associated_volumes == 0 {
         TargetFootprintCheck::Verified
+    } else if expected != WorkspaceStorage::Forbidden
+        && is_only_the_declared_workspace_claim(&owned, sandbox)
+    {
+        // A PV is associated only through a live claim's UID, so once the
+        // claim is gone a PV still being reclaimed is no longer visible here.
+        // Certification requires `reclaimPolicy: Delete`, and every lease gets
+        // a fresh claim and volume, so that PV can hold no data another lease
+        // could reach; it only means capacity may return slightly before the
+        // provisioner finishes deleting it.
+        match expected {
+            WorkspaceStorage::MayExist => TargetFootprintCheck::Verified,
+            _ => TargetFootprintCheck::Retry("workspace_volume_still_present"),
+        }
     } else {
         warn!(
             sandbox = sandbox
@@ -4811,6 +4879,7 @@ async fn preflight_management_target(
         &ctx.namespace,
         &[claim.uid.as_str()],
         target.sandbox.as_ref(),
+        workspace_storage(target, WorkspaceStorage::MayExist),
     )
     .await
 }
@@ -5149,7 +5218,14 @@ async fn management_target_footprint_absent(
         .iter()
         .map(|claim_ref| claim_ref.uid.as_str())
         .collect();
-    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &claim_uids, sandbox).await
+    exact_owned_storage_is_absent(
+        &ctx.client,
+        &ctx.namespace,
+        &claim_uids,
+        sandbox,
+        workspace_storage(target, WorkspaceStorage::MustBeGone),
+    )
+    .await
 }
 
 /// Prove the empty footprint behind an admission-only release tombstone.
@@ -5228,8 +5304,14 @@ async fn admission_only_management_footprint_absent(
         }
     }
 
-    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &[tombstone.uid.as_str()], None)
-        .await
+    exact_owned_storage_is_absent(
+        &ctx.client,
+        &ctx.namespace,
+        &[tombstone.uid.as_str()],
+        None,
+        WorkspaceStorage::Forbidden,
+    )
+    .await
 }
 
 /// Prove nothing was created for a lease cancelled before any create.
@@ -5340,8 +5422,14 @@ async fn pre_create_footprint_absent(
         }
     }
 
-    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &[tombstone.uid.as_str()], None)
-        .await
+    exact_owned_storage_is_absent(
+        &ctx.client,
+        &ctx.namespace,
+        &[tombstone.uid.as_str()],
+        None,
+        WorkspaceStorage::Forbidden,
+    )
+    .await
 }
 
 /// Record the exact tombstone as the sole management Claim identity when the
@@ -5855,6 +5943,7 @@ async fn drive_release(
                 replacement_pods: Vec::new(),
                 service: None,
                 service_required: None,
+                workspace_volume_required: None,
             });
         if target.namespace != ctx.namespace {
             return quarantine_lease(lease, ctx, QuarantineReason::ClaimNamespaceChanged).await;
@@ -5901,7 +5990,9 @@ async fn drive_release(
         ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Verified) => {}
     }
 
-    match preflight_management_target(lease, ctx).await {
+    // Boxed with the other large teardown steps: keeps their state out of
+    // every `reconcile_lease` future.
+    match Box::pin(preflight_management_target(lease, ctx)).await {
         TargetFootprintCheck::Verified => {}
         TargetFootprintCheck::Retry(check) => {
             debug!(lease = %name, check, "management teardown preflight will retry");
@@ -5948,8 +6039,13 @@ async fn drive_release(
             }
         };
 
-    match management_target_footprint_absent(lease, ctx, &tombstone, prior_claim_uid.as_deref())
-        .await
+    match Box::pin(management_target_footprint_absent(
+        lease,
+        ctx,
+        &tombstone,
+        prior_claim_uid.as_deref(),
+    ))
+    .await
     {
         TargetFootprintCheck::Verified => {}
         TargetFootprintCheck::Retry(check) => {
@@ -6991,6 +7087,7 @@ async fn release_child_composition(
                                 replacement_pods: Vec::new(),
                                 service: None,
                                 service_required: None,
+                                workspace_volume_required: None,
                             });
                     proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
                     proposed.child_cluster_lease = Some(reference);
@@ -7042,6 +7139,7 @@ async fn release_child_composition(
                                 replacement_pods: Vec::new(),
                                 service: None,
                                 service_required: None,
+                                workspace_volume_required: None,
                             });
                     if target.namespace != CHILD_SANDBOX_NAMESPACE {
                         return quarantine_lease(
@@ -9469,6 +9567,9 @@ async fn observed_management_pool_provenance(
             replacement_pods: Vec::new(),
             service: None,
             service_required: None,
+            // Recorded here, from the pool fenced to the admitted UID and
+            // generation, so it is durable before any Claim can create storage.
+            workspace_volume_required: Some(pool.spec.template.requires_workspace_volume()),
         });
     proposed.sandbox_template = Some(observed.remove(0));
     proposed.sandbox_warm_pool = Some(observed.remove(0));
@@ -9637,6 +9738,11 @@ async fn observed_provenance(
         // tell "no Service was ever required" from "the Service identity is
         // missing" long after that pool generation is gone.
         service_required: Some(service_required),
+        // Recorded earlier with the pool provenance; carried so this proposal
+        // does not read as clearing it.
+        workspace_volume_required: existing
+            .as_ref()
+            .and_then(|existing| existing.workspace_volume_required),
     }))
 }
 
@@ -10151,6 +10257,7 @@ async fn compose_child_target(
             replacement_pods: Vec::new(),
             service: None,
             service_required: None,
+            workspace_volume_required: None,
         });
     proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
     proposed.child_cluster_lease = Some(crate::crd::SandboxObjectReference {
@@ -12364,6 +12471,7 @@ pub(crate) mod tests {
                     runner_path: None,
                     attach_command: None,
                     files: vec![],
+                    workspace_volume: None,
                 },
                 isolation: SandboxIsolation::TrustedRunc {},
                 readiness: SandboxReadinessRequirements {
@@ -12601,6 +12709,7 @@ pub(crate) mod tests {
                     replacement_pods: Vec::new(),
                     service: Some(reference("v1", "Service", "sandbox-service", "service-uid")),
                     service_required: None,
+                    workspace_volume_required: None,
                 }),
                 ..Default::default()
             }),
@@ -14396,6 +14505,185 @@ pub(crate) mod tests {
         assert_eq!(target["sandboxTemplate"]["uid"], "template-uid");
         assert_eq!(target["sandboxWarmPool"]["uid"], "warm-pool-uid");
         assert!(target.get("sandboxClaim").is_none());
+    }
+
+    /// Whether the admitted pool declared a workspace volume is recorded with
+    /// the pool provenance, before any Claim exists.
+    ///
+    /// Teardown must know whether storage owned by the Sandbox is this lease's
+    /// own workspace or a policy violation, and it cannot ask the pool: a pool
+    /// edited or deleted since admission would give a different answer.
+    #[tokio::test]
+    async fn the_workspace_volume_requirement_is_recorded_before_claim_creation() {
+        for declared in [true, false] {
+            let (ctx, server) = test_context().await;
+            let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+            if declared {
+                pool.spec.template.workspace_volume = Some(crate::crd::SandboxWorkspaceVolume {
+                    storage_class_name: "openebs-zfs".into(),
+                    size: "200Gi".into(),
+                    mount_path: "/home/agent/work".into(),
+                });
+            }
+            Mock::given(method("GET"))
+                .and(path(POOL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(LEASE_STATUS_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+                .mount(&server)
+                .await;
+
+            let mut lease = admitted_lease();
+            lease.status.as_mut().unwrap().target = None;
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(status_value_of)
+                .collect();
+            let target = &statuses.last().expect("pool provenance status")["target"];
+            assert_eq!(target["workspaceVolumeRequired"], declared);
+            assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+        }
+    }
+
+    /// PVCs and PVs as teardown lists them, for the storage-absence tests.
+    async fn serve_storage(server: &MockServer, pvcs: &[&str], bound_pvs: &[&str]) {
+        let pvc = |name: &&str| {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": name, "namespace": NS, "uid": format!("{name}-uid"),
+                    "ownerReferences": [{
+                        "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                        "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                        "name": "sbx",
+                        "uid": "sandbox-uid",
+                        "controller": true,
+                    }],
+                },
+            })
+        };
+        let pv = |claim: &&str| {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": { "name": format!("pv-{claim}"), "uid": format!("pv-{claim}-uid") },
+                "spec": { "claimRef": { "name": claim, "namespace": NS, "uid": format!("{claim}-uid") } },
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path(PVCS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaimList",
+                "metadata": { "resourceVersion": "1" },
+                "items": pvcs.iter().map(pvc).collect::<Vec<_>>(),
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PVS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeList",
+                "metadata": { "resourceVersion": "1" },
+                "items": bound_pvs.iter().map(pv).collect::<Vec<_>>(),
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn storage_check(
+        pvcs: &[&str],
+        bound_pvs: &[&str],
+        expected: WorkspaceStorage,
+    ) -> TargetFootprintCheck {
+        let (ctx, server) = test_context().await;
+        serve_storage(&server, pvcs, bound_pvs).await;
+        let sandbox = SandboxObjectReference {
+            api_version: crate::controllers::sandbox_canary::SANDBOX_API_VERSION.into(),
+            kind: crate::controllers::sandbox_canary::SANDBOX_KIND.into(),
+            namespace: Some(NS.into()),
+            name: "sbx".into(),
+            uid: "sandbox-uid".into(),
+            generation: None,
+        };
+        exact_owned_storage_is_absent(&ctx.client, NS, &["claim-uid"], Some(&sandbox), expected)
+            .await
+    }
+
+    /// A pool that declared no workspace still treats any owned storage as a
+    /// policy violation, exactly as before workspace volumes existed.
+    #[tokio::test]
+    async fn undeclared_storage_still_quarantines() {
+        assert_eq!(
+            storage_check(&["workspace-sbx"], &[], WorkspaceStorage::Forbidden).await,
+            TargetFootprintCheck::Quarantine(QuarantineReason::UnexpectedPersistentStorage)
+        );
+    }
+
+    /// Before the Claim becomes a tombstone the workspace is expected to
+    /// exist: it is deleted with the Sandbox, which the tombstone conversion
+    /// starts. Waiting for it here would never let teardown begin.
+    #[tokio::test]
+    async fn preflight_allows_the_declared_workspace_claim() {
+        assert_eq!(
+            storage_check(
+                &["workspace-sbx"],
+                &["workspace-sbx"],
+                WorkspaceStorage::MayExist
+            )
+            .await,
+            TargetFootprintCheck::Verified
+        );
+    }
+
+    /// After deletion starts, capacity returns only once the workspace claim
+    /// and its volume are gone, so no tenant data outlives the lease.
+    #[tokio::test]
+    async fn footprint_proof_waits_for_the_workspace_claim_and_its_volume() {
+        assert_eq!(
+            storage_check(
+                &["workspace-sbx"],
+                &["workspace-sbx"],
+                WorkspaceStorage::MustBeGone
+            )
+            .await,
+            TargetFootprintCheck::Retry("workspace_volume_still_present")
+        );
+        assert_eq!(
+            storage_check(&[], &["workspace-sbx"], WorkspaceStorage::MustBeGone).await,
+            TargetFootprintCheck::Verified,
+            "a PV is associated through its claim UID, which is gone with the claim"
+        );
+        assert_eq!(
+            storage_check(&[], &[], WorkspaceStorage::MustBeGone).await,
+            TargetFootprintCheck::Verified
+        );
+    }
+
+    /// Declaring a workspace does not excuse any other storage: a second
+    /// claim, or one not named for this Sandbox, is still unexpected.
+    #[tokio::test]
+    async fn a_declared_workspace_does_not_excuse_other_storage() {
+        for pvcs in [
+            &["workspace-sbx", "scratch-sbx"][..],
+            &["workspace-another-sandbox"][..],
+        ] {
+            for expected in [WorkspaceStorage::MayExist, WorkspaceStorage::MustBeGone] {
+                assert_eq!(
+                    storage_check(pvcs, &[], expected).await,
+                    TargetFootprintCheck::Quarantine(QuarantineReason::UnexpectedPersistentStorage),
+                    "{pvcs:?} with {expected:?}"
+                );
+            }
+        }
     }
 
     /// A controller upgrade can observe the base Claim after its CREATE but
@@ -19188,6 +19476,7 @@ pub(crate) mod tests {
             replacement_pods: Vec::new(),
             service: None,
             service_required: None,
+            workspace_volume_required: None,
         });
         status.allocation_fence = Some(crate::crd::SandboxObjectReference {
             api_version: "coordination.k8s.io/v1".into(),

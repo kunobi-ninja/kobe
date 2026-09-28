@@ -1321,6 +1321,47 @@ async function testTemplateFilesAdmission(): Promise<void> {
 	info("template.files retained; invalid paths, duplicate destinations and oversized lists rejected");
 }
 
+// The workspace volume schema must survive the real API server (no pruning)
+// and refuse the malformed shapes its patterns exist for (kobe#407).
+async function testWorkspaceVolumeAdmission(): Promise<void> {
+	const volume = { storageClassName: "openebs-zfs", size: "200Gi", mountPath: "/home/agent/work" };
+	const pool = (workspaceVolume: Record<string, string>) => ({
+		apiVersion: "kobe.kunobi.ninja/v1alpha1", kind: "SandboxPool",
+		metadata: { name: "workspace-contract", namespace },
+		spec: {
+			warmCapacity: 0, defaultTtl: "5m", maxTtl: "10m", provisioningTimeout: "5m",
+			placement: { type: "management" }, isolation: { tier: "trusted-runc" },
+			readiness: { canary: { argv: ["/bin/true"], timeout: "30s" } },
+			template: {
+				defaultContainer: "workspace", workspaceVolume,
+				containers: [{ name: "workspace", image: "registry.k8s.io/pause:3.10", resources: {
+					requests: { cpu: "10m", memory: "16Mi", ephemeralStorage: "16Mi" },
+					limits: { cpu: "100m", memory: "64Mi", ephemeralStorage: "64Mi" },
+				} }],
+			},
+		},
+	});
+	const probe = (workspaceVolume: Record<string, string>) => kubectl(
+		["create", "--dry-run=server", "--validate=false", "-f", "-", "-o", "json"],
+		{ stdin: JSON.stringify(pool(workspaceVolume)), allowFailure: true },
+	);
+	const valid = await probe(volume);
+	assert(valid.exitCode === 0, `valid workspaceVolume rejected: ${valid.stderr}`);
+	const retained = JSON.parse(valid.stdout).spec.template.workspaceVolume;
+	assert(JSON.stringify(retained) === JSON.stringify(volume), `API server pruned workspaceVolume: ${JSON.stringify(retained)}`);
+	for (const mountPath of ["relative", "/", "/home//agent"]) {
+		const result = await probe({ ...volume, mountPath });
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid mountPath ${JSON.stringify(mountPath)}: ${result.stderr}`);
+	}
+	for (const storageClassName of ["", "Not_A_Name"]) {
+		const result = await probe({ ...volume, storageClassName });
+		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid storageClassName ${JSON.stringify(storageClassName)}: ${result.stderr}`);
+	}
+	const unknown = await probe({ ...volume, accessMode: "ReadWriteMany" });
+	assert(unknown.exitCode !== 0 || JSON.parse(unknown.stdout).spec.template.workspaceVolume.accessMode === undefined, "an unknown workspaceVolume field was retained");
+	info("template.workspaceVolume retained; malformed mount paths and StorageClass names rejected");
+}
+
 try {
 	console.log(
 		`SandboxLease API-server contract (${context}, namespace ${namespace})`,
@@ -1328,6 +1369,7 @@ try {
 	await testReleaseCauseCel();
 	await testReplacementPodsCel();
 	await testTemplateFilesAdmission();
+	await testWorkspaceVolumeAdmission();
 	await testJsonPatchFences();
 	await testAdmissionCancellationCas();
 	await testAdmissionLedgerBoundary();
