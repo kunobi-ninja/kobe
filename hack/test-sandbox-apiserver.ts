@@ -1348,7 +1348,11 @@ async function testWorkspaceVolumeAdmission(): Promise<void> {
 	const valid = await probe(volume);
 	assert(valid.exitCode === 0, `valid workspaceVolume rejected: ${valid.stderr}`);
 	const retained = JSON.parse(valid.stdout).spec.template.workspaceVolume;
-	assert(JSON.stringify(retained) === JSON.stringify(volume), `API server pruned workspaceVolume: ${JSON.stringify(retained)}`);
+	// Field by field: the API server returns keys in its own order.
+	assert(
+		retained?.storageClassName === volume.storageClassName && retained?.size === volume.size && retained?.mountPath === volume.mountPath,
+		`API server pruned workspaceVolume: ${JSON.stringify(retained)}`,
+	);
 	for (const mountPath of ["relative", "/", "/home//agent"]) {
 		const result = await probe({ ...volume, mountPath });
 		assert(result.exitCode !== 0 && result.stderr.includes("spec.template"), `accepted invalid mountPath ${JSON.stringify(mountPath)}: ${result.stderr}`);
