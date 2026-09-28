@@ -4339,6 +4339,10 @@ async fn validate_management_target_provenance(
     }
 }
 
+/// Most replacement Pods teardown records for one lease. Matches the CRD
+/// bound on `target.replacementPods`.
+const MAX_REPLACEMENT_PODS: usize = 4;
+
 enum ManagementDescendantCheckpoint {
     Current,
     Updated(Box<crate::crd::SandboxTargetProvenance>),
@@ -4564,13 +4568,29 @@ async fn checkpoint_management_descendants(
                     QuarantineReason::PodOwnerIdentityChanged,
                 ));
             }
-            match target_reference("v1", "Pod", &ctx.namespace, &pod) {
-                Ok(reference) => proposed.pod = Some(reference),
+            let reference = match target_reference("v1", "Pod", &ctx.namespace, &pod) {
+                Ok(reference) => reference,
                 Err(_) => {
                     return ManagementDescendantCheckpoint::Check(
                         TargetFootprintCheck::Quarantine(QuarantineReason::PodIdentityUnverifiable),
                     );
                 }
+            };
+            // The served Pod is written once. A different Pod under the same
+            // Sandbox is a replacement upstream created after the served one
+            // went away: teardown must prove it absent too, but every
+            // execution and credential of this lease still names the served
+            // UID, so it is recorded beside it, never over it (#409).
+            match current_target.pod.as_ref() {
+                None => proposed.pod = Some(reference),
+                Some(served) if served == &reference => {}
+                Some(_) if proposed.replacement_pods.contains(&reference) => {}
+                Some(_) if proposed.replacement_pods.len() >= MAX_REPLACEMENT_PODS => {
+                    return ManagementDescendantCheckpoint::Check(
+                        TargetFootprintCheck::Quarantine(QuarantineReason::PodReplacementUnbounded),
+                    );
+                }
+                Some(_) => proposed.replacement_pods.push(reference),
             }
         }
     }
@@ -4622,6 +4642,49 @@ async fn exact_object_absence(
             ExactObjectAbsence::Transient
         }
     }
+}
+
+/// Observe whether every recorded Pod of a lease is absent.
+///
+/// The served Pod and any replacement share the Sandbox's name, so finding a
+/// Pod at that name is only foreign when its UID is none of the recorded
+/// ones. A recorded UID still there is ordinary "not gone yet".
+async fn recorded_pods_absence(
+    api: &Api<DynamicObject>,
+    recorded: &[&SandboxObjectReference],
+    expected_owner: &SandboxObjectReference,
+) -> ExactObjectAbsence {
+    let mut names: Vec<&str> = recorded.iter().map(|pod| pod.name.as_str()).collect();
+    names.dedup();
+    for name in names {
+        let observed = match api.get(name).await {
+            Ok(object) => object,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                return ExactObjectAbsence::Unverifiable;
+            }
+            Err(error) => {
+                warn!(name, error = %error, "could not read a recorded Sandbox Pod; retrying its absence check");
+                return ExactObjectAbsence::Transient;
+            }
+        };
+        let recorded_uid = recorded
+            .iter()
+            .any(|pod| observed.uid().as_deref() == Some(pod.uid.as_str()));
+        let owned = metadata_is_controlled_by(
+            &observed.metadata,
+            &expected_owner.api_version,
+            &expected_owner.kind,
+            &expected_owner.name,
+            &expected_owner.uid,
+        );
+        return if recorded_uid && owned {
+            ExactObjectAbsence::Present
+        } else {
+            ExactObjectAbsence::Replaced
+        };
+    }
+    ExactObjectAbsence::Absent
 }
 
 fn classify_exact_absence(
@@ -4797,7 +4860,7 @@ async fn claim_labelled_sandboxes_absent(
 async fn exact_owned_objects_absent(
     api: &Api<DynamicObject>,
     sandbox: &SandboxObjectReference,
-    recorded: Option<&SandboxObjectReference>,
+    recorded: &[&SandboxObjectReference],
     present: &'static str,
     replaced: QuarantineReason,
     unverifiable: QuarantineReason,
@@ -4820,11 +4883,13 @@ async fn exact_owned_objects_absent(
                 .collect();
             if owned.is_empty() {
                 TargetFootprintCheck::Verified
-            } else if recorded.is_some_and(|recorded| {
-                owned.iter().any(|object| {
-                    object.name_any() == recorded.name
-                        && object.uid().as_deref() != Some(recorded.uid.as_str())
-                })
+            } else if owned.iter().any(|object| {
+                recorded
+                    .iter()
+                    .any(|recorded| object.name_any() == recorded.name)
+                    && !recorded
+                        .iter()
+                        .any(|recorded| object.uid().as_deref() == Some(recorded.uid.as_str()))
             }) {
                 TargetFootprintCheck::Quarantine(replaced)
             } else {
@@ -4975,9 +5040,16 @@ async fn management_target_footprint_absent(
         &ctx.namespace,
         &core_resource("Pod", "pods"),
     );
-    if let (Some(pod), Some(sandbox)) = (target.pod.as_ref(), sandbox) {
+    let recorded_pods: Vec<&SandboxObjectReference> = target
+        .pod
+        .iter()
+        .chain(target.replacement_pods.iter())
+        .collect();
+    if let Some(sandbox) = sandbox
+        && !recorded_pods.is_empty()
+    {
         let check = classify_exact_absence(
-            exact_object_absence(&pods, pod, sandbox).await,
+            Box::pin(recorded_pods_absence(&pods, &recorded_pods, sandbox)).await,
             "pod_still_present",
             QuarantineReason::PodIdentityChangedDuringTeardown,
             QuarantineReason::PodAbsenceUnverifiable,
@@ -5022,7 +5094,7 @@ async fn management_target_footprint_absent(
             exact_owned_objects_absent(
                 &pods,
                 sandbox,
-                target.pod.as_ref(),
+                &recorded_pods,
                 "sandbox_owned_pod_still_present",
                 QuarantineReason::SandboxOwnedPodReplaced,
                 QuarantineReason::PodEnumerationUnverifiable,
@@ -5032,7 +5104,7 @@ async fn management_target_footprint_absent(
             exact_owned_objects_absent(
                 &services,
                 sandbox,
-                target.service.as_ref(),
+                &target.service.iter().collect::<Vec<_>>(),
                 "sandbox_owned_service_still_present",
                 QuarantineReason::SandboxOwnedServiceReplaced,
                 QuarantineReason::ServiceEnumerationUnverifiable,
@@ -5780,6 +5852,7 @@ async fn drive_release(
                 sandbox_claim: None,
                 sandbox: None,
                 pod: None,
+                replacement_pods: Vec::new(),
                 service: None,
                 service_required: None,
             });
@@ -5804,7 +5877,9 @@ async fn drive_release(
         return quarantine_lease(lease, ctx, QuarantineReason::ClaimProvenanceInvalid).await;
     }
 
-    match checkpoint_management_descendants(lease, ctx, &claims).await {
+    // Boxed like the other large teardown steps: its state would otherwise be
+    // inlined into every `reconcile_lease` future.
+    match Box::pin(checkpoint_management_descendants(lease, ctx, &claims)).await {
         ManagementDescendantCheckpoint::Current => {}
         ManagementDescendantCheckpoint::Updated(target) => {
             let mut next = status.clone();
@@ -6913,6 +6988,7 @@ async fn release_child_composition(
                                 sandbox_claim: None,
                                 sandbox: None,
                                 pod: None,
+                                replacement_pods: Vec::new(),
                                 service: None,
                                 service_required: None,
                             });
@@ -6963,6 +7039,7 @@ async fn release_child_composition(
                                 sandbox_claim: None,
                                 sandbox: None,
                                 pod: None,
+                                replacement_pods: Vec::new(),
                                 service: None,
                                 service_required: None,
                             });
@@ -9389,6 +9466,7 @@ async fn observed_management_pool_provenance(
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            replacement_pods: Vec::new(),
             service: None,
             service_required: None,
         });
@@ -9546,6 +9624,7 @@ async fn observed_provenance(
             &resolved.pod_name,
             &resolved.pod_uid,
         )),
+        replacement_pods: Vec::new(),
         service: resolved
             .service_name
             .as_deref()
@@ -10069,6 +10148,7 @@ async fn compose_child_target(
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            replacement_pods: Vec::new(),
             service: None,
             service_required: None,
         });
@@ -12518,6 +12598,7 @@ pub(crate) mod tests {
                         "sandbox-uid",
                     )),
                     pod: Some(reference("v1", "Pod", "sandbox-pod", "pod-uid")),
+                    replacement_pods: Vec::new(),
                     service: Some(reference("v1", "Service", "sandbox-service", "service-uid")),
                     service_required: None,
                 }),
@@ -17441,6 +17522,279 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Pod owned by the recorded Sandbox, as the teardown checkpoint lists it.
+    fn owned_sandbox_pod(uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sandbox-pod", "namespace": NS, "uid": uid,
+                "ownerReferences": [{
+                    "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                    "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                    "name": "sbx",
+                    "uid": "sandbox-uid",
+                    "controller": true,
+                }],
+            },
+            "status": { "phase": "Running" },
+        })
+    }
+
+    /// Serve the live Claim and its Sandbox with `pod_uid` as the only Pod the
+    /// Sandbox selector finds.
+    async fn mount_live_sandbox_with_pod(server: &MockServer, pod_uid: &str) {
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(claim_json(
+                serde_json::json!({ "sandbox": { "name": "sbx" } }),
+            )))
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PODS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [owned_sandbox_pod(pod_uid)],
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+        mount_resolved_sandbox(server).await;
+    }
+
+    fn claims_api(ctx: &SandboxContext) -> Api<DynamicObject> {
+        Api::namespaced_with(
+            ctx.client.clone(),
+            NS,
+            &upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims"),
+        )
+    }
+
+    fn pod_reference(uid: &str) -> SandboxObjectReference {
+        SandboxObjectReference {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: Some(NS.into()),
+            name: "sandbox-pod".into(),
+            uid: uid.into(),
+            generation: None,
+        }
+    }
+
+    /// Teardown never rewrites the Pod this lease served (#409).
+    ///
+    /// `target.pod` is the identity every execution record and scoped
+    /// credential of this lease names. Upstream creates a Pod whenever its
+    /// Sandbox has none, so if the served Pod is deleted mid-teardown a
+    /// replacement appears under the same name with a new UID. Rewriting
+    /// `target.pod` to it made the next pass reject every execution
+    /// (`ExecutionRunnerProvenanceChanged`) and every credential, quarantining
+    /// the lease and its quota for good. The replacement is still a descendant
+    /// teardown must prove gone, so it is tracked on its own.
+    #[tokio::test]
+    async fn a_replacement_pod_is_tracked_without_rewriting_the_served_pod() {
+        let (ctx, server) = test_context().await;
+        mount_live_sandbox_with_pod(&server, "replacement-pod-uid").await;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+
+        let checkpoint = checkpoint_management_descendants(&lease, &ctx, &claims_api(&ctx)).await;
+
+        let ManagementDescendantCheckpoint::Updated(target) = checkpoint else {
+            panic!("the replacement must be checkpointed before teardown proceeds");
+        };
+        assert_eq!(
+            target.pod,
+            Some(pod_reference("pod-uid")),
+            "the served Pod must never be rewritten"
+        );
+        assert_eq!(
+            target.replacement_pods,
+            vec![pod_reference("replacement-pod-uid")]
+        );
+    }
+
+    /// A replacement already on record is not recorded again, so a lease
+    /// whose teardown is waiting on it does not rewrite status every pass.
+    #[tokio::test]
+    async fn a_recorded_replacement_pod_is_not_checkpointed_twice() {
+        let (ctx, server) = test_context().await;
+        mount_live_sandbox_with_pod(&server, "replacement-pod-uid").await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .replacement_pods = vec![pod_reference("replacement-pod-uid")];
+
+        let checkpoint = checkpoint_management_descendants(&lease, &ctx, &claims_api(&ctx)).await;
+
+        assert!(matches!(
+            checkpoint,
+            ManagementDescendantCheckpoint::Current
+        ));
+    }
+
+    /// Replacements are bounded. A Sandbox that keeps producing new Pods during
+    /// teardown is not converging, and an ever-growing status list would
+    /// eventually be refused by the API server anyway.
+    #[tokio::test]
+    async fn endless_pod_replacement_quarantines_instead_of_growing_status() {
+        let (ctx, server) = test_context().await;
+        mount_live_sandbox_with_pod(&server, "one-more-pod-uid").await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .replacement_pods = (0..MAX_REPLACEMENT_PODS)
+            .map(|index| pod_reference(&format!("replacement-{index}")))
+            .collect();
+
+        let checkpoint = checkpoint_management_descendants(&lease, &ctx, &claims_api(&ctx)).await;
+
+        assert!(matches!(
+            checkpoint,
+            ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                QuarantineReason::PodReplacementUnbounded
+            ))
+        ));
+    }
+
+    /// A lease whose served Pod was replaced, as teardown records it.
+    fn lease_with_replaced_pod() -> SandboxLease {
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .replacement_pods = vec![pod_reference("replacement-pod-uid")];
+        lease
+    }
+
+    async fn footprint_with_pod_at_name(pod: Option<serde_json::Value>) -> TargetFootprintCheck {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOX_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+        let response = match pod {
+            Some(pod) => ResponseTemplate::new(200).set_body_json(pod),
+            None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404
+            })),
+        };
+        Mock::given(method("GET"))
+            .and(path(POD_PATH))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let lease = lease_with_replaced_pod();
+        let tombstone = lease
+            .status
+            .as_ref()
+            .unwrap()
+            .sandbox_claim_tombstone
+            .clone()
+            .unwrap();
+        management_target_footprint_absent(&lease, &ctx, &tombstone, Some("claim-uid")).await
+    }
+
+    /// A recorded replacement still holding the name is present, not foreign.
+    ///
+    /// The served Pod and its replacement share the Sandbox's name. Finding the
+    /// replacement there is the ordinary "not gone yet" state, so teardown
+    /// waits for it rather than quarantining as if a stranger held the name.
+    #[tokio::test]
+    async fn a_recorded_replacement_at_the_pod_name_is_waited_for() {
+        assert_eq!(
+            footprint_with_pod_at_name(Some(owned_sandbox_pod("replacement-pod-uid"))).await,
+            TargetFootprintCheck::Retry("pod_still_present")
+        );
+    }
+
+    /// A Pod at that name that teardown never recorded is still an identity
+    /// failure: nothing proves it belongs to this lease's footprint.
+    #[tokio::test]
+    async fn an_unrecorded_pod_at_the_pod_name_still_quarantines() {
+        assert_eq!(
+            footprint_with_pod_at_name(Some(owned_sandbox_pod("stranger-pod-uid"))).await,
+            TargetFootprintCheck::Quarantine(QuarantineReason::PodIdentityChangedDuringTeardown)
+        );
+    }
+
+    /// The owned-Pod sweep treats every recorded UID as this lease's, and only
+    /// an unrecorded UID at a recorded name as a replacement nobody accounted
+    /// for.
+    #[tokio::test]
+    async fn owned_pod_sweep_waits_for_recorded_replacements_only() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(PODS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [owned_sandbox_pod("replacement-pod-uid")],
+            })))
+            .mount(&server)
+            .await;
+        let pods: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), NS, &core_resource("Pod", "pods"));
+        let sandbox = SandboxObjectReference {
+            api_version: crate::controllers::sandbox_canary::SANDBOX_API_VERSION.into(),
+            kind: crate::controllers::sandbox_canary::SANDBOX_KIND.into(),
+            namespace: Some(NS.into()),
+            name: "sbx".into(),
+            uid: "sandbox-uid".into(),
+            generation: None,
+        };
+        let served = pod_reference("pod-uid");
+        let replacement = pod_reference("replacement-pod-uid");
+
+        assert_eq!(
+            exact_owned_objects_absent(
+                &pods,
+                &sandbox,
+                &[&served, &replacement],
+                "sandbox_owned_pod_still_present",
+                QuarantineReason::SandboxOwnedPodReplaced,
+                QuarantineReason::PodEnumerationUnverifiable,
+                "pod_enumeration_transient",
+            )
+            .await,
+            TargetFootprintCheck::Retry("sandbox_owned_pod_still_present")
+        );
+        assert_eq!(
+            exact_owned_objects_absent(
+                &pods,
+                &sandbox,
+                &[&served],
+                "sandbox_owned_pod_still_present",
+                QuarantineReason::SandboxOwnedPodReplaced,
+                QuarantineReason::PodEnumerationUnverifiable,
+                "pod_enumeration_transient",
+            )
+            .await,
+            TargetFootprintCheck::Quarantine(QuarantineReason::SandboxOwnedPodReplaced)
+        );
+    }
+
     /// If the Claim already identifies a live Sandbox, teardown checkpoints
     /// all discoverable exact descendant UIDs before tombstone conversion.
     #[tokio::test]
@@ -18831,6 +19185,7 @@ pub(crate) mod tests {
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            replacement_pods: Vec::new(),
             service: None,
             service_required: None,
         });

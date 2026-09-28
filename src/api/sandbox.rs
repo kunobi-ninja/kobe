@@ -14444,6 +14444,7 @@ mod tests {
             sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1")),
             sandbox: Some(reference("Sandbox", "sbx")),
             pod: Some(reference("Pod", "sbx-0")),
+            replacement_pods: Vec::new(),
             service: Some(reference("Service", "sbx")),
             service_required: None,
         };
