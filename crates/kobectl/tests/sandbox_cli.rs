@@ -31,6 +31,9 @@ struct Server {
 }
 
 impl Server {
+    /// Serve connections independently so a cancelled request that leaves an
+    /// idle socket cannot block cleanup on another connection. Join handlers
+    /// on shutdown so failures still reach the test that owns the server.
     fn start(handler: impl Fn(Request, &mut TcpStream) + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -38,6 +41,7 @@ impl Server {
         let stop = Arc::clone(&stopped);
         let handler: Arc<Handler> = Arc::new(handler);
         let thread = thread::spawn(move || {
+            let mut connections = Vec::new();
             while !stop.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
@@ -45,10 +49,16 @@ impl Server {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                stream.set_read_timeout(Some(WAIT)).unwrap();
-                if let Some(request) = read_request(&mut stream) {
-                    handler(request, &mut stream);
-                }
+                let handler = Arc::clone(&handler);
+                connections.push(thread::spawn(move || {
+                    stream.set_read_timeout(Some(WAIT)).unwrap();
+                    if let Some(request) = read_request(&mut stream) {
+                        handler(request, &mut stream);
+                    }
+                }));
+            }
+            for connection in connections {
+                connection.join().unwrap();
             }
         });
         Self {
@@ -1699,9 +1709,16 @@ fn sigterm_during_execution_releases_and_exits_143() {
         ],
     );
     stage_rx.recv_timeout(WAIT).unwrap();
+    // A cancelled request can leave another connection without HTTP headers.
+    // Keep one open while cleanup makes its own DELETE and observation requests.
+    let _idle_connection = TcpStream::connect(server.address).unwrap();
     signal(&child, libc::SIGTERM);
     open(&execution_gate);
-    let output = wait_output(child);
+    let (finished, output) = wait_output_bounded(child, WAIT);
+    assert!(
+        finished,
+        "SIGTERM cleanup was blocked by an idle connection"
+    );
     assert_eq!(output.status.code(), Some(143));
     assert!(output.stderr.is_empty());
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
