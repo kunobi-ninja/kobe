@@ -23,7 +23,7 @@ const GLOBAL_OPTIONS: &str = "Global options";
 
 /// Top-level help sections, in print order. clap lists subcommands in one
 /// flat block; twenty commands read better grouped by what you are doing.
-/// A test keeps this table and the command tree in step.
+/// Every visible command appears once; a test checks this against the command tree.
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Get started",
@@ -47,7 +47,14 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Setup",
-        &["config", "target", "ssh-config", "completions", "version"],
+        &[
+            "config",
+            "target",
+            "host",
+            "ssh-config",
+            "completions",
+            "version",
+        ],
     ),
 ];
 
