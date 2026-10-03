@@ -1,6 +1,7 @@
 mod commands;
 mod trace;
 
+use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind};
 use commands::OutputFormat;
@@ -38,6 +39,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         &[
             "run",
             "exec",
+            "flake",
             "attach",
             "vnc",
             "logs",
@@ -133,6 +135,24 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum FlakeCommand {
+    /// Write flake.nix in the current directory
+    ///
+    /// The file pins nixpkgs and lists packages in `paths`. Nix does not need
+    /// to be installed on this machine. Refuses to overwrite an existing
+    /// `flake.nix`.
+    Init,
+    /// List the packages `kobe lease --flake` installed
+    ///
+    /// With no lease, uses the only one you hold, or asks you to pick.
+    List {
+        /// Lease id, name, or pool (optional when you hold one lease)
+        #[arg(value_name = "LEASE")]
+        lease: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -420,6 +440,19 @@ enum Commands {
         /// maximum lease time.
         #[arg(long, conflicts_with = "no_wait")]
         keepalive: bool,
+        /// Install flake.nix from this directory once a Sandbox lease is ready
+        ///
+        /// Copies `flake.nix` and `flake.lock` (when it exists) into the
+        /// sandbox and runs `nix profile install`. The command returns when
+        /// that finishes. Cannot be combined with --no-wait. With --ensure and
+        /// --name, an unchanged flake is left as it is.
+        #[arg(long, value_name = "DIR", conflicts_with = "no_wait")]
+        flake: Option<std::path::PathBuf>,
+    },
+    /// Write a sandbox flake, or list the packages a lease installed
+    Flake {
+        #[command(subcommand)]
+        action: FlakeCommand,
     },
     /// Lease a cluster, run a command with its kubeconfig, then release it
     ///
@@ -953,6 +986,7 @@ async fn main() -> anyhow::Result<()> {
             metadata_json,
             ensure,
             keepalive,
+            flake,
         } => {
             commands::lease_create(commands::LeaseCreateCommand {
                 pool: pool.as_deref(),
@@ -964,12 +998,38 @@ async fn main() -> anyhow::Result<()> {
                 metadata_json: metadata_json.as_deref(),
                 ensure,
                 keepalive,
+                flake: flake.as_deref(),
                 target_override: target,
                 endpoint_override: endpoint,
                 output,
             })
             .await
         }
+        Commands::Flake { action } => match action {
+            FlakeCommand::Init => commands::flake::init(
+                &std::env::current_dir().context("could not read the current directory")?,
+            )
+            .map(|path| {
+                println!("Wrote {}", path.display());
+            }),
+            FlakeCommand::List { lease } => {
+                let lease = commands::lease_for_capability(
+                    lease.as_deref(),
+                    "exec",
+                    "list flake packages on",
+                    target,
+                    endpoint,
+                    output,
+                )
+                .await
+                .unwrap_or_else(|error| exit_resource_error(error, output));
+                match commands::flake::list(lease.as_str(), target, endpoint, output).await {
+                    Ok(0) => Ok(()),
+                    Ok(code) => std::process::exit(code),
+                    Err(error) => exit_resource_error(error, output),
+                }
+            }
+        },
         Commands::WithLease {
             pool,
             ttl,
@@ -1975,6 +2035,13 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["kobe", "list", "--all"]).unwrap();
         assert!(matches!(cli.command, Commands::Status { all: true }));
+    }
+
+    #[test]
+    fn lease_flake_conflicts_with_no_wait() {
+        assert!(
+            Cli::try_parse_from(["kobe", "lease", "agents", "--flake", ".", "--no-wait"]).is_err()
+        );
     }
 
     #[test]

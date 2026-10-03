@@ -2,6 +2,7 @@ mod config;
 mod config_tui;
 mod doctor;
 mod extend;
+pub(crate) mod flake;
 pub(crate) mod host;
 mod init;
 mod keepalive;
