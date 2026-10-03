@@ -87,9 +87,9 @@ impl FlakeFiles {
     pub(crate) fn payload(&self) -> Vec<u8> {
         let lock = self.lock.as_deref().unwrap_or(b"");
         let mut out = Vec::with_capacity(HEADER_LEN + self.nix.len() + lock.len());
-        write!(
+        writeln!(
             &mut out,
-            "{:10} {:10} {}\n",
+            "{:10} {:10} {}",
             self.nix.len(),
             lock.len(),
             self.hash
