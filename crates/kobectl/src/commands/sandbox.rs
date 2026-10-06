@@ -1027,6 +1027,11 @@ pub(crate) struct LeaseCommand<'a> {
     pub no_wait: bool,
     pub wait_timeout: Option<&'a str>,
     pub keepalive: bool,
+    /// Installed after the sandbox is Ready. `None` on `--no-wait`, which
+    /// returns before the sandbox can run `nix`.
+    pub flake: Option<super::flake::FlakeFiles>,
+    /// Directory the user passed to `--flake`, used in the retry line.
+    pub flake_dir: Option<&'a std::path::Path>,
     pub output: OutputFormat,
 }
 
@@ -1179,6 +1184,15 @@ pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) ->
         },
         command.output,
     )?;
+
+    if let Some(files) = command.flake.as_ref() {
+        let hint = super::flake::retry_hint(
+            command.pool,
+            command.alias,
+            command.flake_dir.unwrap_or(std::path::Path::new(".")),
+        );
+        super::flake::install_flake(config, &ready.id, files, false, command.output, &hint).await?;
+    }
 
     if command.keepalive {
         let ttl = command.ttl.unwrap_or(ready.ttl.as_str());

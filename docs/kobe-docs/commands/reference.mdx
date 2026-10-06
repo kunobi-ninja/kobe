@@ -23,6 +23,8 @@ Global flags on every command: `--endpoint URL`, `--target NAME` (alias `--conte
 | `kobe purge` | Release all active leases and remove local kubeconfigs |
 | `kobe with-lease <pool> -- <cmd>` | Cluster lease around one command, then release |
 | `kobe run <pool> -- <cmd>` | Sandbox: create, run one command, release ([details](/docs/commands/sandbox)) |
+| `kobe flake init` | Write `flake.nix` for a sandbox lease |
+| `kobe flake list [lease]` | List packages installed by `kobe lease --flake` |
 | `kobe exec <lease> -- <cmd>` | Run a command in a lease that supports `exec` (`--detach` to return once it starts) |
 | `kobe logs <lease>` | Read output from a lease that supports `logs` |
 | `kobe cancel <lease> --execution <id>` | Cancel a running execution |
@@ -101,7 +103,7 @@ Removes stored credentials. For OIDC, also revokes refresh and access tokens at 
 ## `kobe lease`
 
 ```sh
-kobe lease [pool] [--ttl <duration>] [--kubeconfig <path>] [--name <alias>] [--ensure] [--keepalive] [--no-wait] [--wait-timeout <duration>] [--metadata-json <json|@path>]
+kobe lease [pool] [--ttl <duration>] [--kubeconfig <path>] [--name <alias>] [--ensure] [--keepalive] [--no-wait] [--wait-timeout <duration>] [--metadata-json <json|@path>] [--flake <dir>]
 ```
 
 Creates a lease. The pool's resource kind decides what you get: a kubeconfig for Cluster, exec/logs/attach for Sandbox.
@@ -118,6 +120,7 @@ kobe lease ci-small --keepalive
 kobe lease ci-small --metadata-json '{"github":{"pullRequest":3835}}'
 kobe lease ci-small --metadata-json @lease-metadata.json
 kobe lease ci-small --no-wait
+kobe lease agents --name dev --flake .
 ```
 
 Prints the lease ID, resource kind, capabilities, and expiry. While waiting, Ctrl-C stops waiting and prints `kobe release <id>`; it does not release the lease.
@@ -136,6 +139,20 @@ For a Cluster pool, `kobe lease` and `kobe with-lease` send one idempotency key 
 | `--no-wait` | disabled | Return after creating the lease. |
 | `--wait-timeout` | unset | Maximum time to wait for the lease to become usable. |
 | `--metadata-json` | unset | Opaque JSON object, inline or `@path`. Cluster leases only. Bounded by the server. Never include secrets. |
+| `--flake` | unset | Directory with `flake.nix`. After a Sandbox is Ready, installs that flake. Cannot be combined with `--no-wait`. |
+
+With `--flake`, the command waits until a Sandbox is Ready, then installs that directory's `flake.nix`. Details: [Executable resource commands](/docs/commands/sandbox).
+
+---
+
+## `kobe flake`
+
+```sh
+kobe flake init
+kobe flake list [lease]
+```
+
+`init` writes `flake.nix` in the current directory and refuses to overwrite one. `list` runs `nix profile list` in a lease. With one lease, the name is optional.
 
 ---
 

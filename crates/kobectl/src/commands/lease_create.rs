@@ -29,6 +29,8 @@ pub struct LeaseCreateCommand<'a> {
     pub ensure: bool,
     /// #107 P3: heartbeat-extend the lease until interrupted.
     pub keepalive: bool,
+    /// Directory containing `flake.nix` to install once a Sandbox is Ready.
+    pub flake: Option<&'a std::path::Path>,
     pub target_override: Option<&'a str>,
     pub endpoint_override: Option<&'a str>,
     pub output: OutputFormat,
@@ -217,10 +219,19 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
         super::version::warn_if_cli_behind_endpoint(&endpoint_version);
     }
     let metadata = parse_metadata_json(command.metadata_json)?;
+    // Read the flake before creating anything, so a missing file does not
+    // leave a sandbox behind.
+    let mut flake_files = match command.flake {
+        Some(dir) => Some(super::flake::load(dir)?),
+        None => None,
+    };
 
     // Determine which lease to operate on: an existing active one (#107 P3
     // `--ensure` idempotent renew), else a fresh create.
     let existing = ensure_existing(&config, &command).await?;
+    if flake_files.is_some() && existing.as_ref().is_some_and(|lease| !lease.is_sandbox()) {
+        anyhow::bail!("--flake installs into a Sandbox lease");
+    }
     if let Some(existing) = existing.as_ref()
         && existing.is_sandbox()
     {
@@ -254,6 +265,12 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
             },
             command.output,
         )?;
+        if let Some(files) = flake_files.take() {
+            let hint =
+                super::flake::retry_hint(&detail.profile, command.name, command.flake.unwrap());
+            super::flake::install_flake(&config, &detail.id, &files, true, command.output, &hint)
+                .await?;
+        }
         if command.keepalive {
             let stop = async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -306,10 +323,15 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                         no_wait: command.no_wait,
                         wait_timeout: command.wait_timeout,
                         keepalive: command.keepalive,
+                        flake: flake_files.take(),
+                        flake_dir: command.flake,
                         output: command.output,
                     },
                 )
                 .await;
+            }
+            if flake_files.is_some() {
+                anyhow::bail!("--flake installs into a Sandbox lease");
             }
             let accepted = create_lease_request(
                 &config,

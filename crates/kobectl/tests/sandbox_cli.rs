@@ -2944,3 +2944,245 @@ fn attach_without_a_tty_copies_bytes_both_ways_and_never_touches_a_terminal() {
         "stdin must reach the server byte for byte"
     );
 }
+
+/// Same bytes `flake::hash_parts` hashes: flake.nix, a 0 byte, then flake.lock.
+fn flake_hash(nix: &[u8], lock: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(nix);
+    hasher.update([0]);
+    if let Some(lock) = lock {
+        hasher.update(lock);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn flake_init_writes_once() {
+    let directory = child_directory("http://127.0.0.1:9", "none");
+    let child = spawn_in(&directory, &["flake", "init"]);
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = std::fs::read_to_string(directory.path().join("flake.nix")).unwrap();
+    assert!(written.contains("nixos-26.05"), "{written}");
+    assert!(written.contains("pkgs.ripgrep"), "{written}");
+
+    let child = spawn_in(&directory, &["flake", "init"]);
+    let output = wait_output(child);
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("flake.nix")).unwrap(),
+        written
+    );
+}
+
+#[test]
+fn lease_flake_sends_the_files_on_stdin() {
+    let marker = "{ marker = \"kobe-flake-marker-9f3a\"; }\n";
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_server = Arc::clone(&captured);
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools/agents") => reply(
+                stream,
+                200,
+                &[],
+                &pool_body("agents", "Sandbox", &["lease", "exec", "release"]),
+            ),
+            ("POST", "/v1/sandbox-leases") => {
+                let (_, lease) = keyed_lease(&request.body);
+                let location = format!("/v1/sandbox-leases/{lease}");
+                reply(
+                    stream,
+                    202,
+                    &[("Location", &location)],
+                    &lease_body(&lease, "Pending"),
+                );
+            }
+            ("GET", path) if path.starts_with("/v1/sandbox-leases/") => {
+                let id = path.rsplit('/').next().unwrap();
+                reply(stream, 200, &[], &lease_body(id, "Ready"));
+            }
+            ("POST", path) if path.contains("/executions") => {
+                captured_for_server
+                    .lock()
+                    .unwrap()
+                    .push(request.body.clone());
+                reply(stream, 200, &[], &execution_body("Succeeded", Some(0)));
+            }
+            _ => panic!("unexpected flake lease request: {request:?}"),
+        }
+    });
+    let directory = child_directory(&server.endpoint(), "none");
+    std::fs::write(directory.path().join("flake.nix"), marker).unwrap();
+    let child = spawn_in(
+        &directory,
+        &["lease", "agents", "--flake", ".", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = captured.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "install should be the only execution");
+    let body: Value = serde_json::from_slice(&bodies[0]).unwrap();
+    let command = body["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!command.contains("kobe-flake-marker-9f3a"), "{command}");
+    assert!(body.get("timeout").is_none(), "{body}");
+    let stdin = body["stdin"].as_str().expect("stdin carries the flake");
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, stdin).unwrap();
+    assert!(
+        decoded
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes()),
+        "stdin payload must contain flake.nix"
+    );
+}
+
+#[test]
+fn lease_flake_refuses_a_cluster_pool() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools/ci") => reply(
+                stream,
+                200,
+                &[],
+                &pool_body("ci", "Cluster", &["lease", "kubeconfig", "release"]),
+            ),
+            _ => panic!("a cluster pool must not be leased for a flake: {request:?}"),
+        }
+    });
+    let directory = child_directory(&server.endpoint(), "none");
+    std::fs::write(directory.path().join("flake.nix"), "{ }\n").unwrap();
+    let child = spawn_in(
+        &directory,
+        &["lease", "ci", "--flake", ".", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("Sandbox") || stdout.contains("Sandbox"),
+        "stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn lease_ensure_skips_an_unchanged_flake() {
+    let nix = b"{ marker = \"same\"; }\n";
+    let hash = flake_hash(nix, None);
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let executions_for_server = Arc::clone(&executions);
+    let hash_for_server = hash.clone();
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "sandbox-test",
+                    "phase": "Ready",
+                    "pool": "agents",
+                    "alias": "dev",
+                    "resourceKind": "Sandbox"
+                }])
+                .to_string(),
+            ),
+            ("PATCH", "/v1/leases/sandbox-test") => reply(
+                stream,
+                200,
+                &[],
+                &json!({"expires_at": "2030-01-01T00:00:00Z"}).to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases/sandbox-test") => reply(
+                stream,
+                200,
+                &[],
+                &json!({
+                    "id": "sandbox-test",
+                    "phase": "Ready",
+                    "profile": "agents",
+                    "expires_at": "2030-01-01T00:00:00Z"
+                })
+                .to_string(),
+            ),
+            ("GET", "/v1/pools/agents") => reply(
+                stream,
+                200,
+                &[],
+                &pool_body("agents", "Sandbox", &["lease", "exec", "release"]),
+            ),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let program = body["command"][0].as_str().unwrap_or("");
+                executions_for_server
+                    .lock()
+                    .unwrap()
+                    .push(program.to_string());
+                if program == "/bin/cat" {
+                    reply(
+                        stream,
+                        200,
+                        &[],
+                        &json!({
+                            "id": "sbxe-test",
+                            "state": "Succeeded",
+                            "exitCode": 0,
+                            "stdout": format!("{hash_for_server}\n"),
+                            "stderr": "",
+                            "truncated": false
+                        })
+                        .to_string(),
+                    );
+                } else {
+                    panic!("unchanged flake must not be installed again: {body}");
+                }
+            }
+            _ => panic!("unexpected ensure request: {request:?}"),
+        }
+    });
+    let directory = child_directory(&server.endpoint(), "none");
+    std::fs::write(directory.path().join("flake.nix"), nix).unwrap();
+    let child = spawn_in(
+        &directory,
+        &[
+            "lease", "agents", "--name", "dev", "--ensure", "--flake", ".", "--output", "json",
+        ],
+    );
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        executions.lock().unwrap().as_slice(),
+        ["/bin/cat"],
+        "only the marker read should run"
+    );
+}

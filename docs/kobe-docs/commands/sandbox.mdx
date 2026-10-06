@@ -185,6 +185,23 @@ run it in a
 (`kobe attach dev --session build`). `kobe run` never detaches, because it releases the sandbox when the command
 returns.
 
+## `kobe flake`
+
+`kobe flake init` writes `flake.nix` in the current directory. It pins nixpkgs to `nixos-26.05` and lists packages in `paths`. Nix does not need to be installed on the machine where you run it. If `flake.nix` is already there, the command stops and leaves the file alone.
+
+```bash
+kobe flake init
+kobe lease agents --name dev --ttl 8h --flake .
+```
+
+After the sandbox is Ready, the CLI copies `flake.nix` and, when it exists, `flake.lock` to `/home/agent/.kobe/flake` and runs `nix profile install`. The command returns when that finishes. The file bytes go on stdin, so they are not part of the command line. `--flake` cannot be combined with `--no-wait`.
+
+A failed install leaves the lease up. Run the same command again with `--ensure`, the same `--name`, and the same directory to finish it. When those files are unchanged, `--ensure` skips the install.
+
+`kobe flake list` prints `nix profile list` for a lease. With one lease, the name is optional.
+
+`kobe status` does not show which flake a lease installed. `kobe flake list` reads that from the sandbox.
+
 ## `kobe logs`
 
 Read the sandbox's output. Use `--tail` to request only the last lines. The operator may configure a line ceiling; the default returns all available lines.
