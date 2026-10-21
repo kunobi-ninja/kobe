@@ -65,9 +65,11 @@ stops with `execution_limit_exhausted` before history fills Kubernetes' annotati
 limit, leaving room for logs, terminals and teardown. Start a new lease when
 this budget is exhausted.
 
-Upgrade every operator replica before using compact histories. Older operators
-cannot read the compact format, so rolling back requires draining affected
-leases first. Existing full histories compact on their next access registration.
+This format requires a coordinated operator restart: stop all older replicas
+before starting the updated operator. A rolling upgrade can let an older
+controller quarantine a lease after a newer replica compacts its history.
+Older operators cannot read the compact format, so drain affected leases before
+rolling back. Existing full histories compact on their next access registration.
 
 These defaults require the updated runner image. Existing leases retain their
 old image; an old runner can reject an unlimited-retention request. Update

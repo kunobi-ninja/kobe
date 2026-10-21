@@ -92,8 +92,10 @@ Unlimited output and larger stdin require the updated `kobe-runner` image. Exist
 Execution history reserves half of the 256 KiB annotation budget for access
 and teardown. This storage budget applies even when `maxExecutionsPerLease` is
 zero. Its exhaustion returns `execution_limit_exhausted`; logs and terminals
-remain available within their own access limits. Upgrade all operator replicas
-before using compact histories; older operators cannot read them. Drain leases
+remain available within their own access limits. Stop all older operator
+replicas before starting the updated operator; use a coordinated restart rather
+than a rolling upgrade across this format change. An older controller can
+quarantine a lease whose history a newer replica has compacted. Drain leases
 with compact histories before rolling back to an older operator.
 
 ### Teardown authority
