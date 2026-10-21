@@ -859,6 +859,113 @@ spec:
 	info("tenant reservation DELETE denied and object preserved");
 }
 
+// Validate the storage boundary against Kubernetes itself, independently of
+// the Rust byte-budget helper. Large PATCH bodies go over stdin, not argv.
+async function testLedgerAnnotationCapacity(): Promise<void> {
+	const objectName = "operator-slot-0";
+	const get = async (): Promise<Lease> =>
+		JSON.parse(
+			(
+				await kubectlAs(operatorUsername, [
+					"get",
+					"lease.coordination.k8s.io",
+					objectName,
+					"-n",
+					ledgerNamespace,
+					"-o",
+					"json",
+				])
+			).stdout,
+		);
+	const patch = (operations: JsonPatchOperation[], allowFailure = false) =>
+		kubectl(
+			[
+				`--as=${operatorUsername}`,
+				"patch",
+				"lease.coordination.k8s.io",
+				objectName,
+				"-n",
+				ledgerNamespace,
+				"--type=json",
+				"--patch-file=/dev/stdin",
+				"-o",
+				"json",
+			],
+			{ stdin: JSON.stringify(operations), allowFailure },
+		);
+	const historyKey = "kobe.kunobi.ninja/sandbox-executions";
+	const accessKey = "kobe.kunobi.ninja/sandbox-access-entries";
+	const stateKey = "kobe.kunobi.ninja/sandbox-access-state";
+	const annotations: Record<string, string> = {
+		[stateKey]: "open",
+		[accessKey]: "{}",
+		[historyKey]: "{}",
+	};
+	const bytes = Object.entries(annotations).reduce(
+		(sum, [key, value]) =>
+			sum + Buffer.byteLength(key) + Buffer.byteLength(value),
+		0,
+	);
+	annotations[historyKey] = "{}".padEnd(262144 - bytes + 2, " ");
+	const before = await get();
+	await patch([
+		{ op: "test", path: "/metadata/uid", value: before.metadata.uid },
+		{
+			op: "test",
+			path: "/metadata/resourceVersion",
+			value: before.metadata.resourceVersion,
+		},
+		{ op: "replace", path: "/metadata/annotations", value: annotations },
+	]);
+	const full = await get();
+	const escaped = (key: string) =>
+		`/metadata/annotations/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+	const overflow = await patch(
+		[
+			{ op: "test", path: "/metadata/uid", value: full.metadata.uid },
+			{
+				op: "test",
+				path: "/metadata/resourceVersion",
+				value: full.metadata.resourceVersion,
+			},
+			{ op: "replace", path: escaped(accessKey), value: "{} " },
+		],
+		true,
+	);
+	assert(
+		overflow.exitCode !== 0 && overflow.stderr.includes("262144"),
+		`API server did not enforce the annotation byte ceiling: ${overflow.stderr}`,
+	);
+	const recovered = JSON.parse(
+		(
+			await patch([
+				{ op: "test", path: "/metadata/uid", value: full.metadata.uid },
+				{
+					op: "test",
+					path: "/metadata/resourceVersion",
+					value: full.metadata.resourceVersion,
+				},
+				{
+					op: "test",
+					path: escaped(historyKey),
+					value: annotations[historyKey],
+				},
+				{ op: "replace", path: escaped(historyKey), value: "{}" },
+				{ op: "replace", path: escaped(accessKey), value: "{} " },
+			])
+		).stdout,
+	) as Lease;
+	assert(
+		recovered.metadata.uid === full.metadata.uid &&
+			recovered.metadata.annotations?.[historyKey] === "{}" &&
+			recovered.metadata.annotations?.[accessKey] === "{} ",
+		"a full ledger did not permit an atomic compaction and access update",
+	);
+	info(
+		"annotation ceiling enforced; UID/resourceVersion-fenced compaction restores update capacity",
+	);
+}
+
 function leaseManifest(name: string): string {
 	return JSON.stringify({
 		apiVersion: "kobe.kunobi.ninja/v1alpha1",
@@ -1377,6 +1484,7 @@ try {
 	await testJsonPatchFences();
 	await testAdmissionCancellationCas();
 	await testAdmissionLedgerBoundary();
+	await testLedgerAnnotationCapacity();
 	await testTeardownAdmissionFence();
 	console.log("SandboxLease API-server contract passed");
 } finally {
