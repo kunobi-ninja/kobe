@@ -89,6 +89,13 @@ The operator exports `kobe_sandbox_usage_limit` (zero means disabled), `kobe_san
 
 Unlimited output and larger stdin require the updated `kobe-runner` image. Existing sandboxes keep their image until replaced. Stdin and non-follow output responses are buffered in memory; removing usage ceilings does not remove available-memory, disk or Kubernetes object-size constraints.
 
+Execution history reserves half of the 256 KiB annotation budget for access
+and teardown. This storage budget applies even when `maxExecutionsPerLease` is
+zero. Its exhaustion returns `execution_limit_exhausted`; logs and terminals
+remain available within their own access limits. Upgrade all operator replicas
+before using compact histories; older operators cannot read them. Drain leases
+with compact histories before rolling back to an older operator.
+
 ### Teardown authority
 
 On Kubernetes 1.30+, `teardownAuthority.separate=true` runs teardown proof under a dedicated ServiceAccount. Helm installs two fail-closed ValidatingAdmissionPolicy boundaries: ordinary lifecycle code cannot forge or erase protected evidence, and it cannot replace the authority namespace or cluster-scoped RBAC. The default is single-process mode for older API servers.

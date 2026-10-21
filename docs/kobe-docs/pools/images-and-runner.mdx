@@ -59,6 +59,16 @@ execution ceiling returns `409 Conflict` with `execution_limit_exhausted`;
 configured output ceilings report truncation. Usage measurements remain on
 when enforcement is disabled.
 
+Execution history also has a storage budget. Large histories share repeated
+target and writer identities without dropping entries. New execution admission
+stops with `execution_limit_exhausted` before history fills Kubernetes' annotation
+limit, leaving room for logs, terminals and teardown. Start a new lease when
+this budget is exhausted.
+
+Upgrade every operator replica before using compact histories. Older operators
+cannot read the compact format, so rolling back requires draining affected
+leases first. Existing full histories compact on their next access registration.
+
 These defaults require the updated runner image. Existing leases retain their
 old image; an old runner can reject an unlimited-retention request. Update
 SandboxPool images and replace old leases before using the new defaults.
