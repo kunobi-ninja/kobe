@@ -3,7 +3,7 @@
 
 use super::{
     AccessLedgerError, CLOSED, ENTRIES_ANNOTATION, EXECUTIONS_ANNOTATION, ExecutionCreationState,
-    ExecutionEntry, STATE_ANNOTATION, annotation_path, encoding, lease_rv, lease_uid,
+    ExecutionEntry, OPEN, STATE_ANNOTATION, annotation_path, encoding, lease_rv, lease_uid,
 };
 use k8s_openapi::api::coordination::v1::Lease;
 use kube::ResourceExt;
@@ -74,6 +74,30 @@ pub(super) fn check_execution_patch(gate: &Lease, next: &str) -> Result<(), Acce
     // predates the headroom rule. Only new admissions reserve future growth.
     // Teardown and binding still obey the API server's actual byte ceiling.
     check_size(gate, &[(EXECUTIONS_ANNOTATION, next)], 0)
+}
+
+/// Close and compact one exact gate atomically. Legacy history can already
+/// fill the annotation limit, leaving no room for open -> closed's two bytes.
+/// Closing must preserve existing reservations without requiring new headroom.
+pub(super) fn close_patch(gate: &Lease) -> Result<Value, AccessLedgerError> {
+    let mut patch = vec![
+        json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid(gate)? }),
+        json!({ "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv(gate)? }),
+        json!({ "op": "test", "path": annotation_path(STATE_ANNOTATION), "value": OPEN }),
+        json!({ "op": "replace", "path": annotation_path(STATE_ANNOTATION), "value": CLOSED }),
+    ];
+    let compact;
+    let mut replacements = vec![(STATE_ANNOTATION, CLOSED)];
+    if let Some(history) = gate.annotations().get(EXECUTIONS_ANNOTATION) {
+        compact = encoding::encode(&encoding::decode(history)?)?;
+        replacements.push((EXECUTIONS_ANNOTATION, compact.as_str()));
+        if compact != *history {
+            patch.push(json!({ "op": "test", "path": annotation_path(EXECUTIONS_ANNOTATION), "value": history }));
+            patch.push(json!({ "op": "replace", "path": annotation_path(EXECUTIONS_ANNOTATION), "value": compact }));
+        }
+    }
+    check_size(gate, &replacements, 0)?;
+    Ok(Value::Array(patch))
 }
 
 /// Compact a legacy gate in the same UID/resourceVersion CAS that admits an
@@ -242,6 +266,46 @@ mod tests {
         );
         check_size(&gate, &[], 0).unwrap();
         assert!(!history_fits(&gate, &entries).unwrap());
+    }
+
+    #[test]
+    fn a_physically_full_legacy_gate_can_close_without_prior_access() {
+        let (entries, mut legacy) = full_legacy_history();
+        let overhead = STATE_ANNOTATION.len()
+            + OPEN.len()
+            + ENTRIES_ANNOTATION.len()
+            + 2
+            + EXECUTIONS_ANNOTATION.len();
+        legacy.extend(std::iter::repeat_n(' ', 262_144 - overhead - legacy.len()));
+        let gate = object(BTreeMap::from([
+            (STATE_ANNOTATION.into(), OPEN.into()),
+            (ENTRIES_ANNOTATION.into(), "{}".into()),
+            (EXECUTIONS_ANNOTATION.into(), legacy),
+        ]));
+        assert_eq!(
+            gate.annotations()
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>(),
+            262_144
+        );
+        assert!(matches!(
+            check_size(&gate, &[(STATE_ANNOTATION, CLOSED)], 0),
+            Err(AccessLedgerError::Capacity)
+        ));
+        let patch: json_patch::Patch = serde_json::from_value(close_patch(&gate).unwrap()).unwrap();
+        let mut updated = serde_json::to_value(&gate).unwrap();
+        json_patch::patch(&mut updated, &patch).unwrap();
+        let updated: Lease = serde_json::from_value(updated).unwrap();
+        assert_eq!(updated.annotations()[STATE_ANNOTATION], CLOSED);
+        assert_eq!(
+            encoding::decode(&updated.annotations()[EXECUTIONS_ANNOTATION]).unwrap(),
+            entries
+        );
+        check_size(&updated, &[], 0).unwrap();
+        let mut raced = serde_json::to_value(&gate).unwrap();
+        raced["metadata"]["annotations"][EXECUTIONS_ANNOTATION] = json!("{}");
+        assert!(json_patch::patch(&mut raced, &patch).is_err());
     }
 
     #[test]

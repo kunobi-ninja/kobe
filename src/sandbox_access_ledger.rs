@@ -1750,12 +1750,7 @@ async fn close_gate(api: &Api<Lease>, gate: &Lease) -> Result<(), AccessLedgerEr
     if current != OPEN {
         return Err(AccessLedgerError::Invalid("lease gate state"));
     }
-    let patch = serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": lease_uid(gate)? },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv(gate)? },
-        { "op": "test", "path": annotation_path(STATE_ANNOTATION), "value": OPEN },
-        { "op": "replace", "path": annotation_path(STATE_ANNOTATION), "value": CLOSED }
-    ]);
+    let patch = storage::close_patch(gate)?;
     api.patch(
         &gate.name_any(),
         &PatchParams::default(),
