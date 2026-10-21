@@ -2653,6 +2653,159 @@ mod tests {
         }
     }
 
+    /// The API server rejects the old access PATCH at its annotation ceiling.
+    /// The real admission path must compact under the same CAS and keep the
+    /// complete manifest readable afterwards.
+    #[tokio::test]
+    async fn full_legacy_gate_recovers_through_access_admission() {
+        #[derive(Clone)]
+        struct AnnotationLimitedLease(Arc<std::sync::Mutex<Value>>);
+        impl Respond for AnnotationLimitedLease {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let mut current = self.0.lock().unwrap();
+                if request.method.as_str() == "GET" {
+                    return ResponseTemplate::new(200).set_body_json(current.clone());
+                }
+                let patch: json_patch::Patch = serde_json::from_slice(&request.body).unwrap();
+                let mut next = current.clone();
+                if json_patch::patch(&mut next, &patch).is_err() {
+                    return k8s_error(409);
+                }
+                // Kubernetes ValidateAnnotationsSize counts both keys and
+                // values. Use its independent literal ceiling here.
+                let bytes: usize = next["metadata"]["annotations"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| key.len() + value.as_str().unwrap().len())
+                    .sum();
+                if bytes > 262_144 {
+                    return k8s_error(422);
+                }
+                let rv = current["metadata"]["resourceVersion"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    + 1;
+                next["metadata"]["resourceVersion"] = json!(rv.to_string());
+                *current = next.clone();
+                ResponseTemplate::new(200).set_body_json(next)
+            }
+        }
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let (expected, legacy) = encoding::tests::full_legacy_history();
+        let mut object = gate_with_creating_entry(None);
+        object["metadata"]["annotations"][EXECUTIONS_ANNOTATION] = json!(legacy);
+        let state = Arc::new(std::sync::Mutex::new(object));
+        Mock::given(path(gate_path("sandbox-uid")))
+            .respond_with(AnnotationLimitedLease(state.clone()))
+            .mount(&server)
+            .await;
+        let replica = ServingReplica {
+            namespace: "n".repeat(63),
+            pod_name: "p".repeat(253),
+            pod_uid: uuid::Uuid::new_v4().to_string(),
+            boot_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut registration = test_registration(&replica);
+        let mut pending = None;
+        let api = Api::namespaced(client.clone(), "ledger");
+        let admitted = add_gate_entry(
+            &api,
+            &mut registration,
+            &mut pending,
+            &crate::sandbox_limits::SandboxLimits::default(),
+        )
+        .await
+        .unwrap()
+        .expect("access recovers without deleting history");
+        assert!(pending.is_none());
+        assert_eq!(parse_execution_entries(&admitted).unwrap(), expected);
+        assert_eq!(parse_entries::<GateEntry>(&admitted).unwrap().len(), 1);
+        let manifest = execution_manifest(&client, "ledger", &sandbox_lease())
+            .await
+            .unwrap();
+        let observed: BTreeMap<_, _> = manifest
+            .into_iter()
+            .map(|row| {
+                (
+                    row.name,
+                    ExecutionEntry {
+                        request_digest: row.request_digest,
+                        pod_uid: row.pod_uid,
+                        reserved_at: row.reserved_at,
+                        execution_uid: row.execution_uid,
+                        creation_state: row.creation_state,
+                        active: row.active,
+                        writer: row.writer,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(observed, expected);
+        assert_eq!(state.lock().unwrap()["metadata"]["resourceVersion"], "2");
+    }
+
+    #[tokio::test]
+    async fn full_history_refuses_new_executions_but_keeps_exact_retries() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let entries = encoding::tests::history(1000);
+        let encoded = encoding::encode(&entries).unwrap();
+        assert!(encoded.len() < 262_144);
+        assert!(!storage::history_fits(&entries).unwrap());
+        let mut object = gate_with_creating_entry(None);
+        object["metadata"]["annotations"][EXECUTIONS_ANNOTATION] = json!(encoded);
+        Mock::given(method("GET"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(object))
+            .expect(2)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            reserve_execution_capacity(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                "new-execution",
+                &"f".repeat(64),
+                "pod",
+                None
+            )
+            .await
+            .unwrap(),
+            ExecutionCapacity::LimitReached
+        );
+        let name = format!("sbxe-{:032x}", 1);
+        let existing = &entries[&name];
+        assert_eq!(
+            reserve_execution_capacity(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                &name,
+                &existing.request_digest,
+                &existing.pod_uid,
+                existing.writer.as_ref()
+            )
+            .await
+            .unwrap(),
+            ExecutionCapacity::ExistingActive {
+                execution_uid: existing.execution_uid.clone()
+            }
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET")
+        );
+    }
+
     #[test]
     fn names_are_dns_bounded_and_identity_derived() {
         let gate = gate_name("12345678-1234-1234-1234-123456789012");

@@ -108,7 +108,7 @@ pub(super) fn access_patch<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox_access_ledger::encoding::tests::history;
+    use crate::sandbox_access_ledger::encoding::tests::{full_legacy_history, history};
 
     fn object(annotations: BTreeMap<String, String>) -> Lease {
         serde_json::from_value(json!({
@@ -170,29 +170,14 @@ mod tests {
 
     #[test]
     fn a_full_legacy_history_compacts_in_the_access_cas_without_losing_rows() {
-        let overhead = STATE_ANNOTATION.len()
-            + "closed".len()
-            + ENTRIES_ANNOTATION.len()
-            + 2
-            + EXECUTIONS_ANNOTATION.len();
-        let mut entries = BTreeMap::new();
-        for (name, entry) in history(1500) {
-            entries.insert(name.clone(), entry);
-            if serde_json::to_string(&entries).unwrap().len() + overhead > 262_144 - 256 {
-                entries.remove(&name);
-                break;
-            }
-        }
-        let legacy = serde_json::to_string(&entries).unwrap();
+        let (entries, legacy) = full_legacy_history();
         let original = object(BTreeMap::from([
             (STATE_ANNOTATION.into(), "open".into()),
             (ENTRIES_ANNOTATION.into(), "{}".into()),
             (EXECUTIONS_ANNOTATION.into(), legacy.clone()),
         ]));
         let operations = BTreeMap::from([("new-operation".to_string(), "identity".repeat(256))]);
-        assert!(
-            legacy.len() + serde_json::to_string(&operations).unwrap().len() + overhead > 262_144
-        );
+        assert!(legacy.len() + serde_json::to_string(&operations).unwrap().len() > 262_144);
         let patch = access_patch(&original, "{}", &operations).unwrap();
         assert_eq!(
             patch[0],

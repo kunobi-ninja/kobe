@@ -135,7 +135,7 @@ pub(super) mod tests {
                         request_digest: format!("{index:064x}"),
                         pod_uid: format!("sandbox-pod-{}", index % 2),
                         reserved_at: "2026-10-21T12:00:00.000000+00:00".into(),
-                        execution_uid: (index % 3 != 0)
+                        execution_uid: (index % 3 == 1)
                             .then(|| format!("execution-uid-{index:032x}")),
                         creation_state: match index % 3 {
                             0 => ExecutionCreationState::Creating,
@@ -153,6 +153,31 @@ pub(super) mod tests {
                 )
             })
             .collect()
+    }
+
+    pub(in crate::sandbox_access_ledger) fn full_legacy_history()
+    -> (BTreeMap<String, ExecutionEntry>, String) {
+        use crate::sandbox_access_ledger::{
+            ENTRIES_ANNOTATION, EXECUTIONS_ANNOTATION, STATE_ANNOTATION,
+        };
+        let overhead = STATE_ANNOTATION.len()
+            + "closed".len()
+            + ENTRIES_ANNOTATION.len()
+            + 2
+            + EXECUTIONS_ANNOTATION.len();
+        let target = 262_144 - overhead - 128;
+        let mut entries = BTreeMap::new();
+        for (name, entry) in history(1500) {
+            entries.insert(name.clone(), entry);
+            if serde_json::to_string(&entries).unwrap().len() > target {
+                entries.remove(&name);
+                break;
+            }
+        }
+        let mut legacy = serde_json::to_string(&entries).unwrap();
+        // Valid trailing JSON whitespace fills the last partial row's space.
+        legacy.extend(std::iter::repeat_n(' ', target - legacy.len()));
+        (entries, legacy)
     }
 
     #[test]
