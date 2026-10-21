@@ -32,9 +32,19 @@ fn future_growth(entries: &BTreeMap<String, ExecutionEntry>) -> usize {
 }
 
 pub(super) fn history_fits(
+    gate: &Lease,
     entries: &BTreeMap<String, ExecutionEntry>,
 ) -> Result<bool, AccessLedgerError> {
-    Ok(encoding::encode(entries)?.len() + future_growth(entries) <= HISTORY_BYTES)
+    let encoded = encoding::encode(entries)?;
+    let future = future_growth(entries);
+    if encoded.len() + future > HISTORY_BYTES {
+        return Ok(false);
+    }
+    match check_size(gate, &[(EXECUTIONS_ANNOTATION, &encoded)], future) {
+        Ok(()) => Ok(true),
+        Err(AccessLedgerError::Capacity) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn check_size(
@@ -59,16 +69,11 @@ fn check_size(
     Ok(())
 }
 
-pub(super) fn check_execution_patch(
-    gate: &Lease,
-    next: &str,
-    entries: &BTreeMap<String, ExecutionEntry>,
-) -> Result<(), AccessLedgerError> {
-    check_size(
-        gate,
-        &[(EXECUTIONS_ANNOTATION, next)],
-        future_growth(entries),
-    )
+pub(super) fn check_execution_patch(gate: &Lease, next: &str) -> Result<(), AccessLedgerError> {
+    // Existing reservations must be able to settle even when a legacy gate
+    // predates the headroom rule. Only new admissions reserve future growth.
+    // Teardown and binding still obey the API server's actual byte ceiling.
+    check_size(gate, &[(EXECUTIONS_ANNOTATION, next)], 0)
 }
 
 /// Compact a legacy gate in the same UID/resourceVersion CAS that admits an
@@ -155,8 +160,9 @@ mod tests {
 
     #[test]
     fn new_execution_history_stops_before_access_capacity_is_consumed() {
-        assert!(history_fits(&history(10)).unwrap());
-        assert!(!history_fits(&history(2000)).unwrap());
+        let gate = object(BTreeMap::new());
+        assert!(history_fits(&gate, &history(10)).unwrap());
+        assert!(!history_fits(&gate, &history(2000)).unwrap());
         let mut creating = history(1);
         let before = future_growth(&creating);
         let entry = creating.values_mut().next().unwrap();
@@ -166,6 +172,76 @@ mod tests {
         assert_eq!(future_growth(&creating), 1);
         creating.values_mut().next().unwrap().active = false;
         assert_eq!(future_growth(&creating), 0);
+    }
+
+    #[test]
+    fn existing_legacy_reservations_can_bind_without_new_admission_headroom() {
+        let mut entries = history(500);
+        for entry in entries.values_mut() {
+            entry.execution_uid = None;
+            entry.creation_state = ExecutionCreationState::Creating;
+            entry.active = true;
+            entry.writer = None;
+        }
+        let legacy = serde_json::to_string(&entries).unwrap();
+        let mut gate = object(BTreeMap::from([
+            (STATE_ANNOTATION.into(), "open".into()),
+            (EXECUTIONS_ANNOTATION.into(), legacy),
+            ("padding".into(), String::new()),
+        ]));
+        let used: usize = gate
+            .annotations()
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        gate.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("padding".into(), "x".repeat(262_144 - used - 2));
+        check_size(&gate, &[], 0).unwrap();
+        let compact = encoding::encode(&entries).unwrap();
+        assert!(matches!(
+            check_size(
+                &gate,
+                &[(EXECUTIONS_ANNOTATION, &compact)],
+                future_growth(&entries)
+            ),
+            Err(AccessLedgerError::Capacity)
+        ));
+        assert!(!history_fits(&gate, &entries).unwrap());
+        let entry = entries.values_mut().next().unwrap();
+        entry.execution_uid = Some("8f1d9a91-a725-4f34-90a0-612023f6f806".into());
+        entry.creation_state = ExecutionCreationState::Bound;
+        let bound = encoding::encode(&entries).unwrap();
+        check_execution_patch(&gate, &bound).unwrap();
+        assert_eq!(encoding::decode(&bound).unwrap(), entries);
+        entries.values_mut().next().unwrap().active = false;
+        check_execution_patch(&gate, &encoding::encode(&entries).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn access_annotations_also_limit_new_execution_admission() {
+        let entries = history(10);
+        let encoded = encoding::encode(&entries).unwrap();
+        let mut gate = object(BTreeMap::from([
+            (STATE_ANNOTATION.into(), "open".into()),
+            (EXECUTIONS_ANNOTATION.into(), encoded),
+            (ENTRIES_ANNOTATION.into(), String::new()),
+        ]));
+        assert!(history_fits(&gate, &entries).unwrap());
+        let used: usize = gate
+            .annotations()
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        // Valid JSON whitespace consumes the remaining annotation space.
+        gate.metadata.annotations.as_mut().unwrap().insert(
+            ENTRIES_ANNOTATION.into(),
+            format!("{{}}{}", " ".repeat(262_144 - used - 4)),
+        );
+        check_size(&gate, &[], 0).unwrap();
+        assert!(!history_fits(&gate, &entries).unwrap());
     }
 
     #[test]

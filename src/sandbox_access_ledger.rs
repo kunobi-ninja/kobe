@@ -845,7 +845,7 @@ async fn patch_execution_entries(
     entries: &BTreeMap<String, ExecutionEntry>,
 ) -> Result<Lease, AccessLedgerError> {
     let next = encoding::encode(entries)?;
-    storage::check_execution_patch(gate, &next, entries)?;
+    storage::check_execution_patch(gate, &next)?;
     let patch = serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": lease_uid(gate)? },
         { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv(gate)? },
@@ -1161,7 +1161,7 @@ pub async fn reserve_execution_capacity(
         }
         // Retain every lifetime row while reserving room for access, closing
         // the gate, and binding executions whose CREATE is still pending.
-        if !storage::history_fits(&entries)? {
+        if !storage::history_fits(&gate, &entries)? {
             return Ok(ExecutionCapacity::LimitReached);
         }
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
@@ -2755,9 +2755,12 @@ mod tests {
         let entries = encoding::tests::history(1000);
         let encoded = encoding::encode(&entries).unwrap();
         assert!(encoded.len() < 262_144);
-        assert!(!storage::history_fits(&entries).unwrap());
         let mut object = gate_with_creating_entry(None);
         object["metadata"]["annotations"][EXECUTIONS_ANNOTATION] = json!(encoded);
+        assert!(
+            !storage::history_fits(&serde_json::from_value(object.clone()).unwrap(), &entries)
+                .unwrap()
+        );
         Mock::given(method("GET"))
             .and(path(gate_path("sandbox-uid")))
             .respond_with(ResponseTemplate::new(200).set_body_json(object))
