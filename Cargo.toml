@@ -9,9 +9,9 @@ resolver = "3"
 # CLI so they always publish in lockstep. `just bump X.Y.Z` rewrites this; the
 # version-consistency gate enforces tag == this == Chart.yaml at release time.
 [workspace.package]
-version = "0.61.1"
+version = "0.62.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.95"
 license = "Apache-2.0"
 
 # Strip debug symbols at build time. Without this, `cargo deb` (the build_deb
@@ -51,7 +51,7 @@ name = "kobe-host-reaper"
 path = "src/host_reaper_bin.rs"
 
 [dependencies]
-# Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
+# Kubernetes — kube 4.0 requires k8s-openapi 0.28 + schemars 1.x
 kube = { version = "4.0", features = ["runtime", "derive", "client", "ws"] }
 # Direct dependency purely to turn on one unstable kube-runtime feature. The
 # `kube` umbrella only exposes the whole `unstable-runtime` set, and features are
@@ -88,10 +88,9 @@ sha2 = "0.10"
 form_urlencoded = "1.2"
 
 # Auth
-# Direct use is only `Algorithm`. Same major as kunobi-auth so the tree
-# does not carry jsonwebtoken 9 and 10 side by side. default-features
-# off: jsonwebtoken 10 panics if both crypto backends are compiled in.
-# `rust_crypto` comes from kunobi-auth's defaults.
+# Direct use is only `Algorithm`. kunobi-auth supplies its patched crypto
+# backend; enabling jsonwebtoken's rust_crypto feature would also pull the
+# older elliptic-curve dependency tree back into the build.
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 # Unify with kunobi-auth's reqwest 0.13. The old `rustls-tls` feature
 # was renamed; `rustls-no-provider` keeps ring as our process provider.
@@ -123,7 +122,8 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.32"
 
 # PostgreSQL for direct-k3s shared datastore
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+# Queries use the runtime API; no query macros, migrations, or other drivers.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 # kobe-sync: reverse proxy
 # `client` feature is needed by the upgrade tunnel — we use
@@ -157,7 +157,7 @@ async-trait = "0.1"
 # Operator-side kunobi libs + CLI plumbing. (The interactive `kobe` CLI moved to
 # the `crates/kobectl` member; `ratatui`/`crossterm` went with it — the operator
 # uses none of the TUI crates.)
-kunobi-auth = "0.11.1"
+kunobi-auth = { version = "1.1", default-features = false, features = ["server", "rust_crypto"] }
 kunobi-ha = "0.6.0"
 # Hot-reload the PostgreSQL credential from a mounted Secret on rotation (#91).
 kunobi-reload = { git = "https://github.com/kunobi-ninja/kunobi-reload.git", branch = "main" }

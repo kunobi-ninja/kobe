@@ -40,15 +40,10 @@ buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    # FIXME(first nix build): these are placeholders. Run `nix build .#kobe`
-    # once; nix prints the real `got: sha256-…` for each — paste them in. The
-    # whole workspace lock is processed even though we only build `kobectl`, so
-    # all three git deps need a hash (kunobi-ha/kunobi-reload are operator-only
-    # but still appear in the lock).
+    # importCargoLock fetches the whole workspace, including this operator-only
+    # dependency. Hash the source at the revision pinned in Cargo.lock.
     outputHashes = {
-      "kunobi-auth-0.10.0" = lib.fakeHash;
-      "kunobi-ha-0.5.0" = lib.fakeHash;
-      "kunobi-reload-0.1.0" = lib.fakeHash;
+      "kunobi-reload-0.1.0" = "sha256-HMawWgFcIM2Tgi9JRkC1/c6QiD+3CW5uUcSHxe/RoRQ=";
     };
   };
 

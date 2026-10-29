@@ -735,9 +735,16 @@ pub(crate) fn styled_phase(phase: &str) -> String {
 /// request threw that pool away and paid a new TCP and TLS handshake for every
 /// call. One client lets the commands that make several requests reuse a
 /// single kept-alive connection. Cloning is cheap and shares the pool.
+/// Initialize the CLI's ring provider here too, so callers that do not enter
+/// through `main` can construct the client with reqwest's rustls-no-provider.
 pub(crate) fn authed_client() -> reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new).clone()
+    CLIENT
+        .get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::new()
+        })
+        .clone()
 }
 
 /// Add auth header to a request builder if available.

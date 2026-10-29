@@ -777,7 +777,9 @@ mod tests {
             .mount(&server)
             .await;
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = kube::Config::new(server.uri().parse().expect("mock URI"));
+        let mut config = kube::Config::new(server.uri().parse().expect("mock URI"));
+        // Exercise classification of the 503 without kube-client's retry backoff.
+        config.default_retry = false;
         let client = kube::Client::try_from(config).expect("mock kube client");
 
         assert!(matches!(
