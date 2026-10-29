@@ -73,11 +73,12 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # new ones. `main` installs ring explicitly, exactly as the operator does.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
-# Dual git+version: the git source builds the repo today (and survives until
-# kunobi-auth is published to crates.io); the `version` requirement is what
-# `cargo publish` uses to resolve the dep from crates.io. Once kunobi-auth
-# v0.10.0 is on crates.io, the git key can be dropped.
-kunobi-auth = "0.11.1"
+# Keep browser login and patched JWT crypto without enabling aws-lc TLS:
+# Windows cross-builds use the ring provider installed by the CLI.
+kunobi-auth = { version = "1.1", default-features = false, features = [
+  "browser-login-core",
+  "rust_crypto",
+] }
 
 [dev-dependencies]
 tempfile = "3"

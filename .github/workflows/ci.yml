@@ -137,11 +137,8 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: kunobi-runners
     container:
-      # Toolchain floor is driven by `kunobi-ha` (≥ 1.94 since kunobi-ha
-      # repointed its MSRV in their #6). Bump together with that crate
-      # whenever a newer stable lands; kobe itself only requires the
-      # `rust-version` declared in Cargo.toml.
-      image: rust:1.94-bookworm
+      # Match the workspace MSRV, including kunobi-auth's patched crypto.
+      image: rust:1.95-bookworm
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
@@ -240,8 +237,13 @@ jobs:
       # come with a reason.
       - name: Security audit
         run: |
+          # ssh-key resolves optional ECDSA crypto into Cargo.lock even though
+          # no workspace build enables it. Fail if an affected crypto-bigint
+          # becomes reachable on any target before ignoring that lock entry.
+          bash scripts/check-crypto-dependencies.sh
           cargo install cargo-audit --locked || true
           cargo audit \
+            --ignore RUSTSEC-2026-0387 \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0134 \
@@ -287,8 +289,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The pure crate deliberately supports Rust 1.93: Kani 0.67's verifier
-      # toolchain is one release behind Kobe's 1.94.1 operator MSRV. The
+      # The pure crate supports Rust 1.93 for Kani 0.67's verifier toolchain.
+      # It does not inherit the operator's newer dependency MSRV. The
       # operator imports this exact function, so the proof cannot drift into a
       # second model that production never calls.
       # The upstream composite action executes its installer from the ARC host
