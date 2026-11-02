@@ -52,7 +52,7 @@ spec:
         request.userInfo.username ==
         "system:serviceaccount:{{ .Release.Namespace }}:{{ include "kobe.serviceAccountName" . }}"
   validations:
-    - expression: 'object.metadata.name.startsWith("vcluster-")'
+    - expression: 'oldObject.metadata.name.startsWith("vcluster-")'
       message: "kobe-operator may only delete namespaces matching vcluster-*"
       reason: Forbidden
 ---
