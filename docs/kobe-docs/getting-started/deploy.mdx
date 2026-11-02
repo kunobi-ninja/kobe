@@ -109,6 +109,8 @@ kobe login
 kobe lease ci-small
 ```
 
+Over a plain-HTTP endpoint like this one, you can lease, list and release, but kubectl can't use the lease's kubeconfig. kubectl sends credentials only over TLS, so the connect proxy answers 401. To reach the cluster, use an endpoint behind TLS, such as ingress.
+
 For a public URL, enable ingress on the chart. See [Helm](/docs/operate/helm).
 
 ## Cloud walkthroughs
