@@ -811,6 +811,7 @@ pub enum PoolSpecField {
     ClusterDomain,
     RegistryMirrors,
     KubeletSharedMount,
+    DnsConfig,
     /// `backend.datastore.goldenTemplates: true`. No backend reads it.
     GoldenTemplates,
 }
@@ -829,6 +830,7 @@ impl PoolSpecField {
             Self::ClusterDomain => "cluster.clusterDomain",
             Self::RegistryMirrors => "cluster.registryMirrors",
             Self::KubeletSharedMount => "cluster.kubeletSharedMount",
+            Self::DnsConfig => "cluster.dnsConfig",
             Self::GoldenTemplates => "backend.datastore.goldenTemplates",
         }
     }
@@ -858,6 +860,7 @@ fn requested_pool_fields(spec: &crate::crd::ClusterPoolSpec) -> Vec<PoolSpecFiel
             PoolSpecField::KubeletSharedMount,
             c.kubelet_shared_mount.is_some(),
         ),
+        (PoolSpecField::DnsConfig, c.dns_config.is_some()),
         (PoolSpecField::GoldenTemplates, golden),
     ]
     .into_iter()
@@ -908,6 +911,7 @@ pub(crate) fn pool_spec_requesting_every_field(
             "clusterDomain": "example.local",
             "registryMirrors": { "docker.io": ["https://mirror.example"] },
             "kubeletSharedMount": {},
+            "dnsConfig": {},
         },
     });
     serde_json::from_value(spec).expect("pool spec requesting every field")

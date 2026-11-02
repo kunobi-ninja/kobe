@@ -3086,15 +3086,16 @@ mod pool_spec_coverage_tests {
     use crate::backend::{pool_spec_requesting_every_field, unsupported_pool_fields};
     use crate::crd::BackendType;
 
-    /// k0s renders no registries file and no kubelet hostPath mount.
+    /// k0s renders no registries file, kubelet hostPath mount or pod DNS config.
     #[test]
-    fn k0s_refuses_registry_mirrors_and_kubelet_shared_mount() {
+    fn k0s_refuses_registry_mirrors_kubelet_shared_mount_and_dns_config() {
         let spec = pool_spec_requesting_every_field(BackendType::K0s);
         assert_eq!(
             unsupported_pool_fields(&spec),
             vec![
                 "cluster.registryMirrors",
                 "cluster.kubeletSharedMount",
+                "cluster.dnsConfig",
                 "backend.datastore.goldenTemplates",
             ]
         );

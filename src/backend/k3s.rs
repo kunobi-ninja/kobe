@@ -556,6 +556,7 @@ pub(crate) const HONORED_POOL_FIELDS: &[super::PoolSpecField] = {
         ClusterDomain,
         RegistryMirrors,
         KubeletSharedMount,
+        DnsConfig,
     ]
 };
 
@@ -1612,6 +1613,7 @@ impl K3sBackend {
                         affinity: Self::server_affinity(config.placement.as_ref(), pool),
                         tolerations: Self::pod_tolerations(config.placement.as_ref()),
                         volumes: Some(volumes),
+                        dns_config: config.dns_config.clone(),
                         service_account_name: Some(
                             std::env::var("POOL_SERVICE_ACCOUNT")
                                 .unwrap_or_else(|_| "kobe-operator".to_string()),
@@ -1951,6 +1953,7 @@ impl K3sBackend {
                         affinity: Self::agent_affinity(name, config.placement.as_ref(), pool),
                         tolerations: Self::pod_tolerations(config.placement.as_ref()),
                         volumes: Some(volumes),
+                        dns_config: config.dns_config.clone(),
                         ..Default::default()
                     }),
                 },
@@ -5441,6 +5444,33 @@ mod tests {
             .find(|v| v.name == "registries-config")
             .expect("registries-config volume missing on server pod template");
         assert_eq!(vol.config_map.as_ref().unwrap().name, "c-registries");
+    }
+
+    #[test]
+    fn test_dns_config_reaches_server_and_agent_pods() {
+        let dns_config = k8s_openapi::api::core::v1::PodDNSConfig {
+            options: Some(vec![k8s_openapi::api::core::v1::PodDNSConfigOption {
+                name: Some("ndots".to_string()),
+                value: Some("1".to_string()),
+            }]),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            dns_config: Some(dns_config.clone()),
+            ..base_config()
+        };
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        for pod_spec in [
+            sts.spec.unwrap().template.spec.unwrap(),
+            deploy.spec.unwrap().template.spec.unwrap(),
+        ] {
+            assert_eq!(pod_spec.dns_config, Some(dns_config.clone()));
+        }
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &base_config(), None, 1);
+        assert_eq!(sts.spec.unwrap().template.spec.unwrap().dns_config, None);
     }
 
     #[test]
