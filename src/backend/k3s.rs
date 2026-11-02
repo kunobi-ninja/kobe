@@ -227,6 +227,60 @@ fn node_password_mount() -> VolumeMount {
     }
 }
 
+const MACHINE_ID: &str = "machine-id";
+
+/// Writes the pod's UID, without dashes, as the machine id its node reports.
+///
+/// The k3s image ships no `/etc/machine-id`, so every node's
+/// `status.nodeInfo.machineID` is empty. machine-id(5) is 32 lowercase hex
+/// digits; dbus and systemd reject the dashed UUID a downward-API file holds.
+fn machine_id_init_container(image: &str) -> Container {
+    Container {
+        name: MACHINE_ID.to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"echo "$POD_UID" | tr -d - > /machine-id/machine-id"#.to_string(),
+        ]),
+        env: Some(vec![EnvVar {
+            name: "POD_UID".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "metadata.uid".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: MACHINE_ID.to_string(),
+            mount_path: "/machine-id".to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+fn machine_id_volume() -> Volume {
+    Volume {
+        name: MACHINE_ID.to_string(),
+        empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+        ..Default::default()
+    }
+}
+
+fn machine_id_mount() -> VolumeMount {
+    VolumeMount {
+        name: MACHINE_ID.to_string(),
+        mount_path: "/etc/machine-id".to_string(),
+        sub_path: Some(MACHINE_ID.to_string()),
+        read_only: Some(true),
+        ..Default::default()
+    }
+}
+
 /// True iff the ClusterConfig declares a non-empty registry_mirrors map.
 fn has_registry_mirrors(config: &ClusterConfig) -> bool {
     config
@@ -1293,6 +1347,7 @@ impl K3sBackend {
             // Pinned node password (#145) — without it a single container
             // restart permanently breaks node registration.
             node_password_mount(),
+            machine_id_mount(),
             VolumeMount {
                 name: "output".to_string(),
                 mount_path: "/output".to_string(),
@@ -1488,6 +1543,7 @@ impl K3sBackend {
             },
             // Pinned node password, projected from the same Secret (#145).
             node_password_volume(name),
+            machine_id_volume(),
             // Shared output volume (kubeconfig exchange between server and sidecar)
             Volume {
                 name: "output".to_string(),
@@ -1608,6 +1664,7 @@ impl K3sBackend {
                         ..Default::default()
                     }),
                     spec: Some(PodSpec {
+                        init_containers: Some(vec![machine_id_init_container(&image)]),
                         containers: vec![server_container, publisher_sidecar],
                         affinity: Self::server_affinity(config.placement.as_ref(), pool),
                         tolerations: Self::pod_tolerations(config.placement.as_ref()),
@@ -1822,6 +1879,7 @@ impl K3sBackend {
             // agent pod keeps its node name for its whole life, so a restarted
             // agent container hits the identical hash mismatch.
             node_password_mount(),
+            machine_id_mount(),
             // k3s data dir on an emptyDir, same rationale as the server (see
             // `build_server_container`): the agent's nested containerd needs a
             // real node filesystem, and its state must survive container
@@ -1866,7 +1924,7 @@ impl K3sBackend {
 
         let container = Container {
             name: "k3s-agent".to_string(),
-            image: Some(image),
+            image: Some(image.clone()),
             command: Some(vec!["k3s".to_string()]),
             // FQDN avoids musl's broken `search`-domain fallback after
             // an absolute NXDOMAIN — see `ClusterConfig::cluster_domain`.
@@ -1904,6 +1962,7 @@ impl K3sBackend {
                 ..Default::default()
             },
             node_password_volume(name),
+            machine_id_volume(),
             // Agents are stateless across pod replacement — emptyDir is
             // always the right backing here (no PVC variant like the server).
             Volume {
@@ -1947,6 +2006,7 @@ impl K3sBackend {
                         ..Default::default()
                     }),
                     spec: Some(PodSpec {
+                        init_containers: Some(vec![machine_id_init_container(&image)]),
                         containers: vec![container],
                         affinity: Self::agent_affinity(name, config.placement.as_ref(), pool),
                         tolerations: Self::pod_tolerations(config.placement.as_ref()),
@@ -5187,6 +5247,43 @@ mod tests {
         let server = &pod_spec.containers[0];
         assert_eq!(server.name, "k3s-server");
         assert_node_password_pinned(pod_spec, server, "my-cluster");
+    }
+
+    #[test]
+    fn test_server_and_agent_state_the_pod_uid_as_machine_id() {
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        for pod_spec in [
+            sts.spec.unwrap().template.spec.unwrap(),
+            deploy.spec.unwrap().template.spec.unwrap(),
+        ] {
+            let init = &pod_spec.init_containers.as_ref().unwrap()[0];
+            let uid = init.env.as_ref().unwrap()[0].value_from.as_ref().unwrap();
+            assert_eq!(uid.field_ref.as_ref().unwrap().field_path, "metadata.uid");
+
+            let written = &init.volume_mounts.as_ref().unwrap()[0];
+            let read = pod_spec.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.mount_path == "/etc/machine-id")
+                .expect("machine-id mount missing");
+            assert_eq!(read.name, written.name);
+            assert_eq!(read.read_only, Some(true));
+            let target = format!("{}/{}", written.mount_path, read.sub_path.as_ref().unwrap());
+            assert!(init.command.as_ref().unwrap()[2].ends_with(&format!("> {target}")));
+
+            let volume = pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|v| v.name == read.name)
+                .expect("machine-id volume missing");
+            assert!(volume.empty_dir.is_some());
+        }
     }
 
     #[test]
