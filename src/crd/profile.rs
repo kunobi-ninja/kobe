@@ -520,6 +520,11 @@ pub struct ClusterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kubelet_shared_mount: Option<KubeletSharedMountConfig>,
 
+    /// `dnsConfig` for every server and agent pod, merged with the pod's DNS
+    /// policy as Kubernetes does. Honored only by the k3s backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_config: Option<k8s_openapi::api::core::v1::PodDNSConfig>,
+
     /// Network ranges allocated for this cluster instance. **Operator-
     /// internal**: not part of the CRD spec users write — populated by
     /// the instance reconciler from `ClusterInstance.status.network`

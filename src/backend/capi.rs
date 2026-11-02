@@ -990,6 +990,7 @@ mod pool_spec_coverage_tests {
                 "cluster.clusterDomain",
                 "cluster.registryMirrors",
                 "cluster.kubeletSharedMount",
+                "cluster.dnsConfig",
                 "backend.datastore.goldenTemplates",
             ]
         );

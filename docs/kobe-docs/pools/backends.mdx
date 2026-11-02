@@ -13,7 +13,7 @@ Use k3s unless you have a reason not to. It is the only backend that implements 
 
 | Capability | k3s | k0s | vcluster | CAPI | vkobe (on hold) |
 |---|---|---|---|---|---|
-| `spec.cluster` fields honored | All | All except `kubeletSharedMount` and `registryMirrors` | `version` only | None (uses `spec.backend.capi`) | None (uses `spec.backend.vkobe`); `serverArgs` only without that block |
+| `spec.cluster` fields honored | All | All except `kubeletSharedMount`, `registryMirrors` and `dnsConfig` | `version` only | None (uses `spec.backend.capi`) | None (uses `spec.backend.vkobe`); `serverArgs` only without that block |
 | Shared PostgreSQL datastore | Yes | Yes | No | No | No (uses `KobeStore`) |
 | `VerifiedDestroy` cleanup | Yes, with conditions | No | No | No | No |
 | Drift detection after operator upgrades | Yes | No | No | No | No |
@@ -36,7 +36,7 @@ The operator checks each pool against what its backend reads. A field counts as 
 
 - `servers` other than `1`, or `agents` above `0`
 - a non-empty `serverArgs`
-- any `persistence`, `expose`, `taints` (including `[]`), `placement`, `clusterDomain`, `registryMirrors` or `kubeletSharedMount`
+- any `persistence`, `expose`, `taints` (including `[]`), `placement`, `clusterDomain`, `registryMirrors`, `dnsConfig` or `kubeletSharedMount`
 - `backend.datastore.goldenTemplates: true`, which no backend reads yet
 
 `cluster.version` is required on every pool and is never flagged, although CAPI and vkobe ignore it. `spec.resources` is outside this check.
@@ -90,7 +90,7 @@ The referenced Secret must contain a `connection-url` key with a valid PostgreSQ
 
 ## k0s
 
-k0s clusters follow the same pattern as k3s but use the k0s distribution. Use this if your workloads require k0s-specific features or you're standardizing on k0s in production. It honors the same `spec.cluster` fields as k3s except `kubeletSharedMount` and `registryMirrors`, and lacks the k3s-only checks listed in [Choosing a backend](#choosing-a-backend).
+k0s clusters follow the same pattern as k3s but use the k0s distribution. Use this if your workloads require k0s-specific features or you're standardizing on k0s in production. It honors the same `spec.cluster` fields as k3s except `kubeletSharedMount`, `registryMirrors` and `dnsConfig`, and lacks the k3s-only checks listed in [Choosing a backend](#choosing-a-backend).
 
 ```yaml
 spec:

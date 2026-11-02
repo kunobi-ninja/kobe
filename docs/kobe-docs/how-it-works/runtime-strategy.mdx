@@ -44,7 +44,8 @@ accepted and ignored. Set chart values through `spec.backend.vcluster.values`.
 
 Nested k3s is the production path for real control planes and nodes. k0s
 provisions the same shape with the k0s distribution but lacks the k3s-only
-checks above and does not support `kubeletSharedMount` or `registryMirrors`.
+checks above and does not support `kubeletSharedMount`, `registryMirrors` or
+`dnsConfig`.
 
 CAPI delegates to an infrastructure provider you already run. It ignores
 `spec.cluster` and has no CI leg, so validate it against your provider first.
